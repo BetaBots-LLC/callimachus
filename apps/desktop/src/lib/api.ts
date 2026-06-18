@@ -160,8 +160,7 @@ export const api = {
     invoke<SearchHit[]>("search_threads", { query, filters }),
   recentThreads: (filters?: SearchFilters) =>
     invoke<ThreadSummary[]>("recent_threads", { filters }),
-  getThread: (threadId: number) =>
-    invoke<ThreadDetail | null>("get_thread", { threadId }),
+  getThread: (threadId: number) => invoke<ThreadDetail | null>("get_thread", { threadId }),
   embeddingStatus: () => invoke<EmbedStatus>("embedding_status"),
   buildEmbeddings: () => invoke<void>("build_embeddings"),
 
@@ -181,11 +180,9 @@ export const api = {
     onTokenCh.onmessage = onChunk;
     return invoke<string>("send_chat", { onToken: onTokenCh, ...args });
   },
-  setApiKey: (provider: string, key: string) =>
-    invoke<void>("set_api_key", { provider, key }),
+  setApiKey: (provider: string, key: string) => invoke<void>("set_api_key", { provider, key }),
   deleteApiKey: (provider: string) => invoke<void>("delete_api_key", { provider }),
-  providerHasKey: (provider: string) =>
-    invoke<boolean>("provider_has_key", { provider }),
+  providerHasKey: (provider: string) => invoke<boolean>("provider_has_key", { provider }),
   resumeThread: (threadId: number) => invoke<void>("resume_thread", { threadId }),
   threadContext: (threadId: number) => invoke<string>("thread_context", { threadId }),
   openThreadInCli: (threadId: number, program?: string) =>

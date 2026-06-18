@@ -1,0 +1,24 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      // Build the webview bundle once before launch so the Extension Development
+      // Host has media/webview.{js,css} on first open; `watch` then rebuilds it.
+      "label": "build-webview",
+      "type": "shell",
+      "command": "pnpm run build:webview",
+      "presentation": { "reveal": "silent" },
+      "problemMatcher": []
+    },
+    {
+      "label": "watch",
+      "type": "shell",
+      "command": "pnpm watch",
+      "isBackground": true,
+      "problemMatcher": "$tsc-watch",
+      "presentation": { "reveal": "never" },
+      "group": { "kind": "build", "isDefault": true },
+      "dependsOn": ["build-webview"]
+    }
+  ]
+}

@@ -17,7 +17,9 @@ This extension is a thin client over the **`cal`** CLI, so it shares the exact s
 
 ## Sidebar
 
-A **Callimachus History** view in the Explorer lists your most recent threads — click to open, right-click to insert or copy, refresh from the title bar.
+Click the **Callimachus** icon in the Activity Bar to open the **History** panel — a live search box over your whole AI-history index, with source/project scope, a recent-threads list, and a corpus-stats footer. It themes itself to your editor (light/dark/high-contrast).
+
+Pick any result to open its full transcript as a rich tab, with one-click **Insert**, **Copy**, **Export**, and **Open in CLI** actions. Hover a row in the sidebar to insert or copy without opening it.
 
 ## Commands
 

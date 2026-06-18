@@ -78,12 +78,21 @@
         "icon": "$(refresh)"
       }
     ],
-    "views": {
-      "explorer": [
+    "viewsContainers": {
+      "activitybar": [
         {
-          "id": "callimachus.recent",
-          "name": "Callimachus History",
-          "icon": "$(history)"
+          "id": "callimachus",
+          "title": "Callimachus",
+          "icon": "media/callimachus.svg"
+        }
+      ]
+    },
+    "views": {
+      "callimachus": [
+        {
+          "id": "callimachus.sidebar",
+          "name": "History",
+          "type": "webview"
         }
       ]
     },
@@ -91,24 +100,8 @@
       "view/title": [
         {
           "command": "callimachus.refreshRecent",
-          "when": "view == callimachus.recent",
+          "when": "view == callimachus.sidebar",
           "group": "navigation"
-        },
-        {
-          "command": "callimachus.search",
-          "when": "view == callimachus.recent",
-          "group": "navigation"
-        }
-      ],
-      "view/item/context": [
-        {
-          "command": "callimachus.insertThread",
-          "when": "view == callimachus.recent && viewItem == thread",
-          "group": "inline"
-        },
-        {
-          "command": "callimachus.copyThread",
-          "when": "view == callimachus.recent && viewItem == thread"
         }
       ]
     },
@@ -124,25 +117,57 @@
           "type": "number",
           "default": 40,
           "description": "Maximum number of results to fetch per search."
+        },
+        "callimachus.vaultPath": {
+          "type": "string",
+          "default": "",
+          "description": "Obsidian vault folder for the Export action. When empty, Export opens the note as an untitled document instead of writing to a vault."
+        },
+        "callimachus.openCommand": {
+          "type": "string",
+          "default": "claude",
+          "description": "CLI agent the \"Open in CLI\" action seeds with a thread's context (e.g. `claude`, `codex`, `gemini`). Must be on your PATH."
         }
       }
     }
   },
   "scripts": {
-    "build": "tsc -p ./",
-    "watch": "tsc -w -p ./",
-    "typecheck": "tsc --noEmit -p ./",
-    "clean": "rm -rf dist",
+    "build:host": "tsc -p ./",
+    "build:webview": "vite build --config vite.webview.config.ts",
+    "build": "pnpm run build:host && pnpm run build:webview",
+    "watch:host": "tsc -w -p ./",
+    "watch:webview": "vite build --watch --config vite.webview.config.ts",
+    "watch": "pnpm run watch:webview & pnpm run watch:host",
+    "typecheck": "tsc --noEmit -p ./ && tsc --noEmit -p tsconfig.webview.json",
+    "clean": "rm -rf dist media/webview.js media/webview.css media/assets",
     "vscode:prepublish": "pnpm run build",
     "package": "vsce package --no-dependencies -o callimachus-vscode.vsix",
     "publish:vsce": "vsce publish --packagePath callimachus-vscode.vsix",
     "publish:ovsx": "ovsx publish callimachus-vscode.vsix"
   },
   "devDependencies": {
+    "@base-ui/react": "^1.5.0",
+    "@tailwindcss/typography": "^0.5.16",
+    "@tailwindcss/vite": "^4.3.1",
     "@types/node": "^20.11.0",
+    "@types/react": "^19.1.8",
+    "@types/react-dom": "^19.1.6",
     "@types/vscode": "^1.85.0",
+    "@vitejs/plugin-react": "^6.0.2",
     "@vscode/vsce": "^3.2.1",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "lucide-react": "^1.20.0",
     "ovsx": "^0.10.1",
-    "typescript": "~5.8.3"
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1",
+    "shadcn": "^4.11.0",
+    "tailwind-merge": "^3.6.0",
+    "tailwindcss": "^4.3.1",
+    "tw-animate-css": "^1.4.0",
+    "typescript": "~5.8.3",
+    "vite": "^8.0.16"
   }
 }

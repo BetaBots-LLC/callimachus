@@ -67,8 +67,7 @@ export function ThreadView() {
     onSuccess: markExported,
   });
   const synthExport = useMutation({
-    mutationFn: () =>
-      api.synthesizeExport(threadId as number, vaultDir, synthProvider, synthModel),
+    mutationFn: () => api.synthesizeExport(threadId as number, vaultDir, synthProvider, synthModel),
     onSuccess: markExported,
   });
   const exportBusy = exportNote.isPending || synthExport.isPending;
@@ -80,9 +79,15 @@ export function ThreadView() {
       </div>
     );
   if (isLoading)
-    return <div className="flex h-full items-center justify-center text-muted-foreground">Loading…</div>;
+    return (
+      <div className="flex h-full items-center justify-center text-muted-foreground">Loading…</div>
+    );
   if (!data)
-    return <div className="flex h-full items-center justify-center text-muted-foreground">Thread not found.</div>;
+    return (
+      <div className="flex h-full items-center justify-center text-muted-foreground">
+        Thread not found.
+      </div>
+    );
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -92,10 +97,20 @@ export function ThreadView() {
             {SOURCE_LABELS[data.source]}
           </Badge>
           <div className="flex flex-wrap justify-end gap-1.5">
-            <Button size="xs" variant="outline" onClick={() => addToChat.mutate()} disabled={addToChat.isPending}>
+            <Button
+              size="xs"
+              variant="outline"
+              onClick={() => addToChat.mutate()}
+              disabled={addToChat.isPending}
+            >
               + Add to chat
             </Button>
-            <Button size="xs" variant="outline" onClick={() => copyContext.mutate()} disabled={copyContext.isPending}>
+            <Button
+              size="xs"
+              variant="outline"
+              onClick={() => copyContext.mutate()}
+              disabled={copyContext.isPending}
+            >
               {copied ? "Copied ✓" : "Copy context"}
             </Button>
             <DropdownMenu>
@@ -123,9 +138,7 @@ export function ThreadView() {
             </DropdownMenu>
             <DropdownMenu>
               <DropdownMenuTrigger
-                render={
-                  <Button size="xs" variant="outline" disabled={openInCli.isPending} />
-                }
+                render={<Button size="xs" variant="outline" disabled={openInCli.isPending} />}
               >
                 {openInCli.isPending ? "Opening…" : "Open in"}
                 <ChevronDown className="size-3.5" />
@@ -143,7 +156,12 @@ export function ThreadView() {
               </DropdownMenuContent>
             </DropdownMenu>
             {canResume && (
-              <Button size="xs" variant="secondary" onClick={() => resume.mutate()} disabled={resume.isPending}>
+              <Button
+                size="xs"
+                variant="secondary"
+                onClick={() => resume.mutate()}
+                disabled={resume.isPending}
+              >
                 {resume.isPending ? "…" : "Resume ↗"}
               </Button>
             )}
@@ -155,7 +173,9 @@ export function ThreadView() {
           {data.gitBranch && <span> · {data.gitBranch}</span>}
           <span> · {formatTime(data.updatedAt)}</span>
         </div>
-        {resume.isError && <div className="mt-1 text-xs text-destructive">{String(resume.error)}</div>}
+        {resume.isError && (
+          <div className="mt-1 text-xs text-destructive">{String(resume.error)}</div>
+        )}
         {openInCli.isError && (
           <div className="mt-1 text-xs text-destructive">{String(openInCli.error)}</div>
         )}
@@ -228,7 +248,9 @@ function Message({ m }: { m: MessageRow }) {
         m.role === "user" ? "border-l-2 border-l-blue-500" : "border-l-2 border-l-emerald-500",
       )}
     >
-      <div className="mb-1 text-[0.68rem] uppercase tracking-wide text-muted-foreground">{m.role}</div>
+      <div className="mb-1 text-[0.68rem] uppercase tracking-wide text-muted-foreground">
+        {m.role}
+      </div>
       <div className="whitespace-pre-wrap break-words leading-relaxed">{m.text}</div>
     </div>
   );

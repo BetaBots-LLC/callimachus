@@ -2,6 +2,11 @@ src/**
 **/*.ts
 **/*.map
 tsconfig.json
+tsconfig.webview.json
+vite.webview.config.ts
 .gitignore
+.vscode/**
+.turbo/**
 node_modules/**
 !dist/**
+!media/**

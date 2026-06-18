@@ -1,3 +1,9 @@
 node_modules/
 dist/
 *.vsix
+.turbo/
+
+# Built webview bundle (produced by `vite build`); the icon is committed.
+media/webview.js
+media/webview.css
+media/assets/

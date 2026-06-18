@@ -44,15 +44,12 @@ const section = cargo.slice(pkgHeader, sectionEnd);
 const tail = cargo.slice(sectionEnd);
 
 let cargoBefore;
-const newSection = section.replace(
-  /^version\s*=\s*"[^"]*"/m,
-  (m) => {
-    cargoBefore = m.match(/"([^"]*)"/)[1];
-    return `version = "${version}"`;
-  },
-);
+const newSection = section.replace(/^version\s*=\s*"[^"]*"/m, (m) => {
+  cargoBefore = m.match(/"([^"]*)"/)[1];
+  return `version = "${version}"`;
+});
 if (cargoBefore === undefined) {
-  console.error("sync-versions: no `version = \"...\"` line in [package]");
+  console.error('sync-versions: no `version = "..."` line in [package]');
   process.exit(1);
 }
 writeFileSync(cargoPath, head + newSection + tail);

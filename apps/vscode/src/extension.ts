@@ -1,17 +1,16 @@
-// Callimachus VS Code extension. Thin client over the `cal` CLI so the editor
-// shares the exact same local index as the desktop app and MCP server — no
-// duplicated indexing, no separate DB.
+// Callimachus VS Code / Cursor extension. Thin client over the `cal` CLI so the
+// editor shares the exact same local index as the desktop app and MCP server.
+//
+// The primary UI is a React webview: a search/recent/stats sidebar in the
+// Callimachus Activity Bar container, and per-thread transcript tabs. The
+// QuickPick commands below remain as Command Palette fallbacks.
 
 import * as vscode from "vscode";
-import {
-  catThread,
-  openThread,
-  recentThreads,
-  searchHits,
-  stripMarks,
-  type SearchHit,
-} from "./cal";
-import { RecentThreadsProvider, ThreadNode } from "./tree";
+import { recentThreads, searchHits, stripMarks } from "./cal";
+import { copyThreadById, insertThreadById } from "./actions";
+import { openThreadPanel } from "./threadPanel";
+import { SidebarProvider } from "./sidebarProvider";
+import type { SearchHit } from "./protocol";
 
 type ThreadItem = vscode.QuickPickItem & { threadId: number };
 
@@ -32,7 +31,11 @@ function hitsToItems(hits: SearchHit[]): ThreadItem[] {
   return items;
 }
 
-async function pickAndOpen(items: ThreadItem[], placeHolder: string): Promise<void> {
+async function pickAndOpen(
+  extensionUri: vscode.Uri,
+  items: ThreadItem[],
+  placeHolder: string,
+): Promise<void> {
   if (items.length === 0) {
     vscode.window.showInformationMessage("Callimachus: no matching threads.");
     return;
@@ -42,10 +45,14 @@ async function pickAndOpen(items: ThreadItem[], placeHolder: string): Promise<vo
     matchOnDescription: true,
     matchOnDetail: true,
   });
-  if (choice) await openThread(choice.threadId);
+  if (choice) openThreadPanel(extensionUri, choice.threadId, choice.label);
 }
 
-async function doSearch(scopeToProject: boolean, presetQuery?: string): Promise<void> {
+async function doSearch(
+  extensionUri: vscode.Uri,
+  scopeToProject: boolean,
+  presetQuery?: string,
+): Promise<void> {
   const query =
     presetQuery ??
     (await vscode.window.showInputBox({
@@ -56,20 +63,18 @@ async function doSearch(scopeToProject: boolean, presetQuery?: string): Promise<
     }));
   if (!query) return;
 
-  const project = scopeToProject
-    ? vscode.workspace.workspaceFolders?.[0]?.uri.fsPath
-    : undefined;
+  const project = scopeToProject ? vscode.workspace.workspaceFolders?.[0]?.uri.fsPath : undefined;
 
   await vscode.window.withProgress(
     { location: vscode.ProgressLocation.Window, title: "Callimachus: searching…" },
     async () => {
       const hits = await searchHits(query, project);
-      await pickAndOpen(hitsToItems(hits), `${hits.length} hits for "${query}"`);
+      await pickAndOpen(extensionUri, hitsToItems(hits), `${hits.length} hits for "${query}"`);
     },
   );
 }
 
-async function doRecent(): Promise<void> {
+async function doRecent(extensionUri: vscode.Uri): Promise<void> {
   const rows = await recentThreads();
   const items: ThreadItem[] = rows.map((t) => ({
     threadId: t.id,
@@ -77,19 +82,18 @@ async function doRecent(): Promise<void> {
     description: t.source,
     detail: `${t.messageCount} msgs${t.projectPath ? ` · ${t.projectPath}` : ""}`,
   }));
-  await pickAndOpen(items, "Recent threads");
+  await pickAndOpen(extensionUri, items, "Recent threads");
 }
 
 /** Use the editor selection as the query; fall back to the search input box. */
-async function searchSelection(): Promise<void> {
+async function searchSelection(extensionUri: vscode.Uri): Promise<void> {
   const editor = vscode.window.activeTextEditor;
   const sel = editor?.document.getText(editor.selection).trim();
-  await doSearch(false, sel || undefined);
+  await doSearch(extensionUri, false, sel || undefined);
 }
 
-/** Resolve a thread id from a tree node arg, or prompt the user to pick one. */
-async function resolveThreadId(arg: unknown): Promise<number | undefined> {
-  if (arg instanceof ThreadNode) return arg.thread.id;
+/** Prompt the user to pick a recent thread; returns its id. */
+async function pickThreadId(): Promise<number | undefined> {
   const rows = await recentThreads();
   const choice = await vscode.window.showQuickPick(
     rows.map((t) => ({
@@ -102,28 +106,14 @@ async function resolveThreadId(arg: unknown): Promise<number | undefined> {
   return choice?.threadId;
 }
 
-async function insertThread(arg: unknown): Promise<void> {
-  const editor = vscode.window.activeTextEditor;
-  if (!editor) {
-    vscode.window.showInformationMessage("Callimachus: open an editor to insert into.");
-    return;
-  }
-  const id = await resolveThreadId(arg);
-  if (id === undefined) return;
-  const md = await catThread(id);
-  await editor.edit((b: vscode.TextEditorEdit) => b.insert(editor.selection.active, md));
-}
-
-async function copyThread(arg: unknown): Promise<void> {
-  const id = await resolveThreadId(arg);
-  if (id === undefined) return;
-  await vscode.env.clipboard.writeText(await catThread(id));
-  vscode.window.showInformationMessage("Callimachus: thread context copied.");
+/** Resolve a thread id from a numeric command arg, else prompt. */
+async function resolveThreadId(arg: unknown): Promise<number | undefined> {
+  return typeof arg === "number" ? arg : pickThreadId();
 }
 
 /** Wrap a command so any thrown error surfaces as a VS Code notification. */
 function guard<A extends unknown[]>(
-  fn: (...args: A) => Promise<void>,
+  fn: (...args: A) => Promise<void> | void,
 ): (...args: A) => Promise<void> {
   return async (...args: A) => {
     try {
@@ -135,27 +125,48 @@ function guard<A extends unknown[]>(
 }
 
 export function activate(context: vscode.ExtensionContext): void {
-  const recent = new RecentThreadsProvider();
+  const { extensionUri } = context;
+  const sidebar = new SidebarProvider(extensionUri);
 
   const status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 0);
   status.text = "$(history) Callimachus";
   status.tooltip = "Search your AI coding-agent history";
-  status.command = "callimachus.search";
+  status.command = "callimachus.sidebar.focus"; // auto-registered for the view id
   status.show();
 
   context.subscriptions.push(
     status,
-    vscode.window.registerTreeDataProvider("callimachus.recent", recent),
-    vscode.commands.registerCommand("callimachus.search", guard(() => doSearch(false))),
-    vscode.commands.registerCommand("callimachus.searchCurrentProject", guard(() => doSearch(true))),
-    vscode.commands.registerCommand("callimachus.searchSelection", guard(searchSelection)),
-    vscode.commands.registerCommand("callimachus.recent", guard(doRecent)),
-    vscode.commands.registerCommand("callimachus.insertThread", guard(insertThread)),
-    vscode.commands.registerCommand("callimachus.copyThread", guard(copyThread)),
-    vscode.commands.registerCommand("callimachus.refreshRecent", () => recent.refresh()),
+    vscode.window.registerWebviewViewProvider(SidebarProvider.viewId, sidebar, {
+      webviewOptions: { retainContextWhenHidden: true },
+    }),
+    vscode.commands.registerCommand("callimachus.search", guard(() => doSearch(extensionUri, false))),
+    vscode.commands.registerCommand(
+      "callimachus.searchCurrentProject",
+      guard(() => doSearch(extensionUri, true)),
+    ),
+    vscode.commands.registerCommand(
+      "callimachus.searchSelection",
+      guard(() => searchSelection(extensionUri)),
+    ),
+    vscode.commands.registerCommand("callimachus.recent", guard(() => doRecent(extensionUri))),
+    vscode.commands.registerCommand(
+      "callimachus.insertThread",
+      guard(async (arg: unknown) => {
+        const id = await resolveThreadId(arg);
+        if (id !== undefined) await insertThreadById(id);
+      }),
+    ),
+    vscode.commands.registerCommand(
+      "callimachus.copyThread",
+      guard(async (arg: unknown) => {
+        const id = await resolveThreadId(arg);
+        if (id !== undefined) await copyThreadById(id);
+      }),
+    ),
+    vscode.commands.registerCommand("callimachus.refreshRecent", () => sidebar.refresh()),
     vscode.commands.registerCommand(
       "callimachus.openThread",
-      guard((id: number) => openThread(id)),
+      guard((id: number) => openThreadPanel(extensionUri, id)),
     ),
   );
 }
