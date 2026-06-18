@@ -196,18 +196,34 @@ pub fn hybrid(
     query: &str,
     filters: &SearchFilters,
 ) -> Result<Vec<SearchHit>> {
+    let qv = embed::embed_query(embedder, query)?;
+    hybrid_vec(conn, query, qv.as_deref(), filters)
+}
+
+/// Hybrid (keyword + semantic) search with an ALREADY-embedded query vector. Holds
+/// only `conn` — no model inference — so callers on the UI path should run
+/// `embed::embed_query` BEFORE taking the DB lock. `qv == None` skips the semantic
+/// arm (keyword-only).
+pub fn hybrid_vec(
+    conn: &Connection,
+    query: &str,
+    qv: Option<&[f32]>,
+    filters: &SearchFilters,
+) -> Result<Vec<SearchHit>> {
     const RRF_K: f32 = 60.0;
     let limit = filters.limit.unwrap_or(100).min(500) as usize;
 
     let fts = search(conn, query, filters)?;
-    let sem = embed::semantic_search(
-        conn,
-        embedder,
-        query,
-        filters.include_subagents,
-        &filters.sources,
-        limit.max(50),
-    )?;
+    let sem = match qv {
+        Some(v) => embed::semantic_search_vec(
+            conn,
+            v,
+            filters.include_subagents,
+            &filters.sources,
+            limit.max(50),
+        )?,
+        None => Vec::new(),
+    };
 
     let mut scores: HashMap<i64, f32> = HashMap::new();
     for (rank, h) in fts.iter().enumerate() {
