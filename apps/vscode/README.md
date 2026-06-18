@@ -12,8 +12,7 @@ This extension is a thin client over the **`cal`** CLI, so it shares the exact s
 
 ## Requirements
 
-- The **`cal`** CLI on your `PATH` (ships with Callimachus; `cargo install --path apps/desktop/src-tauri --bin cal`), or set `callimachus.calPath` to its absolute path.
-- The Callimachus desktop app run at least once, so the index exists.
+- The **Callimachus desktop app** installed and run at least once — it builds the index and puts the **`cal`** CLI on your `PATH`, which this extension shells out to. (Building `cal` yourself from a checkout: `cargo install --path apps/desktop/src-tauri --bin cal`; or set `callimachus.calPath` to its absolute path.)
 
 ## Sidebar
 

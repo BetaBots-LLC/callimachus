@@ -1,4 +1,4 @@
-import { createFileRoute } from "@tanstack/react-router";
+import { Link, createFileRoute } from "@tanstack/react-router";
 import { seo } from "@/lib/seo";
 import { ldScript, softwareApplicationLd } from "@/lib/jsonld";
 import { SITE_URL } from "@/lib/site";
@@ -37,13 +37,22 @@ function McpPage() {
       <div className="grid gap-10 lg:grid-cols-2">
         <div className="flex flex-col gap-4">
           <p className="cat-label">Install &amp; connect</p>
+          <p className="text-sm leading-relaxed text-muted-foreground">
+            Install the{" "}
+            <Link to="/download" className="text-link hover:underline">
+              desktop app
+            </Link>{" "}
+            — it ships <code className="font-mono">callimachus-mcp</code> on your PATH. Then
+            register it with your client:
+          </p>
           <CommandBlock
-            label="terminal"
-            lines={[
-              "cargo install --path apps/desktop/src-tauri --bin callimachus-mcp",
-              "# register it with your client (Claude Code shown)",
-              "claude mcp add callimachus -- callimachus-mcp",
-            ]}
+            label="register (Claude Code shown)"
+            lines={["claude mcp add callimachus -- callimachus-mcp"]}
+          />
+          <p className="cat-label pt-2">Or build from source</p>
+          <CommandBlock
+            label="from a checkout of the repo"
+            lines={["cargo install --path apps/desktop/src-tauri --bin callimachus-mcp"]}
           />
           <p className="text-sm leading-relaxed text-muted-foreground">
             Reads the same local index as the app — no separate database, no extra indexing. Ships a{" "}

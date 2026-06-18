@@ -9,7 +9,7 @@ export const Route = createFileRoute("/privacy")({
     meta: seo({
       title: "Privacy — Callimachus",
       description:
-        "Callimachus is local-first and this website does not track you. No analytics, no advertising, no tracking cookies.",
+        "Callimachus is local-first — the app never tracks you. This website uses privacy-friendly, cookieless analytics only: no tracking cookies, no advertising, no cross-site profiles.",
       path: "/privacy",
     }),
     links: [{ rel: "canonical", href: `${SITE_URL}/privacy` }],
