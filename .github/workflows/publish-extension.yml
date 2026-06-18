@@ -1,0 +1,64 @@
+name: Publish Extension
+
+# Triggered by the vscode-vX.Y.Z tag pushed by version.yml (via release-tag.mjs)
+# — or run manually. Packages the VS Code / Cursor extension and publishes it to
+# the VS Code Marketplace and Open VSX (which is where Cursor & VSCodium install
+# from), and attaches the .vsix to a GitHub Release as a manual-install fallback.
+#
+# Marketplace publishing is skipped when its token secret is absent, so the .vsix
+# release still happens with no secrets configured.
+
+on:
+  push:
+    tags: ["vscode-v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing extension tag to publish (e.g. vscode-v0.1.1)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      VSCE_PAT: ${{ secrets.VSCE_PAT }}
+      OVSX_PAT: ${{ secrets.OVSX_PAT }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Package extension (.vsix)
+        working-directory: apps/vscode
+        run: pnpm run package
+
+      - name: Publish to VS Code Marketplace
+        if: env.VSCE_PAT != ''
+        working-directory: apps/vscode
+        run: pnpm exec vsce publish --packagePath callimachus-vscode.vsix -p "$VSCE_PAT"
+
+      - name: Publish to Open VSX (Cursor / VSCodium)
+        if: env.OVSX_PAT != ''
+        working-directory: apps/vscode
+        run: pnpm exec ovsx publish callimachus-vscode.vsix -p "$OVSX_PAT"
+
+      - name: GitHub Release (.vsix asset)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          name: "Callimachus extension ${{ inputs.tag || github.ref_name }}"
+          files: apps/vscode/callimachus-vscode.vsix
+          prerelease: ${{ contains(inputs.tag || github.ref_name, '-rc') || contains(inputs.tag || github.ref_name, '-beta') }}

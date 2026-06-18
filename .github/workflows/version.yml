@@ -1,0 +1,50 @@
+name: Version
+
+# Runs on every push to main. Changesets opens/updates a "Version Packages" PR
+# that, when merged, bumps the version, syncs tauri.conf.json + Cargo.toml, and
+# pushes a vX.Y.Z (or vX.Y.Z-rc.N in prerelease mode) tag. That tag triggers
+# build.yml, which builds + signs the installers and publishes the Release.
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: version-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # RELEASE_TOKEN (a PAT) is required so the pushed tag triggers build.yml.
+          # The default GITHUB_TOKEN cannot trigger another workflow. Falls back
+          # to GITHUB_TOKEN (Version PR still works; the tag just won't auto-build).
+          token: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Create Version PR / tag release
+        uses: changesets/action@v1
+        with:
+          version: pnpm run version-packages
+          publish: pnpm run release:tag
+          commit: "chore: version packages"
+          title: "chore: version packages"
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}

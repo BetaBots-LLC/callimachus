@@ -1,0 +1,64 @@
+name: Build & Release
+
+# Triggered by the vX.Y.Z (or -rc.N) tag pushed by version.yml — or run manually.
+# Builds a universal macOS binary, signs the updater artifacts, and publishes a
+# GitHub Release. RC/beta tags are marked as prereleases so they never become the
+# "latest" release that the stable auto-updater points at.
+
+on:
+  push:
+    # v[0-9]* matches desktop tags (v0.2.0) but NOT extension tags (vscode-v0.1.1).
+    tags: ["v[0-9]*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build (e.g. v0.2.0-rc.1)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ./apps/desktop/src-tauri -> target
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build, sign & release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: apps/desktop
+          tagName: ${{ inputs.tag || github.ref_name }}
+          releaseName: "Callimachus ${{ inputs.tag || github.ref_name }}"
+          releaseDraft: false
+          prerelease: ${{ contains(inputs.tag || github.ref_name, '-rc') || contains(inputs.tag || github.ref_name, '-beta') }}
+          uploadUpdaterJson: true
+          # One universal build => tauri-action fills BOTH darwin-aarch64 and
+          # darwin-x86_64 keys in latest.json from the universal artifact (no
+          # matrix race). On the first real release, eyeball latest.json to
+          # confirm those two arch keys are present (not only darwin-universal).
+          args: --target universal-apple-darwin

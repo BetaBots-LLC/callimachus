@@ -1,0 +1,35 @@
+{
+  "name": "callimachus-monorepo",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "turbo run dev",
+    "build": "turbo run build",
+    "lint": "turbo run lint",
+    "typecheck": "turbo run typecheck",
+    "clean": "turbo run clean && rm -rf node_modules .turbo",
+    "desktop": "pnpm --filter callimachus",
+    "desktop:dev": "pnpm --filter callimachus tauri dev",
+    "desktop:build": "pnpm --filter callimachus tauri build",
+    "tauri": "pnpm --filter callimachus tauri",
+    "changeset": "changeset",
+    "version-packages": "changeset version && node scripts/sync-versions.mjs && pnpm install --lockfile-only",
+    "rc:enter": "changeset pre enter rc",
+    "rc:exit": "changeset pre exit",
+    "release:tag": "node scripts/release-tag.mjs"
+  },
+  "devDependencies": {
+    "@changesets/cli": "^2.27.11",
+    "turbo": "^2.3.3"
+  },
+  "packageManager": "pnpm@10.31.0",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@tailwindcss/typography": "^0.5.20",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1",
+    "use-stick-to-bottom": "^1.1.6"
+  }
+}

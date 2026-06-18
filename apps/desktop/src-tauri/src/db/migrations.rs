@@ -1,0 +1,27 @@
+//! Schema migrations, embedded at compile time and run on startup.
+
+use rusqlite_migration::{Migrations, M};
+use std::sync::LazyLock;
+
+pub static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
+    Migrations::new(vec![
+        // 0001 — canonical store: sources, threads, messages, FTS5, index_state, providers.
+        M::up(include_str!("../../migrations/0001_init.sql")),
+        // 0002 — is_subagent flag on threads.
+        M::up(include_str!("../../migrations/0002_subagent.sql")),
+        // 0003 — embeddings table for semantic search.
+        M::up(include_str!("../../migrations/0003_embeddings.sql")),
+        // 0004 — sqlite-vec vec0 chunk index (replaces the embeddings BLOB table).
+        M::up(include_str!("../../migrations/0004_vec0.sql")),
+        // 0005 — Gemini CLI as an indexable source.
+        M::up(include_str!("../../migrations/0005_gemini.sql")),
+        // 0006 — Qwen Code, Goose, OpenCode, Continue, Cline sources.
+        M::up(include_str!("../../migrations/0006_more_sources.sql")),
+        // 0007 — Roo Code, Kilo Code (Cline-architecture forks).
+        M::up(include_str!("../../migrations/0007_cline_forks.sql")),
+        // 0008 — messages.embedded flag + partial index (fast incremental embedding).
+        M::up(include_str!("../../migrations/0008_embed_flag.sql")),
+        // 0009 — precomputed threads.bytes (fast cleanup list).
+        M::up(include_str!("../../migrations/0009_thread_bytes.sql")),
+    ])
+});

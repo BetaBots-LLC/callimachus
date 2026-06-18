@@ -1,0 +1,27 @@
+Callimachus
+Copyright 2026 Ari Shaller
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use
+this software except in compliance with the License. You may obtain a copy of
+the License at http://www.apache.org/licenses/LICENSE-2.0.
+
+------------------------------------------------------------------------------
+Third-party components
+------------------------------------------------------------------------------
+
+This product bundles or depends on open-source software, each under its own
+license. Notable components:
+
+- Tauri (tauri-apps)            — Apache-2.0 / MIT
+- fastembed-rs (Anush008)       — Apache-2.0
+- sqlite-vec (asg017)           — Apache-2.0 / MIT
+- rust-genai (jeremychone)      — Apache-2.0 / MIT
+- React, Vite, Tailwind CSS     — MIT
+- SQLite (bundled via rusqlite) — Public Domain
+
+The embedding model (BAAI bge-small-en-v1.5) is downloaded at runtime under its
+own license.
+
+The "Callimachus" name and the logo / brand assets in assets/brand/ are
+© 2026 Ari Shaller. The Apache-2.0 license covers the source code; it does not
+grant rights to the project name or logos (Apache-2.0 §6, Trademarks).
