@@ -41,6 +41,10 @@ jobs:
             args: ""
             rust_target: ""
     runs-on: ${{ matrix.platform }}
+    env:
+      # AppImage GPG signing (Linux). Empty until you add the secret → AppImage is
+      # built unsigned, no failure. Gates the import step + the SIGN env below.
+      LINUX_GPG_PRIVATE_KEY: ${{ secrets.LINUX_GPG_PRIVATE_KEY }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -72,12 +76,22 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Import AppImage signing key (Linux)
+        if: startsWith(matrix.platform, 'ubuntu') && env.LINUX_GPG_PRIVATE_KEY != ''
+        run: echo "$LINUX_GPG_PRIVATE_KEY" | gpg --batch --import
+
       - name: Build, sign & release
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # AppImage GPG signing — Linux only, and only when the key secret exists
+          # (otherwise SIGN is empty → unsigned AppImage, no failure).
+          SIGN: ${{ startsWith(matrix.platform, 'ubuntu') && env.LINUX_GPG_PRIVATE_KEY != '' && '1' || '' }}
+          SIGN_KEY: ${{ secrets.LINUX_GPG_KEY_ID }}
+          APPIMAGETOOL_SIGN_PASSPHRASE: ${{ secrets.LINUX_GPG_PASSPHRASE }}
+          APPIMAGETOOL_FORCE_SIGN: ${{ startsWith(matrix.platform, 'ubuntu') && env.LINUX_GPG_PRIVATE_KEY != '' && '1' || '' }}
         with:
           projectPath: apps/desktop
           tagName: ${{ inputs.tag || github.ref_name }}
