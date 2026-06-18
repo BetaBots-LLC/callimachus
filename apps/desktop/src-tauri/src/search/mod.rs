@@ -5,7 +5,7 @@ use crate::embed::{self, Embedder};
 use anyhow::Result;
 use rusqlite::{Connection, ToSql};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Optional filters applied alongside the text query.
 #[derive(Debug, Default, Deserialize)]
@@ -269,6 +269,75 @@ pub fn recent_threads(conn: &Connection, filters: &SearchFilters) -> Result<Vec<
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Threads most semantically related to arbitrary context text (a code selection,
+/// an error, a symbol) — the engine behind "ambient recall". Reuses the message-
+/// level semantic KNN, then dedupes to one summary per thread preserving rank.
+/// All-projects by design; a set `filters.project` post-filters. Returns empty
+/// (not an error) when the index has no embeddings yet.
+pub fn related(
+    conn: &Connection,
+    embedder: &Embedder,
+    context: &str,
+    filters: &SearchFilters,
+) -> Result<Vec<ThreadSummary>> {
+    let limit = filters.limit.unwrap_or(5).clamp(1, 50) as usize;
+    // Over-fetch message hits so dedup-to-thread still leaves `limit` threads.
+    let hits = embed::semantic_search(
+        conn,
+        embedder,
+        context,
+        filters.include_subagents,
+        &filters.sources,
+        limit * 8,
+    )?;
+
+    let mut seen = HashSet::new();
+    let mut out = Vec::with_capacity(limit);
+    for (message_id, _sim) in hits {
+        let thread_id: i64 =
+            conn.query_row("SELECT thread_id FROM messages WHERE id = ?1", [message_id], |r| {
+                r.get(0)
+            })?;
+        if !seen.insert(thread_id) {
+            continue; // a better-ranked message already claimed this thread
+        }
+        if let Some(summary) = thread_summary(conn, thread_id)? {
+            if let Some(p) = &filters.project {
+                if !summary.project_path.as_deref().unwrap_or("").contains(p.as_str()) {
+                    continue;
+                }
+            }
+            out.push(summary);
+            if out.len() >= limit {
+                break;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// One thread's summary row, or None if the id is unknown.
+fn thread_summary(conn: &Connection, id: i64) -> Result<Option<ThreadSummary>> {
+    let mut stmt = conn.prepare(
+        "SELECT t.id, s.kind, t.title, t.project_path, t.message_count, t.updated_at
+         FROM threads t JOIN sources s ON s.id = t.source_id WHERE t.id = ?1",
+    )?;
+    let mut rows = stmt.query_map([id], |r| {
+        Ok(ThreadSummary {
+            id: r.get(0)?,
+            source: r.get(1)?,
+            title: r.get(2)?,
+            project_path: r.get(3)?,
+            message_count: r.get(4)?,
+            updated_at: r.get(5)?,
+        })
+    })?;
+    match rows.next() {
+        Some(row) => Ok(Some(row?)),
+        None => Ok(None),
+    }
 }
 
 /// Aggregate stats over the whole index, for the dashboard / `cal stats`.

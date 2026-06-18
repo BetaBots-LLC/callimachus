@@ -3,7 +3,7 @@
 // the desktop app's shadcn primitives for visual parity; all data comes from the
 // host RPC bridge.
 
-import { useCallback, useEffect, useState } from "react";
+import { type ReactNode, useCallback, useEffect, useState } from "react";
 import { CornerDownLeft, Copy, Search } from "lucide-react";
 import { Button } from "@desktop/components/ui/button";
 import { Input } from "@desktop/components/ui/input";
@@ -11,12 +11,20 @@ import { Badge } from "@desktop/components/ui/badge";
 import { formatTime, renderSnippet, shortPath } from "@desktop/lib/format";
 import type { InitPayload, SearchHit, Stats, ThreadSummary } from "../protocol";
 import { sourceLabel } from "../protocol";
-import { action, getState, onRefresh, request, setState } from "./bridge";
+import { action, getState, onRefresh, onRelated, request, setState } from "./bridge";
 
 type Scope = "all" | "project";
 interface Persisted {
   query?: string;
   scope?: Scope;
+}
+
+function SectionLabel({ children }: { children: ReactNode }) {
+  return (
+    <p className="px-2 py-1 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+      {children}
+    </p>
+  );
 }
 
 function Row({
@@ -85,6 +93,8 @@ export function SidebarApp({ init }: { init: InitPayload }) {
   const [stats, setStats] = useState<Stats | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [related, setRelated] = useState<ThreadSummary[]>([]);
+  const [relatedLabel, setRelatedLabel] = useState("");
 
   const project = init.projectPath ?? null;
 
@@ -97,7 +107,7 @@ export function SidebarApp({ init }: { init: InitPayload }) {
       setLoading(true);
       setError(null);
       try {
-        const proj = sc === "project" ? project ?? undefined : undefined;
+        const proj = sc === "project" ? (project ?? undefined) : undefined;
         setHits(await request("search", { query: q, project: proj }));
       } catch (e) {
         setError((e as Error).message);
@@ -140,7 +150,19 @@ export function SidebarApp({ init }: { init: InitPayload }) {
     });
   }, [loadBase, runSearch, query, scope]);
 
+  // Ambient recall: the host pushes related threads for the current editor context.
+  useEffect(() => {
+    onRelated((label, results) => {
+      setRelatedLabel(label);
+      setRelated(results);
+    });
+  }, []);
+
   const showingResults = query.trim().length > 0;
+  const summaryMeta = (t: ThreadSummary) =>
+    [`${t.messageCount} msgs`, formatTime(t.updatedAt), shortPath(t.projectPath)]
+      .filter(Boolean)
+      .join(" · ");
 
   return (
     <div className="flex h-screen flex-col text-sm">
@@ -183,49 +205,54 @@ export function SidebarApp({ init }: { init: InitPayload }) {
           </p>
         ) : null}
 
-        <p className="px-2 py-1 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
-          {showingResults ? (loading ? "Searching…" : `${hits?.length ?? 0} results`) : "Recent"}
-        </p>
-
         {showingResults ? (
-          hits && hits.length > 0 ? (
-            hits.map((h) => (
-              <Row
-                key={`${h.threadId}-${h.snippet.slice(0, 12)}`}
-                id={h.threadId}
-                source={h.source}
-                title={h.title}
-                meta={shortPath(h.projectPath)}
-                snippetHtml={renderSnippet(h.snippet)}
-              />
-            ))
-          ) : (
-            !loading && (
-              <p className="px-2 py-6 text-center text-xs text-muted-foreground">
-                No matching threads.
-              </p>
-            )
-          )
-        ) : recent && recent.length > 0 ? (
-          recent.map((t) => (
-            <Row
-              key={t.id}
-              id={t.id}
-              source={t.source}
-              title={t.title}
-              meta={[
-                `${t.messageCount} msgs`,
-                formatTime(t.updatedAt),
-                shortPath(t.projectPath),
-              ]
-                .filter(Boolean)
-                .join(" · ")}
-            />
-          ))
+          <>
+            <SectionLabel>{loading ? "Searching…" : `${hits?.length ?? 0} results`}</SectionLabel>
+            {hits && hits.length > 0
+              ? hits.map((h) => (
+                  <Row
+                    key={`${h.threadId}-${h.snippet.slice(0, 12)}`}
+                    id={h.threadId}
+                    source={h.source}
+                    title={h.title}
+                    meta={shortPath(h.projectPath)}
+                    snippetHtml={renderSnippet(h.snippet)}
+                  />
+                ))
+              : !loading && (
+                  <p className="px-2 py-6 text-center text-xs text-muted-foreground">
+                    No matching threads.
+                  </p>
+                )}
+          </>
         ) : (
-          <p className="px-2 py-6 text-center text-xs text-muted-foreground">
-            No threads indexed yet. Open the Callimachus app once to build the index.
-          </p>
+          <>
+            {related.length > 0 ? (
+              <>
+                <SectionLabel>Related{relatedLabel ? ` · ${relatedLabel}` : ""}</SectionLabel>
+                {related.map((t) => (
+                  <Row
+                    key={`related-${t.id}`}
+                    id={t.id}
+                    source={t.source}
+                    title={t.title}
+                    meta={summaryMeta(t)}
+                  />
+                ))}
+              </>
+            ) : null}
+
+            <SectionLabel>Recent</SectionLabel>
+            {recent && recent.length > 0 ? (
+              recent.map((t) => (
+                <Row key={t.id} id={t.id} source={t.source} title={t.title} meta={summaryMeta(t)} />
+              ))
+            ) : (
+              <p className="px-2 py-6 text-center text-xs text-muted-foreground">
+                No threads indexed yet. Open the Callimachus app once to build the index.
+              </p>
+            )}
+          </>
         )}
       </div>
 

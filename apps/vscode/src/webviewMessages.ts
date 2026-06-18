@@ -20,7 +20,12 @@ export async function handleWebviewMessage(
 ): Promise<void> {
   if (msg.kind === "rpc") {
     try {
-      post(webview, { kind: "rpc-result", id: msg.id, ok: true, result: await runRpc(msg.method, msg.params) });
+      post(webview, {
+        kind: "rpc-result",
+        id: msg.id,
+        ok: true,
+        result: await runRpc(msg.method, msg.params),
+      });
     } catch (err) {
       showCalSetupPrompt(err); // download/setup toast for missing cal / no index
       post(webview, { kind: "rpc-result", id: msg.id, ok: false, error: (err as Error).message });

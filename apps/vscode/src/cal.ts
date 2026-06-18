@@ -120,16 +120,15 @@ export function showCalSetupPrompt(err: unknown): boolean {
 
   const buttons =
     err.reason === "missing" ? ["Download Callimachus", "Set cal path…"] : ["Download Callimachus"];
-  void vscode.window.showWarningMessage(`Callimachus: ${err.message}`, ...buttons).then((choice) => {
-    if (choice === "Download Callimachus") {
-      void vscode.env.openExternal(vscode.Uri.parse(DOWNLOAD_URL));
-    } else if (choice === "Set cal path…") {
-      void vscode.commands.executeCommand(
-        "workbench.action.openSettings",
-        "callimachus.calPath",
-      );
-    }
-  });
+  void vscode.window
+    .showWarningMessage(`Callimachus: ${err.message}`, ...buttons)
+    .then((choice) => {
+      if (choice === "Download Callimachus") {
+        void vscode.env.openExternal(vscode.Uri.parse(DOWNLOAD_URL));
+      } else if (choice === "Set cal path…") {
+        void vscode.commands.executeCommand("workbench.action.openSettings", "callimachus.calPath");
+      }
+    });
   return true;
 }
 
@@ -143,7 +142,9 @@ function parseJson<T>(raw: string, command: string): T {
   try {
     return JSON.parse(raw) as T;
   } catch {
-    throw new Error(`\`cal ${command}\` returned output that wasn't valid JSON. Update the cal CLI?`);
+    throw new Error(
+      `\`cal ${command}\` returned output that wasn't valid JSON. Update the cal CLI?`,
+    );
   }
 }
 
@@ -163,6 +164,16 @@ export async function recentThreads(project?: string): Promise<ThreadSummary[]> 
 
 export async function stats(): Promise<Stats> {
   return parseJson<Stats>(await runCal(["stats", "--json"]), "stats");
+}
+
+/** Threads semantically related to arbitrary editor context — powers ambient
+ *  recall. Matches across all projects (no `-p`); returns thread summaries. */
+export async function relatedThreads(contextText: string): Promise<ThreadSummary[]> {
+  const limit = String(config<number>("ambientRecallLimit", 5));
+  return parseJson<ThreadSummary[]>(
+    await runCal(["related", contextText, "--json", "-n", limit]),
+    "related",
+  );
 }
 
 /** The packed markdown transcript for a thread. */

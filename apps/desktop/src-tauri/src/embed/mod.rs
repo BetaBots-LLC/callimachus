@@ -72,38 +72,48 @@ fn chunk_text(s: &str) -> Vec<String> {
     out
 }
 
-/// Embed ONE batch of not-yet-embedded user/assistant messages (chunk-level).
-/// Returns how many messages were embedded (0 when nothing pending). The caller
-/// loops, releasing the DB lock between batches so search stays responsive.
-pub fn embed_batch(conn: &mut Connection, embedder: &Embedder, batch: usize) -> Result<usize> {
-    // The `embedded` flag is maintained by a partial index, so this finds the next
-    // pending batch in O(batch) — no growing `NOT EXISTS` scan against vec0.
-    let rows: Vec<(i64, String)> = {
-        let mut stmt = conn.prepare(&format!(
-            "SELECT m.id, m.text FROM messages m
-             WHERE m.embedded = 0 AND m.role IN {EMBED_ROLES}
-             LIMIT ?1"
-        ))?;
-        let r = stmt.query_map([batch as i64], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
-        })?;
-        r.collect::<rusqlite::Result<Vec<_>>>()?
-    };
-    if rows.is_empty() {
-        return Ok(0);
-    }
+// The embedding job is split into three phases so the DB lock is NEVER held during
+// the (multi-second) model inference — only for the fast SELECT and the fast write.
+// Holding the single `Mutex<Connection>` across inference would block every UI query
+// (search, recent, stats…) and freeze the app. The background job in lib.rs drives
+// these three; `embed_batch` below is the all-in-one convenience for tests.
 
-    // Flatten all chunks across the batch into one embed call, tracking message ids.
-    let mut owners: Vec<i64> = Vec::new();
-    let mut texts: Vec<String> = Vec::new();
-    for (id, text) in &rows {
+/// Select up to `batch` not-yet-embedded user/assistant messages. The `embedded`
+/// flag is maintained by a partial index, so this is O(batch) — no growing scan.
+pub fn pending_batch(conn: &Connection, batch: usize) -> Result<Vec<(i64, String)>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT m.id, m.text FROM messages m
+         WHERE m.embedded = 0 AND m.role IN {EMBED_ROLES}
+         LIMIT ?1"
+    ))?;
+    let rows = stmt
+        .query_map([batch as i64], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Flatten a batch of messages into chunks, tracking each chunk's owning message id.
+/// Pure (no DB / no model) — run between the locked SELECT and the locked write.
+pub fn chunk_messages(rows: &[(i64, String)]) -> (Vec<i64>, Vec<String>) {
+    let mut owners = Vec::new();
+    let mut texts = Vec::new();
+    for (id, text) in rows {
         for c in chunk_text(text) {
             owners.push(*id);
             texts.push(c);
         }
     }
-    let vecs = embedder.embed(texts)?;
+    (owners, texts)
+}
 
+/// Persist chunk vectors and mark the messages embedded, in one transaction. Fast —
+/// the DB lock is held only for this, never for the inference that precedes it.
+pub fn store_batch(
+    conn: &mut Connection,
+    message_ids: &[i64],
+    owners: &[i64],
+    vecs: &[Vec<f32>],
+) -> Result<()> {
     let tx = conn.transaction()?;
     {
         let mut ins = tx.prepare("INSERT INTO vec_chunks (message_id, embedding) VALUES (?1, ?2)")?;
@@ -113,11 +123,27 @@ pub fn embed_batch(conn: &mut Connection, embedder: &Embedder, batch: usize) -> 
         // Mark every selected message done (even any that produced no chunk) so it is
         // never reselected. Re-upserting a thread resets this via fresh rows.
         let mut done = tx.prepare("UPDATE messages SET embedded = 1 WHERE id = ?1")?;
-        for (id, _) in &rows {
+        for id in message_ids {
             done.execute([id])?;
         }
     }
     tx.commit()?;
+    Ok(())
+}
+
+/// Embed ONE batch end-to-end (select → chunk → embed → store) holding `conn`
+/// throughout. Convenience for callers with no UI contention (tests, one-shots).
+/// The app's background job uses the split phases above so it never holds the DB
+/// lock during inference.
+pub fn embed_batch(conn: &mut Connection, embedder: &Embedder, batch: usize) -> Result<usize> {
+    let rows = pending_batch(conn, batch)?;
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let (owners, texts) = chunk_messages(&rows);
+    let vecs = embedder.embed(texts)?;
+    let ids: Vec<i64> = rows.iter().map(|(id, _)| *id).collect();
+    store_batch(conn, &ids, &owners, &vecs)?;
     Ok(rows.len())
 }
 

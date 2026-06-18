@@ -8,6 +8,7 @@ import type {
   InitPayload,
   RpcMap,
   RpcMethod,
+  ThreadSummary,
   ToWebview,
 } from "../protocol";
 
@@ -25,6 +26,7 @@ let seq = 0;
 const pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
 let initHandler: ((init: InitPayload) => void) | null = null;
 let refreshHandler: (() => void) | null = null;
+let relatedHandler: ((label: string, results: ThreadSummary[]) => void) | null = null;
 
 window.addEventListener("message", (ev: MessageEvent<ToWebview>) => {
   const msg = ev.data;
@@ -34,6 +36,9 @@ window.addEventListener("message", (ev: MessageEvent<ToWebview>) => {
       break;
     case "refresh":
       refreshHandler?.();
+      break;
+    case "related":
+      relatedHandler?.(msg.label, msg.results);
       break;
     case "rpc-result": {
       const p = pending.get(msg.id);
@@ -65,6 +70,9 @@ export function action(name: ActionName, id: number, title?: string | null): voi
 
 export const onInit = (fn: (init: InitPayload) => void): void => void (initHandler = fn);
 export const onRefresh = (fn: () => void): void => void (refreshHandler = fn);
+export const onRelated = (fn: (label: string, results: ThreadSummary[]) => void): void => {
+  relatedHandler = fn;
+};
 export const ready = (): void => vscode().postMessage({ kind: "ready" });
 
 export const getState = <T>(): T | undefined => vscode().getState<T>();

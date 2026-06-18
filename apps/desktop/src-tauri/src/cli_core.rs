@@ -11,13 +11,16 @@ use crate::{agent, context, db, embed, export, search, secrets};
 use rusqlite::Connection;
 
 /// Subcommands that identify a `cal` invocation when the app is launched directly.
-pub const COMMANDS: &[&str] = &["search", "recent", "cat", "show", "context", "stats", "export"];
+pub const COMMANDS: &[&str] =
+    &["search", "related", "recent", "cat", "show", "context", "stats", "export"];
 
 const USAGE: &str = "\
 cal — search your indexed AI coding-agent history
 
 USAGE:
   cal search <query…> [-s SOURCE] [-y|--hybrid] [-n LIMIT] [--json]
+  cal related [<text…>] [-s SOURCE] [-p PROJECT] [-n LIMIT] [--json]
+                                (text via args or stdin; semantic only)
   cal recent [-s SOURCE] [-p PROJECT] [-n LIMIT] [--json]
   cal cat <thread-id>            (aliases: show, context)
   cal stats [--json]
@@ -55,6 +58,7 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
     };
     match cmd.as_str() {
         "search" => cmd_search(rest),
+        "related" => cmd_related(rest),
         "recent" => cmd_recent(rest),
         "cat" | "show" | "context" => cmd_cat(rest),
         "stats" => cmd_stats(rest),
@@ -157,6 +161,44 @@ fn cmd_search(args: &[String]) -> anyhow::Result<()> {
         let title = h.title.as_deref().unwrap_or("(untitled)");
         println!("[{}] {:<11} {}", h.thread_id, h.source, title);
         println!("    {}", strip_marks(&h.snippet));
+    }
+    Ok(())
+}
+
+fn cmd_related(args: &[String]) -> anyhow::Result<()> {
+    use std::io::Read;
+    let o = parse(args)?;
+    // Context text comes from the positional args, or stdin when none are given.
+    let mut text = if o.positional.is_empty() {
+        let mut buf = String::new();
+        std::io::stdin().read_to_string(&mut buf)?;
+        buf
+    } else {
+        o.positional.join(" ")
+    };
+    if text.trim().is_empty() {
+        anyhow::bail!("related needs context text — pass it as an argument or pipe it on stdin");
+    }
+    // bge-small caps around 512 tokens; cap input so embedding stays cheap.
+    if text.chars().count() > 1500 {
+        text = text.chars().take(1500).collect();
+    }
+
+    let conn = open_db()?;
+    let embedder = embed::Embedder::default();
+    let rows = search::related(&conn, &embedder, &text, &filters(&o))?;
+
+    if o.json {
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+        return Ok(());
+    }
+    if rows.is_empty() {
+        eprintln!("no related threads (is the index embedded yet? open the app once)");
+        return Ok(());
+    }
+    for t in &rows {
+        let title = t.title.as_deref().unwrap_or("(untitled)");
+        println!("[{}] {:<11} {}  ({} msgs)", t.id, t.source, title, t.message_count);
     }
     Ok(())
 }
