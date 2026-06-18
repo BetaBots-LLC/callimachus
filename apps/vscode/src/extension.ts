@@ -6,7 +6,7 @@
 // QuickPick commands below remain as Command Palette fallbacks.
 
 import * as vscode from "vscode";
-import { recentThreads, searchHits, stripMarks } from "./cal";
+import { recentThreads, searchHits, showCalSetupPrompt, stripMarks } from "./cal";
 import { copyThreadById, insertThreadById } from "./actions";
 import { openThreadPanel } from "./threadPanel";
 import { SidebarProvider } from "./sidebarProvider";
@@ -119,7 +119,9 @@ function guard<A extends unknown[]>(
     try {
       await fn(...args);
     } catch (err) {
-      vscode.window.showErrorMessage(`Callimachus: ${(err as Error).message}`);
+      if (!showCalSetupPrompt(err)) {
+        vscode.window.showErrorMessage(`Callimachus: ${(err as Error).message}`);
+      }
     }
   };
 }

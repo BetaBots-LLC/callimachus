@@ -2,7 +2,7 @@
 // plain thread id so both callers hit the same core.
 
 import * as vscode from "vscode";
-import { catThread, config, runCal } from "./cal";
+import { calBinPath, catThread, config, runCal } from "./cal";
 
 /** Insert a thread's transcript at the cursor of the active editor. */
 export async function insertThreadById(id: number): Promise<void> {
@@ -40,7 +40,7 @@ export async function exportThreadById(id: number): Promise<void> {
 /** Seed a CLI agent (default `claude`) with the thread's context in a terminal. */
 export async function openInCli(id: number): Promise<void> {
   const program = config<string>("openCommand", "claude").trim() || "claude";
-  const bin = config<string>("calPath", "cal");
+  const bin = calBinPath();
   const term = vscode.window.createTerminal(`Callimachus ▸ thread ${id}`);
   term.show();
   // Subshell keeps the (large) context off the visible command line / argv limits.
