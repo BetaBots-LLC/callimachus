@@ -2,44 +2,114 @@
   "name": "callimachus-vscode",
   "displayName": "Callimachus — AI history search",
   "description": "Search your AI coding-agent conversation history (Claude Code, Codex, Cursor, Gemini, and 7 more) from VS Code or Cursor — without leaving the editor.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "publisher": "shaller",
   "license": "Apache-2.0",
   "icon": "icon.png",
   "homepage": "https://github.com/OWNER/callimachus#readme",
-  "repository": { "type": "git", "url": "https://github.com/OWNER/callimachus.git", "directory": "apps/vscode" },
-  "bugs": { "url": "https://github.com/OWNER/callimachus/issues" },
-  "keywords": ["ai", "claude code", "codex", "cursor", "history", "search", "chatgpt", "copilot"],
-  "galleryBanner": { "color": "#C16E2C", "theme": "dark" },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/OWNER/callimachus.git",
+    "directory": "apps/vscode"
+  },
+  "bugs": {
+    "url": "https://github.com/OWNER/callimachus/issues"
+  },
+  "keywords": [
+    "ai",
+    "claude code",
+    "codex",
+    "cursor",
+    "history",
+    "search",
+    "chatgpt",
+    "copilot"
+  ],
+  "galleryBanner": {
+    "color": "#C16E2C",
+    "theme": "dark"
+  },
   "engines": {
     "vscode": "^1.85.0"
   },
-  "categories": ["Other", "Machine Learning"],
+  "categories": [
+    "Other",
+    "Machine Learning"
+  ],
   "main": "./dist/extension.js",
   "contributes": {
     "commands": [
-      { "command": "callimachus.search", "title": "Search History", "category": "Callimachus", "icon": "$(search)" },
-      { "command": "callimachus.searchCurrentProject", "title": "Search History (current project)", "category": "Callimachus" },
-      { "command": "callimachus.searchSelection", "title": "Search History for Selection", "category": "Callimachus" },
-      { "command": "callimachus.recent", "title": "Recent Threads", "category": "Callimachus" },
-      { "command": "callimachus.insertThread", "title": "Insert Thread into Editor", "category": "Callimachus" },
-      { "command": "callimachus.copyThread", "title": "Copy Thread Context", "category": "Callimachus" },
-      { "command": "callimachus.refreshRecent", "title": "Refresh", "category": "Callimachus", "icon": "$(refresh)" }
+      {
+        "command": "callimachus.search",
+        "title": "Search History",
+        "category": "Callimachus",
+        "icon": "$(search)"
+      },
+      {
+        "command": "callimachus.searchCurrentProject",
+        "title": "Search History (current project)",
+        "category": "Callimachus"
+      },
+      {
+        "command": "callimachus.searchSelection",
+        "title": "Search History for Selection",
+        "category": "Callimachus"
+      },
+      {
+        "command": "callimachus.recent",
+        "title": "Recent Threads",
+        "category": "Callimachus"
+      },
+      {
+        "command": "callimachus.insertThread",
+        "title": "Insert Thread into Editor",
+        "category": "Callimachus"
+      },
+      {
+        "command": "callimachus.copyThread",
+        "title": "Copy Thread Context",
+        "category": "Callimachus"
+      },
+      {
+        "command": "callimachus.refreshRecent",
+        "title": "Refresh",
+        "category": "Callimachus",
+        "icon": "$(refresh)"
+      }
     ],
     "views": {
       "explorer": [
-        { "id": "callimachus.recent", "name": "Callimachus History", "icon": "$(history)" }
+        {
+          "id": "callimachus.recent",
+          "name": "Callimachus History",
+          "icon": "$(history)"
+        }
       ]
     },
     "menus": {
       "view/title": [
-        { "command": "callimachus.refreshRecent", "when": "view == callimachus.recent", "group": "navigation" },
-        { "command": "callimachus.search", "when": "view == callimachus.recent", "group": "navigation" }
+        {
+          "command": "callimachus.refreshRecent",
+          "when": "view == callimachus.recent",
+          "group": "navigation"
+        },
+        {
+          "command": "callimachus.search",
+          "when": "view == callimachus.recent",
+          "group": "navigation"
+        }
       ],
       "view/item/context": [
-        { "command": "callimachus.insertThread", "when": "view == callimachus.recent && viewItem == thread", "group": "inline" },
-        { "command": "callimachus.copyThread", "when": "view == callimachus.recent && viewItem == thread" }
+        {
+          "command": "callimachus.insertThread",
+          "when": "view == callimachus.recent && viewItem == thread",
+          "group": "inline"
+        },
+        {
+          "command": "callimachus.copyThread",
+          "when": "view == callimachus.recent && viewItem == thread"
+        }
       ]
     },
     "configuration": {
