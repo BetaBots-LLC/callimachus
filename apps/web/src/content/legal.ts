@@ -20,19 +20,19 @@ export const PRIVACY: LegalDoc = {
   title: "Privacy",
   updated: LEGAL_UPDATED,
   summary:
-    "Callimachus is local-first and this website does not track you. There is no analytics, no advertising, and no tracking cookies.",
+    "Callimachus is local-first, and this website uses only privacy-friendly, cookieless analytics. No advertising, no tracking cookies, no cross-site profiles.",
   sections: [
     {
       heading: "The short version",
       body: [
         "The Callimachus application runs entirely on your computer. Your conversation index, your search queries, and your embeddings never leave your machine. There is no account to create and nothing is sent to us.",
-        "This website (callimachus.app) collects no analytics and sets no tracking cookies. We genuinely don't know who you are, and we'd like to keep it that way.",
+        "This website (callimachus.app) uses Vercel Web Analytics for aggregate visit counts. It is cookieless and sets no tracking cookies — it does not build a profile of you or follow you across sites. We don't know who you are, and we'd like to keep it that way.",
       ],
     },
     {
       heading: "What this website collects",
       body: [
-        "Nothing beyond the ordinary. Our host (Vercel) processes standard server request logs — IP address, user agent, and the page requested — to serve the site and protect against abuse. We do not run analytics, fingerprinting, or advertising scripts, and we do not set cookies.",
+        "Beyond standard server request logs (IP address, user agent, page requested) that our host Vercel processes to serve the site, we use Vercel Web Analytics — a cookieless, privacy-friendly service that records aggregate page views and visitor counts without fingerprinting, advertising, or cross-site tracking. No personal profile is built and no tracking cookies are set.",
         "The download buttons read the latest published release from GitHub's public API at request time so we can show you the current version. That request happens on our server, not in your browser.",
       ],
     },

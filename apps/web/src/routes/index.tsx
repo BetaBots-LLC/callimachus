@@ -200,9 +200,10 @@ function Home() {
             A library that doesn't read over your shoulder.
           </h2>
           <p className="max-w-[60ch] text-lg leading-relaxed text-muted-foreground">
-            No analytics on this site. No telemetry in the app. Your conversations are indexed where
-            they already live — on your machine — and stay there. Open source under AGPL-3.0, so you
-            never have to take our word for it.
+            Cookieless, aggregate analytics on this site — no tracking cookies, no cross-site
+            profiles. No telemetry in the app. Your conversations are indexed where they already
+            live — on your machine — and stay there. Open source under AGPL-3.0, so you never have
+            to take our word for it.
           </p>
           <div className="flex flex-wrap gap-3">
             <a
