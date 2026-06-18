@@ -5,6 +5,7 @@ pub mod secrets;
 
 // Public so the sidecar binaries (MCP server, `cal` CLI) can reuse the core.
 pub mod cleanup;
+pub mod cli_core;
 pub mod context;
 pub mod db;
 pub mod embed;

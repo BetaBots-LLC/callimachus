@@ -3,7 +3,7 @@
 // send) is handled by each provider since it differs per surface.
 
 import * as vscode from "vscode";
-import { catThread, recentThreads, searchHits, stats } from "./cal";
+import { catThread, recentThreads, searchHits, showCalSetupPrompt, stats } from "./cal";
 import { copyThreadById, exportThreadById, insertThreadById, openInCli } from "./actions";
 import type { FromWebview, RpcMethod, ToWebview } from "./protocol";
 
@@ -22,6 +22,7 @@ export async function handleWebviewMessage(
     try {
       post(webview, { kind: "rpc-result", id: msg.id, ok: true, result: await runRpc(msg.method, msg.params) });
     } catch (err) {
+      showCalSetupPrompt(err); // download/setup toast for missing cal / no index
       post(webview, { kind: "rpc-result", id: msg.id, ok: false, error: (err as Error).message });
     }
     return;
@@ -46,7 +47,9 @@ export async function handleWebviewMessage(
           break;
       }
     } catch (err) {
-      vscode.window.showErrorMessage(`Callimachus: ${(err as Error).message}`);
+      if (!showCalSetupPrompt(err)) {
+        vscode.window.showErrorMessage(`Callimachus: ${(err as Error).message}`);
+      }
     }
   }
 }

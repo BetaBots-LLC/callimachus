@@ -31,6 +31,12 @@ fn claude_config_path() -> Result<PathBuf> {
     Ok(home()?.join(".claude.json"))
 }
 
+/// `~/.local/bin/cal` — where we symlink the app so the `cal` CLI (and the VS Code
+/// extension, which probes this path) works without a separate install.
+fn cal_link_path() -> Result<PathBuf> {
+    Ok(home()?.join(".local/bin/cal"))
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IntegrationStatus {
@@ -40,6 +46,8 @@ pub struct IntegrationStatus {
     pub skill_outdated: bool,
     /// An MCP server named `callimachus` is registered and points at this app.
     pub mcp_registered: bool,
+    /// `~/.local/bin/cal` exists (powers the `cal` CLI + the VS Code extension).
+    pub cal_installed: bool,
     pub skill_path: String,
     pub config_path: String,
 }
@@ -69,19 +77,23 @@ pub fn status(app_exe: &Path) -> IntegrationStatus {
         })
         .unwrap_or(false);
 
+    let cal_installed = cal_link_path().map(|p| p.exists()).unwrap_or(false);
+
     IntegrationStatus {
         skill_installed,
         skill_outdated,
         mcp_registered,
+        cal_installed,
         skill_path: skill.map(|p| p.display().to_string()).unwrap_or_default(),
         config_path: claude_config_path().map(|p| p.display().to_string()).unwrap_or_default(),
     }
 }
 
-/// Install (or refresh) the skill + MCP registration. Idempotent.
+/// Install (or refresh) the skill, MCP registration, and `cal` CLI symlink. Idempotent.
 pub fn install(app_exe: &Path) -> Result<IntegrationStatus> {
     write_skill()?;
     register_mcp(app_exe)?;
+    install_cal(app_exe)?;
     Ok(status(app_exe))
 }
 
@@ -99,6 +111,29 @@ pub fn uninstall() -> Result<()> {
             std::fs::write(&cfg, serde_json::to_string_pretty(&v)?)?;
         }
     }
+    if let Ok(link) = cal_link_path() {
+        let _ = std::fs::remove_file(&link);
+    }
+    Ok(())
+}
+
+/// Symlink `~/.local/bin/cal` → this app (which runs in `cal` mode when invoked by
+/// that name). The VS Code extension probes this exact path, so this is what makes
+/// it work without a manual CLI install. Unix only; a no-op elsewhere.
+#[cfg(unix)]
+fn install_cal(app_exe: &Path) -> Result<()> {
+    let link = cal_link_path()?;
+    if let Some(dir) = link.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
+    let _ = std::fs::remove_file(&link); // replace any stale symlink/file
+    std::os::unix::fs::symlink(app_exe, &link)
+        .with_context(|| format!("linking {} -> {}", link.display(), app_exe.display()))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn install_cal(_app_exe: &Path) -> Result<()> {
     Ok(())
 }
 

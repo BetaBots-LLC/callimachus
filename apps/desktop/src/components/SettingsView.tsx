@@ -202,14 +202,15 @@ function RecallIntegrationCard() {
         </CardTitle>
         <p className="text-sm text-muted-foreground">
           Let Claude Code (and other agents) search your history. Installs the{" "}
-          <code>/recall</code> skill and registers Callimachus as an MCP server — no terminal, no
-          setup.
+          <code>/recall</code> skill, registers Callimachus as an MCP server, and adds the{" "}
+          <code>cal</code> CLI (used by the VS Code extension) — no terminal, no setup.
         </p>
       </CardHeader>
       <CardContent className="space-y-3">
         <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
           <span>{s?.skillInstalled ? (s.skillOutdated ? "⚠ skill outdated" : "✓ skill") : "○ skill"}</span>
           <span>{s?.mcpRegistered ? "✓ MCP server" : "○ MCP server"}</span>
+          <span>{s?.calInstalled ? "✓ cal CLI" : "○ cal CLI"}</span>
         </div>
         <div className="flex items-center gap-2">
           <Button size="sm" onClick={() => install.mutate()} disabled={install.isPending}>
