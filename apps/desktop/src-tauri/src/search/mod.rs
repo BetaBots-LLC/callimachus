@@ -577,8 +577,18 @@ mod tests {
     use crate::indexer::{source_id, upsert_thread, ParsedMessage, ParsedThread};
 
     fn temp_db() -> Connection {
-        let p = std::env::temp_dir().join(format!("calli_stats_{}.db", std::process::id()));
-        let _ = std::fs::remove_file(&p);
+        // Unique per call: tests run in parallel, and two opening the same WAL file
+        // race their migrations into a SQLITE_PROTOCOL lock error.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let p = std::env::temp_dir().join(format!(
+            "calli_test_{}_{}.db",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        for ext in ["db", "db-wal", "db-shm"] {
+            let _ = std::fs::remove_file(p.with_extension(ext));
+        }
         crate::db::open(&p).unwrap()
     }
 
