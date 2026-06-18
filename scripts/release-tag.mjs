@@ -20,10 +20,11 @@ import { dirname, join } from "node:path";
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const versionOf = (pkg) => JSON.parse(readFileSync(join(root, pkg), "utf8")).version;
 
-// package.json -> git tag prefix
+// One tag drives everything: build.yml (desktop installers) AND
+// publish-extension.yml (extension) both run on v<version>. The extension version
+// is kept in lockstep with the desktop via the Changesets `fixed` group.
 const ARTIFACTS = [
   { pkg: "apps/desktop/package.json", prefix: "v" },
-  { pkg: "apps/vscode/package.json", prefix: "vscode-v" },
 ];
 
 const existing = new Set(

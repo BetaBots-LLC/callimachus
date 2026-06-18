@@ -1,20 +1,18 @@
 name: Publish Extension
 
-# Triggered by the vscode-vX.Y.Z tag pushed by version.yml (via release-tag.mjs)
-# — or run manually. Packages the VS Code / Cursor extension and publishes it to
-# the VS Code Marketplace and Open VSX (which is where Cursor & VSCodium install
-# from), and attaches the .vsix to a GitHub Release as a manual-install fallback.
-#
-# Marketplace publishing is skipped when its token secret is absent, so the .vsix
-# release still happens with no secrets configured.
+# Runs on the SAME vX.Y.Z tag as the desktop build (one tag drives both; the
+# extension version mirrors the desktop version). Packages the VS Code / Cursor
+# extension, publishes it to the VS Code Marketplace and Open VSX (where Cursor &
+# VSCodium install from), and attaches the .vsix to the SAME GitHub Release as the
+# desktop installers. Marketplace publish is skipped when its token is absent.
 
 on:
   push:
-    tags: ["vscode-v*"]
+    tags: ["v[0-9]*"]
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing extension tag to publish (e.g. vscode-v0.1.1)"
+        description: "Existing release tag to publish the extension for (e.g. v0.4.1)"
         required: true
 
 permissions:
@@ -23,6 +21,9 @@ permissions:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    # Skip on RC/beta tags — the Marketplace doesn't accept prerelease versions
+    # (e.g. 0.4.1-rc.1), and there's no prerelease channel for the extension.
+    if: ${{ !contains(inputs.tag || github.ref_name, '-rc') && !contains(inputs.tag || github.ref_name, '-beta') }}
     env:
       VSCE_PAT: ${{ secrets.VSCE_PAT }}
       OVSX_PAT: ${{ secrets.OVSX_PAT }}
@@ -58,10 +59,10 @@ jobs:
           pnpm exec ovsx create-namespace BetaBotsLLC -p "$OVSX_PAT" || true
           pnpm exec ovsx publish callimachus-vscode.vsix -p "$OVSX_PAT"
 
-      - name: GitHub Release (.vsix asset)
+      - name: Attach .vsix to the release
         uses: softprops/action-gh-release@v2
         with:
+          # Same tag as the desktop build → appends the .vsix to that release.
+          # No name/body here so build.yml owns the release title.
           tag_name: ${{ inputs.tag || github.ref_name }}
-          name: "Callimachus extension ${{ inputs.tag || github.ref_name }}"
           files: apps/vscode/callimachus-vscode.vsix
-          prerelease: ${{ contains(inputs.tag || github.ref_name, '-rc') || contains(inputs.tag || github.ref_name, '-beta') }}
