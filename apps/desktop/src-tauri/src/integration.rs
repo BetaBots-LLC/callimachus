@@ -9,9 +9,10 @@ use serde::Serialize;
 use serde_json::{json, Map, Value};
 use std::path::{Path, PathBuf};
 
-/// The `/recall` skill, embedded at compile time (single source of truth = the
-/// repo's project skill). Written verbatim to the user's skills dir on install.
-pub const SKILL_MD: &str = include_str!("../../../../.claude/skills/recall/SKILL.md");
+/// The `/recall` skill, embedded at compile time from a committed resource (so a
+/// fresh checkout builds — the repo's own `.claude/` is gitignored). Written
+/// verbatim to the user's skills dir on install.
+pub const SKILL_MD: &str = include_str!("../resources/recall/SKILL.md");
 
 /// The MCP server name registered in the user's Claude config.
 const MCP_NAME: &str = "callimachus";
