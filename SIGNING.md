@@ -34,8 +34,9 @@ gpg --armor --export-secret-keys "$KEYID" > callimachus-signing-private.asc   # 
 gpg --armor --export             "$KEYID" > callimachus-signing-public.asc    # publish
 ```
 
-- Commit the **public** key (e.g. `assets/callimachus-signing-public.asc`) and host it
-  on your TLS site so users can confirm the key ID over an authenticated channel.
+- Commit the **public** key (`assets/callimachus-signing-public.asc`) and serve it over TLS
+  so users can confirm the key ID over an authenticated channel. It is published at
+  **https://callimachus.app/callimachus-signing-public.asc** (served from `apps/web/public/`).
 - **Never** commit the private key.
 
 ### 3. Add the GitHub repo secrets
@@ -69,7 +70,8 @@ chmod +x validate-x86_64.AppImage
 ./validate-x86_64.AppImage Callimachus_<version>_amd64.AppImage
 ```
 
-Confirm the reported key ID matches the one published on the Callimachus website.
+Confirm the reported key ID matches the one published at
+**https://callimachus.app/callimachus-signing-public.asc**.
 
 ---
 

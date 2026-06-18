@@ -1,4 +1,4 @@
-import { createFileRoute } from "@tanstack/react-router";
+import { Link, createFileRoute } from "@tanstack/react-router";
 import { seo } from "@/lib/seo";
 import { ldScript, softwareApplicationLd } from "@/lib/jsonld";
 import { SITE_URL } from "@/lib/site";
@@ -30,14 +30,19 @@ function CliPage() {
       <div className="grid gap-10 lg:grid-cols-2">
         <div className="flex flex-col gap-4">
           <p className="cat-label">Install</p>
+          <p className="text-sm leading-relaxed text-muted-foreground">
+            Easiest path: install the{" "}
+            <Link to="/download" className="text-link hover:underline">
+              desktop app
+            </Link>{" "}
+            — it puts <code className="font-mono">cal</code> on your PATH, ready to use. Same local
+            index, nothing else to set up.
+          </p>
+          <p className="cat-label pt-2">Or build from source</p>
           <CommandBlock
-            label="terminal"
+            label="from a checkout of the repo"
             lines={["cargo install --path apps/desktop/src-tauri --bin cal"]}
           />
-          <p className="text-sm leading-relaxed text-muted-foreground">
-            Or just install the desktop app — it ships <code className="font-mono">cal</code> on
-            your PATH. Same index either way.
-          </p>
         </div>
 
         <div className="flex flex-col gap-4">

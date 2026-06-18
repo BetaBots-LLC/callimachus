@@ -87,8 +87,8 @@ Settings → Secrets and variables → Actions:
 3. **Merge the Version Packages PR.** That bumps the version, writes
    `CHANGELOG.md`, and pushes `vX.Y.Z`.
 4. The pushed tags fan out:
-   - `v<ver>` → `build.yml` builds signed installers for **macOS (Apple Silicon +
-     Intel), Windows (x64) and Linux (x64)**, publishes one GitHub Release, uploads
+   - `v<ver>` → `build.yml` builds signed installers for **macOS (Apple Silicon),
+     Windows (x64) and Linux (x64)**, publishes one GitHub Release, uploads
      `latest.json`. Installed apps auto-update.
    - `vscode-v<ver>` → `publish-extension.yml` packages the extension and pushes it
      to the VS Code Marketplace + Open VSX, and attaches the `.vsix` to a Release.

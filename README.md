@@ -17,7 +17,7 @@ Named for [Callimachus](https://en.wikipedia.org/wiki/Callimachus), who built th
 
 ## Download
 
-Grab the latest signed build from **[Releases](../../releases/latest)** — macOS (`.dmg`, universal), Windows (`.msi`), or Linux (`.AppImage` / `.deb`). The app auto-updates from there on. Prefer to build it yourself? See [Develop](#develop).
+Grab the latest signed build from **[Releases](../../releases/latest)** — macOS (`.dmg`, Apple Silicon), Windows (`.msi`), or Linux (`.AppImage` / `.deb`). The app auto-updates from there on. Prefer to build it yourself? See [Develop](#develop).
 
 ## What it does
 
@@ -81,19 +81,19 @@ The `--ignored` tests touch live data on this machine: each source has a `real_<
 
 Beyond the desktop window, the same local index is reachable from your agents, terminal, and editor — all reading one `index.db`.
 
-**MCP server** — let any agent search its own past work mid-session:
+**MCP server** — let any agent search its own past work mid-session. `callimachus-mcp` ships with the desktop app (on your PATH); just register it with your client:
 
 ```bash
-cargo install --path apps/desktop/src-tauri --bin callimachus-mcp
 claude mcp add callimachus -- callimachus-mcp        # or any MCP client
 ```
 
+Building from a checkout instead? `cargo install --path apps/desktop/src-tauri --bin callimachus-mcp`.
+
 Tools: `search_threads`, `search_current_project` (auto-scoped to the repo it runs in), `recent_threads`, `get_thread`. The bundled `/recall` skill ([.claude/skills/recall](.claude/skills/recall/SKILL.md)) tells agents when to reach for them.
 
-**CLI** — `cal`, pipe-friendly:
+**CLI** — `cal`, pipe-friendly. Ships with the desktop app (on your PATH); or build from a checkout with `cargo install --path apps/desktop/src-tauri --bin cal`.
 
 ```bash
-cargo install --path apps/desktop/src-tauri --bin cal
 cal search "vector index migration" -y    # -y = hybrid (semantic + keyword)
 cal recent -n 10
 cal cat 42 | pbcopy                        # packed transcript → clipboard

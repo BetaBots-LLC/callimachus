@@ -35,6 +35,8 @@ export function seo(opts: {
     { property: "og:description", content: description },
     { property: "og:url", content: url },
     { property: "og:image", content: image },
+    { property: "og:image:width", content: "1200" },
+    { property: "og:image:height", content: "630" },
     { name: "twitter:card", content: "summary_large_image" },
     { name: "twitter:title", content: opts.title },
     { name: "twitter:description", content: description },
