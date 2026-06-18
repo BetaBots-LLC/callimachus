@@ -1,10 +1,16 @@
 name: Build & Release
 
 # Triggered by the vX.Y.Z (or -rc.N) tag pushed by version.yml — or run manually.
-# Builds the desktop app for macOS (universal), Windows (x64) and Linux (x64),
-# signs the updater artifacts, and publishes them to one GitHub Release. RC/beta
-# tags are marked prereleases so they never become the "latest" the stable
-# updater points at. v[0-9]* matches desktop tags, not the vscode-v* extension tag.
+# Builds the desktop app for macOS (Apple Silicon + Intel, each on its NATIVE
+# runner), Windows (x64) and Linux (x64), signs the updater artifacts, and
+# publishes them to one GitHub Release. RC/beta tags are marked prereleases.
+# v[0-9]* matches desktop tags, not the vscode-v* extension tag.
+#
+# Why native per-arch macs (NOT --target universal): `ort` (fastembed's ONNX
+# backend) ships no prebuilt for a cross-compiled x86_64-apple-darwin, so a
+# universal build fails on the Intel slice. Building each arch on its own runner
+# avoids the cross-compile. Linux runs on 24.04 because the ONNX prebuilt needs
+# glibc >= 2.38 (22.04 ships 2.35 -> undefined __isoc23_* link errors).
 
 on:
   push:
@@ -12,7 +18,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to build (e.g. v0.2.0-rc.1)"
+        description: "Existing tag to build (e.g. v0.2.0)"
         required: true
 
 permissions:
@@ -24,12 +30,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: macos-latest      # universal (Apple Silicon + Intel)
-            args: "--target universal-apple-darwin"
-          - platform: ubuntu-22.04      # Linux x64 (.AppImage + .deb)
+          - platform: macos-latest      # Apple Silicon (native arm64)
+            args: "--target aarch64-apple-darwin"
+            rust_target: aarch64-apple-darwin
+          - platform: macos-13          # Intel (native x86_64 — no cross-compile)
+            args: "--target x86_64-apple-darwin"
+            rust_target: x86_64-apple-darwin
+          - platform: ubuntu-24.04      # Linux x64 (glibc 2.39 for the ONNX prebuilt)
             args: ""
-          - platform: windows-latest    # Windows x64 (.msi + .exe)
+            rust_target: ""
+          - platform: windows-latest    # Windows x64
             args: ""
+            rust_target: ""
     runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v4
@@ -37,7 +49,7 @@ jobs:
           ref: ${{ inputs.tag || github.ref_name }}
 
       - name: Install Linux build deps
-        if: matrix.platform == 'ubuntu-22.04'
+        if: startsWith(matrix.platform, 'ubuntu')
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf \
@@ -52,7 +64,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+          targets: ${{ matrix.rust_target }}
 
       - uses: swatinem/rust-cache@v2
         with:
@@ -74,6 +86,6 @@ jobs:
           releaseName: "Callimachus ${{ inputs.tag || github.ref_name }}"
           releaseDraft: false
           prerelease: ${{ contains(inputs.tag || github.ref_name, '-rc') || contains(inputs.tag || github.ref_name, '-beta') }}
-          # Each matrix job appends its platform's entry to the release's latest.json.
+          # Each job appends its platform/arch entry to the release's latest.json.
           uploadUpdaterJson: true
           args: ${{ matrix.args }}

@@ -8,6 +8,9 @@
     "build": "turbo run build",
     "lint": "turbo run lint",
     "typecheck": "turbo run typecheck",
+    "format": "biome format --write .",
+    "check": "biome check .",
+    "check:fix": "biome check --write .",
     "clean": "turbo run clean && rm -rf node_modules .turbo",
     "desktop": "pnpm --filter callimachus",
     "desktop:dev": "pnpm --filter callimachus tauri dev",
@@ -20,6 +23,7 @@
     "release:tag": "node scripts/release-tag.mjs"
   },
   "devDependencies": {
+    "@biomejs/biome": "2.2.4",
     "@changesets/cli": "^2.27.11",
     "turbo": "^2.3.3"
   },

@@ -16,9 +16,7 @@ export interface ToolStep {
 
 // The live assistant turn is an ordered list of parts so text and tool steps
 // render in the exact order they streamed in (text → tool → text → …).
-export type StreamPart =
-  | { kind: "text"; text: string }
-  | { kind: "tool"; step: ToolStep };
+export type StreamPart = { kind: "text"; text: string } | { kind: "tool"; step: ToolStep };
 
 interface ChatState {
   threadId: string;
@@ -51,7 +49,9 @@ const newId = () =>
   globalThis.crypto?.randomUUID?.() ?? `chat-${Math.random().toString(36).slice(2)}`;
 
 const mapTool = (parts: StreamPart[], id: string | undefined, fn: (s: ToolStep) => ToolStep) =>
-  parts.map((p) => (p.kind === "tool" && p.step.id === id ? { kind: "tool" as const, step: fn(p.step) } : p));
+  parts.map((p) =>
+    p.kind === "tool" && p.step.id === id ? { kind: "tool" as const, step: fn(p.step) } : p,
+  );
 
 export const useChat = create<ChatState>((set) => ({
   threadId: newId(),
@@ -68,8 +68,7 @@ export const useChat = create<ChatState>((set) => ({
   setProvider: (provider, defaultModel) => set({ provider, model: defaultModel }),
   setModel: (model) => set({ model }),
   setBaseUrl: (baseUrl) => set({ baseUrl }),
-  newChat: () =>
-    set({ threadId: newId(), messages: [], reasoning: "", parts: [], error: null }),
+  newChat: () => set({ threadId: newId(), messages: [], reasoning: "", parts: [], error: null }),
   loadChat: (threadId, messages) =>
     set({
       threadId,
@@ -120,11 +119,19 @@ export const useChat = create<ChatState>((set) => ({
           };
         case "tool_request":
           return {
-            parts: mapTool(s.parts, chunk.toolId, (st) => ({ ...st, arg: chunk.text, status: "awaiting" })),
+            parts: mapTool(s.parts, chunk.toolId, (st) => ({
+              ...st,
+              arg: chunk.text,
+              status: "awaiting",
+            })),
           };
         case "tool_result":
           return {
-            parts: mapTool(s.parts, chunk.toolId, (st) => ({ ...st, output: chunk.text, status: "done" })),
+            parts: mapTool(s.parts, chunk.toolId, (st) => ({
+              ...st,
+              output: chunk.text,
+              status: "done",
+            })),
           };
         default:
           return {};

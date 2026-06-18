@@ -40,7 +40,10 @@ export function ChatView() {
   const [sending, setSending] = useState(false);
   const queryClient = useQueryClient();
 
-  const hasKey = useQuery({ queryKey: ["hasKey", provider], queryFn: () => api.providerHasKey(provider) });
+  const hasKey = useQuery({
+    queryKey: ["hasKey", provider],
+    queryFn: () => api.providerHasKey(provider),
+  });
   const saveKey = useMutation({
     mutationFn: () => api.setApiKey(provider, keyDraft.trim()),
     onSuccess: () => {
@@ -78,7 +81,8 @@ export function ChatView() {
   const modelOptions: string[] = modelsQuery.data?.length ? modelsQuery.data : staticModels;
   // Always include the current model so the (strict) dropdown can display it even
   // before the live list loads or if it isn't in the provider's list.
-  const modelList = model && !modelOptions.includes(model) ? [model, ...modelOptions] : modelOptions;
+  const modelList =
+    model && !modelOptions.includes(model) ? [model, ...modelOptions] : modelOptions;
 
   async function send() {
     const text = draft.trim();
@@ -129,7 +133,13 @@ export function ChatView() {
 
     try {
       const full = await api.sendChat(
-        { threadId, provider, model, baseUrl: baseUrl || null, messages: useChat.getState().messages },
+        {
+          threadId,
+          provider,
+          model,
+          baseUrl: baseUrl || null,
+          messages: useChat.getState().messages,
+        },
         onChunk,
       );
       if (raf) cancelAnimationFrame(raf);
@@ -153,153 +163,160 @@ export function ChatView() {
     <div className="flex min-h-0 flex-1">
       <ChatSidebar />
       <div className="flex min-h-0 flex-1 flex-col">
-      <div className="flex items-center gap-2 border-b px-4 py-2.5">
-        <Select
-          value={provider}
-          onValueChange={(v) => {
-            const p = PROVIDERS.find((x) => x.id === v)!;
-            setProvider(p.id, p.defaultModel);
-          }}
-        >
-          <SelectTrigger className="w-40">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            {PROVIDERS.map((p) => (
-              <SelectItem key={p.id} value={p.id}>
-                {p.label}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-        <Select value={model} onValueChange={(v) => v && setModel(v)}>
-          <SelectTrigger className="flex-1" aria-label="Model">
-            <SelectValue placeholder={modelsQuery.isFetching ? "loading models…" : "model"} />
-          </SelectTrigger>
-          <SelectContent>
-            {modelList.map((m) => (
-              <SelectItem key={m} value={m}>
-                {m}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-        {provider === "ollama" && (
-          <Input
-            value={baseUrl}
-            onChange={(e) => setBaseUrl(e.currentTarget.value)}
-            placeholder="http://localhost:11434"
-          />
-        )}
-        <Button size="sm" variant="outline" onClick={newChat}>
-          New chat
-        </Button>
-      </div>
-
-      {needsKey && !hasKey.data && (
         <div className="flex items-center gap-2 border-b px-4 py-2.5">
-          <Input
-            type="password"
-            value={keyDraft}
-            onChange={(e) => setKeyDraft(e.currentTarget.value)}
-            placeholder={`${provider} API key (stored in your OS keychain)`}
-          />
-          <Button size="sm" onClick={() => saveKey.mutate()} disabled={!keyDraft.trim() || saveKey.isPending}>
-            Save key
+          <Select
+            value={provider}
+            onValueChange={(v) => {
+              const p = PROVIDERS.find((x) => x.id === v)!;
+              setProvider(p.id, p.defaultModel);
+            }}
+          >
+            <SelectTrigger className="w-40">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {PROVIDERS.map((p) => (
+                <SelectItem key={p.id} value={p.id}>
+                  {p.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <Select value={model} onValueChange={(v) => v && setModel(v)}>
+            <SelectTrigger className="flex-1" aria-label="Model">
+              <SelectValue placeholder={modelsQuery.isFetching ? "loading models…" : "model"} />
+            </SelectTrigger>
+            <SelectContent>
+              {modelList.map((m) => (
+                <SelectItem key={m} value={m}>
+                  {m}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          {provider === "ollama" && (
+            <Input
+              value={baseUrl}
+              onChange={(e) => setBaseUrl(e.currentTarget.value)}
+              placeholder="http://localhost:11434"
+            />
+          )}
+          <Button size="sm" variant="outline" onClick={newChat}>
+            New chat
           </Button>
         </div>
-      )}
 
-      <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
-        <StickToBottom
-          className="min-h-0 min-w-0 flex-1 overflow-y-auto overflow-x-hidden"
-          resize="smooth"
-          initial="smooth"
-        >
-          <StickToBottom.Content
-            className="mx-auto flex w-full min-w-0 max-w-3xl flex-col gap-6 px-5 py-6"
-            role="log"
-            aria-live="polite"
-            aria-relevant="additions text"
-          >
-            {messages.length === 0 && !sending && (
-              <div className="m-auto text-muted-foreground">
-                Ask anything. Replies are saved and searchable.
-              </div>
-            )}
-            {messages.map((m) => (
-              <div key={m.id} className="[contain-intrinsic-size:0_80px] [content-visibility:auto]">
-                <Bubble role={m.role} content={m.content} />
-              </div>
-            ))}
-            {sending && <StreamingArea />}
-            {error && (
-              <div
-                role="alert"
-                className="animate-in fade-in slide-in-from-bottom-2 rounded-lg border border-l-2 border-l-destructive bg-destructive/5 px-3 py-2 text-sm text-destructive"
-              >
-                {error}
-              </div>
-            )}
-          </StickToBottom.Content>
-        </StickToBottom>
-        {loadingThread && (
-          <div className="absolute inset-0 z-10 flex items-center justify-center bg-background/60 backdrop-blur-[1px]">
-            <span className="flex items-center gap-2 text-sm text-muted-foreground">
-              <Loader2 className="size-4 animate-spin" /> Loading conversation…
-            </span>
+        {needsKey && !hasKey.data && (
+          <div className="flex items-center gap-2 border-b px-4 py-2.5">
+            <Input
+              type="password"
+              value={keyDraft}
+              onChange={(e) => setKeyDraft(e.currentTarget.value)}
+              placeholder={`${provider} API key (stored in your OS keychain)`}
+            />
+            <Button
+              size="sm"
+              onClick={() => saveKey.mutate()}
+              disabled={!keyDraft.trim() || saveKey.isPending}
+            >
+              Save key
+            </Button>
           </div>
         )}
-      </div>
 
-      <form
-        className="mx-auto w-full min-w-0 max-w-3xl px-4 py-3"
-        onSubmit={(e) => {
-          e.preventDefault();
-          send();
-        }}
-      >
-        <div className="relative flex items-end rounded-2xl border border-input bg-card shadow-sm transition-all focus-within:border-ring focus-within:shadow-md focus-within:ring-4 focus-within:ring-ring/15">
-          <Textarea
-            className="max-h-48 min-h-13 flex-1 resize-none border-0 bg-transparent py-3.5 pl-4 pr-14 shadow-none focus-visible:border-0 focus-visible:ring-0 dark:bg-transparent"
-            rows={1}
-            value={draft}
-            placeholder="Message…"
-            onChange={(e) => setDraft(e.currentTarget.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" && !e.shiftKey) {
-                e.preventDefault();
-                send();
-              }
-            }}
-          />
-          {sending ? (
-            <Button
-              type="button"
-              size="icon"
-              aria-label="Stop generating"
-              onClick={() => api.cancelChat()}
-              className="absolute bottom-2 right-2 size-9 rounded-full transition-transform duration-150 hover:scale-105 active:scale-95"
+        <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
+          <StickToBottom
+            className="min-h-0 min-w-0 flex-1 overflow-y-auto overflow-x-hidden"
+            resize="smooth"
+            initial="smooth"
+          >
+            <StickToBottom.Content
+              className="mx-auto flex w-full min-w-0 max-w-3xl flex-col gap-6 px-5 py-6"
+              role="log"
+              aria-live="polite"
+              aria-relevant="additions text"
             >
-              <Square className="size-3.5 fill-current" />
-            </Button>
-          ) : (
-            <Button
-              type="submit"
-              size="icon"
-              aria-label="Send message"
-              disabled={!draft.trim()}
-              className="absolute bottom-2 right-2 size-9 rounded-full transition-transform duration-150 enabled:hover:scale-105 enabled:active:scale-95 disabled:opacity-40"
-            >
-              <ArrowUp className="size-4" />
-            </Button>
+              {messages.length === 0 && !sending && (
+                <div className="m-auto text-muted-foreground">
+                  Ask anything. Replies are saved and searchable.
+                </div>
+              )}
+              {messages.map((m) => (
+                <div
+                  key={m.id}
+                  className="[contain-intrinsic-size:0_80px] [content-visibility:auto]"
+                >
+                  <Bubble role={m.role} content={m.content} />
+                </div>
+              ))}
+              {sending && <StreamingArea />}
+              {error && (
+                <div
+                  role="alert"
+                  className="animate-in fade-in slide-in-from-bottom-2 rounded-lg border border-l-2 border-l-destructive bg-destructive/5 px-3 py-2 text-sm text-destructive"
+                >
+                  {error}
+                </div>
+              )}
+            </StickToBottom.Content>
+          </StickToBottom>
+          {loadingThread && (
+            <div className="absolute inset-0 z-10 flex items-center justify-center bg-background/60 backdrop-blur-[1px]">
+              <span className="flex items-center gap-2 text-sm text-muted-foreground">
+                <Loader2 className="size-4 animate-spin" /> Loading conversation…
+              </span>
+            </div>
           )}
         </div>
-        <p className="mt-1.5 text-center text-[0.7rem] text-muted-foreground">
-          <kbd className="font-sans">Enter</kbd> to send ·{" "}
-          <kbd className="font-sans">Shift</kbd>+<kbd className="font-sans">Enter</kbd> for newline
-        </p>
-      </form>
+
+        <form
+          className="mx-auto w-full min-w-0 max-w-3xl px-4 py-3"
+          onSubmit={(e) => {
+            e.preventDefault();
+            send();
+          }}
+        >
+          <div className="relative flex items-end rounded-2xl border border-input bg-card shadow-sm transition-all focus-within:border-ring focus-within:shadow-md focus-within:ring-4 focus-within:ring-ring/15">
+            <Textarea
+              className="max-h-48 min-h-13 flex-1 resize-none border-0 bg-transparent py-3.5 pl-4 pr-14 shadow-none focus-visible:border-0 focus-visible:ring-0 dark:bg-transparent"
+              rows={1}
+              value={draft}
+              placeholder="Message…"
+              onChange={(e) => setDraft(e.currentTarget.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  send();
+                }
+              }}
+            />
+            {sending ? (
+              <Button
+                type="button"
+                size="icon"
+                aria-label="Stop generating"
+                onClick={() => api.cancelChat()}
+                className="absolute bottom-2 right-2 size-9 rounded-full transition-transform duration-150 hover:scale-105 active:scale-95"
+              >
+                <Square className="size-3.5 fill-current" />
+              </Button>
+            ) : (
+              <Button
+                type="submit"
+                size="icon"
+                aria-label="Send message"
+                disabled={!draft.trim()}
+                className="absolute bottom-2 right-2 size-9 rounded-full transition-transform duration-150 enabled:hover:scale-105 enabled:active:scale-95 disabled:opacity-40"
+              >
+                <ArrowUp className="size-4" />
+              </Button>
+            )}
+          </div>
+          <p className="mt-1.5 text-center text-[0.7rem] text-muted-foreground">
+            <kbd className="font-sans">Enter</kbd> to send · <kbd className="font-sans">Shift</kbd>+
+            <kbd className="font-sans">Enter</kbd> for newline
+          </p>
+        </form>
       </div>
     </div>
   );
@@ -404,7 +421,9 @@ const ToolStepView = memo(function ToolStepView({ step: s }: { step: ToolStep })
 
       {s.output && s.status === "done" && (
         <details className="mt-2 min-w-0">
-          <summary className="cursor-pointer select-none text-xs text-muted-foreground">output</summary>
+          <summary className="cursor-pointer select-none text-xs text-muted-foreground">
+            output
+          </summary>
           <pre className="mt-1 max-h-72 overflow-auto whitespace-pre-wrap wrap-break-word rounded bg-background/60 p-2 text-xs">
             {s.output}
           </pre>

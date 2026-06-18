@@ -17,10 +17,7 @@ import { cn } from "@/lib/utils";
 
 // The three most-used sources get top-level chips; the rest live under "More".
 const PRIMARY: SourceKind[] = ["claude_code", "codex", "cursor"];
-const MORE: SourceKind[] = [
-  ...INDEXABLE_SOURCES.filter((s) => !PRIMARY.includes(s)),
-  "in_app",
-];
+const MORE: SourceKind[] = [...INDEXABLE_SOURCES.filter((s) => !PRIMARY.includes(s)), "in_app"];
 
 export function SearchBar() {
   const setQuery = useUi((s) => s.setQuery);
@@ -56,7 +53,10 @@ export function SearchBar() {
     queryFn: api.embeddingStatus,
     refetchInterval: (q) => (q.state.data?.running ? 700 : false),
   });
-  const buildIndex = useMutation({ mutationFn: api.buildEmbeddings, onSuccess: () => embed.refetch() });
+  const buildIndex = useMutation({
+    mutationFn: api.buildEmbeddings,
+    onSuccess: () => embed.refetch(),
+  });
 
   const embedPct =
     embed.data && embed.data.total > 0 ? Math.round((embed.data.done / embed.data.total) * 100) : 0;
@@ -94,20 +94,14 @@ export function SearchBar() {
 
         <DropdownMenu>
           <DropdownMenuTrigger
-            render={
-              <Button size="xs" variant={moreActiveCount > 0 ? "default" : "outline"} />
-            }
+            render={<Button size="xs" variant={moreActiveCount > 0 ? "default" : "outline"} />}
           >
             More{moreActiveCount > 0 ? ` (${moreActiveCount})` : ""}
             <ChevronDown className="size-3.5" />
           </DropdownMenuTrigger>
           <DropdownMenuContent align="start">
             {MORE.map((s) => (
-              <DropdownMenuItem
-                key={s}
-                closeOnClick={false}
-                onClick={() => toggleSource(s)}
-              >
+              <DropdownMenuItem key={s} closeOnClick={false} onClick={() => toggleSource(s)}>
                 <Check
                   className={cn("size-4", sources.includes(s) ? "opacity-100" : "opacity-0")}
                 />

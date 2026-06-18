@@ -129,8 +129,8 @@ export function CleanupCard() {
       <CardHeader>
         <CardTitle>Storage cleanup</CardTitle>
         <p className="text-sm text-muted-foreground">
-          Remove old threads to free space — listed least-recently-active first. Deletes
-          cascade to messages, search, and embeddings.
+          Remove old threads to free space — listed least-recently-active first. Deletes cascade to
+          messages, search, and embeddings.
         </p>
       </CardHeader>
       <CardContent className="space-y-3">

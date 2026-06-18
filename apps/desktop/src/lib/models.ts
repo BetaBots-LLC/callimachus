@@ -24,7 +24,10 @@ export function loadModelCache(provider: string): Cached | undefined {
 
 export function saveModelCache(provider: string, models: string[]): void {
   try {
-    localStorage.setItem(key(provider), JSON.stringify({ models, at: Date.now(), ver: CACHE_VERSION }));
+    localStorage.setItem(
+      key(provider),
+      JSON.stringify({ models, at: Date.now(), ver: CACHE_VERSION }),
+    );
   } catch {
     /* ignore quota / unavailable storage */
   }

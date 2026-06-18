@@ -1,30 +1,13 @@
 // Shared wrapper over the `cal` CLI. All `cal` invocations and the JSON shapes it
-// returns live here so the commands and the tree view stay in sync.
+// returns live here so the webview RPC, the panels, and the palette commands stay
+// in sync. Types are shared with the webview via ./protocol.
 
 import * as vscode from "vscode";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import type { SearchHit, Stats, ThreadSummary } from "./protocol";
 
 const exec = promisify(execFile);
-
-/** Message-level search hit (mirrors the Rust `SearchHit`, camelCase JSON). */
-export interface SearchHit {
-  threadId: number;
-  source: string;
-  title: string | null;
-  snippet: string;
-  projectPath: string | null;
-}
-
-/** Thread summary row (mirrors the Rust `ThreadSummary`). */
-export interface ThreadSummary {
-  id: number;
-  source: string;
-  title: string | null;
-  projectPath: string | null;
-  messageCount: number;
-  updatedAt: number | null;
-}
 
 export function config<T>(key: string, fallback: T): T {
   return vscode.workspace.getConfiguration("callimachus").get<T>(key) ?? fallback;
@@ -48,8 +31,9 @@ export async function runCal(args: string[]): Promise<string> {
   }
 }
 
-/** Search snippets wrap matches in \u0001…\u0002 sentinels; strip for display. */
-export const stripMarks = (s: string): string => s.replace(/[\u0001\u0002]/g, "");
+/** Search snippets wrap matches in char(1)/char(2) sentinels; strip for display. */
+const MARK_RE = new RegExp(`[${String.fromCharCode(1)}${String.fromCharCode(2)}]`, "g");
+export const stripMarks = (s: string): string => s.replace(MARK_RE, "");
 
 export async function searchHits(query: string, project?: string): Promise<SearchHit[]> {
   const limit = String(config<number>("resultLimit", 40));
@@ -58,19 +42,18 @@ export async function searchHits(query: string, project?: string): Promise<Searc
   return JSON.parse(await runCal(args)) as SearchHit[];
 }
 
-export async function recentThreads(): Promise<ThreadSummary[]> {
+export async function recentThreads(project?: string): Promise<ThreadSummary[]> {
   const limit = String(config<number>("resultLimit", 40));
-  return JSON.parse(await runCal(["recent", "--json", "-n", limit])) as ThreadSummary[];
+  const args = ["recent", "--json", "-n", limit];
+  if (project) args.push("-p", project);
+  return JSON.parse(await runCal(args)) as ThreadSummary[];
+}
+
+export async function stats(): Promise<Stats> {
+  return JSON.parse(await runCal(["stats", "--json"])) as Stats;
 }
 
 /** The packed markdown transcript for a thread. */
 export function catThread(id: number): Promise<string> {
   return runCal(["cat", String(id)]);
-}
-
-/** Open a thread's packed transcript as a markdown document. */
-export async function openThread(id: number): Promise<void> {
-  const md = await catThread(id);
-  const doc = await vscode.workspace.openTextDocument({ content: md, language: "markdown" });
-  await vscode.window.showTextDocument(doc, { preview: true });
 }

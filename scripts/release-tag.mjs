@@ -18,8 +18,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
-const versionOf = (pkg) =>
-  JSON.parse(readFileSync(join(root, pkg), "utf8")).version;
+const versionOf = (pkg) => JSON.parse(readFileSync(join(root, pkg), "utf8")).version;
 
 // package.json -> git tag prefix
 const ARTIFACTS = [

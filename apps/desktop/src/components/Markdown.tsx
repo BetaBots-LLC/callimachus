@@ -70,7 +70,11 @@ const Block = memo(function Block({ src }: { src: string }) {
 
 /** Incremental markdown for the streaming reply: each block is memoized, so only
  *  the last (growing) block re-parses per frame instead of the whole message. */
-export const StreamingMarkdown = memo(function StreamingMarkdown({ children }: { children: string }) {
+export const StreamingMarkdown = memo(function StreamingMarkdown({
+  children,
+}: {
+  children: string;
+}) {
   const blocks = splitBlocks(children);
   return (
     <div className={PROSE}>

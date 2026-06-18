@@ -21,10 +21,7 @@ const MARK_END = String.fromCharCode(2);
 // which may contain literal "<script>" etc., so HTML-escape the text FIRST and
 // only then swap the control-char sentinels for <mark>.
 export function renderSnippet(snippet: string): string {
-  const escaped = snippet
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
+  const escaped = snippet.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
   return escaped.split(MARK_START).join("<mark>").split(MARK_END).join("</mark>");
 }
 

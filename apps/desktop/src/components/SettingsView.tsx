@@ -87,7 +87,12 @@ export function SettingsView() {
           </p>
         </CardHeader>
         <CardContent>
-          <Button size="sm" variant="outline" onClick={() => buildIndex.mutate()} disabled={embed.data?.running}>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => buildIndex.mutate()}
+            disabled={embed.data?.running}
+          >
             {embed.data?.running ? "Building…" : "Build / update semantic index"}
           </Button>
         </CardContent>
@@ -97,8 +102,8 @@ export function SettingsView() {
         <CardHeader>
           <CardTitle>Obsidian export</CardTitle>
           <p className="text-sm text-muted-foreground">
-            Vault folder that “Export to Obsidian” writes into, and which LLM does the
-            synthesized version.
+            Vault folder that “Export to Obsidian” writes into, and which LLM does the synthesized
+            version.
           </p>
         </CardHeader>
         <CardContent className="space-y-4">

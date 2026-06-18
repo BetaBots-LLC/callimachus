@@ -9,14 +9,15 @@ export function StatsView() {
     queryFn: api.indexStats,
   });
 
-  if (isLoading)
-    return <Centered>Crunching the index…</Centered>;
-  if (isError || !data)
-    return <Centered>Couldn't load stats. {String(error ?? "")}</Centered>;
+  if (isLoading) return <Centered>Crunching the index…</Centered>;
+  if (isError || !data) return <Centered>Couldn't load stats. {String(error ?? "")}</Centered>;
 
   const coverage = data.embeddable > 0 ? data.embedded / data.embeddable : 0;
   const maxSrcMessages = Math.max(1, ...data.perSource.map((s) => s.messages));
-  const totalRoleMessages = Math.max(1, data.perRole.reduce((n, r) => n + r.messages, 0));
+  const totalRoleMessages = Math.max(
+    1,
+    data.perRole.reduce((n, r) => n + r.messages, 0),
+  );
 
   return (
     <div className="mx-auto w-full max-w-4xl space-y-6 overflow-y-auto p-6">
@@ -90,9 +91,7 @@ export function StatsView() {
                 <span className="truncate" title={p.project}>
                   {shortPath(p.project)}
                 </span>
-                <span className="shrink-0 text-muted-foreground">
-                  {p.threads.toLocaleString()}
-                </span>
+                <span className="shrink-0 text-muted-foreground">{p.threads.toLocaleString()}</span>
               </div>
             ))}
           </CardContent>
