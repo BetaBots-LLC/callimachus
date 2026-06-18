@@ -1,5 +1,24 @@
 # callimachus
 
+## 0.5.0
+
+### Minor Changes
+
+- ba7be6c: Stars, tags & collections — organize your archive, not just search it.
+
+  - **Star** any thread and attach free-form **tags**, then filter the list by a ⭐ Starred toggle and tag chips in the search bar.
+  - Stars and tags survive re-indexing (stars live on the thread row but are never overwritten by the indexer; tags are keyed separately).
+  - Reaches every surface: desktop UI, the `cal` CLI (`cal star <id> [--off]`, `cal tag <id> <tag…>`, `cal tags`, plus `--starred` / `-t <tag>` on `recent`/`related`/`search`), and the MCP server (`recent_threads` gains `starred`/`tags`, new `list_tags` tool) so agents can ask for "my starred auth threads".
+  - Added a `busy_timeout` on the SQLite connection so `cal` writes (star/tag) wait for the app's lock instead of failing with "database is locked".
+
+### Patch Changes
+
+- 9ce2bae: Keep the UI responsive while the semantic index builds.
+
+  - **Cap inference threads.** The on-device embedding model (fastembed/ONNX) ran with no thread limit, pinning every CPU core for the whole build and starving the UI. It now leaves 2 logical cores free (`available_parallelism() - 2`).
+  - **Stop holding the DB lock across query inference.** Hybrid/semantic search embedded the query _while holding_ the single SQLite connection, which froze every other UI command during a build. The query vector is now computed before the DB lock is taken (new `embed_query` / `semantic_search_vec` / `hybrid_vec` split).
+  - **Push-based embedding progress.** The UI polled `embedding_status` every 700ms (two locked `COUNT(*)` scans); it now updates from `embed:progress`/`embed:done` events the backend already emitted, with only a slow safety-net refetch. Also disabled `refetchOnWindowFocus` (which fired a ~5-query burst, each serialized behind the one connection) and added a small `staleTime`.
+
 ## 0.4.3
 
 ### Patch Changes
