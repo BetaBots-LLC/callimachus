@@ -331,6 +331,34 @@ fn get_thread(db: tauri::State<'_, db::Db>, thread_id: i64) -> AppResult<Option<
     Ok(search::thread_detail(&conn, thread_id)?)
 }
 
+/// Star or unstar a thread ("collections").
+#[tauri::command]
+fn set_star(db: tauri::State<'_, db::Db>, thread_id: i64, starred: bool) -> AppResult<()> {
+    let conn = lock(&db)?;
+    search::set_star(&conn, thread_id, starred)?;
+    Ok(())
+}
+
+/// Replace a thread's tags with the given set.
+#[tauri::command]
+fn set_thread_tags(
+    db: tauri::State<'_, db::Db>,
+    thread_id: i64,
+    tags: Vec<String>,
+) -> AppResult<()> {
+    let mut conn = lock(&db)?;
+    let now = chrono::Utc::now().timestamp();
+    search::set_thread_tags(&mut conn, thread_id, &tags, now)?;
+    Ok(())
+}
+
+/// All tags in the index with their thread counts, for the filter chips.
+#[tauri::command]
+fn list_tags(db: tauri::State<'_, db::Db>) -> AppResult<Vec<(String, i64)>> {
+    let conn = lock(&db)?;
+    Ok(search::list_tags(&conn)?)
+}
+
 // ---- agent chat ----
 
 /// Stream a chat completion. Tokens are pushed over `on_token`; the full reply is
@@ -715,7 +743,10 @@ pub fn run() {
             synthesize_export,
             recall_integration_status,
             install_recall_integration,
-            uninstall_recall_integration
+            uninstall_recall_integration,
+            set_star,
+            set_thread_tags,
+            list_tags
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

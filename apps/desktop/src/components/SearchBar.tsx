@@ -12,7 +12,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { Check, ChevronDown } from "lucide-react";
+import { Check, ChevronDown, Star } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 // The three most-used sources get top-level chips; the rest live under "More".
@@ -27,7 +27,13 @@ export function SearchBar() {
   const toggleSubagents = useUi((s) => s.toggleSubagents);
   const hybrid = useUi((s) => s.hybrid);
   const toggleHybrid = useUi((s) => s.toggleHybrid);
+  const starredOnly = useUi((s) => s.starredOnly);
+  const toggleStarredOnly = useUi((s) => s.toggleStarredOnly);
+  const selectedTags = useUi((s) => s.selectedTags);
+  const toggleTag = useUi((s) => s.toggleTag);
   const queryClient = useQueryClient();
+
+  const tags = useQuery({ queryKey: ["list_tags"], queryFn: api.listTags, staleTime: 60_000 });
 
   const [text, setText] = useState("");
   // Pacer handles the debounce (no manual timer / useEffect).
@@ -120,6 +126,28 @@ export function SearchBar() {
           <Switch checked={hybrid} onCheckedChange={toggleHybrid} />
           semantic
         </label>
+
+        <Separator />
+        <Button
+          size="xs"
+          variant={starredOnly ? "default" : "outline"}
+          onClick={toggleStarredOnly}
+          title="Only starred threads"
+        >
+          <Star className={cn("size-3.5", starredOnly && "fill-current")} />
+          Starred
+        </Button>
+        {tags.data?.map(([tag, count]) => (
+          <Button
+            key={tag}
+            size="xs"
+            variant={selectedTags.includes(tag) ? "default" : "outline"}
+            onClick={() => toggleTag(tag)}
+            title={`${count} thread${count === 1 ? "" : "s"}`}
+          >
+            #{tag}
+          </Button>
+        ))}
 
         <span className="ml-auto flex items-center gap-2 text-xs text-muted-foreground">
           {embed.data?.running ? (

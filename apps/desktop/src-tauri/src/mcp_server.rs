@@ -54,9 +54,17 @@ struct RecentArgs {
     sources: Vec<String>,
     /// Substring-match the project path (e.g. a repo path) to scope results.
     project: Option<String>,
+    /// If true, return only threads the user has starred.
+    starred: Option<bool>,
+    /// Only threads tagged with ANY of these tags (see list_tags). Empty = all.
+    #[serde(default)]
+    tags: Vec<String>,
     /// Max threads to return (default 20).
     limit: Option<u32>,
 }
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ListTagsArgs {}
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ProjectSearchArgs {
@@ -135,6 +143,8 @@ impl Callimachus {
         let filters = search::SearchFilters {
             sources: args.sources,
             project: args.project,
+            starred: args.starred,
+            tags: args.tags,
             limit: Some(args.limit.unwrap_or(20)),
             ..Default::default()
         };
@@ -175,6 +185,24 @@ impl Callimachus {
         }
         .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         let json = serde_json::to_string_pretty(&hits)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(
+        description = "List all tags the user has applied to their threads, each with the number of threads it's on. Use to discover the user's topic labels / collections, then pass a tag to recent_threads to filter by it."
+    )]
+    async fn list_tags(
+        &self,
+        Parameters(_args): Parameters<ListTagsArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let tags = search::list_tags(&conn)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let json = serde_json::to_string_pretty(&tags)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }

@@ -37,6 +37,8 @@ export interface SearchFilters {
   limit?: number | null;
   includeSubagents?: boolean;
   hybrid?: boolean;
+  starred?: boolean | null; // true = only starred
+  tags?: string[]; // threads having ANY of these tags
 }
 
 export interface EmbedStatus {
@@ -63,6 +65,7 @@ export interface ThreadSummary {
   projectPath: string | null;
   messageCount: number;
   updatedAt: number | null;
+  starred: boolean;
 }
 
 export interface MessageRow {
@@ -82,6 +85,8 @@ export interface ThreadDetail {
   gitBranch: string | null;
   createdAt: number | null;
   updatedAt: number | null;
+  starred: boolean;
+  tags: string[];
   messages: MessageRow[];
 }
 
@@ -161,6 +166,12 @@ export const api = {
   recentThreads: (filters?: SearchFilters) =>
     invoke<ThreadSummary[]>("recent_threads", { filters }),
   getThread: (threadId: number) => invoke<ThreadDetail | null>("get_thread", { threadId }),
+  // Stars & tags ("collections").
+  setStar: (threadId: number, starred: boolean) => invoke<void>("set_star", { threadId, starred }),
+  setThreadTags: (threadId: number, tags: string[]) =>
+    invoke<void>("set_thread_tags", { threadId, tags }),
+  // [tag, threadCount][] sorted by count desc.
+  listTags: () => invoke<[string, number][]>("list_tags"),
   embeddingStatus: () => invoke<EmbedStatus>("embedding_status"),
   buildEmbeddings: () => invoke<void>("build_embeddings"),
 

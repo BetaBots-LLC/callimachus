@@ -1,5 +1,5 @@
 import { useRef, useState } from "react";
-import { useMutation, useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { api, OPEN_TARGETS, SOURCE_LABELS, type MessageRow } from "../lib/api";
 import { useUi } from "../store/ui";
@@ -15,7 +15,8 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { cn } from "@/lib/utils";
-import { ChevronDown, ExternalLink } from "lucide-react";
+import { ChevronDown, ExternalLink, Star } from "lucide-react";
+import { TagsEditor } from "./TagsEditor";
 
 export function ThreadView() {
   const threadId = useUi((s) => s.selectedThreadId);
@@ -72,6 +73,15 @@ export function ThreadView() {
   });
   const exportBusy = exportNote.isPending || synthExport.isPending;
 
+  const queryClient = useQueryClient();
+  const toggleStar = useMutation({
+    mutationFn: () => api.setStar(threadId as number, !data?.starred),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["thread", threadId] });
+      queryClient.invalidateQueries({ queryKey: ["results"] });
+    },
+  });
+
   if (threadId == null)
     return (
       <div className="flex h-full items-center justify-center text-muted-foreground">
@@ -97,6 +107,16 @@ export function ThreadView() {
             {SOURCE_LABELS[data.source]}
           </Badge>
           <div className="flex flex-wrap justify-end gap-1.5">
+            <Button
+              size="xs"
+              variant="outline"
+              onClick={() => toggleStar.mutate()}
+              disabled={toggleStar.isPending}
+              title={data.starred ? "Unstar" : "Star"}
+            >
+              <Star className={cn("size-3.5", data.starred && "fill-current text-primary")} />
+              {data.starred ? "Starred" : "Star"}
+            </Button>
             <Button
               size="xs"
               variant="outline"
@@ -173,6 +193,7 @@ export function ThreadView() {
           {data.gitBranch && <span> · {data.gitBranch}</span>}
           <span> · {formatTime(data.updatedAt)}</span>
         </div>
+        <TagsEditor threadId={data.id} tags={data.tags} />
         {resume.isError && (
           <div className="mt-1 text-xs text-destructive">{String(resume.error)}</div>
         )}
