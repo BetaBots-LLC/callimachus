@@ -100,4 +100,37 @@ jobs:
           prerelease: ${{ contains(inputs.tag || github.ref_name, '-rc') || contains(inputs.tag || github.ref_name, '-beta') }}
           # Each job appends its platform/arch entry to the release's latest.json.
           includeUpdaterJson: true
+
+      # Standalone `cal` + `callimachus-mcp` binaries for CLI/MCP-only users (no GUI
+      # app). Reuses the rust-cache from the app build, so it's a near-incremental
+      # compile. Each job uploads its own arch-suffixed names → no collisions; the
+      # tauri-action above already created/updated the release we attach to.
+      - name: Build & upload standalone cal + callimachus-mcp
+        shell: bash
+        working-directory: apps/desktop/src-tauri
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          TARGET="${{ matrix.rust_target }}"
+          if [ -n "$TARGET" ]; then
+            cargo build --release --target "$TARGET" --bin cal --bin callimachus-mcp
+            OUT="target/$TARGET/release"
+            TRIPLE="$TARGET"
+          else
+            cargo build --release --bin cal --bin callimachus-mcp
+            OUT="target/release"
+            TRIPLE="$(rustc -vV | sed -n 's/host: //p')"
+          fi
+          EXT=""
+          [ "${{ runner.os }}" = "Windows" ] && EXT=".exe"
+          STAGE="$RUNNER_TEMP/cli-bins"
+          mkdir -p "$STAGE"
+          cp "$OUT/cal$EXT"             "$STAGE/cal-$TRIPLE$EXT"
+          cp "$OUT/callimachus-mcp$EXT" "$STAGE/callimachus-mcp-$TRIPLE$EXT"
+          gh release upload "$TAG" \
+            "$STAGE/cal-$TRIPLE$EXT" \
+            "$STAGE/callimachus-mcp-$TRIPLE$EXT" \
+            --clobber
           args: ${{ matrix.args }}
