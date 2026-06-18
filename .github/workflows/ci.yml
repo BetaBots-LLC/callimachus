@@ -11,8 +11,8 @@ concurrency:
 
 jobs:
   check:
-    # macOS-first app: the Rust side (keychain backend, "Continue in CLI") is
-    # macOS-specific, so check it on macOS.
+    # Lint/typecheck/test on macOS. Cross-platform compilation (Windows + Linux)
+    # is exercised by the release matrix in build.yml on every tag.
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4

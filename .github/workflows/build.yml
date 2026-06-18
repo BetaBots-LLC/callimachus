@@ -1,13 +1,13 @@
 name: Build & Release
 
 # Triggered by the vX.Y.Z (or -rc.N) tag pushed by version.yml — or run manually.
-# Builds a universal macOS binary, signs the updater artifacts, and publishes a
-# GitHub Release. RC/beta tags are marked as prereleases so they never become the
-# "latest" release that the stable auto-updater points at.
+# Builds the desktop app for macOS (universal), Windows (x64) and Linux (x64),
+# signs the updater artifacts, and publishes them to one GitHub Release. RC/beta
+# tags are marked prereleases so they never become the "latest" the stable
+# updater points at. v[0-9]* matches desktop tags, not the vscode-v* extension tag.
 
 on:
   push:
-    # v[0-9]* matches desktop tags (v0.2.0) but NOT extension tags (vscode-v0.1.1).
     tags: ["v[0-9]*"]
   workflow_dispatch:
     inputs:
@@ -20,11 +20,28 @@ permissions:
 
 jobs:
   release:
-    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest      # universal (Apple Silicon + Intel)
+            args: "--target universal-apple-darwin"
+          - platform: ubuntu-22.04      # Linux x64 (.AppImage + .deb)
+            args: ""
+          - platform: windows-latest    # Windows x64 (.msi + .exe)
+            args: ""
+    runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.tag || github.ref_name }}
+
+      - name: Install Linux build deps
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf \
+            build-essential pkg-config libssl-dev
 
       - uses: pnpm/action-setup@v4
 
@@ -35,11 +52,12 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-darwin,x86_64-apple-darwin
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
 
       - uses: swatinem/rust-cache@v2
         with:
           workspaces: ./apps/desktop/src-tauri -> target
+          key: ${{ matrix.platform }}
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -56,9 +74,6 @@ jobs:
           releaseName: "Callimachus ${{ inputs.tag || github.ref_name }}"
           releaseDraft: false
           prerelease: ${{ contains(inputs.tag || github.ref_name, '-rc') || contains(inputs.tag || github.ref_name, '-beta') }}
+          # Each matrix job appends its platform's entry to the release's latest.json.
           uploadUpdaterJson: true
-          # One universal build => tauri-action fills BOTH darwin-aarch64 and
-          # darwin-x86_64 keys in latest.json from the universal artifact (no
-          # matrix race). On the first real release, eyeball latest.json to
-          # confirm those two arch keys are present (not only darwin-universal).
-          args: --target universal-apple-darwin
+          args: ${{ matrix.args }}

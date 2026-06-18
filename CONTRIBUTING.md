@@ -60,5 +60,16 @@ at [`apps/desktop/src-tauri/src/indexer/README.md`](apps/desktop/src-tauri/src/i
 
 ## License of contributions
 
-By contributing, you agree your contributions are licensed under the project's
-[Apache-2.0](LICENSE) license.
+Callimachus is **dual-licensed**: [AGPL-3.0-or-later](LICENSE) for everyone, plus
+commercial licenses sold by the copyright holder (see [COMMERCIAL.md](COMMERCIAL.md)).
+For that to work, the maintainer must be able to relicense the whole codebase.
+
+**By submitting a contribution you agree that:**
+
+1. Your contribution is licensed under **AGPL-3.0-or-later**, and
+2. You grant **Ari Shaller** (the copyright holder) a perpetual, worldwide,
+   non-exclusive, royalty-free right to **also license your contribution under other
+   terms**, including the commercial license (so it can ship in commercial builds), and
+3. You have the right to grant this (the work is yours or you're authorized).
+
+If you can't agree to this, please open an issue instead of sending code.

@@ -53,7 +53,10 @@ jobs:
       - name: Publish to Open VSX (Cursor / VSCodium)
         if: env.OVSX_PAT != ''
         working-directory: apps/vscode
-        run: pnpm exec ovsx publish callimachus-vscode.vsix -p "$OVSX_PAT"
+        run: |
+          # Namespace must exist before the first publish; no-op if already created.
+          pnpm exec ovsx create-namespace betabots -p "$OVSX_PAT" || true
+          pnpm exec ovsx publish callimachus-vscode.vsix -p "$OVSX_PAT"
 
       - name: GitHub Release (.vsix asset)
         uses: softprops/action-gh-release@v2

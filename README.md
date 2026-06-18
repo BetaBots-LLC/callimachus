@@ -3,8 +3,8 @@
 </p>
 
 <p align="center">
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-2C436C.svg" alt="License: Apache-2.0"></a>
-  <img src="https://img.shields.io/badge/platform-macOS-1B3252.svg" alt="Platform: macOS">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-2C436C.svg" alt="License: AGPL-3.0"></a>
+  <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-C16E2C.svg" alt="Platform: macOS, Windows, Linux">
   <img src="https://img.shields.io/badge/Tauri-2-24C8DB?logo=tauri&logoColor=white" alt="Tauri 2">
   <img src="https://img.shields.io/badge/Rust-stable-E0A93C?logo=rust&logoColor=white" alt="Rust">
   <img src="https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=white" alt="React 19">
@@ -17,7 +17,7 @@ Named for [Callimachus](https://en.wikipedia.org/wiki/Callimachus), who built th
 
 ## Download
 
-Grab the latest signed macOS build (`.dmg`) from **[Releases](../../releases/latest)** — the app auto-updates from there on. Prefer to build it yourself? See [Develop](#develop).
+Grab the latest signed build from **[Releases](../../releases/latest)** — macOS (`.dmg`, universal), Windows (`.msi`), or Linux (`.AppImage` / `.deb`). The app auto-updates from there on. Prefer to build it yourself? See [Develop](#develop).
 
 ## What it does
 
@@ -34,7 +34,7 @@ Grab the latest signed macOS build (`.dmg`) from **[Releases](../../releases/lat
 - **Store/search:** bundled SQLite + FTS5 (`rusqlite`); on-device embeddings via `fastembed` (bge-small-en-v1.5, 384-dim); KNN in SQL via `sqlite-vec` (vec0)
 - **Watcher:** `notify` + debouncer
 - **Chat:** multi-provider via the `genai` crate (Anthropic / OpenAI / Gemini / OpenRouter / Ollama), streaming tokens over a Tauri Channel, cancellable, with agent tool-calls (history search + approved shell)
-- **Secrets:** macOS Keychain (`keyring-core` + `apple-native-keyring-store`)
+- **Secrets:** OS credential store via the cross-platform `keyring` crate — macOS Keychain, Windows Credential Manager, Linux Secret Service
 - **Sidecars:** `callimachus-mcp` (MCP server) and `cal` (CLI) — both reuse the desktop core lib against the same `index.db`
 - **Editor:** a VS Code / Cursor extension (`apps/vscode`, published to the Marketplace + Open VSX) that shells out to `cal`
 
@@ -105,7 +105,7 @@ cal export 42 --vault ~/Obsidian          # write a thread as an Obsidian note
 
 ## Notes / limitations
 
-- macOS-first. The "Open in CLI" / "Resume" launchers and the keychain backend are macOS-specific today.
+- Cross-platform (macOS / Windows / Linux). The only macOS-only piece left is the "Open in CLI" / "Resume" launchers (they drive Terminal via AppleScript); on Windows/Linux those actions return a "not supported yet" notice — everything else (index, search, chat, export, keychain) works everywhere.
 - Cline / Roo Code / Kilo Code are editor extensions with no CLI, so they are index-only (searchable, but not relaunchable via "Resume").
 - Cursor doesn't store a per-thread workspace, so Cursor threads currently have no project path.
 - Claude Code subagent transcripts are indexed but hidden behind a "subagents" toggle by default.
@@ -122,7 +122,16 @@ Callimachus is local-first by design: your conversation index never leaves your 
 
 ## License
 
-[Apache-2.0](LICENSE) © Ari Shaller. See [NOTICE](NOTICE) for attributions.
+**Dual-licensed.** Free and open source under **[AGPL-3.0-or-later](LICENSE)** — use,
+modify, and share it; if you distribute it or run a modified version as a network
+service, you must release your source under the AGPL.
+
+For **closed-source, proprietary, or for-profit/SaaS use** that the AGPL doesn't
+permit, a **commercial license** is required — see **[COMMERCIAL.md](COMMERCIAL.md)**
+(contact ari@shaller.dev).
+
+© 2026 Ari Shaller. See [NOTICE](NOTICE) for attributions. Contributions are accepted
+under the terms in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Acknowledgements
 

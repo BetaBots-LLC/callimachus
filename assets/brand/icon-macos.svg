@@ -1,0 +1,80 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!-- macOS-grid variant: the scroll card sits inset (824/1024, ~10% margin) with a
+       soft drop shadow, so it renders the same visual size as other Dock icons.
+       Windows/Linux use the full-bleed icon.svg instead. -->
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1024" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#B65E2A"/>
+      <stop offset="0.45" stop-color="#D98A3D"/>
+      <stop offset="1" stop-color="#E9BC72"/>
+    </linearGradient>
+    <radialGradient id="sun" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#FDEFBE"/>
+      <stop offset="0.5" stop-color="#F8D277"/>
+      <stop offset="1" stop-color="#F3C45A" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="sheet" x1="0" y1="300" x2="0" y2="716" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#E4CF9F"/>
+      <stop offset="0.5" stop-color="#F4E8C8"/>
+      <stop offset="1" stop-color="#E0CB9C"/>
+    </linearGradient>
+    <linearGradient id="sideShade" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#9A7B40" stop-opacity="0.45"/>
+      <stop offset="0.12" stop-color="#9A7B40" stop-opacity="0"/>
+      <stop offset="0.88" stop-color="#9A7B40" stop-opacity="0"/>
+      <stop offset="1" stop-color="#9A7B40" stop-opacity="0.45"/>
+    </linearGradient>
+    <linearGradient id="rollBody" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#D9BD81"/><stop offset="0.34" stop-color="#F3E6BE"/>
+      <stop offset="0.62" stop-color="#E6CF96"/><stop offset="1" stop-color="#B7995C"/>
+    </linearGradient>
+    <radialGradient id="capFace" cx="0.42" cy="0.4" r="0.7">
+      <stop offset="0" stop-color="#F1E2B6"/><stop offset="1" stop-color="#C7A86A"/>
+    </radialGradient>
+    <clipPath id="round"><rect width="1024" height="1024" rx="232"/></clipPath>
+    <clipPath id="sheetClip"><rect x="352" y="300" width="320" height="416" rx="6"/></clipPath>
+    <filter id="fiber" x="0" y="0" width="100%" height="100%">
+      <feTurbulence type="fractalNoise" baseFrequency="0.014 0.85" numOctaves="2" seed="7" result="n"/>
+      <feColorMatrix in="n" type="matrix" values="0 0 0 0 0  0 0 0 0 0  0 0 0 0 0  0 0 0 0.05 0"/>
+    </filter>
+  </defs>
+
+  <!-- the icon, scaled into the 824 grid square (the system adds Dock shadow + glass) -->
+  <g transform="translate(100,100) scale(0.8046875)">
+    <g clip-path="url(#round)">
+      <rect width="1024" height="1024" fill="url(#sky)"/>
+      <circle cx="922" cy="128" r="132" fill="url(#sun)"/>
+      <circle cx="922" cy="128" r="74" fill="#FBE7A8"/>
+      <ellipse cx="512" cy="828" rx="252" ry="44" fill="#714419" opacity="0.24"/>
+      <rect x="352" y="300" width="320" height="416" rx="6" fill="url(#sheet)"/>
+      <g clip-path="url(#sheetClip)">
+        <rect x="352" y="300" width="320" height="416" fill="#3A2A12" filter="url(#fiber)" opacity="0.5"/>
+        <rect x="352" y="300" width="320" height="416" fill="url(#sideShade)"/>
+        <g fill="#6B4A26" opacity="0.82">
+          <rect x="404" y="372" width="216" height="15" rx="7"/><rect x="404" y="416" width="184" height="15" rx="7"/>
+          <rect x="404" y="460" width="216" height="15" rx="7"/><rect x="404" y="504" width="150" height="15" rx="7"/>
+          <rect x="404" y="548" width="200" height="15" rx="7"/><rect x="404" y="592" width="172" height="15" rx="7"/>
+          <rect x="404" y="636" width="206" height="15" rx="7"/>
+        </g>
+        <rect x="352" y="300" width="320" height="34" fill="#8A6B36" opacity="0.4"/>
+        <rect x="352" y="682" width="320" height="34" fill="#8A6B36" opacity="0.4"/>
+      </g>
+      <g>
+        <rect x="320" y="276" width="384" height="58" rx="29" fill="url(#rollBody)"/>
+        <rect x="320" y="288" width="384" height="7" rx="3.5" fill="#FFF6DE" opacity="0.5"/>
+        <ellipse cx="338" cy="305" rx="20" ry="29" fill="url(#capFace)"/>
+        <ellipse cx="341" cy="305" rx="11" ry="17" fill="none" stroke="#B0925A" stroke-width="3" opacity="0.7"/>
+        <ellipse cx="686" cy="305" rx="20" ry="29" fill="url(#capFace)"/>
+        <ellipse cx="689" cy="305" rx="11" ry="17" fill="none" stroke="#B0925A" stroke-width="3" opacity="0.7"/>
+      </g>
+      <g>
+        <rect x="320" y="682" width="384" height="58" rx="29" fill="url(#rollBody)"/>
+        <rect x="320" y="694" width="384" height="7" rx="3.5" fill="#FFF6DE" opacity="0.5"/>
+        <ellipse cx="338" cy="711" rx="20" ry="29" fill="url(#capFace)"/>
+        <ellipse cx="341" cy="711" rx="11" ry="17" fill="none" stroke="#B0925A" stroke-width="3" opacity="0.7"/>
+        <ellipse cx="686" cy="711" rx="20" ry="29" fill="url(#capFace)"/>
+        <ellipse cx="689" cy="711" rx="11" ry="17" fill="none" stroke="#B0925A" stroke-width="3" opacity="0.7"/>
+      </g>
+    </g>
+  </g>
+</svg>

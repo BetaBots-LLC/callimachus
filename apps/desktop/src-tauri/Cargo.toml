@@ -3,6 +3,7 @@ name = "callimachus"
 version = "0.2.0"
 description = "Local index & search for AI agent threads"
 authors = ["Ari Shaller"]
+license = "AGPL-3.0-or-later"
 edition = "2021"
 # Two binaries (the app + the MCP server); make `cargo run` (tauri dev) pick the app.
 default-run = "callimachus"
@@ -48,8 +49,9 @@ fastembed = "5.17.2"
 tokio = { version = "1.52.3", features = ["rt", "macros", "rt-multi-thread", "io-std", "process"] }
 futures-util = "0.3.32"
 reqwest = { version = "0.13.4", features = ["json", "stream"] }
-apple-native-keyring-store = { version = "1.0.0", features = ["keychain"] }
-keyring-core = "1"
+# Cross-platform OS credential store: macOS Keychain, Windows Credential Manager,
+# Linux Secret Service (pure-Rust zbus + crypto — no system libsecret needed).
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
 sqlite-vec = "0.1.9"
 zerocopy = "0.8.52"
 genai = "0.6.5"
