@@ -132,6 +132,8 @@ mod tests {
             git_branch: Some("main".into()),
             created_at: Some(1_780_000_000),
             updated_at: Some(1_780_000_500),
+            starred: false,
+            tags: vec![],
             messages: vec![
                 MessageRow { id: 1, role: "user".into(), text: "how do I add fts5".into(), tool_name: None, ts: None },
                 MessageRow { id: 2, role: "assistant".into(), text: "use an external-content table".into(), tool_name: None, ts: None },

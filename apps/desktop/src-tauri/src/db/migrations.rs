@@ -23,5 +23,7 @@ pub static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
         M::up(include_str!("../../migrations/0008_embed_flag.sql")),
         // 0009 — precomputed threads.bytes (fast cleanup list).
         M::up(include_str!("../../migrations/0009_thread_bytes.sql")),
+        // 0010 — stars + free-form tags ("collections").
+        M::up(include_str!("../../migrations/0010_stars_tags.sql")),
     ])
 });

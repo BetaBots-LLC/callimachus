@@ -18,6 +18,8 @@ pub struct SearchFilters {
     pub limit: Option<u32>,
     pub include_subagents: bool, // default false: hide Claude Code subagent transcripts
     pub hybrid: bool,            // default false: fuse keyword + semantic results
+    pub starred: Option<bool>,   // Some(true) = only starred; None = all
+    pub tags: Vec<String>,       // empty = all; else threads having ANY of these tags
 }
 
 /// One message-level search hit.
@@ -44,6 +46,7 @@ pub struct ThreadSummary {
     pub project_path: Option<String>,
     pub message_count: i64,
     pub updated_at: Option<i64>,
+    pub starred: bool,
 }
 
 /// A single message in the thread viewer.
@@ -69,6 +72,8 @@ pub struct ThreadDetail {
     pub git_branch: Option<String>,
     pub created_at: Option<i64>,
     pub updated_at: Option<i64>,
+    pub starred: bool,
+    pub tags: Vec<String>,
     pub messages: Vec<MessageRow>,
 }
 
@@ -84,6 +89,31 @@ fn to_fts_query(raw: &str) -> Option<String> {
         None
     } else {
         Some(terms.join(" "))
+    }
+}
+
+/// Append the starred + tags ("collections") WHERE clauses, assuming the threads
+/// table is aliased `t`. Shared by `search` and `recent_threads`.
+fn push_collection_filters(
+    sql: &mut String,
+    args: &mut Vec<Box<dyn ToSql>>,
+    filters: &SearchFilters,
+) {
+    if let Some(starred) = filters.starred {
+        args.push(Box::new(i64::from(starred)));
+        sql.push_str(&format!(" AND t.starred = ?{}", args.len()));
+    }
+    if !filters.tags.is_empty() {
+        let base = args.len();
+        let placeholders: Vec<String> =
+            (0..filters.tags.len()).map(|i| format!("?{}", base + i + 1)).collect();
+        sql.push_str(&format!(
+            " AND EXISTS (SELECT 1 FROM thread_tags tt WHERE tt.thread_id = t.id AND tt.tag IN ({}))",
+            placeholders.join(", ")
+        ));
+        for tag in &filters.tags {
+            args.push(Box::new(tag.clone()));
+        }
     }
 }
 
@@ -136,6 +166,7 @@ pub fn search(conn: &Connection, query: &str, filters: &SearchFilters) -> Result
         args.push(Box::new(before));
         sql.push_str(&format!(" AND m.ts <= ?{}", args.len()));
     }
+    push_collection_filters(&mut sql, &mut args, filters);
     sql.push_str(" ORDER BY bm25(messages_fts) LIMIT ?");
     args.push(Box::new(limit));
 
@@ -233,7 +264,7 @@ fn hit_for_message(conn: &Connection, message_id: i64) -> Result<Option<SearchHi
 pub fn recent_threads(conn: &Connection, filters: &SearchFilters) -> Result<Vec<ThreadSummary>> {
     let limit = filters.limit.unwrap_or(100).min(500) as i64;
     let mut sql = String::from(
-        "SELECT t.id, s.kind, t.title, t.project_path, t.message_count, t.updated_at
+        "SELECT t.id, s.kind, t.title, t.project_path, t.message_count, t.updated_at, t.starred
          FROM threads t JOIN sources s ON s.id = t.source_id WHERE 1=1",
     );
     if !filters.include_subagents {
@@ -253,6 +284,7 @@ pub fn recent_threads(conn: &Connection, filters: &SearchFilters) -> Result<Vec<
         args.push(Box::new(format!("%{project}%")));
         sql.push_str(&format!(" AND t.project_path LIKE ?{}", args.len()));
     }
+    push_collection_filters(&mut sql, &mut args, filters);
     sql.push_str(" ORDER BY t.updated_at DESC LIMIT ?");
     args.push(Box::new(limit));
 
@@ -266,6 +298,7 @@ pub fn recent_threads(conn: &Connection, filters: &SearchFilters) -> Result<Vec<
             project_path: r.get(3)?,
             message_count: r.get(4)?,
             updated_at: r.get(5)?,
+            starred: r.get::<_, i64>(6)? != 0,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -321,7 +354,7 @@ pub fn related(
 /// One thread's summary row, or None if the id is unknown.
 fn thread_summary(conn: &Connection, id: i64) -> Result<Option<ThreadSummary>> {
     let mut stmt = conn.prepare(
-        "SELECT t.id, s.kind, t.title, t.project_path, t.message_count, t.updated_at
+        "SELECT t.id, s.kind, t.title, t.project_path, t.message_count, t.updated_at, t.starred
          FROM threads t JOIN sources s ON s.id = t.source_id WHERE t.id = ?1",
     )?;
     let mut rows = stmt.query_map([id], |r| {
@@ -332,6 +365,7 @@ fn thread_summary(conn: &Connection, id: i64) -> Result<Option<ThreadSummary>> {
             project_path: r.get(3)?,
             message_count: r.get(4)?,
             updated_at: r.get(5)?,
+            starred: r.get::<_, i64>(6)? != 0,
         })
     })?;
     match rows.next() {
@@ -439,7 +473,7 @@ pub fn stats(conn: &Connection) -> Result<Stats> {
 pub fn thread_detail(conn: &Connection, thread_id: i64) -> Result<Option<ThreadDetail>> {
     let head = conn.query_row(
         "SELECT t.id, s.kind, t.external_id, t.title, t.project_path, t.git_branch,
-                t.created_at, t.updated_at
+                t.created_at, t.updated_at, t.starred
          FROM threads t JOIN sources s ON s.id = t.source_id WHERE t.id = ?1",
         [thread_id],
         |r| {
@@ -452,6 +486,8 @@ pub fn thread_detail(conn: &Connection, thread_id: i64) -> Result<Option<ThreadD
                 git_branch: r.get(5)?,
                 created_at: r.get(6)?,
                 updated_at: r.get(7)?,
+                starred: r.get::<_, i64>(8)? != 0,
+                tags: Vec::new(),
                 messages: Vec::new(),
             })
         },
@@ -461,6 +497,7 @@ pub fn thread_detail(conn: &Connection, thread_id: i64) -> Result<Option<ThreadD
         Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
         Err(e) => return Err(e.into()),
     };
+    detail.tags = thread_tags(conn, thread_id)?;
 
     let mut stmt = conn.prepare(
         "SELECT id, role, text, tool_name, ts FROM messages
@@ -477,6 +514,61 @@ pub fn thread_detail(conn: &Connection, thread_id: i64) -> Result<Option<ThreadD
     })?;
     detail.messages = rows.collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(Some(detail))
+}
+
+// ---- stars & tags ("collections") ----
+
+/// All tags on a thread, alphabetical.
+pub fn thread_tags(conn: &Connection, thread_id: i64) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT tag FROM thread_tags WHERE thread_id = ?1 ORDER BY tag")?;
+    let rows = stmt.query_map([thread_id], |r| r.get::<_, String>(0))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Star or unstar a thread.
+pub fn set_star(conn: &Connection, thread_id: i64, starred: bool) -> Result<()> {
+    conn.execute(
+        "UPDATE threads SET starred = ?1 WHERE id = ?2",
+        rusqlite::params![i64::from(starred), thread_id],
+    )?;
+    Ok(())
+}
+
+/// Replace a thread's tags with `tags` (trimmed, deduped, blanks dropped). `now`
+/// is the epoch-seconds timestamp to record on each tag.
+pub fn set_thread_tags(
+    conn: &mut Connection,
+    thread_id: i64,
+    tags: &[String],
+    now: i64,
+) -> Result<()> {
+    let tx = conn.transaction()?;
+    tx.execute("DELETE FROM thread_tags WHERE thread_id = ?1", [thread_id])?;
+    {
+        let mut ins = tx.prepare(
+            "INSERT OR IGNORE INTO thread_tags (thread_id, tag, added_at) VALUES (?1, ?2, ?3)",
+        )?;
+        let mut seen = HashSet::new();
+        for tag in tags {
+            let t = tag.trim();
+            if t.is_empty() || !seen.insert(t.to_string()) {
+                continue;
+            }
+            ins.execute(rusqlite::params![thread_id, t, now])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Distinct tags across the index with their thread counts, most-used first.
+pub fn list_tags(conn: &Connection) -> Result<Vec<(String, i64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT tag, COUNT(DISTINCT thread_id) AS n FROM thread_tags
+         GROUP BY tag ORDER BY n DESC, tag",
+    )?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 #[cfg(test)]
@@ -536,5 +628,60 @@ mod tests {
 
         let proj = s.top_projects.iter().find(|p| p.project == "/proj/a").unwrap();
         assert_eq!(proj.threads, 2);
+    }
+
+    #[test]
+    fn stars_and_tags_filter_and_survive_reindex() {
+        let mut conn = temp_db();
+        let sid = source_id(&conn, "claude_code").unwrap();
+        let t1 = ParsedThread {
+            external_id: "s1".into(),
+            title: Some("auth bug".into()),
+            created_at: Some(100),
+            updated_at: Some(200),
+            messages: vec![msg("user", "jwt refresh", 100)],
+            ..Default::default()
+        };
+        let t2 = ParsedThread {
+            external_id: "s2".into(),
+            title: Some("ui tweak".into()),
+            created_at: Some(300),
+            updated_at: Some(400),
+            messages: vec![msg("user", "css", 300)],
+            ..Default::default()
+        };
+        upsert_thread(&mut conn, sid, &t1).unwrap();
+        upsert_thread(&mut conn, sid, &t2).unwrap();
+        let id1: i64 = conn
+            .query_row("SELECT id FROM threads WHERE external_id = 's1'", [], |r| r.get(0))
+            .unwrap();
+
+        set_star(&conn, id1, true).unwrap();
+        // Includes a duplicate (" auth ") and a blank — both should be dropped.
+        set_thread_tags(&mut conn, id1, &["auth".into(), "wip".into(), " auth ".into(), "".into()], 500)
+            .unwrap();
+
+        // starred filter returns only the starred thread.
+        let starred =
+            recent_threads(&conn, &SearchFilters { starred: Some(true), ..Default::default() }).unwrap();
+        assert_eq!(starred.len(), 1);
+        assert_eq!(starred[0].id, id1);
+        assert!(starred[0].starred);
+
+        // tag filter returns only the tagged thread.
+        let tagged =
+            recent_threads(&conn, &SearchFilters { tags: vec!["auth".into()], ..Default::default() })
+                .unwrap();
+        assert_eq!(tagged.iter().map(|t| t.id).collect::<Vec<_>>(), vec![id1]);
+
+        // dedup + trim: just the two distinct tags, alphabetical.
+        assert_eq!(thread_tags(&conn, id1).unwrap(), vec!["auth".to_string(), "wip".to_string()]);
+        assert!(list_tags(&conn).unwrap().iter().any(|(t, n)| t == "auth" && *n == 1));
+
+        // Re-indexing the thread must NOT wipe the star or tags.
+        upsert_thread(&mut conn, sid, &t1).unwrap();
+        let d = thread_detail(&conn, id1).unwrap().unwrap();
+        assert!(d.starred, "star lost on re-index");
+        assert_eq!(d.tags, vec!["auth".to_string(), "wip".to_string()], "tags lost on re-index");
     }
 }

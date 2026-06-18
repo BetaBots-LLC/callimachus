@@ -11,8 +11,10 @@ use crate::{agent, context, db, embed, export, search, secrets};
 use rusqlite::Connection;
 
 /// Subcommands that identify a `cal` invocation when the app is launched directly.
-pub const COMMANDS: &[&str] =
-    &["search", "related", "recent", "cat", "show", "context", "stats", "export"];
+pub const COMMANDS: &[&str] = &[
+    "search", "related", "recent", "cat", "show", "context", "stats", "export", "star", "tag",
+    "tags",
+];
 
 const USAGE: &str = "\
 cal — search your indexed AI coding-agent history
@@ -21,16 +23,21 @@ USAGE:
   cal search <query…> [-s SOURCE] [-y|--hybrid] [-n LIMIT] [--json]
   cal related [<text…>] [-s SOURCE] [-p PROJECT] [-n LIMIT] [--json]
                                 (text via args or stdin; semantic only)
-  cal recent [-s SOURCE] [-p PROJECT] [-n LIMIT] [--json]
+  cal recent [-s SOURCE] [-p PROJECT] [--starred] [-t TAG] [-n LIMIT] [--json]
   cal cat <thread-id>            (aliases: show, context)
   cal stats [--json]
   cal export <thread-id> [--vault DIR] [--out FILE] [-S|--synthesize]
+  cal star <thread-id> [--off]   star a thread (--off to unstar)
+  cal tag <thread-id> [<tag…>]   set a thread's tags (no tags = clear them)
+  cal tags [--json]              list all tags with thread counts
   cal help
 
 OPTIONS:
   -s, --source SOURCE   filter by source kind (claude_code, codex, cursor,
                         gemini, qwen, goose, opencode, continue, cline, in_app)
   -p, --project PATH    substring-match the project path
+      --starred         only starred threads (recent/related/search)
+  -t, --tag TAG         only threads with this tag (repeatable)
   -y, --hybrid          fuse keyword + on-device semantic search
   -n, --limit N         max results (default 20)
   -V, --vault DIR       Obsidian vault dir for `export` (else CALLIMACHUS_VAULT)
@@ -63,6 +70,9 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
         "cat" | "show" | "context" => cmd_cat(rest),
         "stats" => cmd_stats(rest),
         "export" => cmd_export(rest),
+        "star" => cmd_star(rest),
+        "tag" => cmd_tag(rest),
+        "tags" => cmd_tags(rest),
         "help" | "-h" | "--help" => {
             println!("{USAGE}");
             Ok(())
@@ -82,6 +92,9 @@ struct Opts {
     vault: Option<String>,
     out: Option<String>,
     synthesize: bool,
+    starred: bool,
+    off: bool,
+    tags: Vec<String>,
     positional: Vec<String>,
 }
 
@@ -101,6 +114,9 @@ fn parse(args: &[String]) -> anyhow::Result<Opts> {
             "-o" | "--out" => o.out = Some(next(&mut it, "--out")?),
             "-y" | "--hybrid" => o.hybrid = true,
             "-S" | "--synthesize" => o.synthesize = true,
+            "-t" | "--tag" => o.tags.push(next(&mut it, "--tag")?),
+            "--starred" => o.starred = true,
+            "--off" => o.off = true,
             "--json" => o.json = true,
             s if s.starts_with('-') && s.len() > 1 => anyhow::bail!("unknown flag '{s}'"),
             _ => o.positional.push(a.clone()),
@@ -130,6 +146,8 @@ fn filters(o: &Opts) -> search::SearchFilters {
         project: o.project.clone(),
         hybrid: o.hybrid,
         limit: Some(o.limit.unwrap_or(20)),
+        starred: if o.starred { Some(true) } else { None },
+        tags: o.tags.clone(),
         ..Default::default()
     }
 }
@@ -226,6 +244,58 @@ fn cmd_recent(args: &[String]) -> anyhow::Result<()> {
             t.message_count,
             fmt_time(t.updated_at)
         );
+    }
+    Ok(())
+}
+
+fn thread_id_arg(o: &Opts, cmd: &str) -> anyhow::Result<i64> {
+    o.positional
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("{cmd} needs a thread id. e.g. `cal {cmd} 42`"))?
+        .parse()
+        .map_err(|_| anyhow::anyhow!("thread id must be a number"))
+}
+
+fn cmd_star(args: &[String]) -> anyhow::Result<()> {
+    let o = parse(args)?;
+    let id = thread_id_arg(&o, "star")?;
+    let conn = open_db()?;
+    search::set_star(&conn, id, !o.off)?;
+    eprintln!("thread {id} {}", if o.off { "unstarred" } else { "starred" });
+    Ok(())
+}
+
+fn cmd_tag(args: &[String]) -> anyhow::Result<()> {
+    let o = parse(args)?;
+    let id = thread_id_arg(&o, "tag")?;
+    // Tags are the positionals after the id; passing none clears the thread's tags.
+    let tags: Vec<String> = o.positional[1..].to_vec();
+    let mut conn = open_db()?;
+    let now = chrono::Utc::now().timestamp();
+    search::set_thread_tags(&mut conn, id, &tags, now)?;
+    let current = search::thread_tags(&conn, id)?;
+    if current.is_empty() {
+        eprintln!("thread {id}: tags cleared");
+    } else {
+        eprintln!("thread {id}: {}", current.join(", "));
+    }
+    Ok(())
+}
+
+fn cmd_tags(args: &[String]) -> anyhow::Result<()> {
+    let o = parse(args)?;
+    let conn = open_db()?;
+    let tags = search::list_tags(&conn)?;
+    if o.json {
+        println!("{}", serde_json::to_string_pretty(&tags)?);
+        return Ok(());
+    }
+    if tags.is_empty() {
+        eprintln!("no tags yet");
+        return Ok(());
+    }
+    for (tag, n) in &tags {
+        println!("{n:>4}  {tag}");
     }
     Ok(())
 }
