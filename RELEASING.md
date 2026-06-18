@@ -1,8 +1,9 @@
 # Releasing
 
 How versions, changelogs, and release candidates work for both shippable
-artifacts in this monorepo — the **desktop app** (`.dmg` + auto-updater) and the
-**VS Code / Cursor extension** (`.vsix` on the marketplaces).
+artifacts in this monorepo — the **desktop app** (macOS / Windows / Linux
+installers + auto-updater) and the **VS Code / Cursor extension** (`.vsix` on the
+marketplaces).
 
 ## How it fits together
 
@@ -20,7 +21,7 @@ PR with a changeset ─┐
               ┌───────────────────────────────┴───────────────────────────────┐
               ▼ v<ver>                                                          ▼ vscode-v<ver>
       build.yml → tauri-action                                  publish-extension.yml
-        → signed .dmg + latest.json                               → VS Code Marketplace (vsce)
+        → signed mac/win/linux installers                        → VS Code Marketplace (vsce)
         → GitHub Release                                          → Open VSX  (Cursor / VSCodium)
               │                                                   → GitHub Release (.vsix)
               ▼
@@ -48,13 +49,12 @@ pnpm --filter callimachus tauri signer generate -w ~/.tauri/callimachus.key
   literal key content, not a path.
 - Keep the **private key** secret. Never commit it.
 
-### 2. Point the updater endpoint at your repo
+### 2. Updater endpoint
 
-In `tauri.conf.json` → `plugins.updater.endpoints`, replace `OWNER` with your
-GitHub org/user:
+`tauri.conf.json` → `plugins.updater.endpoints` already points at this repo:
 
 ```
-https://github.com/OWNER/callimachus/releases/latest/download/latest.json
+https://github.com/BetaBots-LLC/callimachus/releases/latest/download/latest.json
 ```
 
 `releases/latest` always resolves to the newest **non-prerelease**, so the stable
@@ -87,8 +87,9 @@ Settings → Secrets and variables → Actions:
 3. **Merge the Version Packages PR.** That bumps the version, writes
    `CHANGELOG.md`, and pushes `vX.Y.Z`.
 4. The pushed tags fan out:
-   - `v<ver>` → `build.yml` builds the signed universal-macOS installer, publishes
-     the GitHub Release, uploads `latest.json`. Installed apps auto-update.
+   - `v<ver>` → `build.yml` builds signed installers for **macOS (universal),
+     Windows (x64) and Linux (x64)**, publishes one GitHub Release, uploads
+     `latest.json`. Installed apps auto-update.
    - `vscode-v<ver>` → `publish-extension.yml` packages the extension and pushes it
      to the VS Code Marketplace + Open VSX, and attaches the `.vsix` to a Release.
 
@@ -102,11 +103,10 @@ VSCodium install from Open VSX**, official VS Code from the Marketplace.
 - `publish-extension.yml` runs `vsce` (Marketplace) and `ovsx` (Open VSX); each is
   skipped if its token secret is missing, and the `.vsix` is always attached to the
   GitHub Release for manual install.
-- One-time, before the first publish: create the `shaller` publisher on the
+- One-time, before the first publish: create the `betabots` publisher on the
   [VS Code Marketplace](https://marketplace.visualstudio.com/manage) and the
   matching namespace on [Open VSX](https://open-vsx.org), then add `VSCE_PAT` /
-  `OVSX_PAT`. Replace the `OWNER` placeholders in `apps/vscode/package.json`
-  (`repository`, `homepage`, `bugs`) with your GitHub org/user.
+  `OVSX_PAT` (the publish workflow auto-creates the Open VSX namespace).
 
 ## Release candidates
 
