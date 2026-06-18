@@ -100,6 +100,7 @@ jobs:
           prerelease: ${{ contains(inputs.tag || github.ref_name, '-rc') || contains(inputs.tag || github.ref_name, '-beta') }}
           # Each job appends its platform/arch entry to the release's latest.json.
           includeUpdaterJson: true
+          args: ${{ matrix.args }}
 
       # Standalone `cal` + `callimachus-mcp` binaries for CLI/MCP-only users (no GUI
       # app). Reuses the rust-cache from the app build, so it's a near-incremental
@@ -133,4 +134,3 @@ jobs:
             "$STAGE/cal-$TRIPLE$EXT" \
             "$STAGE/callimachus-mcp-$TRIPLE$EXT" \
             --clobber
-          args: ${{ matrix.args }}

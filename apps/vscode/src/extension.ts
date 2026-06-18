@@ -141,7 +141,10 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.window.registerWebviewViewProvider(SidebarProvider.viewId, sidebar, {
       webviewOptions: { retainContextWhenHidden: true },
     }),
-    vscode.commands.registerCommand("callimachus.search", guard(() => doSearch(extensionUri, false))),
+    vscode.commands.registerCommand(
+      "callimachus.search",
+      guard(() => doSearch(extensionUri, false)),
+    ),
     vscode.commands.registerCommand(
       "callimachus.searchCurrentProject",
       guard(() => doSearch(extensionUri, true)),
@@ -150,7 +153,10 @@ export function activate(context: vscode.ExtensionContext): void {
       "callimachus.searchSelection",
       guard(() => searchSelection(extensionUri)),
     ),
-    vscode.commands.registerCommand("callimachus.recent", guard(() => doRecent(extensionUri))),
+    vscode.commands.registerCommand(
+      "callimachus.recent",
+      guard(() => doRecent(extensionUri)),
+    ),
     vscode.commands.registerCommand(
       "callimachus.insertThread",
       guard(async (arg: unknown) => {
@@ -170,6 +176,18 @@ export function activate(context: vscode.ExtensionContext): void {
       "callimachus.openThread",
       guard((id: number) => openThreadPanel(extensionUri, id)),
     ),
+    vscode.commands.registerCommand("callimachus.toggleAmbientRecall", async () => {
+      const cfg = vscode.workspace.getConfiguration("callimachus");
+      const next = !cfg.get<boolean>("ambientRecall", true);
+      await cfg.update("ambientRecall", next, vscode.ConfigurationTarget.Global);
+      vscode.window.showInformationMessage(`Callimachus: ambient recall ${next ? "on" : "off"}.`);
+      sidebar.refresh();
+    }),
+    vscode.workspace.onDidChangeConfiguration((e) => {
+      if (e.affectsConfiguration("callimachus.ambientRecall")) sidebar.refresh();
+    }),
+    // The provider owns the editor watcher; dispose it on shutdown.
+    sidebar,
   );
 }
 

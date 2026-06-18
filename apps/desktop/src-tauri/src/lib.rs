@@ -269,23 +269,46 @@ fn build_embeddings(app: AppHandle) -> AppResult<()> {
         return Ok(()); // already running
     }
     std::thread::spawn(move || {
+        // Smaller batches keep each locked write + each inference short, so the UI
+        // (and ambient-recall) stay snappy while the job runs in the background.
+        const BATCH: usize = 64;
         let db = app.state::<db::Db>();
         let embedder = app.state::<embed::Embedder>();
         loop {
-            let step = {
-                let Ok(mut conn) = db.0.lock() else { break };
-                embed::embed_batch(&mut conn, &embedder, 256)
-            };
-            match step {
-                Ok(0) => break,
-                Ok(_) => {
-                    let _ = app.emit("embed:progress", ());
+            // 1. Locked, fast: claim the next batch of pending messages.
+            let rows = {
+                let Ok(conn) = db.0.lock() else { break };
+                match embed::pending_batch(&conn, BATCH) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!("[embed] {e}");
+                        break;
+                    }
                 }
+            };
+            if rows.is_empty() {
+                break;
+            }
+            // 2. UNLOCKED: the heavy model inference runs with the DB lock released,
+            //    so search/recent/stats stay responsive while embeddings build.
+            let (owners, texts) = embed::chunk_messages(&rows);
+            let vecs = match embedder.embed(texts) {
+                Ok(v) => v,
                 Err(e) => {
                     eprintln!("[embed] {e}");
                     break;
                 }
+            };
+            // 3. Locked, fast: persist the vectors + mark the messages embedded.
+            let ids: Vec<i64> = rows.iter().map(|(id, _)| *id).collect();
+            {
+                let Ok(mut conn) = db.0.lock() else { break };
+                if let Err(e) = embed::store_batch(&mut conn, &ids, &owners, &vecs) {
+                    eprintln!("[embed] {e}");
+                    break;
+                }
             }
+            let _ = app.emit("embed:progress", ());
         }
         app.state::<EmbedJob>().0.store(false, Ordering::SeqCst);
         let _ = app.emit("embed:done", ());

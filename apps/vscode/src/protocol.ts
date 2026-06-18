@@ -89,7 +89,10 @@ export type ToWebview =
   | { kind: "init"; init: InitPayload }
   | { kind: "rpc-result"; id: number; ok: true; result: unknown }
   | { kind: "rpc-result"; id: number; ok: false; error: string }
-  | { kind: "refresh" };
+  | { kind: "refresh" }
+  // Ambient recall: the host computes related threads from the editor context and
+  // pushes them; `label` is a short hint of what matched (a symbol, "selection"…).
+  | { kind: "related"; label: string; results: ThreadSummary[] };
 
 /** Human labels for the source kinds (kept in sync with the desktop app). */
 export const SOURCE_LABELS: Record<string, string> = {

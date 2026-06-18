@@ -8,11 +8,7 @@ import type { FromWebview, InitPayload, ToWebview } from "./protocol";
 
 const panels = new Map<number, vscode.WebviewPanel>();
 
-export function openThreadPanel(
-  extensionUri: vscode.Uri,
-  id: number,
-  title?: string | null,
-): void {
+export function openThreadPanel(extensionUri: vscode.Uri, id: number, title?: string | null): void {
   const existing = panels.get(id);
   if (existing) {
     existing.reveal();

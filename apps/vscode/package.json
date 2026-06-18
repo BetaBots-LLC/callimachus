@@ -76,6 +76,11 @@
         "title": "Refresh",
         "category": "Callimachus",
         "icon": "$(refresh)"
+      },
+      {
+        "command": "callimachus.toggleAmbientRecall",
+        "title": "Toggle Ambient Recall",
+        "category": "Callimachus"
       }
     ],
     "viewsContainers": {
@@ -127,6 +132,26 @@
           "type": "string",
           "default": "claude",
           "description": "CLI agent the \"Open in CLI\" action seeds with a thread's context (e.g. `claude`, `codex`, `gemini`). Must be on your PATH."
+        },
+        "callimachus.ambientRecall": {
+          "type": "boolean",
+          "default": true,
+          "description": "Ambient recall: surface past threads related to whatever you're looking at (selection, symbol, or error) in the Callimachus sidebar, with no searching."
+        },
+        "callimachus.ambientRecallThrottle": {
+          "type": "number",
+          "default": 500,
+          "description": "Milliseconds to wait after the cursor/selection settles before querying for related threads."
+        },
+        "callimachus.ambientRecallMinContext": {
+          "type": "number",
+          "default": 10,
+          "description": "Minimum length of the editor context (selection or symbol) before ambient recall runs."
+        },
+        "callimachus.ambientRecallLimit": {
+          "type": "number",
+          "default": 5,
+          "description": "Maximum related threads to show in the ambient-recall section."
         }
       }
     }
