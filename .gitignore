@@ -18,6 +18,13 @@ dist-ssr
 # Next.js (apps/web, later)
 .next
 out
+node_modules/
+dist/
+.output/
+.vercel/
+.nitro/
+.tanstack/
+*.local
 
 # Editor directories and files
 .vscode/*

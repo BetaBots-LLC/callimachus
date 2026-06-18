@@ -195,7 +195,20 @@ export const api = {
   // Approve or deny a shell command the agent asked to run.
   approveTool: (toolId: string, approved: boolean) =>
     invoke<void>("approve_tool", { toolId, approved }),
+  // One-click Claude Code integration: /recall skill + self-registered MCP server.
+  recallIntegrationStatus: () => invoke<IntegrationStatus>("recall_integration_status"),
+  installRecallIntegration: () => invoke<IntegrationStatus>("install_recall_integration"),
+  uninstallRecallIntegration: () => invoke<void>("uninstall_recall_integration"),
 };
+
+// State of the Claude Code integration (the `/recall` skill + `callimachus` MCP server).
+export interface IntegrationStatus {
+  skillInstalled: boolean;
+  skillOutdated: boolean;
+  mcpRegistered: boolean;
+  skillPath: string;
+  configPath: string;
+}
 
 export interface ChatMessage {
   role: "system" | "user" | "assistant";

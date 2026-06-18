@@ -44,7 +44,7 @@ jobs:
             rust_target: ""
     runs-on: ${{ matrix.platform }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ inputs.tag || github.ref_name }}
 
@@ -57,7 +57,7 @@ jobs:
 
       - uses: pnpm/action-setup@v4
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 20
           cache: pnpm
@@ -87,5 +87,5 @@ jobs:
           releaseDraft: false
           prerelease: ${{ contains(inputs.tag || github.ref_name, '-rc') || contains(inputs.tag || github.ref_name, '-beta') }}
           # Each job appends its platform/arch entry to the release's latest.json.
-          uploadUpdaterJson: true
+          includeUpdaterJson: true
           args: ${{ matrix.args }}

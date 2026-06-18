@@ -103,7 +103,7 @@ VSCodium install from Open VSX**, official VS Code from the Marketplace.
 - `publish-extension.yml` runs `vsce` (Marketplace) and `ovsx` (Open VSX); each is
   skipped if its token secret is missing, and the `.vsix` is always attached to the
   GitHub Release for manual install.
-- One-time, before the first publish: create the `betabots` publisher on the
+- One-time, before the first publish: create the `BetaBotsLLC` publisher on the
   [VS Code Marketplace](https://marketplace.visualstudio.com/manage) and the
   matching namespace on [Open VSX](https://open-vsx.org), then add `VSCE_PAT` /
   `OVSX_PAT` (the publish workflow auto-creates the Open VSX namespace).
