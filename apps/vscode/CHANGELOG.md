@@ -1,5 +1,7 @@
 # callimachus-vscode
 
+## 0.4.1
+
 ## 0.3.0
 
 ### Minor Changes
