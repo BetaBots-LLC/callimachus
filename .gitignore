@@ -45,3 +45,12 @@ dist/
 
 # env
 .env*
+
+# Signing keys — NEVER commit private keys (public keys are allowed)
+*.asc
+*.gpg
+*.pgp
+*.p12
+*.pfx
+*.key
+!*public*.asc
