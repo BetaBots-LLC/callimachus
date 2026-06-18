@@ -2,11 +2,10 @@
 // `getPrimaryOs` in server/releases.ts), so the right download is chosen before
 // the first byte — no client state, no effect, no hydration flash.
 
-export type OsKey = "mac_arm" | "mac_x64" | "win" | "linux_appimage" | "linux_deb";
+export type OsKey = "mac_arm" | "win" | "linux_appimage" | "linux_deb";
 
 const FAMILY: Record<OsKey, string> = {
   mac_arm: "macOS",
-  mac_x64: "macOS",
   win: "Windows",
   linux_appimage: "Linux",
   linux_deb: "Linux",
