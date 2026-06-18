@@ -2,7 +2,7 @@
   "name": "callimachus-vscode",
   "displayName": "Callimachus — AI history search",
   "description": "Search your AI coding-agent conversation history (Claude Code, Codex, Cursor, Gemini, and 7 more) from VS Code or Cursor — without leaving the editor.",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "private": true,
   "publisher": "betabots",
   "license": "AGPL-3.0-or-later",
