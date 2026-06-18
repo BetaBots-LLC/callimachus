@@ -137,22 +137,32 @@ export function showCalSetupPrompt(err: unknown): boolean {
 const MARK_RE = new RegExp(`[${String.fromCharCode(1)}${String.fromCharCode(2)}]`, "g");
 export const stripMarks = (s: string): string => s.replace(MARK_RE, "");
 
+/** Parse `cal --json` stdout, turning malformed output into a clear error rather
+ *  than a raw SyntaxError (e.g. an old `cal` that doesn't support `--json`). */
+function parseJson<T>(raw: string, command: string): T {
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    throw new Error(`\`cal ${command}\` returned output that wasn't valid JSON. Update the cal CLI?`);
+  }
+}
+
 export async function searchHits(query: string, project?: string): Promise<SearchHit[]> {
   const limit = String(config<number>("resultLimit", 40));
   const args = ["search", query, "--json", "-n", limit];
   if (project) args.push("-p", project);
-  return JSON.parse(await runCal(args)) as SearchHit[];
+  return parseJson<SearchHit[]>(await runCal(args), "search");
 }
 
 export async function recentThreads(project?: string): Promise<ThreadSummary[]> {
   const limit = String(config<number>("resultLimit", 40));
   const args = ["recent", "--json", "-n", limit];
   if (project) args.push("-p", project);
-  return JSON.parse(await runCal(args)) as ThreadSummary[];
+  return parseJson<ThreadSummary[]>(await runCal(args), "recent");
 }
 
 export async function stats(): Promise<Stats> {
-  return JSON.parse(await runCal(["stats", "--json"])) as Stats;
+  return parseJson<Stats>(await runCal(["stats", "--json"]), "stats");
 }
 
 /** The packed markdown transcript for a thread. */

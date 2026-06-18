@@ -132,7 +132,27 @@ fn install_cal(app_exe: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+/// Place a `cal.exe` next to the app so the `cal` CLI resolves without touching
+/// PATH. The VS Code extension probes the install dir for `cal.exe` (see
+/// `calCandidates()` in apps/vscode/src/cal.ts), and the binary runs in `cal`
+/// mode when invoked by that name (main.rs argv0 check). A hardlink keeps it to
+/// one on-disk copy (same dir → same volume); falls back to a plain copy.
+#[cfg(windows)]
+fn install_cal(app_exe: &Path) -> Result<()> {
+    // Don't link onto ourselves if somehow invoked as cal.exe.
+    if app_exe.file_stem().and_then(|s| s.to_str()) == Some("cal") {
+        return Ok(());
+    }
+    let dir = app_exe.parent().context("app exe has no parent directory")?;
+    let link = dir.join("cal.exe");
+    let _ = std::fs::remove_file(&link); // replace any stale link/copy
+    std::fs::hard_link(app_exe, &link)
+        .or_else(|_| std::fs::copy(app_exe, &link).map(|_| ()))
+        .with_context(|| format!("creating {}", link.display()))?;
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
 fn install_cal(_app_exe: &Path) -> Result<()> {
     Ok(())
 }

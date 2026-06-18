@@ -65,7 +65,11 @@ export function parseTranscript(raw: string, fallbackTitle?: string | null): Tra
 
   const open = body.match(/^<reference_thread\b([^>]*)>/);
   if (open) {
-    const attr = (k: string) => open[1].match(new RegExp(`${k}="([^"]*)"`))?.[1] ?? null;
+    const attrs = open[1];
+    const attr = (k: string): string | null =>
+      // k is a fixed literal below, but escape defensively so a regex meta-char
+      // could never break out of the pattern.
+      attrs.match(new RegExp(`${k.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}="([^"]*)"`))?.[1] ?? null;
     meta.source = attr("source");
     meta.title = attr("title") || meta.title;
     meta.project = attr("project");

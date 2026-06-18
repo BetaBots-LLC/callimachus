@@ -66,5 +66,7 @@ async function runRpc(method: RpcMethod, params: unknown): Promise<unknown> {
       return stats();
     case "cat":
       return catThread((params as { id: number }).id);
+    default:
+      throw new Error(`unknown RPC method: ${String(method)}`);
   }
 }
