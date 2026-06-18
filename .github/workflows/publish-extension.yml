@@ -27,13 +27,13 @@ jobs:
       VSCE_PAT: ${{ secrets.VSCE_PAT }}
       OVSX_PAT: ${{ secrets.OVSX_PAT }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ inputs.tag || github.ref_name }}
 
       - uses: pnpm/action-setup@v4
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 20
           cache: pnpm
@@ -55,7 +55,7 @@ jobs:
         working-directory: apps/vscode
         run: |
           # Namespace must exist before the first publish; no-op if already created.
-          pnpm exec ovsx create-namespace betabots -p "$OVSX_PAT" || true
+          pnpm exec ovsx create-namespace BetaBotsLLC -p "$OVSX_PAT" || true
           pnpm exec ovsx publish callimachus-vscode.vsix -p "$OVSX_PAT"
 
       - name: GitHub Release (.vsix asset)

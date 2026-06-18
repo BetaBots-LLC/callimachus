@@ -9,6 +9,8 @@ pub mod context;
 pub mod db;
 pub mod embed;
 pub mod export;
+pub mod integration;
+pub mod mcp_server;
 pub mod search;
 
 use error::AppResult;
@@ -610,6 +612,30 @@ fn resume_thread(db: tauri::State<'_, db::Db>, thread_id: i64) -> AppResult<()> 
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+// ---- Claude Code integration (one-click /recall skill + MCP server) ----
+
+/// Whether the `/recall` skill + `callimachus` MCP server are installed for Claude Code.
+#[tauri::command]
+fn recall_integration_status() -> AppResult<integration::IntegrationStatus> {
+    let exe = std::env::current_exe().map_err(anyhow::Error::from)?;
+    Ok(integration::status(&exe))
+}
+
+/// Install (or refresh) the `/recall` skill and register this app as Claude Code's
+/// `callimachus` MCP server — no terminal, cargo, or extra binary needed.
+#[tauri::command]
+fn install_recall_integration() -> AppResult<integration::IntegrationStatus> {
+    let exe = std::env::current_exe().map_err(anyhow::Error::from)?;
+    Ok(integration::install(&exe)?)
+}
+
+/// Remove the skill file and the MCP registration.
+#[tauri::command]
+fn uninstall_recall_integration() -> AppResult<()> {
+    integration::uninstall()?;
+    Ok(())
+}
+
 pub fn run() {
     let mut builder = tauri::Builder::default().plugin(tauri_plugin_opener::init());
 
@@ -662,7 +688,10 @@ pub fn run() {
             export_thread,
             obsidian_vaults,
             can_synthesize,
-            synthesize_export
+            synthesize_export,
+            recall_integration_status,
+            install_recall_integration,
+            uninstall_recall_integration
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -113,16 +113,17 @@ pub fn launch_with_context(program: &str, context_md: &str, project_path: Option
             applescript_escape(&shell)
         );
         std::process::Command::new("osascript").arg("-e").arg(script).spawn()?;
+        Ok(file_str)
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = cmd;
-        bail!("Launching the CLI is currently supported on macOS only");
+        let _ = (cmd, file_str);
+        bail!("Launching the CLI is currently supported on macOS only")
     }
-    Ok(file_str)
 }
 
 /// Build the `cd <cwd> && <program> <args…>` shell line.
+#[cfg(target_os = "macos")]
 fn build_shell_command(cmd: &ResumeCommand) -> String {
     let mut parts = Vec::new();
     if let Some(cwd) = &cmd.cwd {
@@ -138,11 +139,13 @@ fn build_shell_command(cmd: &ResumeCommand) -> String {
 }
 
 /// Single-quote a value for the shell, escaping embedded single quotes.
+#[cfg(target_os = "macos")]
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 /// Escape a string for embedding inside an AppleScript double-quoted literal.
+#[cfg(target_os = "macos")]
 fn applescript_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }

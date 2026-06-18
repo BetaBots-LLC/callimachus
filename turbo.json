@@ -4,7 +4,17 @@
   "tasks": {
     "build": {
       "dependsOn": ["^build"],
-      "outputs": ["dist/**", "media/webview.js", "media/webview.css", "media/assets/**", ".next/**", "!.next/cache/**"]
+      "outputs": [
+        "dist/**",
+        "media/webview.js",
+        "media/webview.css",
+        "media/assets/**",
+        ".output/**",
+        ".vercel/output/**",
+        ".tanstack/**",
+        ".next/**",
+        "!.next/cache/**"
+      ]
     },
     "dev": {
       "cache": false,

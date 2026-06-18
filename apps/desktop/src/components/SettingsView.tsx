@@ -51,6 +51,8 @@ export function SettingsView() {
         </CardContent>
       </Card>
 
+      <RecallIntegrationCard />
+
       <Card>
         <CardHeader>
           <CardTitle>Sources</CardTitle>
@@ -168,6 +170,79 @@ export function SettingsView() {
 
       <CleanupCard />
     </div>
+  );
+}
+
+/** One-click Claude Code integration: install the /recall skill + register this
+ *  app as the `callimachus` MCP server, no terminal or cargo. */
+function RecallIntegrationCard() {
+  const queryClient = useQueryClient();
+  const status = useQuery({
+    queryKey: ["recall_integration"],
+    queryFn: api.recallIntegrationStatus,
+  });
+  const refresh = () => queryClient.invalidateQueries({ queryKey: ["recall_integration"] });
+  const install = useMutation({ mutationFn: api.installRecallIntegration, onSuccess: refresh });
+  const uninstall = useMutation({ mutationFn: api.uninstallRecallIntegration, onSuccess: refresh });
+
+  const s = status.data;
+  const connected = !!s && s.skillInstalled && s.mcpRegistered && !s.skillOutdated;
+  const partial = !!s && (s.skillInstalled || s.mcpRegistered) && !connected;
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2">
+          Claude Code
+          {connected && (
+            <span className="rounded-full bg-emerald-500/15 px-2 py-0.5 text-[0.6rem] font-medium uppercase tracking-wide text-emerald-600 dark:text-emerald-400">
+              connected
+            </span>
+          )}
+        </CardTitle>
+        <p className="text-sm text-muted-foreground">
+          Let Claude Code (and other agents) search your history. Installs the{" "}
+          <code>/recall</code> skill and registers Callimachus as an MCP server — no terminal, no
+          setup.
+        </p>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
+          <span>{s?.skillInstalled ? (s.skillOutdated ? "⚠ skill outdated" : "✓ skill") : "○ skill"}</span>
+          <span>{s?.mcpRegistered ? "✓ MCP server" : "○ MCP server"}</span>
+        </div>
+        <div className="flex items-center gap-2">
+          <Button size="sm" onClick={() => install.mutate()} disabled={install.isPending}>
+            {install.isPending
+              ? "Installing…"
+              : connected
+                ? "Reinstall"
+                : partial
+                  ? "Finish setup"
+                  : "Enable for Claude Code"}
+          </Button>
+          {(s?.skillInstalled || s?.mcpRegistered) && (
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={() => uninstall.mutate()}
+              disabled={uninstall.isPending}
+            >
+              Remove
+            </Button>
+          )}
+        </div>
+        {install.isSuccess && (
+          <p className="text-xs text-muted-foreground">
+            Done. Restart Claude Code (or run <code>/mcp</code>) to pick up the server, then type{" "}
+            <code>/recall</code>.
+          </p>
+        )}
+        {install.isError && (
+          <p className="text-xs text-destructive">{String(install.error)}</p>
+        )}
+      </CardContent>
+    </Card>
   );
 }
 
