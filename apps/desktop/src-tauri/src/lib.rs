@@ -229,10 +229,15 @@ fn search_threads(
     filters: Option<SearchFilters>,
 ) -> AppResult<Vec<SearchHit>> {
     let filters = filters.unwrap_or_default();
-    let conn = lock(&db)?;
     let hits = if filters.hybrid {
-        search::hybrid(&conn, &embedder, &query, &filters)?
+        // Embed the query BEFORE locking the DB so the (multi-second on first call)
+        // inference never holds the single connection and freezes other UI commands —
+        // especially while a background embedding build is running.
+        let qv = embed::embed_query(&embedder, &query)?;
+        let conn = lock(&db)?;
+        search::hybrid_vec(&conn, &query, qv.as_deref(), &filters)?
     } else {
+        let conn = lock(&db)?;
         search::search(&conn, &query, &filters)?
     };
     Ok(hits)
@@ -244,6 +249,15 @@ struct EmbedStatus {
     done: i64,
     total: i64,
     running: bool,
+}
+
+/// Pushed on each embedded batch so the UI can show progress WITHOUT polling
+/// `embedding_status` (which runs two locked COUNT(*) scans). Counts are tracked
+/// incrementally by the job, not re-queried.
+#[derive(Clone, Serialize)]
+struct EmbedProgressEvent {
+    done: i64,
+    total: i64,
 }
 
 #[tauri::command]
@@ -274,6 +288,12 @@ fn build_embeddings(app: AppHandle) -> AppResult<()> {
         const BATCH: usize = 64;
         let db = app.state::<db::Db>();
         let embedder = app.state::<embed::Embedder>();
+        // Snapshot totals ONCE; then increment a running counter per batch so progress
+        // events carry counts without re-running COUNT(*) scans under the lock.
+        let (mut done, total) = match db.0.lock() {
+            Ok(conn) => embed::embed_progress(&conn).unwrap_or((0, 0)),
+            Err(_) => (0, 0),
+        };
         loop {
             // 1. Locked, fast: claim the next batch of pending messages.
             let rows = {
@@ -308,7 +328,8 @@ fn build_embeddings(app: AppHandle) -> AppResult<()> {
                     break;
                 }
             }
-            let _ = app.emit("embed:progress", ());
+            done += rows.len() as i64;
+            let _ = app.emit("embed:progress", EmbedProgressEvent { done, total });
         }
         app.state::<EmbedJob>().0.store(false, Ordering::SeqCst);
         let _ = app.emit("embed:done", ());

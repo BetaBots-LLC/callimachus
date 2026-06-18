@@ -54,10 +54,12 @@ export function SearchBar() {
     },
   });
 
+  // Progress is pushed via embed:progress/embed:done events (see main.tsx); a slow
+  // safety-net refetch covers any missed event while a build runs.
   const embed = useQuery({
     queryKey: ["embed_status"],
     queryFn: api.embeddingStatus,
-    refetchInterval: (q) => (q.state.data?.running ? 700 : false),
+    refetchInterval: (q) => (q.state.data?.running ? 5_000 : false),
   });
   const buildIndex = useMutation({
     mutationFn: api.buildEmbeddings,

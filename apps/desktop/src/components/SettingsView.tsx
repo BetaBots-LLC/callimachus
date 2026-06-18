@@ -13,10 +13,12 @@ const INDEXABLE: SourceKind[] = INDEXABLE_SOURCES;
 export function SettingsView() {
   const queryClient = useQueryClient();
   const stats = useQuery({ queryKey: ["db_stats"], queryFn: api.dbStats });
+  // Progress is pushed via embed:progress/embed:done events (see main.tsx); a slow
+  // safety-net refetch covers any missed event while a build runs.
   const embed = useQuery({
     queryKey: ["embed_status"],
     queryFn: api.embeddingStatus,
-    refetchInterval: (q) => (q.state.data?.running ? 700 : false),
+    refetchInterval: (q) => (q.state.data?.running ? 5_000 : false),
   });
 
   const indexOne = useMutation({
@@ -201,14 +203,16 @@ function RecallIntegrationCard() {
           )}
         </CardTitle>
         <p className="text-sm text-muted-foreground">
-          Let Claude Code (and other agents) search your history. Installs the{" "}
-          <code>/recall</code> skill, registers Callimachus as an MCP server, and adds the{" "}
-          <code>cal</code> CLI (used by the VS Code extension) — no terminal, no setup.
+          Let Claude Code (and other agents) search your history. Installs the <code>/recall</code>{" "}
+          skill, registers Callimachus as an MCP server, and adds the <code>cal</code> CLI (used by
+          the VS Code extension) — no terminal, no setup.
         </p>
       </CardHeader>
       <CardContent className="space-y-3">
         <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
-          <span>{s?.skillInstalled ? (s.skillOutdated ? "⚠ skill outdated" : "✓ skill") : "○ skill"}</span>
+          <span>
+            {s?.skillInstalled ? (s.skillOutdated ? "⚠ skill outdated" : "✓ skill") : "○ skill"}
+          </span>
           <span>{s?.mcpRegistered ? "✓ MCP server" : "○ MCP server"}</span>
           <span>{s?.calInstalled ? "✓ cal CLI" : "○ cal CLI"}</span>
         </div>
@@ -239,9 +243,7 @@ function RecallIntegrationCard() {
             <code>/recall</code>.
           </p>
         )}
-        {install.isError && (
-          <p className="text-xs text-destructive">{String(install.error)}</p>
-        )}
+        {install.isError && <p className="text-xs text-destructive">{String(install.error)}</p>}
       </CardContent>
     </Card>
   );

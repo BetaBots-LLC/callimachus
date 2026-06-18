@@ -40,8 +40,15 @@ impl Embedder {
         }
         let mut guard = self.0.lock().map_err(|e| anyhow::anyhow!("embedder lock: {e}"))?;
         if guard.is_none() {
+            // Cap ONNX intra-op parallelism so a build doesn't pin every core and
+            // starve the UI thread. fastembed counts logical cores; leave 2 free.
+            let threads = std::thread::available_parallelism()
+                .map(|n| n.get().saturating_sub(2).max(1))
+                .unwrap_or(1);
             let model = TextEmbedding::try_new(
-                InitOptions::new(FeModel::BGESmallENV15).with_show_download_progress(false),
+                InitOptions::new(FeModel::BGESmallENV15)
+                    .with_show_download_progress(false)
+                    .with_intra_threads(threads),
             )?;
             *guard = Some(model);
         }
@@ -147,8 +154,18 @@ pub fn embed_batch(conn: &mut Connection, embedder: &Embedder, batch: usize) -> 
     Ok(rows.len())
 }
 
+/// Embed a search query (with bge's query instruction prefix) into a single vector.
+/// Runs the model — call this WITHOUT holding the DB lock so inference never blocks
+/// other UI queries. Returns None for an empty/unembeddable query.
+pub fn embed_query(embedder: &Embedder, query: &str) -> Result<Option<Vec<f32>>> {
+    let qv = embedder.embed(vec![format!("{QUERY_PREFIX}{query}")])?;
+    Ok(qv.into_iter().next())
+}
+
 /// Semantic KNN over chunk embeddings, deduped to message level, with source/
-/// subagent filters applied. Returns (message_id, similarity) best-first.
+/// subagent filters applied. Embeds the query first, then runs the SQL KNN. Holds
+/// `conn` across inference — prefer `embed_query` + `semantic_search_vec` on the
+/// hot UI path so the DB lock isn't held during inference.
 pub fn semantic_search(
     conn: &Connection,
     embedder: &Embedder,
@@ -157,10 +174,21 @@ pub fn semantic_search(
     sources: &[String],
     k: usize,
 ) -> Result<Vec<(i64, f32)>> {
-    let qv = embedder.embed(vec![format!("{QUERY_PREFIX}{query}")])?;
-    let Some(qv) = qv.into_iter().next() else {
+    let Some(qv) = embed_query(embedder, query)? else {
         return Ok(Vec::new());
     };
+    semantic_search_vec(conn, &qv, include_subagents, sources, k)
+}
+
+/// SQL-only semantic KNN given an already-embedded query vector. No model inference
+/// here, so the DB lock is held only for the (fast) query. See `embed_query`.
+pub fn semantic_search_vec(
+    conn: &Connection,
+    qv: &[f32],
+    include_subagents: bool,
+    sources: &[String],
+    k: usize,
+) -> Result<Vec<(i64, f32)>> {
     // Over-fetch chunks so dedup + filtering still leaves k messages. vec0 applies
     // the source/subagent filter AFTER the KNN, so a selective source filter can
     // starve results — over-fetch far more candidates when one is active. sqlite-vec
@@ -185,7 +213,7 @@ pub fn semantic_search(
          JOIN sources s ON s.id = t.source_id
          WHERE 1=1"
     );
-    let mut args: Vec<Box<dyn ToSql>> = vec![Box::new(vec_to_bytes(&qv))];
+    let mut args: Vec<Box<dyn ToSql>> = vec![Box::new(vec_to_bytes(qv))];
     if !include_subagents {
         sql.push_str(" AND t.is_subagent = 0");
     }
