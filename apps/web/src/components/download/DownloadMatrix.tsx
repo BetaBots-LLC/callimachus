@@ -18,15 +18,15 @@ const ROWS: Row[] = [
   {
     no: "01",
     os: "macOS",
-    format: "Universal .dmg",
-    note: "Apple Silicon + Intel",
+    format: ".dmg",
+    note: "Apple Silicon (M-series)",
     href: (r) => r.assets.mac_arm,
     icon: Apple,
   },
   {
     no: "02",
     os: "Windows",
-    format: "Installer .msi",
+    format: "Installer .exe",
     note: "x64",
     href: (r) => r.assets.win,
     icon: Monitor,

@@ -1,16 +1,17 @@
 name: Build & Release
 
 # Triggered by the vX.Y.Z (or -rc.N) tag pushed by version.yml — or run manually.
-# Builds the desktop app for macOS (Apple Silicon + Intel, each on its NATIVE
-# runner), Windows (x64) and Linux (x64), signs the updater artifacts, and
-# publishes them to one GitHub Release. RC/beta tags are marked prereleases.
-# v[0-9]* matches desktop tags, not the vscode-v* extension tag.
+# Builds the desktop app for macOS (Apple Silicon), Windows (x64) and Linux (x64),
+# signs the updater artifacts, and publishes them to one GitHub Release. RC/beta
+# tags are marked prereleases. v[0-9]* matches desktop tags, not the vscode-v* tag.
 #
-# Why native per-arch macs (NOT --target universal): `ort` (fastembed's ONNX
-# backend) ships no prebuilt for a cross-compiled x86_64-apple-darwin, so a
-# universal build fails on the Intel slice. Building each arch on its own runner
-# avoids the cross-compile. Linux runs on 24.04 because the ONNX prebuilt needs
-# glibc >= 2.38 (22.04 ships 2.35 -> undefined __isoc23_* link errors).
+# macOS is Apple Silicon only: `ort` (fastembed's ONNX backend, currently pinned
+# via fastembed to ort 2.0.0-rc.12) publishes NO x86_64-apple-darwin prebuilt at
+# all — not even on a native Intel runner — and fastembed force-enables
+# `download-binaries`, so there's no config knob to point it elsewhere. Supporting
+# Intel would require a system/dynamic ONNX Runtime + bundling its dylib; not worth
+# it for the shrinking Intel-Mac base. Linux runs on 24.04 because the ONNX prebuilt
+# needs glibc >= 2.38 (22.04 ships 2.35 -> undefined __isoc23_* link errors).
 
 on:
   push:
@@ -33,9 +34,6 @@ jobs:
           - platform: macos-latest      # Apple Silicon (native arm64)
             args: "--target aarch64-apple-darwin"
             rust_target: aarch64-apple-darwin
-          - platform: macos-15-intel    # Intel (native x86_64 — macos-13 retired Dec 2025)
-            args: "--target x86_64-apple-darwin"
-            rust_target: x86_64-apple-darwin
           - platform: ubuntu-24.04      # Linux x64 (glibc 2.39 for the ONNX prebuilt)
             args: ""
             rust_target: ""

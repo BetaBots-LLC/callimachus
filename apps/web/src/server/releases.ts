@@ -20,17 +20,16 @@ export interface Release {
   fallback: boolean;
 }
 
-const LATEST_DL = `https://github.com/${REPO}/releases/latest/download`;
-
-// Stable "latest" redirect URLs GitHub serves without the API. Asset names follow
-// the desktop build workflow's naming.
+// Fallback when the GitHub API is unreachable. Asset names embed the version, so a
+// fixed `releases/latest/download/<name>` URL can't be hardcoded reliably — send
+// users to the latest release page instead, which never 404s.
+const RELEASES_LATEST = `https://github.com/${REPO}/releases/latest`;
 function staticAssets(): ReleaseAssets {
   return {
-    mac_arm: `${LATEST_DL}/Callimachus_macos_universal.dmg`,
-    mac_x64: `${LATEST_DL}/Callimachus_macos_universal.dmg`,
-    win: `${LATEST_DL}/Callimachus_x64-setup.msi`,
-    linux_appimage: `${LATEST_DL}/callimachus_amd64.AppImage`,
-    linux_deb: `${LATEST_DL}/callimachus_amd64.deb`,
+    mac_arm: RELEASES_LATEST,
+    win: RELEASES_LATEST,
+    linux_appimage: RELEASES_LATEST,
+    linux_deb: RELEASES_LATEST,
   };
 }
 
@@ -73,9 +72,13 @@ export const getLatestRelease = createServerFn({ method: "GET" }).handler(
         publishedAt: json.published_at ?? null,
         fallback: false,
         assets: {
-          mac_arm: url(/(aarch64|arm64|macos_universal).*\.dmg$/i, fb.mac_arm),
-          mac_x64: url(/(x64|x86_64|intel|macos_universal).*\.dmg$/i, fb.mac_x64),
-          win: url(/\.msi$/i, fb.win),
+          // macOS is Apple Silicon only (no x86_64 ONNX prebuilt — see build.yml).
+          mac_arm: url(/(aarch64|arm64).*\.dmg$/i, fb.mac_arm),
+          // Serve Tauri's NSIS installer `*_x64-setup.exe` — a per-user installer
+          // (no admin prompt), the better default than the WiX `*_en-US.msi` (which
+          // also ships, for enterprise/admin installs). Both self-update via the
+          // updater's install-type-aware keys.
+          win: url(/-setup\.exe$/i, fb.win),
           linux_appimage: url(/\.AppImage$/i, fb.linux_appimage),
           linux_deb: url(/\.deb$/i, fb.linux_deb),
         },
