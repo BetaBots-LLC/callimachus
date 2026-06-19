@@ -7,13 +7,13 @@
 //! Set CALLIMACHUS_DB to point at a specific index.db; CALLIMACHUS_VAULT to a
 //! default Obsidian vault for `cal export`.
 
-use crate::{agent, context, db, embed, export, search, secrets};
+use crate::{agent, context, db, embed, export, knowledge, search, secrets};
 use rusqlite::Connection;
 
 /// Subcommands that identify a `cal` invocation when the app is launched directly.
 pub const COMMANDS: &[&str] = &[
     "search", "related", "recent", "cat", "show", "context", "stats", "export", "star", "tag",
-    "tags",
+    "tags", "todos", "knowledge", "distill",
 ];
 
 const USAGE: &str = "\
@@ -30,6 +30,12 @@ USAGE:
   cal star <thread-id> [--off]   star a thread (--off to unstar)
   cal tag <thread-id> [<tag…>]   set a thread's tags (no tags = clear them)
   cal tags [--json]              list all tags with thread counts
+  cal todos [-p PROJECT] [-s SOURCE] [-n LIMIT] [--json]
+                                open TODOs found across your history
+  cal knowledge <thread-id> [--json]
+                                distilled summary/decisions/gotchas for a thread
+  cal distill <thread-id>       extract knowledge for a thread (needs distillation
+                                enabled in the app: local Ollama or an API key)
   cal help
 
 OPTIONS:
@@ -73,6 +79,9 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
         "star" => cmd_star(rest),
         "tag" => cmd_tag(rest),
         "tags" => cmd_tags(rest),
+        "todos" => cmd_todos(rest),
+        "knowledge" => cmd_knowledge(rest),
+        "distill" => cmd_distill(rest),
         "help" | "-h" | "--help" => {
             println!("{USAGE}");
             Ok(())
@@ -297,6 +306,93 @@ fn cmd_tags(args: &[String]) -> anyhow::Result<()> {
     for (tag, n) in &tags {
         println!("{n:>4}  {tag}");
     }
+    Ok(())
+}
+
+fn cmd_todos(args: &[String]) -> anyhow::Result<()> {
+    let o = parse(args)?;
+    let conn = open_db()?;
+    let todos = knowledge::list_open_todos(
+        &conn,
+        o.project.as_deref(),
+        o.source.as_deref(),
+        o.limit.unwrap_or(50) as i64,
+    )?;
+    if o.json {
+        println!("{}", serde_json::to_string_pretty(&todos)?);
+        return Ok(());
+    }
+    if todos.is_empty() {
+        eprintln!("no open todos found");
+        return Ok(());
+    }
+    for t in &todos {
+        let title = t.title.as_deref().unwrap_or("untitled");
+        println!("• {}", t.text);
+        println!("    {} · {} · thread {}", t.source, title, t.thread_id);
+    }
+    Ok(())
+}
+
+fn print_knowledge(k: &knowledge::ThreadKnowledge) {
+    if let Some(s) = &k.summary {
+        println!("Summary: {s}\n");
+    }
+    if !k.decisions.is_empty() {
+        println!("Decisions:");
+        for f in &k.decisions {
+            println!("  • {}", f.text);
+        }
+        println!();
+    }
+    if !k.gotchas.is_empty() {
+        println!("Gotchas:");
+        for f in &k.gotchas {
+            println!("  • {}", f.text);
+        }
+        println!();
+    }
+    if !k.todos.is_empty() {
+        println!("TODOs:");
+        for f in &k.todos {
+            println!("  • {}", f.text);
+        }
+    }
+    if k.stale {
+        eprintln!("(stale — thread changed since it was distilled; re-run `cal distill`)");
+    }
+}
+
+fn cmd_knowledge(args: &[String]) -> anyhow::Result<()> {
+    let o = parse(args)?;
+    let id = thread_id_arg(&o, "knowledge")?;
+    let conn = open_db()?;
+    let k = knowledge::get_thread_knowledge(&conn, id)?;
+    if o.json {
+        println!("{}", serde_json::to_string_pretty(&k)?);
+        return Ok(());
+    }
+    if !k.extracted && k.todos.is_empty() {
+        eprintln!("no knowledge for thread {id} yet — run `cal distill {id}`");
+        return Ok(());
+    }
+    print_knowledge(&k);
+    Ok(())
+}
+
+fn cmd_distill(args: &[String]) -> anyhow::Result<()> {
+    let o = parse(args)?;
+    let id = thread_id_arg(&o, "distill")?;
+    let mut conn = open_db()?;
+    let (provider, model, key) = crate::resolve_distill_engine(&conn)?;
+    let packed = context::pack_thread(&conn, id, context::DEFAULT_BUDGET_CHARS)?
+        .ok_or_else(|| anyhow::anyhow!("thread {id} not found"))?;
+    eprintln!("distilling thread {id} with {provider}/{model}…");
+    let rt = tokio::runtime::Runtime::new()?;
+    let distilled = rt.block_on(agent::distill(&provider, &model, key.as_deref(), &packed))?;
+    let now = chrono::Utc::now().timestamp();
+    knowledge::store_distilled(&mut conn, id, &distilled, now)?;
+    print_knowledge(&knowledge::get_thread_knowledge(&conn, id)?);
     Ok(())
 }
 

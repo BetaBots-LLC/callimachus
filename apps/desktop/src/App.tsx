@@ -4,6 +4,7 @@ import { SearchBar } from "./components/SearchBar";
 import { ResultsList } from "./components/ResultsList";
 import { ThreadView } from "./components/ThreadView";
 import { ChatView } from "./components/ChatView";
+import { TodosView } from "./components/TodosView";
 import { StatsView } from "./components/StatsView";
 import { SettingsView } from "./components/SettingsView";
 import { Button } from "@/components/ui/button";
@@ -24,6 +25,13 @@ function App() {
   const theme = useTheme((s) => s.theme);
   const toggleTheme = useTheme((s) => s.toggle);
   const { data: stats } = useQuery({ queryKey: ["db_stats"], queryFn: api.dbStats });
+  // The knowledge feature is opt-in; only surface the Todos tab once it's enabled.
+  const knowledge = useQuery({ queryKey: ["knowledge_config"], queryFn: api.knowledgeConfig });
+  const tabs: { id: View; label: string }[] = [
+    ...TABS.slice(0, 2),
+    ...(knowledge.data?.enabled ? [{ id: "todos" as View, label: "Todos" }] : []),
+    ...TABS.slice(2),
+  ];
 
   return (
     <div className="flex h-screen flex-col bg-background text-foreground">
@@ -31,7 +39,7 @@ function App() {
         <div className="flex items-center gap-3">
           <span className="font-semibold tracking-tight">Callimachus</span>
           <nav className="flex gap-1">
-            {TABS.map((t) => (
+            {tabs.map((t) => (
               <Button
                 key={t.id}
                 size="sm"
@@ -70,6 +78,7 @@ function App() {
           </>
         )}
         {view === "chat" && <ChatView />}
+        {view === "todos" && <TodosView />}
         {view === "stats" && <StatsView />}
         {view === "settings" && <SettingsView />}
       </div>

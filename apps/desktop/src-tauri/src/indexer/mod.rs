@@ -132,6 +132,7 @@ pub fn upsert_thread(conn: &mut Connection, source_id: i64, thread: &ParsedThrea
     // Full replace: clear existing messages (FTS triggers keep the index in sync).
     tx.execute("DELETE FROM messages WHERE thread_id = ?1", [thread_id])?;
 
+    let mut inserted: Vec<(i64, &str, &str)> = Vec::with_capacity(thread.messages.len());
     {
         let mut stmt = tx.prepare(
             "INSERT INTO messages (thread_id, seq, role, text, tool_name, ts)
@@ -146,6 +147,56 @@ pub fn upsert_thread(conn: &mut Connection, source_id: i64, thread: &ParsedThrea
                 m.tool_name,
                 m.ts
             ])?;
+            inserted.push((tx.last_insert_rowid(), m.role.as_str(), m.text.as_str()));
+        }
+    }
+
+    // Free heuristic knowledge tier: re-derive this thread's TODO facts every index
+    // (delete + rescan) so they never go stale. Only user/assistant text is scanned.
+    // The LLM-distilled facts (extractor='llm') are left untouched here. Gated on the
+    // opt-in: when knowledge is off we don't write todo facts at all.
+    if crate::knowledge::get_config(&tx)?.enabled {
+        const MAX_TODOS_PER_THREAD: usize = 25;
+        tx.execute("DELETE FROM facts WHERE thread_id = ?1 AND extractor = 'heuristic'", [thread_id])?;
+        let mut fstmt = tx.prepare(
+            "INSERT INTO facts (thread_id, kind, text, source_message_id, status, extractor, created_at)
+             VALUES (?1, 'todo', ?2, ?3, 'open', 'heuristic', ?4)",
+        )?;
+        let mut seen = std::collections::HashSet::new();
+        let mut count = 0usize;
+        'outer: for (mid, role, text) in &inserted {
+            if *role != "user" && *role != "assistant" {
+                continue;
+            }
+            for todo in crate::knowledge::extract_todos(text) {
+                if count >= MAX_TODOS_PER_THREAD {
+                    break 'outer;
+                }
+                if seen.insert(todo.to_ascii_lowercase()) {
+                    fstmt.execute(params![thread_id, todo, mid, now])?;
+                    count += 1;
+                }
+            }
+        }
+    }
+
+    // Invalidate LLM-distilled knowledge when the message set actually changed. The
+    // upsert above doesn't touch knowledge_msg_count (set at distillation time), so it
+    // still holds the prior count here; only threads that were distilled AND changed
+    // get reset, so unchanged re-indexes never wipe distilled facts.
+    let prev_kcount: Option<i64> = tx
+        .query_row("SELECT knowledge_msg_count FROM threads WHERE id = ?1", [thread_id], |r| {
+            r.get::<_, Option<i64>>(0)
+        })
+        .optional()?
+        .flatten();
+    if let Some(pc) = prev_kcount {
+        if pc != thread.messages.len() as i64 {
+            tx.execute(
+                "UPDATE threads SET knowledge_extracted = 0, knowledge_error = NULL WHERE id = ?1",
+                [thread_id],
+            )?;
+            tx.execute("DELETE FROM facts WHERE thread_id = ?1 AND extractor = 'llm'", [thread_id])?;
         }
     }
 

@@ -90,6 +90,41 @@ export interface ThreadDetail {
   messages: MessageRow[];
 }
 
+/** An open TODO extracted from history (knowledge layer). */
+export interface TodoFact {
+  id: number;
+  threadId: number;
+  text: string;
+  source: SourceKind;
+  title: string | null;
+  projectPath: string | null;
+  createdAt: number;
+}
+
+/** Distillation engine config (shared across app/cal/MCP via the DB). */
+export interface KnowledgeConfig {
+  enabled: boolean;
+  provider: string | null;
+  model: string | null;
+}
+
+export interface KFact {
+  id: number;
+  text: string;
+}
+
+/** Distilled knowledge for one thread. */
+export interface ThreadKnowledge {
+  summary: string | null;
+  decisions: KFact[];
+  gotchas: KFact[];
+  todos: KFact[];
+  extracted: boolean;
+  stale: boolean;
+  error: string | null;
+  canDistill: boolean;
+}
+
 export interface SourceStat {
   kind: SourceKind;
   threads: number;
@@ -172,6 +207,19 @@ export const api = {
     invoke<void>("set_thread_tags", { threadId, tags }),
   // [tag, threadCount][] sorted by count desc.
   listTags: () => invoke<[string, number][]>("list_tags"),
+  // Knowledge layer: open TODOs across history (free heuristic tier).
+  listOpenTodos: (project?: string, source?: string) =>
+    invoke<TodoFact[]>("list_open_todos", { project: project ?? null, source: source ?? null }),
+  // Distillation (opt-in LLM tier).
+  knowledgeConfig: () => invoke<KnowledgeConfig>("knowledge_config"),
+  setKnowledgeConfig: (enabled: boolean, provider?: string, model?: string) =>
+    invoke<void>("set_knowledge_config", {
+      enabled,
+      provider: provider ?? null,
+      model: model ?? null,
+    }),
+  threadKnowledge: (threadId: number) => invoke<ThreadKnowledge>("thread_knowledge", { threadId }),
+  distillThread: (threadId: number) => invoke<ThreadKnowledge>("distill_thread", { threadId }),
   embeddingStatus: () => invoke<EmbedStatus>("embedding_status"),
   buildEmbeddings: () => invoke<void>("build_embeddings"),
 

@@ -2,12 +2,13 @@
 //! change, re-scans only the affected source into the canonical store. Runs on its
 //! own thread and reaches the DB through the Tauri-managed state.
 
-use crate::db::Db;
+use crate::db;
 use notify::RecursiveMode;
 use notify_debouncer_full::{new_debouncer, DebounceEventResult};
+use rusqlite::Connection;
 use std::path::PathBuf;
 use std::time::Duration;
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter};
 
 /// Roots to watch, paired with the source kind they belong to.
 fn watch_targets() -> Vec<(PathBuf, &'static str)> {
@@ -71,6 +72,12 @@ fn run(app: AppHandle) -> anyhow::Result<()> {
         }
     }
 
+    // Index on a DEDICATED connection, separate from the app's shared Mutex<Connection>.
+    // Holding the shared lock across a re-scan was freezing every UI query ("stuck
+    // loading") whenever an agent wrote a thread file. With WAL, this writer and the
+    // UI's readers run concurrently.
+    let mut conn = db::open(&db::default_index_path())?;
+
     // Block on debounced batches until the channel closes (app exit drops debouncer).
     for result in rx {
         let DebounceEventResult::Ok(events) = result else {
@@ -113,30 +120,27 @@ fn run(app: AppHandle) -> anyhow::Result<()> {
         if kinds.is_empty() {
             continue;
         }
-        reindex(&app, &kinds);
+        reindex(&app, &mut conn, &kinds);
     }
     Ok(())
 }
 
-/// Re-scan the affected sources and notify the frontend.
-fn reindex(app: &AppHandle, kinds: &[&str]) {
-    let state = app.state::<Db>();
-    let Ok(mut conn) = state.0.lock() else {
-        return;
-    };
+/// Re-scan the affected sources and notify the frontend. Writes on its own `conn`, so
+/// the UI's shared connection is never blocked across the scan.
+fn reindex(app: &AppHandle, conn: &mut Connection, kinds: &[&str]) {
     for &kind in kinds {
         let report = match kind {
-            k if k == super::claude::KIND => super::claude::scan(&mut conn),
-            k if k == super::codex::KIND => super::codex::scan(&mut conn),
-            k if k == super::cursor::KIND => super::cursor::scan(&mut conn),
-            k if k == super::gemini::KIND => super::gemini::scan(&mut conn),
-            k if k == super::qwen::KIND => super::qwen::scan(&mut conn),
-            k if k == super::goose::KIND => super::goose::scan(&mut conn),
-            k if k == super::opencode::KIND => super::opencode::scan(&mut conn),
-            k if k == super::continue_cli::KIND => super::continue_cli::scan(&mut conn),
-            k if k == super::cline::KIND => super::cline::scan(&mut conn),
-            k if k == super::roo::KIND => super::roo::scan(&mut conn),
-            k if k == super::kilo::KIND => super::kilo::scan(&mut conn),
+            k if k == super::claude::KIND => super::claude::scan(conn),
+            k if k == super::codex::KIND => super::codex::scan(conn),
+            k if k == super::cursor::KIND => super::cursor::scan(conn),
+            k if k == super::gemini::KIND => super::gemini::scan(conn),
+            k if k == super::qwen::KIND => super::qwen::scan(conn),
+            k if k == super::goose::KIND => super::goose::scan(conn),
+            k if k == super::opencode::KIND => super::opencode::scan(conn),
+            k if k == super::continue_cli::KIND => super::continue_cli::scan(conn),
+            k if k == super::cline::KIND => super::cline::scan(conn),
+            k if k == super::roo::KIND => super::roo::scan(conn),
+            k if k == super::kilo::KIND => super::kilo::scan(conn),
             _ => continue,
         };
         if let Ok(r) = report {

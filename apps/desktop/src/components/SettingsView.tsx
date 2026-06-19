@@ -1,9 +1,18 @@
 import type { ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { api, INDEXABLE_SOURCES, PROVIDERS, SOURCE_LABELS, type SourceKind } from "../lib/api";
+import { useDebouncedCallback } from "@tanstack/react-pacer";
+import {
+  api,
+  INDEXABLE_SOURCES,
+  type KnowledgeConfig,
+  PROVIDERS,
+  SOURCE_LABELS,
+  type SourceKind,
+} from "../lib/api";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
+import { Switch } from "@/components/ui/switch";
 import { useAppForm } from "@/lib/form";
 import { useSettings } from "../store/settings";
 import { CleanupCard } from "./CleanupCard";
@@ -101,6 +110,8 @@ export function SettingsView() {
           </Button>
         </CardContent>
       </Card>
+
+      <DistillationCard />
 
       <Card>
         <CardHeader>
@@ -256,6 +267,110 @@ function Field({ label, children }: { label: string; children: ReactNode }) {
       <span className="block text-xs font-medium text-muted-foreground">{label}</span>
       {children}
     </div>
+  );
+}
+
+const DISTILL_ENGINES = [
+  { id: "", label: "Auto (first API key)" },
+  { id: "ollama", label: "Ollama (local · private)" },
+  { id: "anthropic", label: "Anthropic" },
+  { id: "openai", label: "OpenAI" },
+  { id: "gemini", label: "Gemini" },
+  { id: "openrouter", label: "OpenRouter" },
+];
+
+const SELECT_CLASS =
+  "h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm text-foreground outline-none transition-colors focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 dark:bg-input/30";
+
+/** Opt-in LLM distillation: enable + pick engine (local Ollama or a cloud key). */
+function DistillationCard() {
+  const queryClient = useQueryClient();
+  const cfg = useQuery({ queryKey: ["knowledge_config"], queryFn: api.knowledgeConfig });
+  const save = useMutation({
+    mutationFn: (next: { enabled: boolean; provider: string; model: string }) =>
+      api.setKnowledgeConfig(next.enabled, next.provider || undefined, next.model || undefined),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["knowledge_config"] }),
+  });
+  // Debounce the actual write (toggling ON kicks a background backfill) so rapid flips
+  // coalesce into one; the cache is updated optimistically so the UI stays instant.
+  const debouncedSave = useDebouncedCallback(
+    (next: { enabled: boolean; provider: string; model: string }) => save.mutate(next),
+    { wait: 400 },
+  );
+
+  const c = cfg.data;
+  const enabled = c?.enabled ?? false;
+  const provider = c?.provider ?? "";
+  const model = c?.model ?? "";
+  const update = (next: Partial<{ enabled: boolean; provider: string; model: string }>) => {
+    const merged = { enabled, provider, model, ...next };
+    queryClient.setQueryData<KnowledgeConfig>(["knowledge_config"], {
+      enabled: merged.enabled,
+      provider: merged.provider || null,
+      model: merged.model || null,
+    });
+    debouncedSave(merged);
+  };
+  const local = provider === "ollama";
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Knowledge</CardTitle>
+        <p className="text-sm text-muted-foreground">
+          Surface what matters from your history. When on, Callimachus extracts open TODOs from your
+          threads (free, on-device) and adds a Todos tab. Optionally distill decisions, gotchas
+          &amp; summaries with an LLM — local (Ollama) or your own API key. Off by default.
+        </p>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        <div className="flex items-center gap-2 text-sm">
+          <Switch checked={enabled} onCheckedChange={(v) => update({ enabled: v })} />
+          Enable knowledge
+        </div>
+        {enabled && (
+          <>
+            <p className="text-xs text-muted-foreground">
+              Distillation engine (optional — TODOs need none). Pick one to distill decisions &amp;
+              gotchas per thread.
+            </p>
+            <div className="grid grid-cols-2 gap-3">
+              <Field label="Engine">
+                <select
+                  value={provider}
+                  onChange={(e) => update({ provider: e.target.value })}
+                  className={SELECT_CLASS}
+                >
+                  {DISTILL_ENGINES.map((e) => (
+                    <option key={e.id} value={e.id}>
+                      {e.label}
+                    </option>
+                  ))}
+                </select>
+              </Field>
+              <Field label={local ? "Model" : "Model (optional)"}>
+                <Input
+                  key={model}
+                  defaultValue={model}
+                  onBlur={(e) => {
+                    if (e.target.value !== model) update({ model: e.target.value });
+                  }}
+                  placeholder={local ? "llama3.1" : "default for engine"}
+                  spellCheck={false}
+                />
+              </Field>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              {local
+                ? "Runs locally via Ollama — thread text never leaves your machine."
+                : provider
+                  ? `Sends thread text to ${provider} using your stored API key, on demand per thread.`
+                  : "Uses the first provider you've added a key for. Sends thread text to that provider, on demand per thread."}
+            </p>
+          </>
+        )}
+      </CardContent>
+    </Card>
   );
 }
 

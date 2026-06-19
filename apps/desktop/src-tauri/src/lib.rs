@@ -11,6 +11,7 @@ pub mod db;
 pub mod embed;
 pub mod export;
 pub mod integration;
+pub mod knowledge;
 pub mod mcp_server;
 pub mod search;
 
@@ -195,15 +196,18 @@ fn vacuum_db(db: tauri::State<'_, db::Db>) -> AppResult<()> {
 
 /// Index (or re-index changed files from) every source.
 #[tauri::command]
-fn index_all(db: tauri::State<'_, db::Db>) -> AppResult<indexer::IndexReport> {
-    let mut conn = lock(&db)?;
+fn index_all() -> AppResult<indexer::IndexReport> {
+    // Index on a DEDICATED connection, not the shared Mutex<Connection>, so the (slow)
+    // file scan + parse + upserts never hold the lock every other UI query needs. WAL
+    // lets readers proceed while we write — this is what kept the UI "stuck loading".
+    let mut conn = db::open(&db::default_index_path())?;
     Ok(indexer::scan_all(&mut conn)?)
 }
 
 /// Index a single source by kind ("claude_code" | "codex" | "cursor").
 #[tauri::command]
-fn index_source(db: tauri::State<'_, db::Db>, kind: String) -> AppResult<indexer::IndexReport> {
-    let mut conn = lock(&db)?;
+fn index_source(kind: String) -> AppResult<indexer::IndexReport> {
+    let mut conn = db::open(&db::default_index_path())?;
     let report = match kind.as_str() {
         "claude_code" => indexer::claude::scan(&mut conn)?,
         "codex" => indexer::codex::scan(&mut conn)?,
@@ -378,6 +382,105 @@ fn set_thread_tags(
 fn list_tags(db: tauri::State<'_, db::Db>) -> AppResult<Vec<(String, i64)>> {
     let conn = lock(&db)?;
     Ok(search::list_tags(&conn)?)
+}
+
+/// Open TODOs across the corpus (free heuristic knowledge tier), newest first,
+/// optionally scoped to a project-path substring and/or a source kind.
+#[tauri::command]
+fn list_open_todos(
+    db: tauri::State<'_, db::Db>,
+    project: Option<String>,
+    source: Option<String>,
+) -> AppResult<Vec<knowledge::TodoFact>> {
+    let conn = lock(&db)?;
+    Ok(knowledge::list_open_todos(&conn, project.as_deref(), source.as_deref(), 500)?)
+}
+
+/// Current distillation engine config (enabled + provider/model).
+#[tauri::command]
+fn knowledge_config(db: tauri::State<'_, db::Db>) -> AppResult<knowledge::KnowledgeConfig> {
+    let conn = lock(&db)?;
+    Ok(knowledge::get_config(&conn)?)
+}
+
+/// Enable/disable distillation and pick the engine. Enabling is the user's consent.
+#[tauri::command]
+fn set_knowledge_config(
+    app: AppHandle,
+    enabled: bool,
+    provider: Option<String>,
+    model: Option<String>,
+) -> AppResult<()> {
+    let db = app.state::<db::Db>();
+    // Quick: write the config; clearing on OFF is one fast statement.
+    let was_enabled = {
+        let conn = lock(&db)?;
+        let prev = knowledge::get_config(&conn)?.enabled;
+        knowledge::set_config(&conn, enabled, provider.as_deref(), model.as_deref())?;
+        if !enabled {
+            knowledge::clear_heuristic(&conn)?;
+        }
+        prev
+    };
+    // Turning ON backfills todos from already-indexed text — in the BACKGROUND, in
+    // short batches, so the toggle returns instantly and the UI stays snappy.
+    if enabled && !was_enabled {
+        let app = app.clone();
+        std::thread::spawn(move || {
+            let db = app.state::<db::Db>();
+            let now = chrono::Utc::now().timestamp();
+            if let Err(e) = knowledge::backfill_todos(&db, now) {
+                eprintln!("[knowledge] backfill: {e}");
+            }
+            let _ = app.emit("knowledge:todos-ready", ());
+        });
+    }
+    Ok(())
+}
+
+/// Cached distilled knowledge (summary/decisions/gotchas/todos) for one thread.
+#[tauri::command]
+fn thread_knowledge(
+    db: tauri::State<'_, db::Db>,
+    thread_id: i64,
+) -> AppResult<knowledge::ThreadKnowledge> {
+    let conn = lock(&db)?;
+    Ok(knowledge::get_thread_knowledge(&conn, thread_id)?)
+}
+
+/// Distill one thread now (decisions/gotchas/summary) using the configured engine, and
+/// return the fresh knowledge. The LLM call runs WITHOUT the DB lock held.
+#[tauri::command]
+async fn distill_thread(
+    db: tauri::State<'_, db::Db>,
+    thread_id: i64,
+) -> AppResult<knowledge::ThreadKnowledge> {
+    // Resolve engine + pack the transcript under the lock, then release it.
+    let (provider, model, key, packed) = {
+        let conn = lock(&db)?;
+        let (provider, model, key) = resolve_distill_engine(&conn)?;
+        let packed = context::pack_thread(&conn, thread_id, context::DEFAULT_BUDGET_CHARS)?
+            .ok_or_else(|| anyhow::anyhow!("thread {thread_id} not found"))?;
+        (provider, model, key, packed)
+    };
+
+    match agent::distill(&provider, &model, key.as_deref(), &packed).await {
+        Ok(distilled) => {
+            let mut conn = lock(&db)?;
+            let now = chrono::Utc::now().timestamp();
+            knowledge::store_distilled(&mut conn, thread_id, &distilled, now)?;
+            Ok(knowledge::get_thread_knowledge(&conn, thread_id)?)
+        }
+        Err(e) => {
+            let conn = lock(&db)?;
+            // Store a short, sanitized summary — not the raw provider error, which can
+            // echo HTTP status / URLs / response bodies.
+            let msg: String =
+                e.to_string().lines().next().unwrap_or("distillation failed").chars().take(160).collect();
+            knowledge::set_error(&conn, thread_id, &msg)?;
+            Err(e.into())
+        }
+    }
 }
 
 // ---- agent chat ----
@@ -609,6 +712,22 @@ fn can_synthesize() -> bool {
     pick_synth_provider().is_some()
 }
 
+/// Resolve (provider, model, api_key) for distillation from the saved engine config,
+/// gated on distillation being enabled. Shared by the Tauri command and `cal distill`.
+/// Ollama is keyless; cloud providers must have a stored key.
+pub fn resolve_distill_engine(
+    conn: &rusqlite::Connection,
+) -> anyhow::Result<(String, String, Option<String>)> {
+    let cfg = knowledge::get_config(conn)?;
+    if !cfg.enabled {
+        anyhow::bail!("distillation is off — enable it in Settings (local Ollama or an API key)");
+    }
+    let (provider, model) = resolve_synth(cfg.provider.as_deref(), cfg.model.as_deref())
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let key = if provider == "ollama" { None } else { secrets::get_key(&provider)? };
+    Ok((provider, model, key))
+}
+
 /// Synthesized export: pack the thread, run the chosen (or first available) LLM to
 /// extract a summary + decisions / gotchas / TODOs, and write a knowledge-grade
 /// Obsidian note (synthesis above the transcript) into `vault_dir`.
@@ -767,7 +886,12 @@ pub fn run() {
             uninstall_recall_integration,
             set_star,
             set_thread_tags,
-            list_tags
+            list_tags,
+            list_open_todos,
+            knowledge_config,
+            set_knowledge_config,
+            thread_knowledge,
+            distill_thread
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

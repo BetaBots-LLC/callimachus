@@ -67,6 +67,22 @@ struct RecentArgs {
 struct ListTagsArgs {}
 
 #[derive(Debug, Deserialize, JsonSchema)]
+struct ListTodosArgs {
+    /// Substring-match the project path (e.g. a repo path) to scope results.
+    project: Option<String>,
+    /// Optional source filter (see search_threads). Empty = all sources.
+    source: Option<String>,
+    /// Max TODOs to return (default 100).
+    limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ThreadKnowledgeArgs {
+    /// The thread id from a search/recent result.
+    thread_id: i64,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 struct ProjectSearchArgs {
     /// The search query.
     query: String,
@@ -203,6 +219,47 @@ impl Callimachus {
         let tags = search::list_tags(&conn)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         let json = serde_json::to_string_pretty(&tags)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(
+        description = "List unfinished TODOs / action items the user left across past coding sessions (newest first), optionally scoped to a project path or source. Extracted heuristically from the history (markdown task checkboxes + TODO/FIXME markers), so it works with NO API key and no AI distillation. Each TODO carries the threadId it came from — fetch that thread for full context."
+    )]
+    async fn list_open_todos(
+        &self,
+        Parameters(args): Parameters<ListTodosArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let todos = crate::knowledge::list_open_todos(
+            &conn,
+            args.project.as_deref(),
+            args.source.as_deref(),
+            args.limit.unwrap_or(100) as i64,
+        )
+        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let json = serde_json::to_string_pretty(&todos)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(
+        description = "Get the distilled knowledge for one thread by threadId: a short summary plus key decisions, gotchas, and open TODOs. A fast, high-signal recap instead of reading the whole transcript. Decisions/gotchas/summary exist only if the user enabled distillation; TODOs are always available."
+    )]
+    async fn get_thread_knowledge(
+        &self,
+        Parameters(args): Parameters<ThreadKnowledgeArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let k = crate::knowledge::get_thread_knowledge(&conn, args.thread_id)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let json = serde_json::to_string_pretty(&k)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }

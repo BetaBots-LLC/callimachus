@@ -25,5 +25,9 @@ pub static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
         M::up(include_str!("../../migrations/0009_thread_bytes.sql")),
         // 0010 — stars + free-form tags ("collections").
         M::up(include_str!("../../migrations/0010_stars_tags.sql")),
+        // 0011 — distilled knowledge layer (facts: todos now, decisions/gotchas later).
+        M::up(include_str!("../../migrations/0011_knowledge.sql")),
+        // 0012 — opt-in LLM distillation tier: extraction state, fact vectors, config.
+        M::up(include_str!("../../migrations/0012_knowledge_llm.sql")),
     ])
 });
