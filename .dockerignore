@@ -1,0 +1,12 @@
+# Keep the build context small + reproducible (the Dockerfile only needs the
+# Rust crate source, not build output or JS deps).
+**/node_modules
+**/target
+**/dist
+**/.next
+**/out
+**/.turbo
+apps/desktop/src-tauri/gen
+*.db
+*.db-*
+.git

@@ -38,6 +38,13 @@ pub fn default_index_path() -> PathBuf {
 /// Open (or create) the database at `path`, apply pragmas, and migrate to latest.
 pub fn open(path: &Path) -> Result<Connection> {
     register_vec();
+    // Create the parent dir so a first run (e.g. the MCP server in a fresh
+    // container, or CALLIMACHUS_DB pointing somewhere new) can create the file —
+    // rusqlite makes the file but not the directory.
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating db directory {}", parent.display()))?;
+    }
     let mut conn = Connection::open(path)
         .with_context(|| format!("opening database at {}", path.display()))?;
 
