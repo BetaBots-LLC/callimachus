@@ -1,5 +1,5 @@
 ---
-"callimachus": minor
+"callimachus": patch
 ---
 
 Knowledge layer (slice 2): opt-in LLM distillation — decisions, gotchas & summaries.

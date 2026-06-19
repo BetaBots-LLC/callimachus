@@ -1,5 +1,5 @@
 ---
-"callimachus": minor
+"callimachus": patch
 ---
 
 Knowledge layer: an opt-in **Knowledge** feature that surfaces what matters from your history.
