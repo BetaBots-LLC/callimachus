@@ -68,6 +68,8 @@ struct ListTagsArgs {}
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ListTodosArgs {
+    /// Optional text search over the TODO text + thread title (case-insensitive).
+    query: Option<String>,
     /// Substring-match the project path (e.g. a repo path) to scope results.
     project: Option<String>,
     /// Optional source filter (see search_threads). Empty = all sources.
@@ -80,6 +82,16 @@ struct ListTodosArgs {
 struct ThreadKnowledgeArgs {
     /// The thread id from a search/recent result.
     thread_id: i64,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct RecallArgs {
+    /// What to recall about (e.g. "auth token refresh", "database migration approach").
+    query: String,
+    /// Substring-match the project path to scope results. Empty = all projects.
+    project: Option<String>,
+    /// Max facts to return (default 20).
+    limit: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -236,6 +248,7 @@ impl Callimachus {
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         let todos = crate::knowledge::list_open_todos(
             &conn,
+            args.query.as_deref(),
             args.project.as_deref(),
             args.source.as_deref(),
             args.limit.unwrap_or(100) as i64,
@@ -260,6 +273,53 @@ impl Callimachus {
         let k = crate::knowledge::get_thread_knowledge(&conn, args.thread_id)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         let json = serde_json::to_string_pretty(&k)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(
+        description = "Recall concrete technical DECISIONS the user made across ALL past sessions (and why), semantically matched to a query. Use BEFORE re-deciding something the user may have already settled. Returns decision facts, each with the threadId it came from. Requires the user to have distilled some threads."
+    )]
+    async fn recall_decisions(
+        &self,
+        Parameters(args): Parameters<RecallArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.recall_facts(args, "decision")
+    }
+
+    #[tool(
+        description = "Recall GOTCHAS / pitfalls / non-obvious constraints the user discovered across ALL past sessions, semantically matched to a query. Use to avoid repeating a known mistake. Returns gotcha facts with the threadId they came from. Requires the user to have distilled some threads."
+    )]
+    async fn recall_gotchas(
+        &self,
+        Parameters(args): Parameters<RecallArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.recall_facts(args, "gotcha")
+    }
+}
+
+impl Callimachus {
+    /// Shared recall path for the recall_decisions/recall_gotchas tools: embed the query,
+    /// then run the SQL KNN over `vec_facts`.
+    fn recall_facts(&self, args: RecallArgs, kind: &str) -> Result<CallToolResult, ErrorData> {
+        let qv = embed::embed_query(&self.embedder, &args.query)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let Some(qv) = qv else {
+            return Ok(CallToolResult::success(vec![Content::text("[]".to_string())]));
+        };
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let hits = crate::knowledge::recall(
+            &conn,
+            &qv,
+            kind,
+            args.project.as_deref(),
+            args.limit.unwrap_or(20) as usize,
+        )
+        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let json = serde_json::to_string_pretty(&hits)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }

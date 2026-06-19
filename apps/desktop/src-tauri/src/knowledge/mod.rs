@@ -203,6 +203,7 @@ pub struct TodoFact {
 /// substring and/or a source kind. Plain SQL — no embedding, works with zero LLM use.
 pub fn list_open_todos(
     conn: &Connection,
+    query: Option<&str>,
     project: Option<&str>,
     source: Option<&str>,
     limit: i64,
@@ -215,6 +216,16 @@ pub fn list_open_todos(
          WHERE f.kind = 'todo' AND f.status = 'open'",
     );
     let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    // Server-side text search (over the whole corpus, not just the loaded page) so it
+    // scales past the page limit for users with thousands of todos.
+    if let Some(qy) = query.map(str::trim).filter(|q| !q.is_empty()) {
+        let like = format!("%{qy}%");
+        args.push(Box::new(like.clone()));
+        let a = args.len();
+        args.push(Box::new(like));
+        let b = args.len();
+        sql.push_str(&format!(" AND (f.text LIKE ?{a} OR t.title LIKE ?{b})"));
+    }
     if let Some(p) = project.filter(|p| !p.is_empty()) {
         args.push(Box::new(format!("%{p}%")));
         sql.push_str(&format!(" AND t.project_path LIKE ?{}", args.len()));
@@ -422,6 +433,73 @@ pub fn get_thread_knowledge(conn: &Connection, thread_id: i64) -> Result<ThreadK
     })
 }
 
+/// A semantically-recalled fact (decision/gotcha) with the thread it came from.
+#[derive(Debug, Serialize)]
+pub struct RecallHit {
+    pub id: i64,
+    #[serde(rename = "threadId")]
+    pub thread_id: i64,
+    pub kind: String,
+    pub text: String,
+    pub source: String,
+    pub title: Option<String>,
+    #[serde(rename = "projectPath")]
+    pub project_path: Option<String>,
+    pub similarity: f32,
+}
+
+/// Cross-thread semantic recall of distilled facts. `qv` is a PRECOMPUTED query vector
+/// (embed it via `embed::embed_query` BEFORE locking the DB so inference never holds the
+/// lock). `kind` is 'decision' or 'gotcha'; optionally scope to a project-path substring.
+pub fn recall(
+    conn: &Connection,
+    qv: &[f32],
+    kind: &str,
+    project: Option<&str>,
+    k: usize,
+) -> Result<Vec<RecallHit>> {
+    // Over-fetch chunks so the kind/project filter (applied AFTER the KNN) still leaves k.
+    let knn_k = (k * 5).max(100);
+    let mut sql = format!(
+        "WITH knn AS MATERIALIZED (
+            SELECT fact_id, distance FROM vec_facts
+            WHERE embedding MATCH ?1 AND k = {knn_k} ORDER BY distance
+         )
+         SELECT f.id, f.thread_id, f.kind, f.text, s.kind, t.title, t.project_path,
+                MIN(knn.distance) AS d
+         FROM knn
+         JOIN facts f ON f.id = knn.fact_id
+         JOIN threads t ON t.id = f.thread_id
+         JOIN sources s ON s.id = t.source_id
+         WHERE f.kind = ?2"
+    );
+    let mut args: Vec<Box<dyn rusqlite::ToSql>> =
+        vec![Box::new(crate::embed::vec_to_bytes(qv)), Box::new(kind.to_string())];
+    if let Some(p) = project.filter(|p| !p.is_empty()) {
+        args.push(Box::new(format!("%{p}%")));
+        sql.push_str(&format!(" AND t.project_path LIKE ?{}", args.len()));
+    }
+    args.push(Box::new(k as i64));
+    sql.push_str(&format!(" GROUP BY f.id ORDER BY d LIMIT ?{}", args.len()));
+
+    let arg_refs: Vec<&dyn rusqlite::ToSql> = args.iter().map(|b| b.as_ref()).collect();
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(arg_refs.as_slice(), |r| {
+        let dist: f64 = r.get(7)?;
+        Ok(RecallHit {
+            id: r.get(0)?,
+            thread_id: r.get(1)?,
+            kind: r.get(2)?,
+            text: r.get(3)?,
+            source: r.get(4)?,
+            title: r.get(5)?,
+            project_path: r.get(6)?,
+            similarity: (1.0 - dist) as f32,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -533,5 +611,52 @@ mod tests {
         assert!(!k2.extracted, "changed message count must reset extraction");
         assert!(k2.decisions.is_empty(), "llm facts cleared on invalidation");
         assert!(needs_distill(&conn, id).unwrap());
+    }
+
+    #[test]
+    fn recall_finds_nearest_fact_by_kind() {
+        use crate::embed::{vec_to_bytes, DIM};
+        use crate::indexer::{source_id, upsert_thread, ParsedMessage, ParsedThread};
+
+        let mut conn = temp_db();
+        let sid = source_id(&conn, "claude_code").unwrap();
+        upsert_thread(
+            &mut conn,
+            sid,
+            &ParsedThread {
+                external_id: "r1".into(),
+                title: Some("auth".into()),
+                messages: vec![ParsedMessage {
+                    role: "user".into(),
+                    text: "x".into(),
+                    tool_name: None,
+                    ts: Some(1),
+                }],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let tid: i64 =
+            conn.query_row("SELECT id FROM threads WHERE external_id = 'r1'", [], |r| r.get(0)).unwrap();
+        conn.execute(
+            "INSERT INTO facts (thread_id, kind, text, status, extractor, created_at)
+             VALUES (?1, 'decision', 'use jwt for auth', 'open', 'llm', 1)",
+            [tid],
+        )
+        .unwrap();
+        let fid = conn.last_insert_rowid();
+        let v = vec![0.1_f32; DIM];
+        conn.execute(
+            "INSERT INTO vec_facts (fact_id, embedding) VALUES (?1, ?2)",
+            rusqlite::params![fid, vec_to_bytes(&v)],
+        )
+        .unwrap();
+
+        let hits = recall(&conn, &v, "decision", None, 5).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].text, "use jwt for auth");
+        assert!(hits[0].similarity > 0.99);
+        // Kind filter excludes non-matching kinds.
+        assert!(recall(&conn, &v, "gotcha", None, 5).unwrap().is_empty());
     }
 }
