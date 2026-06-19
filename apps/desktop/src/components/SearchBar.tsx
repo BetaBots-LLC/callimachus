@@ -38,7 +38,7 @@ export function SearchBar() {
   const [text, setText] = useState("");
   // Pacer handles the debounce (no manual timer / useEffect).
   const commitQuery = useDebouncedCallback((value: string) => setQuery(value.trim()), {
-    wait: 180,
+    wait: 260,
   });
 
   function onChange(value: string) {

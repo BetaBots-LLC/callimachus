@@ -13,6 +13,7 @@ interface UiState {
   starredOnly: boolean; // collection filter: only starred threads
   selectedTags: string[]; // collection filter: threads having ANY of these tags
   selectedThreadId: number | null;
+  targetMessageId: number | null; // scroll-to target when opening from a search hit
   setQuery: (q: string) => void;
   toggleSource: (s: SourceKind) => void;
   toggleSubagents: () => void;
@@ -20,7 +21,7 @@ interface UiState {
   toggleStarredOnly: () => void;
   toggleTag: (t: string) => void;
   clearCollectionFilters: () => void;
-  selectThread: (id: number | null) => void;
+  selectThread: (id: number | null, messageId?: number | null) => void;
 }
 
 // Subscribe with selectors (e.g. useUi((s) => s.query)) — never the whole store.
@@ -34,6 +35,7 @@ export const useUi = create<UiState>((set) => ({
   starredOnly: false,
   selectedTags: [],
   selectedThreadId: null,
+  targetMessageId: null,
   setQuery: (query) => set({ query }),
   toggleSource: (s) =>
     set((state) => ({
@@ -51,5 +53,6 @@ export const useUi = create<UiState>((set) => ({
         : [...state.selectedTags, t],
     })),
   clearCollectionFilters: () => set({ starredOnly: false, selectedTags: [] }),
-  selectThread: (selectedThreadId) => set({ selectedThreadId }),
+  selectThread: (id, messageId) =>
+    set({ selectedThreadId: id, targetMessageId: messageId ?? null }),
 }));

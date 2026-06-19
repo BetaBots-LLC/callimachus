@@ -212,16 +212,20 @@ function MessageList({ messages }: { messages: MessageRow[] }) {
     estimateSize: () => 110,
     overscan: 8,
   });
-  // Chat-style: open pinned to the newest message, scroll up for history. MessageList
-  // is keyed by thread id (remounts per thread), so this runs once per open. A second
-  // pass on the next frame corrects the landing after dynamic heights are measured.
+  // Arriving from a search hit: land centered on the matched message. Otherwise open
+  // pinned to the newest message (chat-style), scroll up for history. A second pass on
+  // the next frame corrects the landing after dynamic heights are measured.
+  const target = useUi((s) => s.targetMessageId);
   useEffect(() => {
     if (messages.length === 0) return;
-    const toBottom = () => virtualizer.scrollToIndex(messages.length - 1, { align: "end" });
-    toBottom();
-    const id = requestAnimationFrame(toBottom);
-    return () => cancelAnimationFrame(id);
-  }, [messages.length, virtualizer]);
+    const idx = target != null ? messages.findIndex((m) => m.id === target) : -1;
+    const index = idx >= 0 ? idx : messages.length - 1;
+    const align = idx >= 0 ? "center" : "end";
+    const go = () => virtualizer.scrollToIndex(index, { align });
+    go();
+    const raf = requestAnimationFrame(go);
+    return () => cancelAnimationFrame(raf);
+  }, [messages, target, virtualizer]);
   return (
     <div ref={parentRef} className="min-h-0 flex-1 overflow-y-auto pt-3">
       <div className="relative w-full" style={{ height: virtualizer.getTotalSize() }}>
@@ -233,7 +237,7 @@ function MessageList({ messages }: { messages: MessageRow[] }) {
             className="absolute left-0 top-0 w-full px-5 pb-3"
             style={{ transform: `translateY(${vrow.start}px)` }}
           >
-            <Message m={messages[vrow.index]} />
+            <Message m={messages[vrow.index]} highlight={messages[vrow.index].id === target} />
           </div>
         ))}
       </div>
@@ -261,10 +265,11 @@ function toolBody(text: string, toolName: string | null): string {
   return asCodeBlock(body);
 }
 
-const Message = memo(function Message({ m }: { m: MessageRow }) {
+const Message = memo(function Message({ m, highlight }: { m: MessageRow; highlight?: boolean }) {
+  const ring = highlight ? "ring-2 ring-primary/60" : "";
   if (m.toolName || m.role === "tool") {
     return (
-      <details className="rounded-lg border bg-muted/40 px-3 py-2 text-sm">
+      <details className={cn("rounded-lg border bg-muted/40 px-3 py-2 text-sm", ring)}>
         <summary className="cursor-pointer text-muted-foreground">
           <span className="text-[0.68rem] uppercase tracking-wide">
             {m.toolName ? `tool · ${m.toolName}` : "result"}
@@ -281,6 +286,7 @@ const Message = memo(function Message({ m }: { m: MessageRow }) {
       className={cn(
         "rounded-lg border bg-card px-3 py-2",
         m.role === "user" ? "border-l-2 border-l-blue-500" : "border-l-2 border-l-emerald-500",
+        ring,
       )}
     >
       <div className="mb-1 text-[0.68rem] uppercase tracking-wide text-muted-foreground">
