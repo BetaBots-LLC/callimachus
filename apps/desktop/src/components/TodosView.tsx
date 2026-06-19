@@ -3,6 +3,7 @@ import { api, SOURCE_LABELS } from "../lib/api";
 import { useUi } from "../store/ui";
 import { shortPath } from "../lib/format";
 import { Badge } from "@/components/ui/badge";
+import { Loading } from "./Loading";
 
 /**
  * Open TODOs / action items pulled from history by the free heuristic knowledge tier
@@ -19,7 +20,7 @@ export function TodosView() {
   }
 
   if (todos.isLoading) {
-    return <div className="p-6 text-sm text-muted-foreground">Loading…</div>;
+    return <Loading label="Loading…" />;
   }
 
   const items = todos.data ?? [];

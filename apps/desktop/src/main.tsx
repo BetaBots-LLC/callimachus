@@ -9,8 +9,10 @@ import "./index.css";
 const queryClient = new QueryClient({
   defaultOptions: {
     // Window refocus would otherwise fire a ~5-query burst — each serialized behind
-    // the app's single DB connection. Stale window keeps it calm.
-    queries: { refetchOnWindowFocus: false, staleTime: 5_000 },
+    // the app's single DB connection. Stale window keeps it calm. Local invoke calls
+    // mostly fail deterministically, so one quick retry (not the default 3 with
+    // exponential backoff, ~7s) surfaces errors fast instead of looking "stuck".
+    queries: { refetchOnWindowFocus: false, staleTime: 5_000, retry: 1, retryDelay: 400 },
   },
 });
 

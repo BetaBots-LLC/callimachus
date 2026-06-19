@@ -190,7 +190,9 @@ export function CleanupCard() {
               {rows.isLoading && (
                 <TableRow className="hover:bg-transparent">
                   <TableCell colSpan={5} className="text-muted-foreground">
-                    Loading…
+                    <span className="inline-flex items-center gap-2">
+                      <Loader2 className="size-3.5 animate-spin" /> Loading…
+                    </span>
                   </TableCell>
                 </TableRow>
               )}
