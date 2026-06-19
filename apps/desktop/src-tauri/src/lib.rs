@@ -196,15 +196,18 @@ fn vacuum_db(db: tauri::State<'_, db::Db>) -> AppResult<()> {
 
 /// Index (or re-index changed files from) every source.
 #[tauri::command]
-fn index_all(db: tauri::State<'_, db::Db>) -> AppResult<indexer::IndexReport> {
-    let mut conn = lock(&db)?;
+fn index_all() -> AppResult<indexer::IndexReport> {
+    // Index on a DEDICATED connection, not the shared Mutex<Connection>, so the (slow)
+    // file scan + parse + upserts never hold the lock every other UI query needs. WAL
+    // lets readers proceed while we write — this is what kept the UI "stuck loading".
+    let mut conn = db::open(&db::default_index_path())?;
     Ok(indexer::scan_all(&mut conn)?)
 }
 
 /// Index a single source by kind ("claude_code" | "codex" | "cursor").
 #[tauri::command]
-fn index_source(db: tauri::State<'_, db::Db>, kind: String) -> AppResult<indexer::IndexReport> {
-    let mut conn = lock(&db)?;
+fn index_source(kind: String) -> AppResult<indexer::IndexReport> {
+    let mut conn = db::open(&db::default_index_path())?;
     let report = match kind.as_str() {
         "claude_code" => indexer::claude::scan(&mut conn)?,
         "codex" => indexer::codex::scan(&mut conn)?,
