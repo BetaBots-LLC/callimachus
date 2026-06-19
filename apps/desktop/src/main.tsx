@@ -3,7 +3,7 @@ import ReactDOM from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { listen } from "@tauri-apps/api/event";
 import App from "./App";
-import type { EmbedStatus } from "./lib/api";
+import type { EmbedStatus, IndexProgress } from "./lib/api";
 import "./index.css";
 
 const queryClient = new QueryClient({
@@ -32,6 +32,17 @@ void listen("embed:done", () => {
 // Background todo backfill (after enabling the Knowledge feature) finished.
 void listen("knowledge:todos-ready", () => {
   void queryClient.invalidateQueries({ queryKey: ["open_todos"] });
+});
+// Per-source reindex progress → drives the progress bar.
+void listen<IndexProgress>("index:progress", (e) => {
+  queryClient.setQueryData<IndexProgress>(["index_progress"], e.payload);
+});
+// Background re-index finished — clear progress, refresh results/stats/button state.
+void listen("index:done", () => {
+  queryClient.setQueryData(["index_progress"], null);
+  for (const key of ["results", "db_stats", "index_stats", "index_status"]) {
+    void queryClient.invalidateQueries({ queryKey: [key] });
+  }
 });
 
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(

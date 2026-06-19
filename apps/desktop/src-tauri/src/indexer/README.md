@@ -43,7 +43,7 @@ pub struct ParsedMessage {
 
 1. **Migration** — `migrations/00NN_*.sql`: `INSERT OR IGNORE INTO sources (kind) VALUES ('<kind>');` and register it in `db/migrations.rs`.
 2. **Indexer** — `indexer/<kind>.rs` with `KIND` + `scan()`. Parse to `ParsedThread`, call `upsert_thread`. Skip unchanged work (see change-detection below).
-3. **Register** — add `pub mod <kind>;` and `<kind>::scan(conn)` to `scan_all` in `indexer/mod.rs`.
+3. **Register** — add `pub mod <kind>;` and `("<kind>", <kind>::scan)` to the `sources` array in `scan_all_with_progress` in `indexer/mod.rs`.
 4. **Watcher** — `indexer/watcher.rs`: add the store dir to `watch_targets`, a path→kind branch in the classifier, and a dispatch arm in `reindex`.
 5. **Manual reindex** — add a `"<kind>" =>` arm to `index_source` in `lib.rs`.
 6. **Frontend** — extend `SourceKind`, `SOURCE_LABELS`, and `INDEXABLE_SOURCES` in `apps/desktop/src/lib/api.ts` (the filter chips and reindex buttons derive from the last one). Optionally add to `OPEN_TARGETS` / `cli_resume` if the CLI is launchable.

@@ -144,6 +144,41 @@ pub async fn synthesize(
     Ok(text.trim().to_string())
 }
 
+/// System prompt for "ask your history" — RAG over the user's own past sessions.
+const ANSWER_SYSTEM: &str = "You answer the user's question using ONLY the provided excerpts \
+from their own past AI-coding sessions. Cite sources inline as [thread N], using the thread \
+number shown next to each excerpt. Be concise, specific, and technical. If the excerpts do not \
+contain the answer, say you couldn't find it in their history — never invent.";
+
+/// Answer a question from packed excerpts of the user's history, with inline [thread N]
+/// citations. Same provider plumbing as `synthesize`. The caller does retrieval + packing.
+pub async fn answer(
+    provider: &str,
+    model: &str,
+    api_key: Option<&str>,
+    question: &str,
+    context: &str,
+) -> Result<String> {
+    let adapter = adapter_for(provider)?;
+    let key = api_key.map(str::to_string);
+    let client = Client::builder()
+        .with_adapter_kind(adapter)
+        .with_auth_resolver_fn(move |_iden: genai::ModelIden| Ok(key.clone().map(AuthData::from_single)))
+        .build();
+    let req = ChatRequest::new(Vec::new())
+        .with_system(ANSWER_SYSTEM)
+        .append_message(GMessage::user(format!(
+            "Question: {question}\n\nExcerpts from past sessions:\n\n{context}"
+        )));
+    let options = ChatOptions::default().with_temperature(0.2).with_max_tokens(900);
+    let resp = client
+        .exec_chat(model, req, Some(&options))
+        .await
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let text = resp.into_first_text().ok_or_else(|| anyhow::anyhow!("no answer returned"))?;
+    Ok(text.trim().to_string())
+}
+
 /// System prompt for STRUCTURED distillation into the knowledge `facts` table. We ask
 /// for plain JSON and parse leniently (works identically across cloud and local Ollama
 /// — no adapter-specific response-format API). TODOs are intentionally NOT requested:

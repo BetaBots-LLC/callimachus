@@ -10,7 +10,7 @@ use callimachus_lib::{db, mcp_server};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let conn = db::open(&db::default_index_path())?;
+    let conn = db::open_readonly(&db::default_index_path())?;
     mcp_server::serve(conn).await?;
     Ok(())
 }

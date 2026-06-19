@@ -1,4 +1,4 @@
-import { Loader2 } from "lucide-react";
+import { Spinner } from "@/components/ui/spinner";
 import { cn } from "@/lib/utils";
 
 /** Consistent loading state: a spinner + optional label. Pass `className="h-full"`
@@ -11,7 +11,7 @@ export function Loading({ label, className }: { label?: string; className?: stri
         className,
       )}
     >
-      <Loader2 className="size-4 animate-spin" />
+      <Spinner />
       {label}
     </div>
   );

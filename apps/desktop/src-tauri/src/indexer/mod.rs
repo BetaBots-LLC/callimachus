@@ -43,7 +43,7 @@ pub struct ParsedMessage {
 }
 
 /// Tally returned to the frontend after an indexing pass.
-#[derive(Debug, Default, serde::Serialize)]
+#[derive(Debug, Default, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IndexReport {
     pub threads_indexed: usize,
@@ -53,27 +53,38 @@ pub struct IndexReport {
 }
 
 /// Run every source indexer and sum the reports.
-pub fn scan_all(conn: &mut Connection) -> Result<IndexReport> {
+/// Index every source, one at a time. Calls `on_progress(done, total, next_source)`
+/// before each — `done` sources already finished, `next_source` about to scan — so a
+/// background reindex can drive a progress bar. Pass `|_, _, _| {}` to ignore progress.
+pub fn scan_all_with_progress(
+    conn: &mut Connection,
+    mut on_progress: impl FnMut(usize, usize, &str),
+) -> Result<IndexReport> {
+    type Scan = fn(&mut Connection) -> Result<IndexReport>;
+    let sources: [(&str, Scan); 11] = [
+        ("claude_code", claude::scan),
+        ("codex", codex::scan),
+        ("cursor", cursor::scan),
+        ("gemini", gemini::scan),
+        ("qwen", qwen::scan),
+        ("goose", goose::scan),
+        ("opencode", opencode::scan),
+        ("continue", continue_cli::scan),
+        ("cline", cline::scan),
+        ("roo", roo::scan),
+        ("kilo", kilo::scan),
+    ];
+    let n = sources.len();
     let mut total = IndexReport::default();
-    for report in [
-        claude::scan(conn),
-        codex::scan(conn),
-        cursor::scan(conn),
-        gemini::scan(conn),
-        qwen::scan(conn),
-        goose::scan(conn),
-        opencode::scan(conn),
-        continue_cli::scan(conn),
-        cline::scan(conn),
-        roo::scan(conn),
-        kilo::scan(conn),
-    ] {
-        let r = report?;
+    for (i, (name, scan)) in sources.into_iter().enumerate() {
+        on_progress(i, n, name);
+        let r = scan(conn)?;
         total.threads_indexed += r.threads_indexed;
         total.threads_skipped += r.threads_skipped;
         total.messages_indexed += r.messages_indexed;
         total.errors += r.errors;
     }
+    on_progress(n, n, "");
     Ok(total)
 }
 
@@ -180,6 +191,29 @@ pub fn upsert_thread(conn: &mut Connection, source_id: i64, thread: &ParsedThrea
         }
     }
 
+    // Code-aware search: re-derive this thread's file-path mentions (delete + rescan,
+    // every index). Only user/assistant text — tool RESULTS (ls output) would be noise.
+    tx.execute("DELETE FROM file_mentions WHERE thread_id = ?1", [thread_id])?;
+    {
+        const MAX_PATHS_PER_THREAD: usize = 200;
+        let mut pstmt =
+            tx.prepare("INSERT OR IGNORE INTO file_mentions (thread_id, path) VALUES (?1, ?2)")?;
+        let mut seen = std::collections::HashSet::new();
+        'paths: for (_mid, role, text) in &inserted {
+            if *role != "user" && *role != "assistant" {
+                continue;
+            }
+            for path in extract_paths(text) {
+                if seen.len() >= MAX_PATHS_PER_THREAD {
+                    break 'paths;
+                }
+                if seen.insert(path.to_ascii_lowercase()) {
+                    pstmt.execute(params![thread_id, path])?;
+                }
+            }
+        }
+    }
+
     // Invalidate LLM-distilled knowledge when the message set actually changed. The
     // upsert above doesn't touch knowledge_msg_count (set at distillation time), so it
     // still holds the prior count here; only threads that were distilled AND changed
@@ -202,6 +236,45 @@ pub fn upsert_thread(conn: &mut Connection, source_id: i64, thread: &ParsedThrea
 
     tx.commit()?;
     Ok(thread.messages.len())
+}
+
+/// Extensions that mark a bare filename (no slash) as a real file reference.
+const CODE_EXTS: &[&str] = &[
+    "rs", "ts", "tsx", "js", "jsx", "mjs", "cjs", "py", "go", "java", "kt", "rb", "php", "c", "cc",
+    "cpp", "h", "hpp", "cs", "swift", "sql", "sh", "bash", "zsh", "toml", "yaml", "yml", "json",
+    "md", "mdx", "css", "scss", "html", "xml", "lock", "cfg", "ini", "vue", "svelte", "proto",
+    "gradle", "ex", "exs", "scala", "dart", "lua",
+];
+
+/// Extract likely file-path mentions from text. Conservative: a token counts if it has a
+/// `/` plus an extension (`src/foo.rs`) or is a bare filename with a known code extension
+/// (`mod.rs`). Skips URLs and version-like tokens (`1.2.3`).
+pub fn extract_paths(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for raw in text.split(|c: char| {
+        c.is_whitespace()
+            || matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | '"' | '\'' | '`' | ',' | ';' | '<' | '>' | '|' | '=')
+    }) {
+        let t = raw.trim_matches(|c: char| matches!(c, '.' | ':' | '*' | '#' | '!' | '?' | '@'));
+        if t.len() < 3 || t.len() > 200 || t.contains("://") {
+            continue;
+        }
+        let Some(dot) = t.rfind('.') else {
+            continue;
+        };
+        let (stem, ext) = (&t[..dot], &t[dot + 1..]);
+        if stem.is_empty()
+            || ext.is_empty()
+            || !ext.bytes().all(|b| b.is_ascii_alphanumeric())
+            || ext.bytes().all(|b| b.is_ascii_digit())
+        {
+            continue;
+        }
+        if t.contains('/') || CODE_EXTS.contains(&ext.to_ascii_lowercase().as_str()) {
+            out.push(t.to_string());
+        }
+    }
+    out
 }
 
 /// Read the stored (mtime, size) for a file, if we've indexed it before.
@@ -269,4 +342,23 @@ pub fn file_unchanged(conn: &Connection, path: &Path, kind: &str) -> Result<bool
         set_file_state(conn, &path_str, kind, mtime, size)?;
     }
     Ok(unchanged)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_paths;
+
+    #[test]
+    fn extract_paths_finds_real_paths_only() {
+        let text = "I edited `src/embed/mod.rs` and apps/desktop/package.json, \
+            also see README.md. Ran cargo 1.2.3 and visited https://x.com/y.html, \
+            and a plain word.foo shouldn't count.";
+        let paths = extract_paths(text);
+        assert!(paths.iter().any(|p| p == "src/embed/mod.rs"));
+        assert!(paths.iter().any(|p| p == "apps/desktop/package.json"));
+        assert!(paths.iter().any(|p| p == "README.md")); // bare, known ext
+        assert!(!paths.iter().any(|p| p.contains("1.2.3"))); // version, not a path
+        assert!(!paths.iter().any(|p| p.contains("x.com"))); // url stripped (://)
+        assert!(!paths.iter().any(|p| p == "word.foo")); // unknown ext, no slash
+    }
 }

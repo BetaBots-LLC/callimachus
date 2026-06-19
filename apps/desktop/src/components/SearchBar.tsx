@@ -1,11 +1,19 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useDebouncedCallback } from "@tanstack/react-pacer";
-import { api, INDEXABLE_SOURCES, SOURCE_LABELS, type SourceKind } from "../lib/api";
+import {
+  api,
+  INDEXABLE_SOURCES,
+  type IndexProgress,
+  SOURCE_LABELS,
+  type SourceKind,
+} from "../lib/api";
 import { useUi } from "../store/ui";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
+import { Spinner } from "@/components/ui/spinner";
+import { Progress, ProgressLabel, ProgressValue } from "@/components/ui/progress";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -46,12 +54,16 @@ export function SearchBar() {
     commitQuery(value);
   }
 
+  // Reindex runs in the BACKGROUND now: the button just kicks it off and reflects the
+  // job flag, so it never blocks the UI. main.tsx refreshes results/stats on index:done.
+  const indexing = useQuery({
+    queryKey: ["index_status"],
+    queryFn: api.indexingStatus,
+    refetchInterval: (q) => (q.state.data ? 1500 : false),
+  });
   const reindex = useMutation({
     mutationFn: api.indexAll,
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["results"] });
-      queryClient.invalidateQueries({ queryKey: ["db_stats"] });
-    },
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["index_status"] }),
   });
 
   // Progress is pushed via embed:progress/embed:done events (see main.tsx); a slow
@@ -69,6 +81,27 @@ export function SearchBar() {
   const embedPct =
     embed.data && embed.data.total > 0 ? Math.round((embed.data.done / embed.data.total) * 100) : 0;
 
+  // Per-source reindex progress, pushed via the index:progress event (see main.tsx).
+  const indexProgress = useQuery<IndexProgress | null>({
+    queryKey: ["index_progress"],
+    queryFn: () => queryClient.getQueryData<IndexProgress>(["index_progress"]) ?? null,
+    staleTime: Number.POSITIVE_INFINITY,
+  });
+
+  // One progress bar, whichever long job is active (they're mutually exclusive).
+  const ip = indexProgress.data;
+  const jobActive = embed.data?.running || indexing.data;
+  const jobPct = embed.data?.running
+    ? embedPct
+    : ip && ip.total > 0
+      ? Math.round((ip.done / ip.total) * 100)
+      : 0;
+  const jobLabel = embed.data?.running
+    ? `Building semantic index · ${embed.data.done.toLocaleString()} / ${embed.data.total.toLocaleString()} messages`
+    : ip?.current
+      ? `Indexing ${SOURCE_LABELS[ip.current as SourceKind] ?? ip.current}…`
+      : "Indexing…";
+
   // How many "More" sources are active — surfaced on the dropdown so a hidden
   // filter is never silently in effect.
   const moreActiveCount = MORE.filter((s) => sources.includes(s)).length;
@@ -82,8 +115,18 @@ export function SearchBar() {
           autoFocus
           onChange={(e) => onChange(e.currentTarget.value)}
         />
-        <Button variant="secondary" onClick={() => reindex.mutate()} disabled={reindex.isPending}>
-          {reindex.isPending ? "Indexing…" : "Reindex"}
+        <Button
+          variant="secondary"
+          onClick={() => reindex.mutate()}
+          disabled={indexing.data || reindex.isPending || embed.data?.running}
+        >
+          {indexing.data ? (
+            <>
+              <Spinner /> Indexing…
+            </>
+          ) : (
+            "Reindex"
+          )}
         </Button>
       </div>
 
@@ -152,13 +195,12 @@ export function SearchBar() {
         ))}
 
         <span className="ml-auto flex items-center gap-2 text-xs text-muted-foreground">
-          {embed.data?.running ? (
-            <>indexing meaning… {embedPct}%</>
-          ) : embed.data && embed.data.done < embed.data.total ? (
+          {embed.data?.running ? null : embed.data && embed.data.done < embed.data.total ? (
             <Button
               size="xs"
               variant="outline"
               onClick={() => buildIndex.mutate()}
+              disabled={indexing.data || buildIndex.isPending}
               title={`${embed.data.done}/${embed.data.total} messages embedded`}
             >
               Build semantic index ({embedPct}%)
@@ -166,13 +208,17 @@ export function SearchBar() {
           ) : embed.data && embed.data.total > 0 ? (
             <span>semantic ready</span>
           ) : null}
-          {reindex.data && (
-            <span>
-              +{reindex.data.threadsIndexed} threads · {reindex.data.messagesIndexed} msgs
-            </span>
-          )}
         </span>
       </div>
+
+      {jobActive && (
+        <Progress value={jobPct} className="gap-1.5">
+          <ProgressLabel className="text-xs font-normal text-muted-foreground">
+            {jobLabel}
+          </ProgressLabel>
+          <ProgressValue className="text-xs" />
+        </Progress>
+      )}
     </div>
   );
 }

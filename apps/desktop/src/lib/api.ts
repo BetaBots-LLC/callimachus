@@ -29,6 +29,13 @@ export interface IndexReport {
   errors: number;
 }
 
+/** Per-source progress pushed during a background reindex (the `index:progress` event). */
+export interface IndexProgress {
+  done: number; // sources finished
+  total: number; // total sources
+  current: string; // source kind about to scan ("" when finishing)
+}
+
 export interface SearchFilters {
   sources?: string[];
   project?: string | null;
@@ -111,6 +118,19 @@ export interface KnowledgeConfig {
 export interface KFact {
   id: number;
   text: string;
+}
+
+/** A thread cited as a source in an "ask your history" answer. */
+export interface AskSource {
+  threadId: number;
+  title: string | null;
+  source: SourceKind;
+  projectPath: string | null;
+}
+
+export interface AskAnswer {
+  answer: string;
+  sources: AskSource[];
 }
 
 /** A semantically-recalled fact (decision/gotcha) with its source thread. */
@@ -206,12 +226,16 @@ export const api = {
   canSynthesize: () => invoke<boolean>("can_synthesize"),
   // Vault folders Obsidian already knows about (from its own config) — recommendations.
   obsidianVaults: () => invoke<string[]>("obsidian_vaults"),
-  indexAll: () => invoke<IndexReport>("index_all"),
+  // Background re-index: returns immediately; watch indexingStatus / the index:done event.
+  indexAll: () => invoke<void>("index_all"),
+  indexingStatus: () => invoke<boolean>("indexing_status"),
   indexSource: (kind: SourceKind) => invoke<IndexReport>("index_source", { kind }),
   searchThreads: (query: string, filters?: SearchFilters) =>
     invoke<SearchHit[]>("search_threads", { query, filters }),
   recentThreads: (filters?: SearchFilters) =>
     invoke<ThreadSummary[]>("recent_threads", { filters }),
+  // Code-aware search: threads that mention a file path (substring).
+  searchByFile: (path: string) => invoke<ThreadSummary[]>("search_by_file", { path }),
   getThread: (threadId: number) => invoke<ThreadDetail | null>("get_thread", { threadId }),
   // Stars & tags ("collections").
   setStar: (threadId: number, starred: boolean) => invoke<void>("set_star", { threadId, starred }),
@@ -241,6 +265,8 @@ export const api = {
     invoke<RecallHit[]>("recall_decisions", { query, project: project ?? null }),
   recallGotchas: (query: string, project?: string) =>
     invoke<RecallHit[]>("recall_gotchas", { query, project: project ?? null }),
+  // Ask-your-history (RAG): synthesized answer + cited source threads.
+  askHistory: (question: string) => invoke<AskAnswer>("ask_history", { question }),
   embeddingStatus: () => invoke<EmbedStatus>("embedding_status"),
   buildEmbeddings: () => invoke<void>("build_embeddings"),
 
