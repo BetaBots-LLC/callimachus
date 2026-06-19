@@ -45,6 +45,10 @@ jobs:
       # AppImage GPG signing (Linux). Empty until you add the secret → AppImage is
       # built unsigned, no failure. Gates the import step + the SIGN env below.
       LINUX_GPG_PRIVATE_KEY: ${{ secrets.LINUX_GPG_PRIVATE_KEY }}
+      # Windows Authenticode via Azure Trusted Signing. Empty until you add the
+      # AZURE_CLIENT_ID secret → gates the trusted-signing-cli install. The
+      # signCommand (tauri.conf.json) only runs on the Windows leg.
+      AZURE_SIGN: ${{ secrets.AZURE_CLIENT_ID }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -80,6 +84,10 @@ jobs:
         if: startsWith(matrix.platform, 'ubuntu') && env.LINUX_GPG_PRIVATE_KEY != ''
         run: echo "$LINUX_GPG_PRIVATE_KEY" | gpg --batch --import
 
+      - name: Install Trusted Signing CLI (Windows)
+        if: matrix.platform == 'windows-latest' && env.AZURE_SIGN != ''
+        run: cargo install trusted-signing-cli --locked
+
       - name: Build, sign & release
         uses: tauri-apps/tauri-action@v0
         env:
@@ -92,6 +100,11 @@ jobs:
           SIGN_KEY: ${{ secrets.LINUX_GPG_KEY_ID }}
           APPIMAGETOOL_SIGN_PASSPHRASE: ${{ secrets.LINUX_GPG_PASSPHRASE }}
           APPIMAGETOOL_FORCE_SIGN: ${{ startsWith(matrix.platform, 'ubuntu') && env.LINUX_GPG_PRIVATE_KEY != '' && '1' || '' }}
+          # Azure Trusted Signing creds — read by trusted-signing-cli (the Windows
+          # signCommand in tauri.conf.json). Unused/harmless on macOS & Linux legs.
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
         with:
           projectPath: apps/desktop
           tagName: ${{ inputs.tag || github.ref_name }}
