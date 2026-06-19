@@ -169,6 +169,12 @@ pub fn backfill_todos(db: &crate::db::Db, now: i64) -> Result<()> {
 
     for chunk in thread_ids.chunks(BATCH) {
         let mut conn = lock()?;
+        // The user may have toggled the feature OFF mid-backfill (which cleared the
+        // facts in the gap between batches). Re-check under the lock and stop, so we
+        // don't re-insert todos the user just turned off.
+        if !get_config(&conn)?.enabled {
+            return Ok(());
+        }
         let tx = conn.transaction()?;
         for &tid in chunk {
             rebuild_thread_todos(&tx, tid, now)?;

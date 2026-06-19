@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { api, OPEN_TARGETS, SOURCE_LABELS, type MessageRow } from "../lib/api";
@@ -199,7 +199,7 @@ export function ThreadView() {
           </div>
         )}
       </header>
-      <MessageList messages={data.messages} />
+      <MessageList key={data.id} messages={data.messages} />
     </div>
   );
 }
@@ -212,6 +212,16 @@ function MessageList({ messages }: { messages: MessageRow[] }) {
     estimateSize: () => 110,
     overscan: 8,
   });
+  // Chat-style: open pinned to the newest message, scroll up for history. MessageList
+  // is keyed by thread id (remounts per thread), so this runs once per open. A second
+  // pass on the next frame corrects the landing after dynamic heights are measured.
+  useEffect(() => {
+    if (messages.length === 0) return;
+    const toBottom = () => virtualizer.scrollToIndex(messages.length - 1, { align: "end" });
+    toBottom();
+    const id = requestAnimationFrame(toBottom);
+    return () => cancelAnimationFrame(id);
+  }, [messages.length, virtualizer]);
   return (
     <div ref={parentRef} className="min-h-0 flex-1 overflow-y-auto pt-3">
       <div className="relative w-full" style={{ height: virtualizer.getTotalSize() }}>
@@ -251,7 +261,7 @@ function toolBody(text: string, toolName: string | null): string {
   return asCodeBlock(body);
 }
 
-function Message({ m }: { m: MessageRow }) {
+const Message = memo(function Message({ m }: { m: MessageRow }) {
   if (m.toolName || m.role === "tool") {
     return (
       <details className="rounded-lg border bg-muted/40 px-3 py-2 text-sm">
@@ -279,4 +289,4 @@ function Message({ m }: { m: MessageRow }) {
       <Markdown>{m.text}</Markdown>
     </div>
   );
-}
+});

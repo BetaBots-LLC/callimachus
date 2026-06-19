@@ -2,14 +2,45 @@ import { type ComponentProps, memo } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
+import { unified } from "unified";
+import remarkParse from "remark-parse";
+import remarkRehype from "remark-rehype";
+import rehypeStringify from "rehype-stringify";
 
 // Syntax-highlight fenced code; detect the language when unlabeled, ignore unknown.
 const REHYPE: ComponentProps<typeof ReactMarkdown>["rehypePlugins"] = [
   [rehypeHighlight, { detect: true, ignoreMissing: true }],
 ];
 
+// A single sanitizing markdown→HTML pipeline (no allowDangerousHtml, so raw HTML in a
+// transcript is stripped). We render committed messages this way and CACHE the HTML by
+// source string: in a long virtualized thread, scrolling a message back into view reuses
+// its HTML instead of re-parsing + re-highlighting it — the difference between smooth and
+// janky on 1000+-message threads.
+const processor = unified()
+  .use(remarkParse)
+  .use(remarkGfm)
+  .use(remarkRehype)
+  .use(rehypeHighlight, { detect: true, ignoreMissing: true })
+  .use(rehypeStringify);
+
+const htmlCache = new Map<string, string>();
+const MAX_CACHE = 600;
+
+function mdToHtml(src: string): string {
+  const cached = htmlCache.get(src);
+  if (cached !== undefined) return cached;
+  const html = String(processor.processSync(src));
+  htmlCache.set(src, html);
+  if (htmlCache.size > MAX_CACHE) {
+    const oldest = htmlCache.keys().next().value;
+    if (oldest !== undefined) htmlCache.delete(oldest);
+  }
+  return html;
+}
+
 const PROSE =
-  "prose prose-sm dark:prose-invert max-w-none break-words prose-p:my-2 prose-pre:my-2 prose-pre:overflow-x-auto prose-pre:rounded-md prose-pre:bg-muted prose-pre:p-3 prose-code:rounded prose-code:bg-muted prose-code:px-1 prose-code:py-0.5 prose-code:before:content-none prose-code:after:content-none prose-pre:prose-code:bg-transparent prose-pre:prose-code:p-0";
+  "prose prose-sm dark:prose-invert max-w-none break-words prose-p:my-2 prose-pre:my-3 prose-pre:overflow-x-auto prose-pre:rounded-md prose-pre:bg-muted prose-pre:p-3 prose-code:rounded prose-code:bg-muted prose-code:px-1 prose-code:py-0.5 prose-code:before:content-none prose-code:after:content-none prose-pre:prose-code:bg-transparent prose-pre:prose-code:p-0";
 
 // Above this, parsing markdown synchronously can jank the main thread (e.g. a
 // pasted/packed-context message). Render those as plain, collapsed text instead.
@@ -32,11 +63,11 @@ export const Markdown = memo(function Markdown({ children }: { children: string 
     );
   }
   return (
-    <div className={PROSE}>
-      <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={REHYPE}>
-        {children}
-      </ReactMarkdown>
-    </div>
+    <div
+      className={PROSE}
+      // biome-ignore lint/security/noDangerouslySetInnerHtml: sanitized unified-pipeline HTML (no raw passthrough), cached for scroll perf
+      dangerouslySetInnerHTML={{ __html: mdToHtml(children) }}
+    />
   );
 });
 

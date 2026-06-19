@@ -470,7 +470,11 @@ async fn distill_thread(
         }
         Err(e) => {
             let conn = lock(&db)?;
-            knowledge::set_error(&conn, thread_id, &e.to_string())?;
+            // Store a short, sanitized summary — not the raw provider error, which can
+            // echo HTTP status / URLs / response bodies.
+            let msg: String =
+                e.to_string().lines().next().unwrap_or("distillation failed").chars().take(160).collect();
+            knowledge::set_error(&conn, thread_id, &msg)?;
             Err(e.into())
         }
     }
