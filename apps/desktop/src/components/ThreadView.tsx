@@ -15,8 +15,10 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { cn } from "@/lib/utils";
-import { ChevronDown, ExternalLink, Star } from "lucide-react";
+import { ExternalLink, MoreHorizontal, Star } from "lucide-react";
 import { TagsEditor } from "./TagsEditor";
+import { KnowledgeButton } from "./KnowledgeSection";
+import { Markdown, asCodeBlock } from "./Markdown";
 
 export function ThreadView() {
   const threadId = useUi((s) => s.selectedThreadId);
@@ -71,7 +73,6 @@ export function ThreadView() {
     mutationFn: () => api.synthesizeExport(threadId as number, vaultDir, synthProvider, synthModel),
     onSuccess: markExported,
   });
-  const exportBusy = exportNote.isPending || synthExport.isPending;
 
   const queryClient = useQueryClient();
   const toggleStar = useMutation({
@@ -106,75 +107,17 @@ export function ThreadView() {
           <Badge variant="outline" className="text-[0.62rem] uppercase">
             {SOURCE_LABELS[data.source]}
           </Badge>
-          <div className="flex flex-wrap justify-end gap-1.5">
+          <div className="flex items-center justify-end gap-1.5">
+            <KnowledgeButton threadId={data.id} />
             <Button
-              size="xs"
+              size="icon-sm"
               variant="outline"
               onClick={() => toggleStar.mutate()}
               disabled={toggleStar.isPending}
               title={data.starred ? "Unstar" : "Star"}
             >
               <Star className={cn("size-3.5", data.starred && "fill-current text-primary")} />
-              {data.starred ? "Starred" : "Star"}
             </Button>
-            <Button
-              size="xs"
-              variant="outline"
-              onClick={() => addToChat.mutate()}
-              disabled={addToChat.isPending}
-            >
-              + Add to chat
-            </Button>
-            <Button
-              size="xs"
-              variant="outline"
-              onClick={() => copyContext.mutate()}
-              disabled={copyContext.isPending}
-            >
-              {copied ? "Copied ✓" : "Copy context"}
-            </Button>
-            <DropdownMenu>
-              <DropdownMenuTrigger
-                render={<Button size="xs" variant="outline" disabled={exportBusy} />}
-              >
-                {exportBusy ? "Exporting…" : exported ? "Exported ✓" : "Export"}
-                <ChevronDown className="size-3.5" />
-              </DropdownMenuTrigger>
-              <DropdownMenuContent>
-                <div className="px-2 py-1 text-xs text-muted-foreground">
-                  {vaultDir ? "Export to Obsidian" : "Set a vault in Settings first"}
-                </div>
-                <DropdownMenuItem onClick={() => exportNote.mutate()} disabled={!vaultDir}>
-                  Quick note (transcript)
-                </DropdownMenuItem>
-                <DropdownMenuItem
-                  onClick={() => synthExport.mutate()}
-                  disabled={!vaultDir || !canSynth.data}
-                >
-                  Synthesize &amp; export
-                  {canSynth.data === false ? " (add API key)" : ""}
-                </DropdownMenuItem>
-              </DropdownMenuContent>
-            </DropdownMenu>
-            <DropdownMenu>
-              <DropdownMenuTrigger
-                render={<Button size="xs" variant="outline" disabled={openInCli.isPending} />}
-              >
-                {openInCli.isPending ? "Opening…" : "Open in"}
-                <ChevronDown className="size-3.5" />
-              </DropdownMenuTrigger>
-              <DropdownMenuContent>
-                {/* Plain div, not DropdownMenuLabel: Base UI's GroupLabel throws
-                    unless wrapped in a <Menu.Group>, which this menu has none of. */}
-                <div className="px-2 py-1 text-xs text-muted-foreground">Open thread in…</div>
-                {OPEN_TARGETS.map((t) => (
-                  <DropdownMenuItem key={t.program} onClick={() => openInCli.mutate(t.program)}>
-                    <ExternalLink />
-                    {t.label}
-                  </DropdownMenuItem>
-                ))}
-              </DropdownMenuContent>
-            </DropdownMenu>
             {canResume && (
               <Button
                 size="xs"
@@ -185,6 +128,47 @@ export function ThreadView() {
                 {resume.isPending ? "…" : "Resume ↗"}
               </Button>
             )}
+            <DropdownMenu>
+              <DropdownMenuTrigger
+                render={<Button size="icon-sm" variant="outline" title="More actions" />}
+              >
+                <MoreHorizontal className="size-4" />
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end">
+                <DropdownMenuItem onClick={() => addToChat.mutate()} disabled={addToChat.isPending}>
+                  Add to chat
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  onClick={() => copyContext.mutate()}
+                  disabled={copyContext.isPending}
+                >
+                  {copied ? "Copied ✓" : "Copy context"}
+                </DropdownMenuItem>
+
+                <div className="-mx-1 my-1 h-px bg-border" />
+                <div className="px-2 py-1 text-xs text-muted-foreground">
+                  {vaultDir ? "Export to Obsidian" : "Set a vault in Settings first"}
+                </div>
+                <DropdownMenuItem onClick={() => exportNote.mutate()} disabled={!vaultDir}>
+                  {exported ? "Exported ✓" : "Quick note (transcript)"}
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  onClick={() => synthExport.mutate()}
+                  disabled={!vaultDir || !canSynth.data}
+                >
+                  Synthesize &amp; export{canSynth.data === false ? " (add API key)" : ""}
+                </DropdownMenuItem>
+
+                <div className="-mx-1 my-1 h-px bg-border" />
+                <div className="px-2 py-1 text-xs text-muted-foreground">Open thread in…</div>
+                {OPEN_TARGETS.map((t) => (
+                  <DropdownMenuItem key={t.program} onClick={() => openInCli.mutate(t.program)}>
+                    <ExternalLink />
+                    {t.label}
+                  </DropdownMenuItem>
+                ))}
+              </DropdownMenuContent>
+            </DropdownMenu>
           </div>
         </div>
         <h2 className="mt-1.5 text-lg font-semibold">{data.title || "Untitled thread"}</h2>
@@ -247,6 +231,26 @@ function MessageList({ messages }: { messages: MessageRow[] }) {
   );
 }
 
+/** Render a tool message body: pretty-print JSON args (tool calls are stored as
+ *  "Name: {json}") or a JSON result; otherwise a plain highlighted code block (e.g.
+ *  a line-numbered file read, which isn't valid JSON). */
+function toolBody(text: string, toolName: string | null): string {
+  let body = text;
+  if (toolName) {
+    const sep = text.indexOf(": ");
+    if (sep > 0) body = text.slice(sep + 2);
+  }
+  const trimmed = body.trim();
+  if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+    try {
+      return asCodeBlock(JSON.stringify(JSON.parse(trimmed), null, 2), "json");
+    } catch {
+      // Not valid JSON (e.g. a line-numbered file read) — fall through.
+    }
+  }
+  return asCodeBlock(body);
+}
+
 function Message({ m }: { m: MessageRow }) {
   if (m.toolName || m.role === "tool") {
     return (
@@ -256,9 +260,9 @@ function Message({ m }: { m: MessageRow }) {
             {m.toolName ? `tool · ${m.toolName}` : "result"}
           </span>
         </summary>
-        <pre className="mt-2 max-h-80 overflow-auto whitespace-pre-wrap break-words text-[0.8rem] text-muted-foreground">
-          {m.text}
-        </pre>
+        <div className="mt-2 max-h-80 overflow-auto text-[0.8rem]">
+          <Markdown>{toolBody(m.text, m.toolName)}</Markdown>
+        </div>
       </details>
     );
   }
@@ -272,7 +276,7 @@ function Message({ m }: { m: MessageRow }) {
       <div className="mb-1 text-[0.68rem] uppercase tracking-wide text-muted-foreground">
         {m.role}
       </div>
-      <div className="whitespace-pre-wrap break-words leading-relaxed">{m.text}</div>
+      <Markdown>{m.text}</Markdown>
     </div>
   );
 }

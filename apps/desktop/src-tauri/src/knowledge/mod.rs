@@ -1,0 +1,531 @@
+//! Distilled knowledge layer. Slice 1 is the FREE heuristic tier: TODO/action items
+//! pulled out of message text with conservative, low-noise markers (markdown unchecked
+//! tasks + word-boundaried TODO/FIXME), stored in the `facts` table by the indexer and
+//! surfaced via `list_open_todos` (desktop, `cal todos`, MCP). No model, no API key.
+//! The LLM tier (decisions / gotchas / summaries, lazy on-demand) reuses the same table.
+
+use crate::agent::Distilled;
+use anyhow::Result;
+use rusqlite::{params, Connection, OptionalExtension};
+use serde::Serialize;
+
+/// Hard cap on a single extracted TODO so one runaway line can't bloat the list.
+const MAX_TODO_LEN: usize = 240;
+
+/// Pull likely TODO/action items out of one message's text. Intentionally
+/// conservative — only markdown unchecked tasks (`- [ ]`) and word-boundaried
+/// `TODO`/`FIXME` markers — so we get signal, not every "we need to" aside.
+pub fn extract_todos(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let candidate = match unchecked_task(line) {
+            Some(rest) => Some(rest),
+            None => marker_pos(line).map(|i| strip_marker(&line[i..])),
+        };
+        if let Some(c) = candidate {
+            if let Some(todo) = clean(c) {
+                out.push(todo);
+            }
+        }
+    }
+    out
+}
+
+/// Text after a markdown unchecked task bullet, e.g. `- [ ] wire up auth` -> `wire up auth`.
+fn unchecked_task(line: &str) -> Option<&str> {
+    for p in ["- [ ]", "* [ ]", "- [] ", "* [] "] {
+        if let Some(rest) = line.strip_prefix(p) {
+            return Some(rest);
+        }
+    }
+    None
+}
+
+/// Byte index of a word-boundaried, case-insensitive TODO/FIXME marker (so "mastodon"
+/// and "fixmestyle" don't match). None if the line has no marker.
+fn marker_pos(line: &str) -> Option<usize> {
+    let lower = line.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    for m in ["todo", "fixme"] {
+        let mut start = 0;
+        while let Some(rel) = lower[start..].find(m) {
+            let i = start + rel;
+            let before_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+            let after_idx = i + m.len();
+            let after_ok = after_idx >= bytes.len() || !bytes[after_idx].is_ascii_alphanumeric();
+            if before_ok && after_ok {
+                return Some(i);
+            }
+            start = i + m.len();
+        }
+    }
+    None
+}
+
+/// Drop the leading `TODO`/`FIXME` label and its trailing punctuation:
+/// `TODO: fix the parser` -> `fix the parser`.
+fn strip_marker(frag: &str) -> &str {
+    let lower = frag.to_ascii_lowercase();
+    let rest = if lower.starts_with("todo") {
+        &frag[4..]
+    } else if lower.starts_with("fixme") {
+        &frag[5..]
+    } else {
+        frag
+    };
+    rest.trim_start_matches([':', '-', ' ', '\t', ')', '(', '.', '*'])
+}
+
+/// Trim, reject noise/too-short fragments, and length-cap. None = not a usable TODO.
+fn clean(s: &str) -> Option<String> {
+    let t = s.trim();
+    if t.chars().count() < 4 {
+        return None;
+    }
+    // Reject code / JSON / markdown-table / escaped-newline blobs. Some transcripts
+    // store command output or whole tables on a single line (literal "\n"), which
+    // would otherwise yield a garbage "todo". Prefer precision over recall here.
+    if is_noise(t) {
+        return None;
+    }
+    if t.chars().count() > MAX_TODO_LEN {
+        let mut capped: String = t.chars().take(MAX_TODO_LEN).collect();
+        capped.push('…');
+        return Some(capped);
+    }
+    Some(t.to_string())
+}
+
+/// Heuristic junk filter: literal escaped newlines, table pipes, or JSON/code braces
+/// mean this "line" is really structured output, not a human action item.
+fn is_noise(t: &str) -> bool {
+    t.contains("\\n") || t.contains('|') || t.contains("\",\"") || t.contains('{') || t.contains('}')
+}
+
+/// Cap on heuristic todos kept per thread (matches the indexer).
+const MAX_TODOS_PER_THREAD: usize = 25;
+
+/// Wipe all heuristic todos (used when the user turns the knowledge feature off).
+pub fn clear_heuristic(conn: &Connection) -> Result<()> {
+    conn.execute("DELETE FROM facts WHERE extractor = 'heuristic'", [])?;
+    Ok(())
+}
+
+/// Re-derive a single thread's heuristic todos from its already-stored messages,
+/// inside the caller's transaction. Shared by the indexer and the backfill.
+fn rebuild_thread_todos(tx: &Connection, thread_id: i64, now: i64) -> Result<()> {
+    tx.execute("DELETE FROM facts WHERE thread_id = ?1 AND extractor = 'heuristic'", [thread_id])?;
+    let mut sel = tx.prepare(
+        "SELECT id, text FROM messages WHERE thread_id = ?1 AND role IN ('user', 'assistant')
+         ORDER BY seq, id",
+    )?;
+    let rows: Vec<(i64, String)> = sel
+        .query_map([thread_id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut ins = tx.prepare(
+        "INSERT INTO facts (thread_id, kind, text, source_message_id, status, extractor, created_at)
+         VALUES (?1, 'todo', ?2, ?3, 'open', 'heuristic', ?4)",
+    )?;
+    let mut seen = std::collections::HashSet::new();
+    let mut per = 0usize;
+    'outer: for (mid, text) in rows {
+        if per >= MAX_TODOS_PER_THREAD {
+            break;
+        }
+        for todo in extract_todos(&text) {
+            if per >= MAX_TODOS_PER_THREAD {
+                break 'outer;
+            }
+            if seen.insert(todo.to_ascii_lowercase()) {
+                ins.execute(rusqlite::params![thread_id, todo, mid, now])?;
+                per += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Backfill heuristic todos across the whole corpus from already-indexed message text
+/// (no file reading). Used when the user opts INTO the feature so todos appear without
+/// a full re-index. Runs in BATCHES, taking the DB lock briefly per chunk of threads so
+/// the UI stays responsive — never one long lock hold. Safe to run on a background thread.
+pub fn backfill_todos(db: &crate::db::Db, now: i64) -> Result<()> {
+    const BATCH: usize = 50;
+    let lock = || db.0.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"));
+
+    // Clear stale heuristic facts up front (one short lock).
+    lock()?.execute("DELETE FROM facts WHERE extractor = 'heuristic'", [])?;
+
+    let thread_ids: Vec<i64> = {
+        let conn = lock()?;
+        let mut stmt = conn.prepare("SELECT id FROM threads ORDER BY id")?;
+        let ids: Vec<i64> = stmt.query_map([], |r| r.get::<_, i64>(0))?.collect::<rusqlite::Result<_>>()?;
+        ids
+    };
+
+    for chunk in thread_ids.chunks(BATCH) {
+        let mut conn = lock()?;
+        let tx = conn.transaction()?;
+        for &tid in chunk {
+            rebuild_thread_todos(&tx, tid, now)?;
+        }
+        tx.commit()?;
+    }
+    Ok(())
+}
+
+/// An open TODO surfaced to the UI / agents, with the thread it came from.
+#[derive(Debug, Serialize)]
+pub struct TodoFact {
+    pub id: i64,
+    #[serde(rename = "threadId")]
+    pub thread_id: i64,
+    pub text: String,
+    pub source: String,
+    pub title: Option<String>,
+    #[serde(rename = "projectPath")]
+    pub project_path: Option<String>,
+    #[serde(rename = "createdAt")]
+    pub created_at: i64,
+}
+
+/// Open TODOs across the corpus, newest first. Optionally scoped to a project-path
+/// substring and/or a source kind. Plain SQL — no embedding, works with zero LLM use.
+pub fn list_open_todos(
+    conn: &Connection,
+    project: Option<&str>,
+    source: Option<&str>,
+    limit: i64,
+) -> Result<Vec<TodoFact>> {
+    let mut sql = String::from(
+        "SELECT f.id, f.thread_id, f.text, s.kind, t.title, t.project_path, f.created_at
+         FROM facts f
+         JOIN threads t ON t.id = f.thread_id
+         JOIN sources s ON s.id = t.source_id
+         WHERE f.kind = 'todo' AND f.status = 'open'",
+    );
+    let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    if let Some(p) = project.filter(|p| !p.is_empty()) {
+        args.push(Box::new(format!("%{p}%")));
+        sql.push_str(&format!(" AND t.project_path LIKE ?{}", args.len()));
+    }
+    if let Some(src) = source.filter(|s| !s.is_empty()) {
+        args.push(Box::new(src.to_string()));
+        sql.push_str(&format!(" AND s.kind = ?{}", args.len()));
+    }
+    args.push(Box::new(limit));
+    sql.push_str(&format!(" ORDER BY f.created_at DESC, f.id DESC LIMIT ?{}", args.len()));
+
+    let arg_refs: Vec<&dyn rusqlite::ToSql> = args.iter().map(|b| b.as_ref()).collect();
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(arg_refs.as_slice(), |r| {
+        Ok(TodoFact {
+            id: r.get(0)?,
+            thread_id: r.get(1)?,
+            text: r.get(2)?,
+            source: r.get(3)?,
+            title: r.get(4)?,
+            project_path: r.get(5)?,
+            created_at: r.get(6)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+// ---------------------------------------------------------------------------
+// LLM distillation tier (opt-in). Decisions / gotchas / summary per thread.
+// ---------------------------------------------------------------------------
+
+/// Distillation engine config, shared across the app / cal / MCP via `app_config`.
+/// `enabled` is the consent flag — nothing distills until the user turns it on.
+#[derive(Debug, Serialize)]
+pub struct KnowledgeConfig {
+    pub enabled: bool,
+    pub provider: Option<String>, // None = first available cloud key
+    pub model: Option<String>,
+}
+
+fn config_get(conn: &Connection, key: &str) -> Result<Option<String>> {
+    Ok(conn
+        .query_row("SELECT value FROM app_config WHERE key = ?1", [key], |r| r.get::<_, String>(0))
+        .optional()?)
+}
+
+/// Read the distillation config (defaults to disabled / unset).
+pub fn get_config(conn: &Connection) -> Result<KnowledgeConfig> {
+    Ok(KnowledgeConfig {
+        enabled: config_get(conn, "knowledge.enabled")?.as_deref() == Some("1"),
+        provider: config_get(conn, "knowledge.provider")?.filter(|s| !s.is_empty()),
+        model: config_get(conn, "knowledge.model")?.filter(|s| !s.is_empty()),
+    })
+}
+
+/// Persist the distillation config. Enabling it is the user's consent to send thread
+/// text to the chosen engine (cloud key) — or to keep it local (Ollama).
+pub fn set_config(
+    conn: &Connection,
+    enabled: bool,
+    provider: Option<&str>,
+    model: Option<&str>,
+) -> Result<()> {
+    for (k, v) in [
+        ("knowledge.enabled", if enabled { "1" } else { "0" }),
+        ("knowledge.provider", provider.unwrap_or("")),
+        ("knowledge.model", model.unwrap_or("")),
+    ] {
+        conn.execute(
+            "INSERT INTO app_config (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = ?2",
+            params![k, v],
+        )?;
+    }
+    Ok(())
+}
+
+/// Replace a thread's LLM-distilled facts with a fresh set and mark it extracted at
+/// the current message count. Heuristic todos (extractor='heuristic') are untouched.
+pub fn store_distilled(conn: &mut Connection, thread_id: i64, d: &Distilled, now: i64) -> Result<()> {
+    let tx = conn.transaction()?;
+    tx.execute("DELETE FROM facts WHERE thread_id = ?1 AND extractor = 'llm'", [thread_id])?;
+    {
+        let mut ins = tx.prepare(
+            "INSERT INTO facts (thread_id, kind, text, status, extractor, seq, created_at)
+             VALUES (?1, ?2, ?3, 'open', 'llm', ?4, ?5)",
+        )?;
+        let summary = d.summary.trim();
+        if !summary.is_empty() {
+            ins.execute(params![thread_id, "summary", summary, 0_i64, now])?;
+        }
+        for (i, text) in d.decisions.iter().enumerate() {
+            let t = text.trim();
+            if !t.is_empty() {
+                ins.execute(params![thread_id, "decision", t, i as i64, now])?;
+            }
+        }
+        for (i, text) in d.gotchas.iter().enumerate() {
+            let t = text.trim();
+            if !t.is_empty() {
+                ins.execute(params![thread_id, "gotcha", t, i as i64, now])?;
+            }
+        }
+    }
+    tx.execute(
+        "UPDATE threads SET knowledge_extracted = 1, knowledge_extracted_at = ?2,
+            knowledge_msg_count = message_count, knowledge_error = NULL WHERE id = ?1",
+        params![thread_id, now],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Record a distillation failure so the UI can show it and lazy-on-open won't retry it
+/// in a loop (a manual re-distill clears it). Leaves knowledge_extracted = 0.
+pub fn set_error(conn: &Connection, thread_id: i64, err: &str) -> Result<()> {
+    conn.execute("UPDATE threads SET knowledge_error = ?2 WHERE id = ?1", params![thread_id, err])?;
+    Ok(())
+}
+
+/// Clear extraction state so a thread re-distills on next request (the "Re-distill" path).
+pub fn mark_for_redistill(conn: &Connection, thread_id: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE threads SET knowledge_extracted = 0, knowledge_error = NULL WHERE id = ?1",
+        [thread_id],
+    )?;
+    Ok(())
+}
+
+/// A single distilled fact for the thread view.
+#[derive(Debug, Serialize)]
+pub struct KFact {
+    pub id: i64,
+    pub text: String,
+}
+
+/// All distilled knowledge for one thread, grouped by kind, with freshness flags.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadKnowledge {
+    pub summary: Option<String>,
+    pub decisions: Vec<KFact>,
+    pub gotchas: Vec<KFact>,
+    pub todos: Vec<KFact>,
+    pub extracted: bool,
+    pub stale: bool,
+    pub error: Option<String>,
+    pub can_distill: bool,
+}
+
+/// Whether a thread should be (re)distilled now: enabled, not already done, no prior
+/// error (so we don't loop on a failing API), and either never-done or stale.
+pub fn needs_distill(conn: &Connection, thread_id: i64) -> Result<bool> {
+    if !get_config(conn)?.enabled {
+        return Ok(false);
+    }
+    let row: Option<(bool, Option<i64>, Option<String>, i64)> = conn
+        .query_row(
+            "SELECT knowledge_extracted, knowledge_msg_count, knowledge_error, message_count
+             FROM threads WHERE id = ?1",
+            [thread_id],
+            |r| Ok((r.get::<_, i64>(0)? != 0, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()?;
+    let Some((extracted, kmsg, error, mcount)) = row else { return Ok(false) };
+    let stale = extracted && kmsg != Some(mcount);
+    Ok(error.is_none() && (!extracted || stale))
+}
+
+/// Read the distilled knowledge for one thread (cached; does not run the model).
+pub fn get_thread_knowledge(conn: &Connection, thread_id: i64) -> Result<ThreadKnowledge> {
+    let (extracted, kmsg, error, mcount): (bool, Option<i64>, Option<String>, i64) = conn.query_row(
+        "SELECT knowledge_extracted, knowledge_msg_count, knowledge_error, message_count
+         FROM threads WHERE id = ?1",
+        [thread_id],
+        |r| Ok((r.get::<_, i64>(0)? != 0, r.get(1)?, r.get(2)?, r.get(3)?)),
+    )?;
+
+    let mut stmt =
+        conn.prepare("SELECT id, kind, text FROM facts WHERE thread_id = ?1 ORDER BY seq, id")?;
+    let rows = stmt.query_map([thread_id], |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+    })?;
+    let mut summary = None;
+    let (mut decisions, mut gotchas, mut todos) = (Vec::new(), Vec::new(), Vec::new());
+    for row in rows {
+        let (id, kind, text) = row?;
+        match kind.as_str() {
+            "summary" => summary = Some(text),
+            "decision" => decisions.push(KFact { id, text }),
+            "gotcha" => gotchas.push(KFact { id, text }),
+            "todo" => todos.push(KFact { id, text }),
+            _ => {}
+        }
+    }
+    Ok(ThreadKnowledge {
+        summary,
+        decisions,
+        gotchas,
+        todos,
+        extracted,
+        stale: extracted && kmsg != Some(mcount),
+        error,
+        can_distill: get_config(conn)?.enabled,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_markers_and_tasks_only() {
+        let text = "\
+            Here is what we did.\n\
+            TODO: wire up the refresh token flow\n\
+            - [ ] add a retry to the uploader\n\
+            - [x] already done, ignore me\n\
+            We use mastodon for our posts.\n\
+            // FIXME handle the empty-array case\n\
+            just a normal sentence";
+        let todos = extract_todos(text);
+        assert!(todos.iter().any(|t| t == "wire up the refresh token flow"));
+        assert!(todos.iter().any(|t| t == "add a retry to the uploader"));
+        assert!(todos.iter().any(|t| t == "handle the empty-array case"));
+        // "mastodon" must NOT trip the word-boundaried todo marker.
+        assert!(!todos.iter().any(|t| t.contains("mastodon")));
+        // the checked task is not an open todo.
+        assert!(!todos.iter().any(|t| t.contains("already done")));
+        assert_eq!(todos.len(), 3);
+    }
+
+    #[test]
+    fn ignores_bare_or_tiny_markers() {
+        assert!(extract_todos("TODO").is_empty());
+        assert!(extract_todos("TODO: x").is_empty()); // < 4 chars after the marker
+        assert!(extract_todos("no markers here at all").is_empty());
+    }
+
+    #[test]
+    fn rejects_structured_noise() {
+        // markdown table cell, escaped-newline blob, and JSON — all junk, not todos.
+        assert!(extract_todos("| Windows .exe | TODO (needs a cert) |").is_empty());
+        assert!(extract_todos("TODO: run \\nthen \\nmore blob output").is_empty());
+        assert!(extract_todos("TODO: {\"key\": \"value\"}").is_empty());
+    }
+
+    fn temp_db() -> Connection {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let p = std::env::temp_dir()
+            .join(format!("calli_know_{}_{}.db", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
+        for ext in ["db", "db-wal", "db-shm"] {
+            let _ = std::fs::remove_file(p.with_extension(ext));
+        }
+        crate::db::open(&p).unwrap()
+    }
+
+    #[test]
+    fn distill_config_store_and_invalidation() {
+        use crate::agent::Distilled;
+        use crate::indexer::{source_id, upsert_thread, ParsedMessage, ParsedThread};
+
+        let mut conn = temp_db();
+        let sid = source_id(&conn, "claude_code").unwrap();
+        let msg = |r: &str, t: &str| ParsedMessage {
+            role: r.into(),
+            text: t.into(),
+            tool_name: None,
+            ts: Some(1),
+        };
+        let seed = |msgs: Vec<ParsedMessage>| ParsedThread {
+            external_id: "k1".into(),
+            title: Some("auth".into()),
+            created_at: Some(1),
+            updated_at: Some(2),
+            messages: msgs,
+            ..Default::default()
+        };
+        upsert_thread(&mut conn, sid, &seed(vec![msg("user", "hi"), msg("assistant", "yo")])).unwrap();
+        let id: i64 =
+            conn.query_row("SELECT id FROM threads WHERE external_id = 'k1'", [], |r| r.get(0)).unwrap();
+
+        // Off by default → never distills.
+        assert!(!get_config(&conn).unwrap().enabled);
+        assert!(!needs_distill(&conn, id).unwrap());
+
+        // Enable (consent) with the local Ollama engine.
+        set_config(&conn, true, Some("ollama"), Some("llama3.1")).unwrap();
+        let cfg = get_config(&conn).unwrap();
+        assert!(cfg.enabled && cfg.provider.as_deref() == Some("ollama"));
+        assert!(needs_distill(&conn, id).unwrap()); // enabled + never extracted
+
+        // Store distilled facts (empty items dropped).
+        let d = Distilled {
+            summary: "did auth".into(),
+            decisions: vec!["use jwt".into(), "  ".into()],
+            gotchas: vec!["clock skew".into()],
+        };
+        store_distilled(&mut conn, id, &d, 100).unwrap();
+        let k = get_thread_knowledge(&conn, id).unwrap();
+        assert_eq!(k.summary.as_deref(), Some("did auth"));
+        assert_eq!(k.decisions.len(), 1);
+        assert_eq!(k.gotchas.len(), 1);
+        assert!(k.extracted && !k.stale && k.can_distill);
+        assert!(!needs_distill(&conn, id).unwrap()); // already done
+
+        // Re-index with an added message must invalidate the distilled facts.
+        upsert_thread(
+            &mut conn,
+            sid,
+            &seed(vec![msg("user", "hi"), msg("assistant", "yo"), msg("user", "more")]),
+        )
+        .unwrap();
+        let k2 = get_thread_knowledge(&conn, id).unwrap();
+        assert!(!k2.extracted, "changed message count must reset extraction");
+        assert!(k2.decisions.is_empty(), "llm facts cleared on invalidation");
+        assert!(needs_distill(&conn, id).unwrap());
+    }
+}

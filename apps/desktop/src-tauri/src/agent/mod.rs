@@ -144,6 +144,80 @@ pub async fn synthesize(
     Ok(text.trim().to_string())
 }
 
+/// System prompt for STRUCTURED distillation into the knowledge `facts` table. We ask
+/// for plain JSON and parse leniently (works identically across cloud and local Ollama
+/// — no adapter-specific response-format API). TODOs are intentionally NOT requested:
+/// those come from the free heuristic tier.
+const DISTILL_SYSTEM: &str = "You distill one AI coding-agent session into structured \
+knowledge for the developer. Output ONLY a single JSON object — no prose, no markdown \
+code fences — of exactly this shape:\n\
+{\"summary\": string, \"decisions\": string[], \"gotchas\": string[]}\n\
+- summary: 1-2 sentences on what the session did and the outcome.\n\
+- decisions: concrete technical decisions made, and why — one terse sentence each.\n\
+- gotchas: pitfalls, surprises, or non-obvious constraints discovered — one each.\n\
+Ground every item in the transcript; omit anything you cannot support; never invent. \
+Use an empty string / empty array when a field has nothing.";
+
+/// The distilled knowledge for one thread. Deserialized leniently from the model's
+/// JSON; `summary` carries the raw completion as a fallback if parsing fails.
+#[derive(Debug, Default, Deserialize, Serialize)]
+pub struct Distilled {
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub decisions: Vec<String>,
+    #[serde(default)]
+    pub gotchas: Vec<String>,
+}
+
+/// One-shot structured distillation of a packed transcript. Same provider plumbing as
+/// `synthesize`; returns parsed facts (tolerant of fences / surrounding prose).
+pub async fn distill(
+    provider: &str,
+    model: &str,
+    api_key: Option<&str>,
+    transcript: &str,
+) -> Result<Distilled> {
+    let adapter = adapter_for(provider)?;
+    let key = api_key.map(str::to_string);
+    let client = Client::builder()
+        .with_adapter_kind(adapter)
+        .with_auth_resolver_fn(move |_iden: genai::ModelIden| Ok(key.clone().map(AuthData::from_single)))
+        .build();
+    let req = ChatRequest::new(Vec::new())
+        .with_system(DISTILL_SYSTEM)
+        .append_message(GMessage::user(format!("Transcript:\n\n{transcript}")));
+    let options = ChatOptions::default().with_temperature(0.1).with_max_tokens(1200);
+    let resp = client
+        .exec_chat(model, req, Some(&options))
+        .await
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let text = resp
+        .into_first_text()
+        .ok_or_else(|| anyhow::anyhow!("distillation returned no text"))?;
+    Ok(parse_distilled(&text))
+}
+
+/// Lenient JSON extraction: strip code fences, take the outer `{…}`, parse. On failure,
+/// keep the raw completion as a single summary fact so a thread always yields something.
+pub fn parse_distilled(raw: &str) -> Distilled {
+    let trimmed = raw
+        .trim()
+        .trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim();
+    if let (Some(s), Some(e)) = (trimmed.find('{'), trimmed.rfind('}')) {
+        if e > s {
+            if let Ok(d) = serde_json::from_str::<Distilled>(&trimmed[s..=e]) {
+                return d;
+            }
+        }
+    }
+    let summary: String = trimmed.chars().take(2000).collect();
+    Distilled { summary, decisions: Vec::new(), gotchas: Vec::new() }
+}
+
 /// Stream a chat completion via the genai crate (multi-provider, native protocols,
 /// retries). The adapter is forced per `provider`; the API key (from the keychain)
 /// is injected through an auth resolver so it never leaves Rust. `on_token` fires

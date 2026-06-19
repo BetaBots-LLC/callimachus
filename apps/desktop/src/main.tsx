@@ -27,6 +27,10 @@ void listen("embed:done", () => {
   // One authoritative refetch for the final counts + running:false.
   void queryClient.invalidateQueries({ queryKey: ["embed_status"] });
 });
+// Background todo backfill (after enabling the Knowledge feature) finished.
+void listen("knowledge:todos-ready", () => {
+  void queryClient.invalidateQueries({ queryKey: ["open_todos"] });
+});
 
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>

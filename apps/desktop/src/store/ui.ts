@@ -1,7 +1,7 @@
 import { create } from "zustand";
 import type { SourceKind } from "../lib/api";
 
-export type View = "search" | "chat" | "stats" | "settings";
+export type View = "search" | "chat" | "todos" | "stats" | "settings";
 
 interface UiState {
   view: View;

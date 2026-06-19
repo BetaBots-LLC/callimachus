@@ -132,3 +132,75 @@
     @apply font-sans;
   }
 }
+
+/* Code syntax highlighting (rehype-highlight / highlight.js tokens). The UI is
+   neutral, so tokens use restrained accent hues that read on the muted code
+   background; the .dark set lifts lightness for contrast on the dark surface. */
+.hljs-comment,
+.hljs-quote {
+  color: var(--muted-foreground);
+  font-style: italic;
+}
+.hljs-keyword,
+.hljs-selector-tag,
+.hljs-literal,
+.hljs-section,
+.hljs-doctag,
+.hljs-type {
+  color: oklch(0.52 0.16 305);
+}
+.hljs-string,
+.hljs-attr,
+.hljs-symbol,
+.hljs-addition {
+  color: oklch(0.5 0.12 150);
+}
+.hljs-number,
+.hljs-built_in {
+  color: oklch(0.52 0.13 50);
+}
+.hljs-title,
+.hljs-name,
+.hljs-selector-id,
+.hljs-selector-class {
+  color: oklch(0.5 0.15 250);
+}
+.hljs-variable,
+.hljs-template-variable,
+.hljs-attribute,
+.hljs-params {
+  color: var(--foreground);
+}
+.hljs-meta,
+.hljs-deletion {
+  color: oklch(0.55 0.14 25);
+}
+
+.dark .hljs-keyword,
+.dark .hljs-selector-tag,
+.dark .hljs-literal,
+.dark .hljs-section,
+.dark .hljs-doctag,
+.dark .hljs-type {
+  color: oklch(0.78 0.13 305);
+}
+.dark .hljs-string,
+.dark .hljs-attr,
+.dark .hljs-symbol,
+.dark .hljs-addition {
+  color: oklch(0.8 0.13 150);
+}
+.dark .hljs-number,
+.dark .hljs-built_in {
+  color: oklch(0.82 0.1 60);
+}
+.dark .hljs-title,
+.dark .hljs-name,
+.dark .hljs-selector-id,
+.dark .hljs-selector-class {
+  color: oklch(0.78 0.12 250);
+}
+.dark .hljs-meta,
+.dark .hljs-deletion {
+  color: oklch(0.75 0.13 25);
+}

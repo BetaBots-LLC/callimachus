@@ -1,6 +1,12 @@
-import { memo } from "react";
+import { type ComponentProps, memo } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import rehypeHighlight from "rehype-highlight";
+
+// Syntax-highlight fenced code; detect the language when unlabeled, ignore unknown.
+const REHYPE: ComponentProps<typeof ReactMarkdown>["rehypePlugins"] = [
+  [rehypeHighlight, { detect: true, ignoreMissing: true }],
+];
 
 const PROSE =
   "prose prose-sm dark:prose-invert max-w-none break-words prose-p:my-2 prose-pre:my-2 prose-pre:overflow-x-auto prose-pre:rounded-md prose-pre:bg-muted prose-pre:p-3 prose-code:rounded prose-code:bg-muted prose-code:px-1 prose-code:py-0.5 prose-code:before:content-none prose-code:after:content-none prose-pre:prose-code:bg-transparent prose-pre:prose-code:p-0";
@@ -27,10 +33,43 @@ export const Markdown = memo(function Markdown({ children }: { children: string 
   }
   return (
     <div className={PROSE}>
-      <ReactMarkdown remarkPlugins={[remarkGfm]}>{children}</ReactMarkdown>
+      <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={REHYPE}>
+        {children}
+      </ReactMarkdown>
     </div>
   );
 });
+
+/** Inline markdown for short strings (distilled facts, summaries): renders inline
+ *  code / emphasis / links but unwraps the block `<p>` so it flows inside a list item
+ *  or sentence. No syntax-highlight pass — these are one-liners, not code blocks. */
+export const InlineMarkdown = memo(function InlineMarkdown({ children }: { children: string }) {
+  return (
+    <span className="[&_code]:rounded [&_code]:bg-muted [&_code]:px-1 [&_code]:py-0.5 [&_code]:text-[0.85em]">
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={{
+          // Unwrap blocks and links: distilled facts are one-liners, and any embedded
+          // link (often a scraped relative file path) is dead in the webview — show its
+          // text, not a broken anchor.
+          p: ({ children }) => <>{children}</>,
+          a: ({ children }) => <>{children}</>,
+        }}
+      >
+        {children}
+      </ReactMarkdown>
+    </span>
+  );
+});
+
+/** Wrap arbitrary text (e.g. tool output) as one fenced code block so it renders
+ *  monospaced + syntax-highlighted through the Markdown pipeline. The fence is one
+ *  backtick longer than any run already in the text, so embedded fences can't escape. */
+export function asCodeBlock(text: string, lang = ""): string {
+  const longest = (text.match(/`+/g) ?? []).reduce((m, s) => Math.max(m, s.length), 0);
+  const fence = "`".repeat(Math.max(3, longest + 1));
+  return `${fence}${lang}\n${text}\n${fence}`;
+}
 
 /** Split markdown into top-level blocks on blank lines, without breaking fenced
  *  code. Only the trailing (growing) block changes while streaming. */
@@ -65,7 +104,11 @@ export function splitBlocks(src: string): string[] {
 }
 
 const Block = memo(function Block({ src }: { src: string }) {
-  return <ReactMarkdown remarkPlugins={[remarkGfm]}>{src}</ReactMarkdown>;
+  return (
+    <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={REHYPE}>
+      {src}
+    </ReactMarkdown>
+  );
 });
 
 /** Incremental markdown for the streaming reply: each block is memoized, so only
