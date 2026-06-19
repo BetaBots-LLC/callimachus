@@ -367,6 +367,29 @@ pub fn related(
     Ok(out)
 }
 
+/// Threads that mention a file path (substring, case-insensitive), newest first.
+/// Backs code-aware search: "find every thread that touched embed/mod.rs".
+pub fn threads_with_file(conn: &Connection, path: &str, limit: i64) -> Result<Vec<ThreadSummary>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT fm.thread_id
+         FROM file_mentions fm
+         JOIN threads t ON t.id = fm.thread_id
+         WHERE fm.path LIKE ?1 AND t.is_subagent = 0
+         ORDER BY t.updated_at DESC, t.id DESC
+         LIMIT ?2",
+    )?;
+    let ids = stmt
+        .query_map(rusqlite::params![format!("%{path}%"), limit], |r| r.get::<_, i64>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut out = Vec::with_capacity(ids.len());
+    for id in ids {
+        if let Some(s) = thread_summary(conn, id)? {
+            out.push(s);
+        }
+    }
+    Ok(out)
+}
+
 /// One thread's summary row, or None if the id is unknown.
 fn thread_summary(conn: &Connection, id: i64) -> Result<Option<ThreadSummary>> {
     let mut stmt = conn.prepare(

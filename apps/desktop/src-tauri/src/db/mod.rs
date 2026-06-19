@@ -4,7 +4,7 @@
 pub mod migrations;
 
 use anyhow::{Context, Result};
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, Once};
 
@@ -61,6 +61,30 @@ pub fn open(path: &Path) -> Result<Connection> {
         .to_latest(&mut conn)
         .context("running migrations")?;
 
+    Ok(conn)
+}
+
+/// Open the index **read-only**, for the sidecar processes (MCP server, `cal`).
+///
+/// The desktop app is the single writer; sidecars only query. In WAL mode a
+/// read-only connection never blocks (or is blocked by) the app's writes, which is
+/// what keeps "database is locked" from ever happening across processes. Does NOT
+/// migrate or change journal mode (read-only can't, and the app already owns that).
+pub fn open_readonly(path: &Path) -> Result<Connection> {
+    register_vec(); // vec0 must be loaded to read the KNN (vec_chunks) index
+    if !path.exists() {
+        anyhow::bail!(
+            "no index at {} — open the Callimachus app once to build it (or set CALLIMACHUS_DB)",
+            path.display()
+        );
+    }
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .with_context(|| format!("opening {} read-only", path.display()))?;
+    // Still honor a busy wait for the rare moment a WAL checkpoint is in flight.
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
     Ok(conn)
 }
 

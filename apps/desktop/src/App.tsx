@@ -5,6 +5,7 @@ import { ResultsList } from "./components/ResultsList";
 import { ThreadView } from "./components/ThreadView";
 import { ChatView } from "./components/ChatView";
 import { KnowledgeView } from "./components/KnowledgeView";
+import { AskView } from "./components/AskView";
 import { StatsView } from "./components/StatsView";
 import { SettingsView } from "./components/SettingsView";
 import { Button } from "@/components/ui/button";
@@ -29,7 +30,12 @@ function App() {
   const knowledge = useQuery({ queryKey: ["knowledge_config"], queryFn: api.knowledgeConfig });
   const tabs: { id: View; label: string }[] = [
     ...TABS.slice(0, 2),
-    ...(knowledge.data?.enabled ? [{ id: "knowledge" as View, label: "Knowledge" }] : []),
+    ...(knowledge.data?.enabled
+      ? [
+          { id: "knowledge" as View, label: "Knowledge" },
+          { id: "ask" as View, label: "Ask" },
+        ]
+      : []),
     ...TABS.slice(2),
   ];
 
@@ -79,6 +85,7 @@ function App() {
         )}
         {view === "chat" && <ChatView />}
         {view === "knowledge" && <KnowledgeView />}
+        {view === "ask" && <AskView />}
         {view === "stats" && <StatsView />}
         {view === "settings" && <SettingsView />}
       </div>

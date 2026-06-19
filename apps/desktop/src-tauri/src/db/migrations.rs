@@ -29,5 +29,7 @@ pub static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
         M::up(include_str!("../../migrations/0011_knowledge.sql")),
         // 0012 — opt-in LLM distillation tier: extraction state, fact vectors, config.
         M::up(include_str!("../../migrations/0012_knowledge_llm.sql")),
+        // 0013 — file-path mentions for code-aware search.
+        M::up(include_str!("../../migrations/0013_file_mentions.sql")),
     ])
 });

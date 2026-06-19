@@ -13,7 +13,7 @@ use rusqlite::Connection;
 /// Subcommands that identify a `cal` invocation when the app is launched directly.
 pub const COMMANDS: &[&str] = &[
     "search", "related", "recent", "cat", "show", "context", "stats", "export", "star", "tag",
-    "tags", "todos", "knowledge", "distill", "decisions", "gotchas",
+    "tags", "todos", "knowledge", "distill", "decisions", "gotchas", "ask", "files",
 ];
 
 const USAGE: &str = "\
@@ -39,6 +39,8 @@ USAGE:
   cal decisions <query…> [-p PROJECT] [-n LIMIT] [--json]
   cal gotchas <query…> [-p PROJECT] [-n LIMIT] [--json]
                                 semantic recall of distilled decisions/gotchas
+  cal ask <question…>           answer a question from your history (RAG, cited)
+  cal files <path>              threads that mention a file path (e.g. embed/mod.rs)
   cal help
 
 OPTIONS:
@@ -87,6 +89,8 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
         "distill" => cmd_distill(rest),
         "decisions" => cmd_recall(rest, "decision"),
         "gotchas" => cmd_recall(rest, "gotcha"),
+        "ask" => cmd_ask(rest),
+        "files" => cmd_files(rest),
         "help" | "-h" | "--help" => {
             println!("{USAGE}");
             Ok(())
@@ -144,14 +148,10 @@ fn next(it: &mut std::slice::Iter<'_, String>, flag: &str) -> anyhow::Result<Str
 }
 
 fn open_db() -> anyhow::Result<Connection> {
-    let path = db::default_index_path();
-    if !path.exists() {
-        anyhow::bail!(
-            "no index found at {} — open the Callimachus app once to build it, or set CALLIMACHUS_DB",
-            path.display()
-        );
-    }
-    db::open(&path)
+    // Read-only: the desktop app is the single writer; `cal` only queries, so it
+    // runs safely while the app writes (WAL readers never block). open_readonly
+    // returns a clear "no index" error if the app hasn't built one yet.
+    db::open_readonly(&db::default_index_path())
 }
 
 fn filters(o: &Opts) -> search::SearchFilters {
@@ -401,6 +401,71 @@ fn cmd_distill(args: &[String]) -> anyhow::Result<()> {
     let now = chrono::Utc::now().timestamp();
     knowledge::store_distilled(&mut conn, id, &distilled, now)?;
     print_knowledge(&knowledge::get_thread_knowledge(&conn, id)?);
+    Ok(())
+}
+
+fn cmd_files(args: &[String]) -> anyhow::Result<()> {
+    let o = parse(args)?;
+    let path = o.positional.join(" ");
+    if path.trim().is_empty() {
+        anyhow::bail!("usage: cal files <path>  (e.g. `cal files embed/mod.rs`)");
+    }
+    let conn = open_db()?;
+    let threads = search::threads_with_file(&conn, &path, o.limit.unwrap_or(40) as i64)?;
+    if o.json {
+        println!("{}", serde_json::to_string_pretty(&threads)?);
+        return Ok(());
+    }
+    if threads.is_empty() {
+        eprintln!("no threads mention '{path}'");
+        return Ok(());
+    }
+    for t in &threads {
+        println!("{:>6}  {}", t.id, t.title.as_deref().unwrap_or("untitled"));
+    }
+    Ok(())
+}
+
+fn cmd_ask(args: &[String]) -> anyhow::Result<()> {
+    let o = parse(args)?;
+    let question = o.positional.join(" ");
+    if question.trim().is_empty() {
+        anyhow::bail!("usage: cal ask <question…>");
+    }
+    let conn = open_db()?;
+    let (provider, model, key) = crate::resolve_distill_engine(&conn)?;
+    let embedder = embed::Embedder::default();
+    let qv = embed::embed_query(&embedder, &question)?;
+    let filters = search::SearchFilters { limit: Some(30), ..Default::default() };
+    let hits = search::hybrid_vec(&conn, &question, qv.as_deref(), &filters)?;
+
+    let mut seen = std::collections::HashSet::new();
+    let mut context = String::new();
+    let mut sources: Vec<(i64, String)> = Vec::new();
+    for h in &hits {
+        if !seen.insert(h.thread_id) {
+            continue;
+        }
+        if sources.len() >= 5 {
+            break;
+        }
+        let excerpt = context::pack_thread(&conn, h.thread_id, 2500)?.unwrap_or_default();
+        let title = h.title.clone().unwrap_or_else(|| "untitled".into());
+        context.push_str(&format!("[thread {}] {title}\n{excerpt}\n\n", h.thread_id));
+        sources.push((h.thread_id, title));
+    }
+    if sources.is_empty() {
+        eprintln!("nothing relevant found in your history");
+        return Ok(());
+    }
+    eprintln!("asking {provider}/{model}…");
+    let rt = tokio::runtime::Runtime::new()?;
+    let answer = rt.block_on(agent::answer(&provider, &model, key.as_deref(), &question, &context))?;
+    println!("{answer}\n");
+    println!("Sources:");
+    for (id, title) in &sources {
+        println!("  [thread {id}] {title}");
+    }
     Ok(())
 }
 

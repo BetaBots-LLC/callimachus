@@ -26,6 +26,10 @@ use tauri::{AppHandle, Emitter, Manager};
 #[derive(Default)]
 struct EmbedJob(AtomicBool);
 
+/// Guards against more than one background re-index running at a time.
+#[derive(Default)]
+struct IndexJob(AtomicBool);
+
 /// Cancellation token for the in-flight chat stream (one generation at a time).
 #[derive(Default)]
 struct ChatGeneration(Mutex<Option<tokio_util::sync::CancellationToken>>);
@@ -194,14 +198,43 @@ fn vacuum_db(db: tauri::State<'_, db::Db>) -> AppResult<()> {
     Ok(())
 }
 
-/// Index (or re-index changed files from) every source.
+/// Kick off a re-index of every source in the BACKGROUND on a dedicated connection, so
+/// the button returns instantly and the UI stays responsive. Emits `index:done` (with
+/// the report) when finished; no-op if one is already running.
 #[tauri::command]
-fn index_all() -> AppResult<indexer::IndexReport> {
-    // Index on a DEDICATED connection, not the shared Mutex<Connection>, so the (slow)
-    // file scan + parse + upserts never hold the lock every other UI query needs. WAL
-    // lets readers proceed while we write — this is what kept the UI "stuck loading".
-    let mut conn = db::open(&db::default_index_path())?;
-    Ok(indexer::scan_all(&mut conn)?)
+fn index_all(app: AppHandle) -> AppResult<()> {
+    if app.state::<EmbedJob>().0.load(Ordering::Relaxed) {
+        return Ok(()); // a semantic build is writing — don't fight it for the write lock
+    }
+    if app.state::<IndexJob>().0.swap(true, Ordering::SeqCst) {
+        return Ok(()); // already running
+    }
+    std::thread::spawn(move || {
+        // Dedicated connection (not the shared Mutex<Connection>): the scan never holds
+        // the lock every other UI query needs — WAL lets readers proceed while we write.
+        let prog = app.clone();
+        let report = db::open(&db::default_index_path()).and_then(|mut c| {
+            indexer::scan_all_with_progress(&mut c, |done, total, current| {
+                let _ = prog.emit(
+                    "index:progress",
+                    IndexProgressEvent { done: done as i64, total: total as i64, current: current.to_string() },
+                );
+            })
+        });
+        app.state::<IndexJob>().0.store(false, Ordering::SeqCst);
+        let report = report.unwrap_or_else(|e| {
+            eprintln!("[index] {e}");
+            indexer::IndexReport::default()
+        });
+        let _ = app.emit("index:done", report);
+    });
+    Ok(())
+}
+
+/// Whether a background re-index is in progress (for the Reindex button state).
+#[tauri::command]
+fn indexing_status(job: tauri::State<'_, IndexJob>) -> bool {
+    job.0.load(Ordering::Relaxed)
 }
 
 /// Index a single source by kind ("claude_code" | "codex" | "cursor").
@@ -264,6 +297,14 @@ struct EmbedProgressEvent {
     total: i64,
 }
 
+/// Pushed before each source during a background reindex, to drive a progress bar.
+#[derive(Clone, Serialize)]
+struct IndexProgressEvent {
+    done: i64,
+    total: i64,
+    current: String,
+}
+
 #[tauri::command]
 fn embedding_status(
     db: tauri::State<'_, db::Db>,
@@ -278,10 +319,20 @@ fn embedding_status(
     })
 }
 
+/// True for transient SQLite contention ("database is locked"/"busy") so the
+/// embed job retries rather than aborting when another process holds a write lock.
+fn is_db_locked(e: &anyhow::Error) -> bool {
+    let s = e.to_string().to_lowercase();
+    s.contains("database is locked") || s.contains("database is busy")
+}
+
 /// Kick off (or no-op if already running) a background job that embeds all pending
 /// messages batch-by-batch, releasing the DB lock between batches.
 #[tauri::command]
 fn build_embeddings(app: AppHandle) -> AppResult<()> {
+    if app.state::<IndexJob>().0.load(Ordering::Relaxed) {
+        return Ok(()); // a reindex is writing — don't fight it for the write lock
+    }
     let job = app.state::<EmbedJob>();
     if job.0.swap(true, Ordering::SeqCst) {
         return Ok(()); // already running
@@ -298,6 +349,11 @@ fn build_embeddings(app: AppHandle) -> AppResult<()> {
             Ok(conn) => embed::embed_progress(&conn).unwrap_or((0, 0)),
             Err(_) => (0, 0),
         };
+        // Consecutive batches we couldn't persist because another writer held the lock.
+        // We re-queue instead of aborting (the manual Reindex is now mutually exclusive,
+        // but the file watcher still indexes incrementally), bailing only after a long
+        // standoff so a truly stuck writer can't spin us forever.
+        let mut deferrals = 0u32;
         loop {
             // 1. Locked, fast: claim the next batch of pending messages.
             let rows = {
@@ -324,14 +380,40 @@ fn build_embeddings(app: AppHandle) -> AppResult<()> {
                 }
             };
             // 3. Locked, fast: persist the vectors + mark the messages embedded.
+            //    Another writer (the MCP server, `cal`, a second app instance) can
+            //    hold the write lock; retry "database is locked" instead of aborting
+            //    the whole job, releasing the mutex between tries so the UI breathes.
             let ids: Vec<i64> = rows.iter().map(|(id, _)| *id).collect();
-            {
-                let Ok(mut conn) = db.0.lock() else { break };
-                if let Err(e) = embed::store_batch(&mut conn, &ids, &owners, &vecs) {
-                    eprintln!("[embed] {e}");
-                    break;
+            let mut stored = false;
+            for _ in 0..10 {
+                let res = {
+                    let Ok(mut conn) = db.0.lock() else { break };
+                    embed::store_batch(&mut conn, &ids, &owners, &vecs)
+                };
+                match res {
+                    Ok(()) => {
+                        stored = true;
+                        break;
+                    }
+                    Err(e) if is_db_locked(&e) => {
+                        std::thread::sleep(std::time::Duration::from_millis(300));
+                    }
+                    Err(e) => {
+                        eprintln!("[embed] {e}");
+                        break;
+                    }
                 }
             }
+            if !stored {
+                deferrals += 1;
+                if deferrals > 40 {
+                    eprintln!("[embed] giving up — database stayed locked too long");
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                continue; // re-queue this batch; don't kill the whole job
+            }
+            deferrals = 0;
             done += rows.len() as i64;
             let _ = app.emit("embed:progress", EmbedProgressEvent { done, total });
         }
@@ -537,6 +619,84 @@ fn recall_facts(
     };
     let conn = lock(db)?;
     Ok(knowledge::recall(&conn, &qv, kind, project, limit.unwrap_or(20) as usize)?)
+}
+
+/// A thread cited as a source in an "ask your history" answer.
+#[derive(Debug, Serialize)]
+struct AskSource {
+    #[serde(rename = "threadId")]
+    thread_id: i64,
+    title: Option<String>,
+    source: String,
+    #[serde(rename = "projectPath")]
+    project_path: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct AskAnswer {
+    answer: String,
+    sources: Vec<AskSource>,
+}
+
+/// "Ask your history" (RAG): retrieve the most relevant threads for a question, pack
+/// excerpts, and have the configured LLM answer with [thread N] citations.
+#[tauri::command]
+async fn ask_history(
+    db: tauri::State<'_, db::Db>,
+    embedder: tauri::State<'_, embed::Embedder>,
+    question: String,
+) -> AppResult<AskAnswer> {
+    let q = question.trim().to_string();
+    if q.is_empty() {
+        return Err(anyhow::anyhow!("ask needs a question").into());
+    }
+    // Embed the query OUTSIDE the lock; retrieve + pack excerpts under it; LLM after.
+    let qv = embed::embed_query(&embedder, &q)?;
+    let (provider, model, key, context, sources) = {
+        let conn = lock(&db)?;
+        let (provider, model, key) = resolve_distill_engine(&conn)?;
+        let filters = SearchFilters { limit: Some(30), ..Default::default() };
+        let hits = search::hybrid_vec(&conn, &q, qv.as_deref(), &filters)?;
+        let mut seen = std::collections::HashSet::new();
+        let mut sources: Vec<AskSource> = Vec::new();
+        let mut context = String::new();
+        for h in &hits {
+            if !seen.insert(h.thread_id) {
+                continue;
+            }
+            if sources.len() >= 5 {
+                break;
+            }
+            let excerpt = context::pack_thread(&conn, h.thread_id, 2500)?.unwrap_or_default();
+            context.push_str(&format!(
+                "[thread {}] {}\n{excerpt}\n\n",
+                h.thread_id,
+                h.title.as_deref().unwrap_or("untitled")
+            ));
+            sources.push(AskSource {
+                thread_id: h.thread_id,
+                title: h.title.clone(),
+                source: h.source.clone(),
+                project_path: h.project_path.clone(),
+            });
+        }
+        (provider, model, key, context, sources)
+    };
+    if sources.is_empty() {
+        return Ok(AskAnswer {
+            answer: "I couldn't find anything relevant in your history.".into(),
+            sources: Vec::new(),
+        });
+    }
+    let answer = agent::answer(&provider, &model, key.as_deref(), &q, &context).await?;
+    Ok(AskAnswer { answer, sources })
+}
+
+/// Code-aware search: threads that mention a file path (substring, case-insensitive).
+#[tauri::command]
+fn search_by_file(db: tauri::State<'_, db::Db>, path: String) -> AppResult<Vec<ThreadSummary>> {
+    let conn = lock(&db)?;
+    Ok(search::threads_with_file(&conn, &path, 200)?)
 }
 
 // ---- agent chat ----
@@ -904,6 +1064,7 @@ pub fn run() {
             app.manage(db::Db(Mutex::new(conn)));
             app.manage(embed::Embedder::default());
             app.manage(EmbedJob::default());
+            app.manage(IndexJob::default());
             app.manage(ChatGeneration::default());
             app.manage(PendingApprovals::default());
             // Background watcher keeps the index fresh as agents write new threads.
@@ -929,6 +1090,7 @@ pub fn run() {
             delete_threads,
             vacuum_db,
             index_all,
+            indexing_status,
             index_source,
             search_threads,
             recent_threads,
@@ -961,7 +1123,9 @@ pub fn run() {
             thread_knowledge,
             distill_thread,
             recall_decisions,
-            recall_gotchas
+            recall_gotchas,
+            ask_history,
+            search_by_file
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

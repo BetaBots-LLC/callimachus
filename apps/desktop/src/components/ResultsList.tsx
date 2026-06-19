@@ -29,12 +29,16 @@ export function ResultsList() {
     starred: starredOnly ? true : null,
     tags: selectedTags,
   };
-  const searching = query.length > 0;
+  // `file:embed/mod.rs` → code-aware search (threads mentioning that path).
+  const fileFilter = query.startsWith("file:") ? query.slice(5).trim() : null;
+  const searching = query.length > 0 && fileFilter === null;
 
   const { data, isLoading, isFetching, error } = useQuery<ResultItem[]>({
     queryKey: ["results", query, sources, includeSubagents, hybrid, starredOnly, selectedTags],
-    queryFn: async () =>
-      searching ? await api.searchThreads(query, filters) : await api.recentThreads(filters),
+    queryFn: async () => {
+      if (fileFilter) return await api.searchByFile(fileFilter);
+      return searching ? await api.searchThreads(query, filters) : await api.recentThreads(filters);
+    },
     // Keep the current results visible while the next search loads (no empty flash).
     placeholderData: keepPreviousData,
   });
