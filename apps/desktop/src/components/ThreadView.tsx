@@ -18,6 +18,7 @@ import { cn } from "@/lib/utils";
 import { ExternalLink, MoreHorizontal, Star } from "lucide-react";
 import { TagsEditor } from "./TagsEditor";
 import { KnowledgeButton } from "./KnowledgeSection";
+import { Loading } from "./Loading";
 import { Markdown, asCodeBlock } from "./Markdown";
 
 export function ThreadView() {
@@ -89,10 +90,7 @@ export function ThreadView() {
         Select a thread to read it.
       </div>
     );
-  if (isLoading)
-    return (
-      <div className="flex h-full items-center justify-center text-muted-foreground">Loading…</div>
-    );
+  if (isLoading) return <Loading label="Loading…" className="h-full" />;
   if (!data)
     return (
       <div className="flex h-full items-center justify-center text-muted-foreground">

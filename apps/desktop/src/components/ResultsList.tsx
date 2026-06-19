@@ -5,8 +5,9 @@ import { api, SOURCE_LABELS, type SearchHit, type ThreadSummary } from "../lib/a
 import { useUi } from "../store/ui";
 import { formatTime, renderSnippet, shortPath } from "../lib/format";
 import { Badge } from "@/components/ui/badge";
-import { Loader2, Star } from "lucide-react";
+import { Star } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { Loading } from "./Loading";
 
 type ResultItem = SearchHit | ThreadSummary;
 
@@ -47,13 +48,7 @@ export function ResultsList() {
     overscan: 10,
   });
 
-  if (isLoading)
-    return (
-      <div className="flex items-center justify-center gap-2 p-6 text-sm text-muted-foreground">
-        <Loader2 className="size-4 animate-spin" />
-        {searching ? "Searching…" : "Loading…"}
-      </div>
-    );
+  if (isLoading) return <Loading label={searching ? "Searching…" : "Loading…"} />;
   if (error) return <div className="p-6 text-sm text-destructive">{String(error)}</div>;
   if (items.length === 0) {
     return (

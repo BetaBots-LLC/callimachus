@@ -2,6 +2,7 @@ import { useQuery } from "@tanstack/react-query";
 import { api, SOURCE_LABELS, type SourceKind } from "../lib/api";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { formatTime, shortPath } from "../lib/format";
+import { Loading } from "./Loading";
 
 export function StatsView() {
   const { data, isLoading, isError, error } = useQuery({
@@ -9,7 +10,7 @@ export function StatsView() {
     queryFn: api.indexStats,
   });
 
-  if (isLoading) return <Centered>Crunching the index…</Centered>;
+  if (isLoading) return <Loading label="Crunching the index…" className="h-full" />;
   if (isError || !data) return <Centered>Couldn't load stats. {String(error ?? "")}</Centered>;
 
   const coverage = data.embeddable > 0 ? data.embedded / data.embeddable : 0;
