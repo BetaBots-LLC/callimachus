@@ -13,7 +13,7 @@ use rusqlite::Connection;
 /// Subcommands that identify a `cal` invocation when the app is launched directly.
 pub const COMMANDS: &[&str] = &[
     "search", "related", "recent", "cat", "show", "context", "stats", "export", "star", "tag",
-    "tags", "todos", "knowledge", "distill",
+    "tags", "todos", "knowledge", "distill", "decisions", "gotchas",
 ];
 
 const USAGE: &str = "\
@@ -30,12 +30,15 @@ USAGE:
   cal star <thread-id> [--off]   star a thread (--off to unstar)
   cal tag <thread-id> [<tag…>]   set a thread's tags (no tags = clear them)
   cal tags [--json]              list all tags with thread counts
-  cal todos [-p PROJECT] [-s SOURCE] [-n LIMIT] [--json]
-                                open TODOs found across your history
+  cal todos [<query…>] [-p PROJECT] [-s SOURCE] [-n LIMIT] [--json]
+                                open TODOs (optionally text-searched)
   cal knowledge <thread-id> [--json]
                                 distilled summary/decisions/gotchas for a thread
   cal distill <thread-id>       extract knowledge for a thread (needs distillation
                                 enabled in the app: local Ollama or an API key)
+  cal decisions <query…> [-p PROJECT] [-n LIMIT] [--json]
+  cal gotchas <query…> [-p PROJECT] [-n LIMIT] [--json]
+                                semantic recall of distilled decisions/gotchas
   cal help
 
 OPTIONS:
@@ -82,6 +85,8 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
         "todos" => cmd_todos(rest),
         "knowledge" => cmd_knowledge(rest),
         "distill" => cmd_distill(rest),
+        "decisions" => cmd_recall(rest, "decision"),
+        "gotchas" => cmd_recall(rest, "gotcha"),
         "help" | "-h" | "--help" => {
             println!("{USAGE}");
             Ok(())
@@ -312,8 +317,11 @@ fn cmd_tags(args: &[String]) -> anyhow::Result<()> {
 fn cmd_todos(args: &[String]) -> anyhow::Result<()> {
     let o = parse(args)?;
     let conn = open_db()?;
+    let query = o.positional.join(" ");
+    let query = (!query.trim().is_empty()).then_some(query.as_str());
     let todos = knowledge::list_open_todos(
         &conn,
+        query,
         o.project.as_deref(),
         o.source.as_deref(),
         o.limit.unwrap_or(50) as i64,
@@ -393,6 +401,40 @@ fn cmd_distill(args: &[String]) -> anyhow::Result<()> {
     let now = chrono::Utc::now().timestamp();
     knowledge::store_distilled(&mut conn, id, &distilled, now)?;
     print_knowledge(&knowledge::get_thread_knowledge(&conn, id)?);
+    Ok(())
+}
+
+fn cmd_recall(args: &[String], kind: &str) -> anyhow::Result<()> {
+    let o = parse(args)?;
+    let query = o.positional.join(" ");
+    if query.trim().is_empty() {
+        let cmd = if kind == "decision" { "decisions" } else { "gotchas" };
+        anyhow::bail!("usage: cal {cmd} <query…>");
+    }
+    let conn = open_db()?;
+    let embedder = embed::Embedder::default();
+    let Some(qv) = embed::embed_query(&embedder, &query)? else {
+        return Ok(());
+    };
+    let limit = o.limit.unwrap_or(20) as usize;
+    let hits = knowledge::recall(&conn, &qv, kind, o.project.as_deref(), limit)?;
+    if o.json {
+        println!("{}", serde_json::to_string_pretty(&hits)?);
+        return Ok(());
+    }
+    if hits.is_empty() {
+        eprintln!("nothing recalled — distill some threads first (`cal distill <id>`)");
+        return Ok(());
+    }
+    for h in &hits {
+        println!("• {}", h.text);
+        println!(
+            "    {} · thread {} · {:.0}% match",
+            h.title.as_deref().unwrap_or("untitled"),
+            h.thread_id,
+            h.similarity * 100.0
+        );
+    }
     Ok(())
 }
 

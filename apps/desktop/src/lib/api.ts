@@ -113,6 +113,18 @@ export interface KFact {
   text: string;
 }
 
+/** A semantically-recalled fact (decision/gotcha) with its source thread. */
+export interface RecallHit {
+  id: number;
+  threadId: number;
+  kind: string;
+  text: string;
+  source: SourceKind;
+  title: string | null;
+  projectPath: string | null;
+  similarity: number;
+}
+
 /** Distilled knowledge for one thread. */
 export interface ThreadKnowledge {
   summary: string | null;
@@ -208,8 +220,12 @@ export const api = {
   // [tag, threadCount][] sorted by count desc.
   listTags: () => invoke<[string, number][]>("list_tags"),
   // Knowledge layer: open TODOs across history (free heuristic tier).
-  listOpenTodos: (project?: string, source?: string) =>
-    invoke<TodoFact[]>("list_open_todos", { project: project ?? null, source: source ?? null }),
+  listOpenTodos: (query?: string, project?: string, source?: string) =>
+    invoke<TodoFact[]>("list_open_todos", {
+      query: query ?? null,
+      project: project ?? null,
+      source: source ?? null,
+    }),
   // Distillation (opt-in LLM tier).
   knowledgeConfig: () => invoke<KnowledgeConfig>("knowledge_config"),
   setKnowledgeConfig: (enabled: boolean, provider?: string, model?: string) =>
@@ -220,6 +236,11 @@ export const api = {
     }),
   threadKnowledge: (threadId: number) => invoke<ThreadKnowledge>("thread_knowledge", { threadId }),
   distillThread: (threadId: number) => invoke<ThreadKnowledge>("distill_thread", { threadId }),
+  // Cross-thread semantic recall of distilled facts.
+  recallDecisions: (query: string, project?: string) =>
+    invoke<RecallHit[]>("recall_decisions", { query, project: project ?? null }),
+  recallGotchas: (query: string, project?: string) =>
+    invoke<RecallHit[]>("recall_gotchas", { query, project: project ?? null }),
   embeddingStatus: () => invoke<EmbedStatus>("embedding_status"),
   buildEmbeddings: () => invoke<void>("build_embeddings"),
 

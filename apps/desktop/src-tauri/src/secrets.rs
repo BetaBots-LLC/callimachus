@@ -4,8 +4,17 @@
 //! under service "callimachus", account = the provider name.
 
 use anyhow::{Context, Result};
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
 
 const SERVICE: &str = "callimachus";
+
+/// In-memory cache of resolved keys (provider -> Some(key) | None), so we hit the OS
+/// keychain at most ONCE per provider per process. Without this, has_key/pick_synth
+/// poll the keychain on every UI query — which on macOS re-prompts for access every
+/// time (especially in dev, where each rebuild is a "new" app). Writes keep it in sync.
+static CACHE: LazyLock<Mutex<HashMap<String, Option<String>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn entry(provider: &str) -> Result<keyring::Entry> {
     keyring::Entry::new(SERVICE, provider).context("opening credential-store entry")
@@ -13,24 +22,41 @@ fn entry(provider: &str) -> Result<keyring::Entry> {
 
 /// Store (or replace) the API key for a provider.
 pub fn set_key(provider: &str, key: &str) -> Result<()> {
-    entry(provider)?.set_password(key).context("writing key")
+    entry(provider)?.set_password(key).context("writing key")?;
+    if let Ok(mut c) = CACHE.lock() {
+        c.insert(provider.to_string(), Some(key.to_string()));
+    }
+    Ok(())
 }
 
-/// Fetch a provider's API key, or None if not set.
+/// Fetch a provider's API key, or None if not set. Cached in memory after the first read.
 pub fn get_key(provider: &str) -> Result<Option<String>> {
-    match entry(provider)?.get_password() {
-        Ok(k) => Ok(Some(k)),
-        Err(keyring::Error::NoEntry) => Ok(None),
-        Err(e) => Err(anyhow::Error::from(e).context("reading key")),
+    if let Ok(c) = CACHE.lock() {
+        if let Some(cached) = c.get(provider) {
+            return Ok(cached.clone());
+        }
     }
+    let val = match entry(provider)?.get_password() {
+        Ok(k) => Some(k),
+        Err(keyring::Error::NoEntry) => None,
+        Err(e) => return Err(anyhow::Error::from(e).context("reading key")),
+    };
+    if let Ok(mut c) = CACHE.lock() {
+        c.insert(provider.to_string(), val.clone());
+    }
+    Ok(val)
 }
 
 /// Remove a provider's API key (no error if it was absent).
 pub fn delete_key(provider: &str) -> Result<()> {
-    match entry(provider)?.delete_credential() {
+    let res = match entry(provider)?.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
         Err(e) => Err(anyhow::Error::from(e).context("deleting key")),
+    };
+    if let Ok(mut c) = CACHE.lock() {
+        c.insert(provider.to_string(), None);
     }
+    res
 }
 
 /// Whether a key exists for a provider (without returning it).

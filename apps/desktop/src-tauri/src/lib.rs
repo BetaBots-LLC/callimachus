@@ -389,11 +389,18 @@ fn list_tags(db: tauri::State<'_, db::Db>) -> AppResult<Vec<(String, i64)>> {
 #[tauri::command]
 fn list_open_todos(
     db: tauri::State<'_, db::Db>,
+    query: Option<String>,
     project: Option<String>,
     source: Option<String>,
 ) -> AppResult<Vec<knowledge::TodoFact>> {
     let conn = lock(&db)?;
-    Ok(knowledge::list_open_todos(&conn, project.as_deref(), source.as_deref(), 500)?)
+    Ok(knowledge::list_open_todos(
+        &conn,
+        query.as_deref(),
+        project.as_deref(),
+        source.as_deref(),
+        500,
+    )?)
 }
 
 /// Current distillation engine config (enabled + provider/model).
@@ -453,6 +460,7 @@ fn thread_knowledge(
 #[tauri::command]
 async fn distill_thread(
     db: tauri::State<'_, db::Db>,
+    embedder: tauri::State<'_, embed::Embedder>,
     thread_id: i64,
 ) -> AppResult<knowledge::ThreadKnowledge> {
     // Resolve engine + pack the transcript under the lock, then release it.
@@ -466,9 +474,17 @@ async fn distill_thread(
 
     match agent::distill(&provider, &model, key.as_deref(), &packed).await {
         Ok(distilled) => {
-            let mut conn = lock(&db)?;
-            let now = chrono::Utc::now().timestamp();
-            knowledge::store_distilled(&mut conn, thread_id, &distilled, now)?;
+            {
+                let mut conn = lock(&db)?;
+                let now = chrono::Utc::now().timestamp();
+                knowledge::store_distilled(&mut conn, thread_id, &distilled, now)?;
+            }
+            // Embed the new facts so they're recallable across threads (lock released
+            // during inference). Best-effort — recall just lags if it fails.
+            if let Err(e) = embed::embed_pending_facts(&db, &embedder) {
+                eprintln!("[knowledge] embed facts: {e}");
+            }
+            let conn = lock(&db)?;
             Ok(knowledge::get_thread_knowledge(&conn, thread_id)?)
         }
         Err(e) => {
@@ -481,6 +497,46 @@ async fn distill_thread(
             Err(e.into())
         }
     }
+}
+
+/// Cross-thread semantic recall of distilled DECISIONS, matched to a query.
+#[tauri::command]
+fn recall_decisions(
+    db: tauri::State<'_, db::Db>,
+    embedder: tauri::State<'_, embed::Embedder>,
+    query: String,
+    project: Option<String>,
+    limit: Option<u32>,
+) -> AppResult<Vec<knowledge::RecallHit>> {
+    recall_facts(&db, &embedder, "decision", &query, project.as_deref(), limit)
+}
+
+/// Cross-thread semantic recall of distilled GOTCHAS, matched to a query.
+#[tauri::command]
+fn recall_gotchas(
+    db: tauri::State<'_, db::Db>,
+    embedder: tauri::State<'_, embed::Embedder>,
+    query: String,
+    project: Option<String>,
+    limit: Option<u32>,
+) -> AppResult<Vec<knowledge::RecallHit>> {
+    recall_facts(&db, &embedder, "gotcha", &query, project.as_deref(), limit)
+}
+
+/// Shared recall path: embed the query OUTSIDE the DB lock, then run the SQL KNN.
+fn recall_facts(
+    db: &db::Db,
+    embedder: &embed::Embedder,
+    kind: &str,
+    query: &str,
+    project: Option<&str>,
+    limit: Option<u32>,
+) -> AppResult<Vec<knowledge::RecallHit>> {
+    let Some(qv) = embed::embed_query(embedder, query)? else {
+        return Ok(Vec::new());
+    };
+    let conn = lock(db)?;
+    Ok(knowledge::recall(&conn, &qv, kind, project, limit.unwrap_or(20) as usize)?)
 }
 
 // ---- agent chat ----
@@ -852,6 +908,18 @@ pub fn run() {
             app.manage(PendingApprovals::default());
             // Background watcher keeps the index fresh as agents write new threads.
             indexer::watcher::spawn(app.handle().clone());
+            // Drain any distilled facts that aren't embedded yet (e.g. distilled before
+            // the recall index shipped) so cross-thread recall works. No-op if none.
+            {
+                let app = app.handle().clone();
+                std::thread::spawn(move || {
+                    let db = app.state::<db::Db>();
+                    let embedder = app.state::<embed::Embedder>();
+                    if let Err(e) = embed::embed_pending_facts(&db, &embedder) {
+                        eprintln!("[knowledge] startup fact embed: {e}");
+                    }
+                });
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -891,7 +959,9 @@ pub fn run() {
             knowledge_config,
             set_knowledge_config,
             thread_knowledge,
-            distill_thread
+            distill_thread,
+            recall_decisions,
+            recall_gotchas
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

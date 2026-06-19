@@ -154,6 +154,49 @@ pub fn embed_batch(conn: &mut Connection, embedder: &Embedder, batch: usize) -> 
     Ok(rows.len())
 }
 
+/// Embed pending decision/gotcha facts into `vec_facts` for cross-thread recall.
+/// Batched with the DB lock released during inference (same discipline as the message
+/// embed job). Called after distillation; a thread has only a handful of facts, so this
+/// is cheap. Idempotent — only `embedded = 0` facts are processed.
+pub fn embed_pending_facts(db: &crate::db::Db, embedder: &Embedder) -> Result<()> {
+    const BATCH: usize = 64;
+    loop {
+        // 1. Locked, fast: claim a batch of un-embedded recall facts.
+        let rows: Vec<(i64, String)> = {
+            let conn = db.0.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+            let mut stmt = conn.prepare(
+                "SELECT id, text FROM facts
+                 WHERE embedded = 0 AND kind IN ('decision', 'gotcha') LIMIT ?1",
+            )?;
+            let r = stmt
+                .query_map([BATCH as i64], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            r
+        };
+        if rows.is_empty() {
+            break;
+        }
+        // 2. UNLOCKED: model inference.
+        let vecs = embedder.embed(rows.iter().map(|(_, t)| t.clone()).collect())?;
+        // 3. Locked, fast: persist vectors + mark embedded.
+        {
+            let mut conn = db.0.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+            let tx = conn.transaction()?;
+            {
+                let mut ins =
+                    tx.prepare("INSERT INTO vec_facts (fact_id, embedding) VALUES (?1, ?2)")?;
+                let mut done = tx.prepare("UPDATE facts SET embedded = 1 WHERE id = ?1")?;
+                for ((id, _), v) in rows.iter().zip(vecs.iter()) {
+                    ins.execute(params![id, vec_to_bytes(v)])?;
+                    done.execute([*id])?;
+                }
+            }
+            tx.commit()?;
+        }
+    }
+    Ok(())
+}
+
 /// Embed a search query (with bge's query instruction prefix) into a single vector.
 /// Runs the model — call this WITHOUT holding the DB lock so inference never blocks
 /// other UI queries. Returns None for an empty/unembeddable query.
