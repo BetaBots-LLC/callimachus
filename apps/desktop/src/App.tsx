@@ -6,6 +6,7 @@ import { ThreadView } from "./components/ThreadView";
 import { ChatView } from "./components/ChatView";
 import { KnowledgeView } from "./components/KnowledgeView";
 import { AskView } from "./components/AskView";
+import { ProjectMemoryView } from "./components/ProjectMemoryView";
 import { StatsView } from "./components/StatsView";
 import { SettingsView } from "./components/SettingsView";
 import { Button } from "@/components/ui/button";
@@ -34,6 +35,7 @@ function App() {
       ? [
           { id: "knowledge" as View, label: "Knowledge" },
           { id: "ask" as View, label: "Ask" },
+          { id: "projects" as View, label: "Projects" },
         ]
       : []),
     ...TABS.slice(2),
@@ -86,6 +88,7 @@ function App() {
         {view === "chat" && <ChatView />}
         {view === "knowledge" && <KnowledgeView />}
         {view === "ask" && <AskView />}
+        {view === "projects" && <ProjectMemoryView />}
         {view === "stats" && <StatsView />}
         {view === "settings" && <SettingsView />}
       </div>

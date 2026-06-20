@@ -120,6 +120,34 @@ export interface KFact {
   text: string;
 }
 
+/** A distilled fact in a project's aggregated memory, with its source thread. */
+export interface MemoryFact {
+  id: number;
+  threadId: number;
+  text: string;
+  title: string | null;
+  createdAt: number;
+}
+
+/** Durable, aggregated knowledge for one project + distillation coverage. */
+export interface ProjectMemory {
+  project: string;
+  decisions: MemoryFact[];
+  gotchas: MemoryFact[];
+  openTodos: MemoryFact[];
+  threadCount: number;
+  distilledCount: number;
+  pendingCount: number;
+}
+
+/** A project (by path) with thread + distillation-coverage counts, for the picker. */
+export interface ProjectInfo {
+  project: string;
+  threadCount: number;
+  distilledCount: number;
+  lastActivity: number;
+}
+
 /** A thread cited as a source in an "ask your history" answer. */
 export interface AskSource {
   threadId: number;
@@ -236,6 +264,15 @@ export const api = {
     invoke<ThreadSummary[]>("recent_threads", { filters }),
   // Code-aware search: threads that mention a file path (substring).
   searchByFile: (path: string) => invoke<ThreadSummary[]>("search_by_file", { path }),
+  // Project Memory: aggregated distilled knowledge per project.
+  listProjects: () => invoke<ProjectInfo[]>("list_projects"),
+  projectMemory: (project: string) => invoke<ProjectMemory>("project_memory", { project }),
+  projectBrief: (project: string) => invoke<string>("project_brief", { project }),
+  distillProject: (project: string) => invoke<void>("distill_project", { project }),
+  distillingStatus: () => invoke<boolean>("distilling_status"),
+  cancelDistill: () => invoke<void>("cancel_distill"),
+  writeProjectMemoryFile: (project: string, withBrief: boolean) =>
+    invoke<string>("write_project_memory_file", { project, withBrief }),
   getThread: (threadId: number) => invoke<ThreadDetail | null>("get_thread", { threadId }),
   // Stars & tags ("collections").
   setStar: (threadId: number, starred: boolean) => invoke<void>("set_star", { threadId, starred }),

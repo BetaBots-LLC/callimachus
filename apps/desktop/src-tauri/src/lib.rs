@@ -30,6 +30,11 @@ struct EmbedJob(AtomicBool);
 #[derive(Default)]
 struct IndexJob(AtomicBool);
 
+/// Guards against more than one project-distill running at a time; clearing it mid-run
+/// (via `cancel_distill`) also signals the running job to stop.
+#[derive(Default)]
+struct DistillJob(AtomicBool);
+
 /// Cancellation token for the in-flight chat stream (one generation at a time).
 #[derive(Default)]
 struct ChatGeneration(Mutex<Option<tokio_util::sync::CancellationToken>>);
@@ -152,6 +157,11 @@ fn lock<'a>(db: &'a db::Db) -> AppResult<std::sync::MutexGuard<'a, rusqlite::Con
         .map_err(|e| anyhow::anyhow!("db lock poisoned: {e}").into())
 }
 
+/// Same as [`lock`] but anyhow-typed, for the background `run_project_distill` helper.
+fn lock_anyhow(db: &db::Db) -> anyhow::Result<std::sync::MutexGuard<'_, rusqlite::Connection>> {
+    db.0.lock().map_err(|e| anyhow::anyhow!("db lock poisoned: {e}"))
+}
+
 #[tauri::command]
 fn db_stats(db: tauri::State<'_, db::Db>) -> AppResult<DbStats> {
     let conn = lock(&db)?;
@@ -203,8 +213,10 @@ fn vacuum_db(db: tauri::State<'_, db::Db>) -> AppResult<()> {
 /// the report) when finished; no-op if one is already running.
 #[tauri::command]
 fn index_all(app: AppHandle) -> AppResult<()> {
-    if app.state::<EmbedJob>().0.load(Ordering::Relaxed) {
-        return Ok(()); // a semantic build is writing — don't fight it for the write lock
+    if app.state::<EmbedJob>().0.load(Ordering::Relaxed)
+        || app.state::<DistillJob>().0.load(Ordering::Relaxed)
+    {
+        return Ok(()); // a semantic build / distill is writing — don't fight for the lock
     }
     if app.state::<IndexJob>().0.swap(true, Ordering::SeqCst) {
         return Ok(()); // already running
@@ -305,6 +317,13 @@ struct IndexProgressEvent {
     current: String,
 }
 
+/// Pushed per thread during a project distill, to drive a progress bar.
+#[derive(Clone, Serialize)]
+struct DistillProgressEvent {
+    done: i64,
+    total: i64,
+}
+
 #[tauri::command]
 fn embedding_status(
     db: tauri::State<'_, db::Db>,
@@ -330,8 +349,10 @@ fn is_db_locked(e: &anyhow::Error) -> bool {
 /// messages batch-by-batch, releasing the DB lock between batches.
 #[tauri::command]
 fn build_embeddings(app: AppHandle) -> AppResult<()> {
-    if app.state::<IndexJob>().0.load(Ordering::Relaxed) {
-        return Ok(()); // a reindex is writing — don't fight it for the write lock
+    if app.state::<IndexJob>().0.load(Ordering::Relaxed)
+        || app.state::<DistillJob>().0.load(Ordering::Relaxed)
+    {
+        return Ok(()); // a reindex / distill is writing — don't fight it for the write lock
     }
     let job = app.state::<EmbedJob>();
     if job.0.swap(true, Ordering::SeqCst) {
@@ -579,6 +600,174 @@ async fn distill_thread(
             Err(e.into())
         }
     }
+}
+
+// ---- project memory ----
+
+/// Distinct projects with distillation coverage, for the Project Memory picker.
+#[tauri::command]
+fn list_projects(db: tauri::State<'_, db::Db>) -> AppResult<Vec<knowledge::ProjectInfo>> {
+    let conn = lock(&db)?;
+    Ok(knowledge::list_projects(&conn)?)
+}
+
+/// Aggregated, durable memory (decisions/gotchas/open todos + coverage) for one project.
+#[tauri::command]
+fn project_memory(
+    db: tauri::State<'_, db::Db>,
+    project: String,
+) -> AppResult<knowledge::ProjectMemory> {
+    let conn = lock(&db)?;
+    Ok(knowledge::get_project_memory(&conn, &project, 60)?)
+}
+
+/// Flatten a project's facts into markdown notes for the brief / memory file.
+fn format_memory_notes(m: &knowledge::ProjectMemory) -> String {
+    fn section(s: &mut String, title: &str, facts: &[knowledge::MemoryFact]) {
+        if facts.is_empty() {
+            return;
+        }
+        s.push_str(&format!("## {title}\n"));
+        for f in facts {
+            s.push_str(&format!("- {}\n", f.text.trim()));
+        }
+        s.push('\n');
+    }
+    let mut s = String::new();
+    section(&mut s, "Decisions", &m.decisions);
+    section(&mut s, "Gotchas", &m.gotchas);
+    section(&mut s, "Open TODOs", &m.open_todos);
+    s
+}
+
+/// LLM-synthesized orientation brief from a project's aggregated facts. Needs distillation
+/// enabled (it reuses the distill engine). Returns "" if there are no facts yet.
+#[tauri::command]
+async fn project_brief(db: tauri::State<'_, db::Db>, project: String) -> AppResult<String> {
+    let (provider, model, key, notes) = {
+        let conn = lock(&db)?;
+        let (provider, model, key) = resolve_distill_engine(&conn)?;
+        let mem = knowledge::get_project_memory(&conn, &project, 80)?;
+        (provider, model, key, format_memory_notes(&mem))
+    };
+    if notes.trim().is_empty() {
+        return Ok(String::new());
+    }
+    Ok(agent::project_brief(&provider, &model, key.as_deref(), &project, &notes).await?)
+}
+
+/// Write a project's memory (optionally with an LLM brief) to `<project>/.callimachus/
+/// memory.md` so agents can be pointed at it. Returns the written path.
+#[tauri::command]
+async fn write_project_memory_file(
+    db: tauri::State<'_, db::Db>,
+    project: String,
+    with_brief: bool,
+) -> AppResult<String> {
+    let (mem, engine) = {
+        let conn = lock(&db)?;
+        let mem = knowledge::get_project_memory(&conn, &project, 200)?;
+        let engine = if with_brief { resolve_distill_engine(&conn).ok() } else { None };
+        (mem, engine)
+    };
+    let brief = match engine {
+        Some((provider, model, key)) => {
+            let notes = format_memory_notes(&mem);
+            if notes.trim().is_empty() {
+                None
+            } else {
+                agent::project_brief(&provider, &model, key.as_deref(), &project, &notes).await.ok()
+            }
+        }
+        None => None,
+    };
+    let md = export::project_memory_md(&project, &mem, brief.as_deref());
+    let dir = std::path::Path::new(&project).join(".callimachus");
+    std::fs::create_dir_all(&dir).map_err(anyhow::Error::from)?;
+    let path = dir.join("memory.md");
+    std::fs::write(&path, md).map_err(anyhow::Error::from)?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+/// Whether a project distill is in progress (for the Build-memory button state).
+#[tauri::command]
+fn distilling_status(job: tauri::State<'_, DistillJob>) -> bool {
+    job.0.load(Ordering::Relaxed)
+}
+
+/// Stop a running project distill at the next thread boundary.
+#[tauri::command]
+fn cancel_distill(job: tauri::State<'_, DistillJob>) {
+    job.0.store(false, Ordering::SeqCst);
+}
+
+/// Distill every not-yet-distilled thread in a project, in the BACKGROUND, so the whole
+/// project's memory fills in. Rate-limited + cancellable; mutually exclusive with reindex
+/// and the embedding build (all share one write lock). Emits distill:progress / distill:done.
+#[tauri::command]
+fn distill_project(app: AppHandle, project: String) -> AppResult<()> {
+    if app.state::<IndexJob>().0.load(Ordering::Relaxed)
+        || app.state::<EmbedJob>().0.load(Ordering::Relaxed)
+    {
+        return Ok(()); // a reindex / embed build is writing — don't fight for the lock
+    }
+    if app.state::<DistillJob>().0.swap(true, Ordering::SeqCst) {
+        return Ok(()); // already running
+    }
+    tauri::async_runtime::spawn(async move {
+        if let Err(e) = run_project_distill(&app, &project).await {
+            eprintln!("[distill] {e}");
+        }
+        app.state::<DistillJob>().0.store(false, Ordering::SeqCst);
+        let _ = app.emit("distill:done", ());
+    });
+    Ok(())
+}
+
+async fn run_project_distill(app: &AppHandle, project: &str) -> anyhow::Result<()> {
+    let db = app.state::<db::Db>();
+    let embedder = app.state::<embed::Embedder>();
+    // Engine + worklist under the lock, then release it for the LLM calls.
+    let (provider, model, key, ids) = {
+        let conn = lock_anyhow(&db)?;
+        let (provider, model, key) = resolve_distill_engine(&conn)?;
+        let ids = knowledge::project_pending_threads(&conn, project)?;
+        (provider, model, key, ids)
+    };
+    let total = ids.len() as i64;
+    let _ = app.emit("distill:progress", DistillProgressEvent { done: 0, total });
+    for (i, tid) in ids.into_iter().enumerate() {
+        // cancel_distill clears the flag to stop us here.
+        if !app.state::<DistillJob>().0.load(Ordering::Relaxed) {
+            break;
+        }
+        let packed = {
+            let conn = lock_anyhow(&db)?;
+            context::pack_thread(&conn, tid, context::DEFAULT_BUDGET_CHARS)?
+        };
+        let Some(packed) = packed else { continue };
+        match agent::distill(&provider, &model, key.as_deref(), &packed).await {
+            Ok(distilled) => {
+                {
+                    let mut conn = lock_anyhow(&db)?;
+                    knowledge::store_distilled(&mut conn, tid, &distilled, chrono::Utc::now().timestamp())?;
+                }
+                if let Err(e) = embed::embed_pending_facts(&db, &embedder) {
+                    eprintln!("[distill] embed facts: {e}");
+                }
+            }
+            Err(e) => {
+                let conn = lock_anyhow(&db)?;
+                let msg: String =
+                    e.to_string().lines().next().unwrap_or("distillation failed").chars().take(160).collect();
+                let _ = knowledge::set_error(&conn, tid, &msg);
+            }
+        }
+        let _ = app.emit("distill:progress", DistillProgressEvent { done: (i as i64) + 1, total });
+        // Gentle pacing so a cloud provider isn't hammered.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    Ok(())
 }
 
 /// Cross-thread semantic recall of distilled DECISIONS, matched to a query.
@@ -990,6 +1179,23 @@ fn open_thread_in_cli(
             .map_err(anyhow::Error::from)?;
         (packed, project)
     };
+    // Prepend the project's distilled memory so the agent opens with what was already
+    // decided + the gotchas to avoid, not just this one thread's transcript.
+    let packed = match project.as_deref().filter(|p| !p.is_empty()) {
+        Some(proj) => {
+            let mem = lock(&db).ok().and_then(|c| knowledge::get_project_memory(&c, proj, 25).ok());
+            match mem {
+                Some(m) if !(m.decisions.is_empty() && m.gotchas.is_empty() && m.open_todos.is_empty()) => {
+                    format!(
+                        "<project_memory project=\"{proj}\">\n{}</project_memory>\n\n{packed}",
+                        format_memory_notes(&m)
+                    )
+                }
+                _ => packed,
+            }
+        }
+        None => packed,
+    };
     let program = program.unwrap_or_else(|| "claude".into());
     let path = agent::cli_resume::launch_with_context(&program, &packed, project.as_deref())?;
     Ok(path)
@@ -1065,6 +1271,7 @@ pub fn run() {
             app.manage(embed::Embedder::default());
             app.manage(EmbedJob::default());
             app.manage(IndexJob::default());
+            app.manage(DistillJob::default());
             app.manage(ChatGeneration::default());
             app.manage(PendingApprovals::default());
             // Background watcher keeps the index fresh as agents write new threads.
@@ -1125,7 +1332,14 @@ pub fn run() {
             recall_decisions,
             recall_gotchas,
             ask_history,
-            search_by_file
+            search_by_file,
+            list_projects,
+            project_memory,
+            project_brief,
+            write_project_memory_file,
+            distilling_status,
+            cancel_distill,
+            distill_project
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

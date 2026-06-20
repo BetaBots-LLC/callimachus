@@ -37,6 +37,16 @@ void listen("knowledge:todos-ready", () => {
 void listen<IndexProgress>("index:progress", (e) => {
   queryClient.setQueryData<IndexProgress>(["index_progress"], e.payload);
 });
+// Per-thread project-distill progress + completion → drive the bar, refresh the memory.
+void listen<{ done: number; total: number }>("distill:progress", (e) => {
+  queryClient.setQueryData(["distill_progress"], e.payload);
+});
+void listen("distill:done", () => {
+  queryClient.setQueryData(["distill_progress"], null);
+  for (const key of ["distill_status", "project_memory", "projects", "knowledge_config"]) {
+    void queryClient.invalidateQueries({ queryKey: [key] });
+  }
+});
 // Background re-index finished — clear progress, refresh results/stats/button state.
 void listen("index:done", () => {
   queryClient.setQueryData(["index_progress"], null);

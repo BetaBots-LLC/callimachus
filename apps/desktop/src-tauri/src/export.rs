@@ -117,6 +117,44 @@ fn fmt_date(epoch: Option<i64>) -> Option<String> {
         .map(|dt| dt.format("%Y-%m-%d").to_string())
 }
 
+/// Render a project's aggregated memory as the managed `.callimachus/memory.md`: a header,
+/// an optional LLM brief, then decisions / gotchas / open TODOs as bullets tagged with the
+/// source thread id. Pure string generation; the caller decides where to write it.
+pub fn project_memory_md(
+    project: &str,
+    mem: &crate::knowledge::ProjectMemory,
+    brief: Option<&str>,
+) -> String {
+    fn section(out: &mut String, title: &str, facts: &[crate::knowledge::MemoryFact]) {
+        if facts.is_empty() {
+            return;
+        }
+        out.push_str(&format!("## {title}\n\n"));
+        for f in facts {
+            out.push_str(&format!("- {} _(thread {})_\n", f.text.trim(), f.thread_id));
+        }
+        out.push('\n');
+    }
+    let base = project.rsplit(['/', '\\']).find(|s| !s.is_empty()).unwrap_or(project);
+    let mut out = String::new();
+    out.push_str(&format!("# Project memory: {base}\n\n"));
+    out.push_str(&format!(
+        "_Distilled by Callimachus across {} thread(s), {} analyzed. Project: `{}`._\n\n",
+        mem.thread_count, mem.distilled_count, project
+    ));
+    if let Some(b) = brief.map(str::trim).filter(|b| !b.is_empty()) {
+        out.push_str(b);
+        out.push_str("\n\n");
+    }
+    section(&mut out, "Decisions", &mem.decisions);
+    section(&mut out, "Gotchas", &mem.gotchas);
+    section(&mut out, "Open TODOs", &mem.open_todos);
+    if mem.decisions.is_empty() && mem.gotchas.is_empty() && mem.open_todos.is_empty() {
+        out.push_str("_No distilled knowledge yet. Run Build memory in Callimachus._\n");
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
