@@ -1,7 +1,7 @@
 import { create } from "zustand";
 import type { SourceKind } from "../lib/api";
 
-export type View = "search" | "chat" | "knowledge" | "ask" | "stats" | "settings";
+export type View = "search" | "chat" | "knowledge" | "ask" | "projects" | "stats" | "settings";
 
 interface UiState {
   view: View;
@@ -14,6 +14,8 @@ interface UiState {
   selectedTags: string[]; // collection filter: threads having ANY of these tags
   selectedThreadId: number | null;
   targetMessageId: number | null; // scroll-to target when opening from a search hit
+  selectedProject: string | null; // active project in the Projects view
+  openProject: (project: string) => void; // jump to a project's memory
   setQuery: (q: string) => void;
   toggleSource: (s: SourceKind) => void;
   toggleSubagents: () => void;
@@ -36,6 +38,8 @@ export const useUi = create<UiState>((set) => ({
   selectedTags: [],
   selectedThreadId: null,
   targetMessageId: null,
+  selectedProject: null,
+  openProject: (project) => set({ selectedProject: project, view: "projects" }),
   setQuery: (query) => set({ query }),
   toggleSource: (s) =>
     set((state) => ({

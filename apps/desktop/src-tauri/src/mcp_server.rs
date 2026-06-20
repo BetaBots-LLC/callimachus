@@ -95,6 +95,12 @@ struct RecallArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+struct ProjectMemoryArgs {
+    /// Project-path substring. Omit to use the git repo the server runs in.
+    project: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 struct ProjectSearchArgs {
     /// The search query.
     query: String,
@@ -295,6 +301,25 @@ impl Callimachus {
         Parameters(args): Parameters<RecallArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         self.recall_facts(args, "gotcha")
+    }
+
+    #[tool(
+        description = "Get a project's durable MEMORY: the decisions, gotchas, and open TODOs distilled across ALL past AI-coding sessions on it, with coverage counts. Omit `project` to use the repo the server runs in. Call this at the START of work on a project to recall what was already decided and what to watch out for. Decisions/gotchas need the user to have distilled threads; TODOs are always available."
+    )]
+    async fn project_memory(
+        &self,
+        Parameters(args): Parameters<ProjectMemoryArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let project = args.project.or_else(current_project_root).unwrap_or_default();
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let mem = crate::knowledge::get_project_memory(&conn, &project, 60)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let json = serde_json::to_string_pretty(&mem)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 }
 

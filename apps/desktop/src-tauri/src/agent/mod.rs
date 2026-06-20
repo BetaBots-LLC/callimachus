@@ -179,6 +179,42 @@ pub async fn answer(
     Ok(text.trim().to_string())
 }
 
+/// System prompt for the project-memory brief — a tight orientation built from facts
+/// already distilled across many sessions on ONE project.
+const BRIEF_SYSTEM: &str = "You write a concise project-memory brief for a developer, from \
+notes (decisions, gotchas, open TODOs) distilled across many past AI coding sessions on a \
+SINGLE project. Output GitHub-flavored markdown: a 1-2 sentence orientation, then short \
+sections — Key decisions, Watch out for (gotchas), and Open threads — as tight bullets. \
+Merge duplicates, keep the most load-bearing points, stay specific and technical. Use ONLY \
+the provided notes; never invent. If a section has nothing, omit it.";
+
+/// Synthesize a project-memory brief from a project's aggregated facts. Same provider
+/// plumbing as `synthesize`. The caller formats the facts into `notes`.
+pub async fn project_brief(
+    provider: &str,
+    model: &str,
+    api_key: Option<&str>,
+    project: &str,
+    notes: &str,
+) -> Result<String> {
+    let adapter = adapter_for(provider)?;
+    let key = api_key.map(str::to_string);
+    let client = Client::builder()
+        .with_adapter_kind(adapter)
+        .with_auth_resolver_fn(move |_iden: genai::ModelIden| Ok(key.clone().map(AuthData::from_single)))
+        .build();
+    let req = ChatRequest::new(Vec::new())
+        .with_system(BRIEF_SYSTEM)
+        .append_message(GMessage::user(format!("Project: {project}\n\nDistilled notes:\n\n{notes}")));
+    let options = ChatOptions::default().with_temperature(0.2).with_max_tokens(900);
+    let resp = client
+        .exec_chat(model, req, Some(&options))
+        .await
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let text = resp.into_first_text().ok_or_else(|| anyhow::anyhow!("brief returned no text"))?;
+    Ok(text.trim().to_string())
+}
+
 /// System prompt for STRUCTURED distillation into the knowledge `facts` table. We ask
 /// for plain JSON and parse leniently (works identically across cloud and local Ollama
 /// — no adapter-specific response-format API). TODOs are intentionally NOT requested:
