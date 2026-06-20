@@ -182,6 +182,63 @@ pub fn project_memory_md(
     out
 }
 
+/// The project memory as a `##` section for embedding in an agent context file
+/// (AGENTS.md / CLAUDE.md): compact decisions + gotchas + open TODOs, optional brief.
+pub fn agent_memory_md(
+    project: &str,
+    mem: &crate::knowledge::ProjectMemory,
+    brief: Option<&str>,
+) -> String {
+    fn bullets(out: &mut String, title: &str, facts: &[crate::knowledge::MemoryFact]) {
+        if facts.is_empty() {
+            return;
+        }
+        out.push_str(&format!("**{title}:**\n"));
+        for f in facts {
+            out.push_str(&format!("- {}\n", f.text.trim()));
+        }
+        out.push('\n');
+    }
+    let base = project
+        .rsplit(['/', '\\'])
+        .find(|s| !s.is_empty())
+        .unwrap_or(project);
+    let mut out = format!("## Project memory ({base})\n\n");
+    out.push_str(
+        "_Distilled from past AI-coding sessions by Callimachus. Read this before starting: it captures prior decisions and gotchas for this repo._\n\n",
+    );
+    if let Some(b) = brief.map(str::trim).filter(|b| !b.is_empty()) {
+        out.push_str(b);
+        out.push_str("\n\n");
+    }
+    bullets(&mut out, "Decisions", &mem.decisions);
+    bullets(&mut out, "Watch out for", &mem.gotchas);
+    bullets(&mut out, "Open TODOs", &mem.open_todos);
+    out.trim_end().to_string()
+}
+
+/// HTML-comment markers wrapping the Callimachus-managed section of an agent file.
+pub const MANAGED_START: &str = "<!-- callimachus:memory:start -->";
+pub const MANAGED_END: &str = "<!-- callimachus:memory:end -->";
+
+/// Insert or replace the Callimachus-managed block in an existing agent context file,
+/// leaving everything else (the user's own content) untouched.
+pub fn upsert_managed_block(existing: &str, body: &str) -> String {
+    let managed = format!("{MANAGED_START}\n{body}\n{MANAGED_END}");
+    if let (Some(s), Some(e)) = (existing.find(MANAGED_START), existing.find(MANAGED_END)) {
+        if e >= s {
+            let e_end = e + MANAGED_END.len();
+            return format!("{}{}{}", &existing[..s], managed, &existing[e_end..]);
+        }
+    }
+    let trimmed = existing.trim_end();
+    if trimmed.is_empty() {
+        format!("{managed}\n")
+    } else {
+        format!("{trimmed}\n\n{managed}\n")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,6 +312,21 @@ mod tests {
             "synthesis must sit above the transcript"
         );
         assert!(md.contains("used external-content table"));
+    }
+
+    #[test]
+    fn managed_block_inserts_then_replaces_idempotently() {
+        let v1 = upsert_managed_block("# AGENTS\n\nkeep this.", "BODY1");
+        assert!(v1.contains("keep this.") && v1.contains("BODY1"));
+        assert!(v1.contains(MANAGED_START) && v1.contains(MANAGED_END));
+        // Re-run with a new body: replaces the block, keeps user content, one block only.
+        let v2 = upsert_managed_block(&v1, "BODY2");
+        assert!(v2.contains("keep this.") && v2.contains("BODY2") && !v2.contains("BODY1"));
+        assert_eq!(
+            v2.matches(MANAGED_START).count(),
+            1,
+            "no duplicate managed block"
+        );
     }
 
     #[test]

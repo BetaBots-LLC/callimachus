@@ -285,6 +285,9 @@ export const api = {
   cancelDistill: () => invoke<void>("cancel_distill"),
   writeProjectMemoryFile: (project: string, withBrief: boolean) =>
     invoke<string>("write_project_memory_file", { project, withBrief }),
+  // Write/refresh the managed memory block in a project's AGENTS.md / CLAUDE.md.
+  writeAgentMemoryFile: (project: string, filename: string) =>
+    invoke<string>("write_agent_memory_file", { project, filename }),
   // Fact curation: pin / edit / hide distilled facts; LLM conflict review.
   setFactPinned: (factId: number, pinned: boolean) =>
     invoke<void>("set_fact_pinned", { factId, pinned }),

@@ -75,6 +75,9 @@ export function ProjectMemoryView() {
   const writeFile = useMutation({
     mutationFn: () => api.writeProjectMemoryFile(project as string, true),
   });
+  const agentsFile = useMutation({
+    mutationFn: () => api.writeAgentMemoryFile(project as string, "AGENTS.md"),
+  });
   const conflicts = useMutation({ mutationFn: () => api.detectConflicts(project as string) });
 
   // Curation actions (pin / hide / edit). Each updates the cached memory optimistically
@@ -219,6 +222,15 @@ export function ProjectMemoryView() {
           <Button
             size="sm"
             variant="ghost"
+            onClick={() => agentsFile.mutate()}
+            disabled={!project || agentsFile.isPending || empty}
+            title="Write/refresh the memory block in this repo's AGENTS.md"
+          >
+            {agentsFile.isPending ? "Writing…" : "Update AGENTS.md"}
+          </Button>
+          <Button
+            size="sm"
+            variant="ghost"
             onClick={() => conflicts.mutate()}
             disabled={!project || conflicts.isPending || !mem || mem.decisions.length < 2}
           >
@@ -234,8 +246,10 @@ export function ProjectMemoryView() {
             <ProgressValue className="text-xs" />
           </Progress>
         )}
-        {writeFile.data && (
-          <p className="truncate text-xs text-muted-foreground">Wrote {writeFile.data}</p>
+        {(writeFile.data || agentsFile.data) && (
+          <p className="truncate text-xs text-muted-foreground">
+            Wrote {writeFile.data || agentsFile.data}
+          </p>
         )}
         {curationError && <p className="text-xs text-destructive">{curationError}</p>}
       </div>

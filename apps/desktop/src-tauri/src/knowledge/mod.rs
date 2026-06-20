@@ -666,14 +666,16 @@ pub struct ProjectInfo {
 
 /// Distinct projects (by `project_path`), newest-active first, with distillation coverage.
 pub fn list_projects(conn: &Connection) -> Result<Vec<ProjectInfo>> {
+    // Group on the canonical project key (falls back to project_path until backfill runs)
+    // so worktrees / symlinks / ~ vs absolute don't split one repo into several projects.
     let mut stmt = conn.prepare(&format!(
-        "SELECT project_path,
+        "SELECT COALESCE(project_key, project_path) AS pkey,
                 COUNT(*) AS threads,
                 SUM(CASE WHEN knowledge_extracted = 1 THEN 1 ELSE 0 END) AS distilled,
                 MAX(updated_at) AS last
          FROM threads
          WHERE project_path IS NOT NULL AND project_path != '' AND {DISTILLABLE}
-         GROUP BY project_path
+         GROUP BY pkey
          ORDER BY last DESC"
     ))?;
     let rows = stmt.query_map([], |r| {
@@ -695,12 +697,12 @@ fn project_facts(
     open_only: bool,
     limit: usize,
 ) -> Result<Vec<MemoryFact>> {
-    // Exact project_path match (the picker / cwd pass the canonical path) so this uses
-    // idx_threads_project + idx_facts_thread_kind instead of scanning a kind-partition.
+    // Match the canonical project key (callers pass it; falls back to project_path until
+    // backfill), so all of one repo's threads aggregate together.
     let mut sql = String::from(
         "SELECT f.id, f.thread_id, f.text, t.title, f.created_at, f.pinned
          FROM facts f JOIN threads t ON t.id = f.thread_id
-         WHERE f.kind = ?1 AND t.project_path = ?2 AND f.hidden = 0",
+         WHERE f.kind = ?1 AND COALESCE(t.project_key, t.project_path) = ?2 AND f.hidden = 0",
     );
     if open_only {
         sql.push_str(" AND f.status = 'open'");
@@ -742,7 +744,8 @@ pub fn get_project_memory(
     let count = |extra: &str| -> Result<i64> {
         Ok(conn.query_row(
             &format!(
-                "SELECT COUNT(*) FROM threads WHERE project_path = ?1 AND {DISTILLABLE}{extra}"
+                "SELECT COUNT(*) FROM threads
+                 WHERE COALESCE(project_key, project_path) = ?1 AND {DISTILLABLE}{extra}"
             ),
             [project],
             |r| r.get(0),
@@ -765,7 +768,7 @@ pub fn get_project_memory(
 pub fn project_pending_threads(conn: &Connection, project: &str) -> Result<Vec<i64>> {
     let mut stmt = conn.prepare(&format!(
         "SELECT id FROM threads
-         WHERE project_path = ?1 AND knowledge_extracted = 0 AND {DISTILLABLE}
+         WHERE COALESCE(project_key, project_path) = ?1 AND knowledge_extracted = 0 AND {DISTILLABLE}
          ORDER BY updated_at DESC"
     ))?;
     let rows = stmt.query_map([project], |r| r.get::<_, i64>(0))?;
@@ -792,8 +795,8 @@ pub fn record_fact(
         })?;
     let ext = format!("callimachus-notes:{project}");
     conn.execute(
-        "INSERT INTO threads (source_id, external_id, title, project_path, created_at, updated_at)
-         VALUES (?1, ?2, 'Recorded memory', ?3, ?4, ?4)
+        "INSERT INTO threads (source_id, external_id, title, project_path, project_key, created_at, updated_at)
+         VALUES (?1, ?2, 'Recorded memory', ?3, ?3, ?4, ?4)
          ON CONFLICT(source_id, external_id) DO UPDATE SET updated_at = ?4",
         params![source_id, ext, project, now],
     )?;
@@ -814,7 +817,7 @@ pub fn record_fact(
 pub fn project_decisions(conn: &Connection, project: &str) -> Result<Vec<(i64, String)>> {
     let mut stmt = conn.prepare(
         "SELECT f.id, f.text FROM facts f JOIN threads t ON t.id = f.thread_id
-         WHERE f.kind = 'decision' AND t.project_path = ?1 AND f.hidden = 0
+         WHERE f.kind = 'decision' AND COALESCE(t.project_key, t.project_path) = ?1 AND f.hidden = 0
          ORDER BY f.created_at DESC",
     )?;
     let rows = stmt.query_map([project], |r| {

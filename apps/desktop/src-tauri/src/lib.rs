@@ -929,6 +929,27 @@ async fn write_project_memory_file(
     Ok(path.to_string_lossy().into_owned())
 }
 
+/// Write/refresh the Callimachus memory block in a project's agent context file (AGENTS.md
+/// / CLAUDE.md), preserving the user's own content. So any agent that reads the file opens
+/// with the project's distilled memory. `project` is the canonical key (a repo path).
+#[tauri::command]
+fn write_agent_memory_file(
+    pool: tauri::State<'_, db::ReadPool>,
+    project: String,
+    filename: String,
+) -> AppResult<String> {
+    let mem = {
+        let conn = read(&pool)?;
+        knowledge::get_project_memory(&conn, &project, 100)?
+    };
+    let body = export::agent_memory_md(&project, &mem, None);
+    let path = std::path::Path::new(&project).join(&filename);
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    std::fs::write(&path, export::upsert_managed_block(&existing, &body))
+        .map_err(anyhow::Error::from)?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
 /// Whether a project distill is in progress (for the Build-memory button state).
 #[tauri::command]
 fn distilling_status(job: tauri::State<'_, DistillJob>) -> bool {
@@ -1585,9 +1606,10 @@ fn open_thread_in_cli(
     // decided + the gotchas to avoid, not just this one thread's transcript.
     let packed = match project.as_deref().filter(|p| !p.is_empty()) {
         Some(proj) => {
+            let key = indexer::canonical_project(proj).unwrap_or_else(|| proj.to_string());
             let mem = read(&pool)
                 .ok()
-                .and_then(|c| knowledge::get_project_memory(&c, proj, 25).ok());
+                .and_then(|c| knowledge::get_project_memory(&c, &key, 25).ok());
             match mem {
                 Some(m)
                     if !(m.decisions.is_empty()
@@ -1669,6 +1691,10 @@ pub fn run() {
             std::fs::create_dir_all(&dir)?;
             let db_path = dir.join("index.db");
             let conn = db::open(&db_path)?; // single WRITER; also runs migrations
+                                            // Post-migration: fill canonical project keys for existing threads (fast).
+            if let Err(e) = indexer::backfill_project_keys(&conn) {
+                eprintln!("[index] project-key backfill: {e}");
+            }
             app.manage(db::Db(Mutex::new(conn)));
             // Read pool (after the writer migrated): UI read commands run concurrently
             // here instead of serializing behind the writer mutex.
@@ -1751,6 +1777,7 @@ pub fn run() {
             distilling_status,
             cancel_distill,
             distill_project,
+            write_agent_memory_file,
             set_fact_pinned,
             hide_fact,
             set_todo_done,
