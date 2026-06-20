@@ -1,5 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
-import { Moon, Sun } from "lucide-react";
+import { BarChart3, Moon, Settings, Sun } from "lucide-react";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { SearchBar } from "./components/SearchBar";
 import { ResultsList } from "./components/ResultsList";
 import { ThreadView } from "./components/ThreadView";
@@ -18,11 +19,14 @@ import { api } from "./lib/api";
 import { useUi, type View } from "./store/ui";
 import { useTheme } from "./store/theme";
 
+// Content views shown as labeled tabs. Utilities (Stats, Settings) live as right-side icons.
 const TABS: { id: View; label: string }[] = [
   { id: "search", label: "Search" },
   { id: "chat", label: "Chat" },
-  { id: "stats", label: "Stats" },
-  { id: "settings", label: "Settings" },
+  { id: "coach", label: "Coach" },
+  { id: "knowledge", label: "Knowledge" },
+  { id: "ask", label: "Ask" },
+  { id: "projects", label: "Projects" },
 ];
 
 function App() {
@@ -41,22 +45,13 @@ function App() {
   const forceOnboard =
     import.meta.env.DEV &&
     (import.meta.env.VITE_ONBOARD === "1" || localStorage.getItem("cal:onboard") === "1");
-  const tabs: { id: View; label: string }[] = [
-    ...TABS.slice(0, 2),
-    { id: "coach", label: "Coach" },
-    { id: "knowledge", label: "Knowledge" },
-    { id: "ask", label: "Ask" },
-    { id: "projects", label: "Projects" },
-    ...TABS.slice(2),
-  ];
-
   return (
     <div className="flex h-screen flex-col bg-background text-foreground">
       <header className="flex items-center justify-between border-b px-4 py-2">
         <div className="flex items-center gap-3">
           <span className="font-semibold tracking-tight">Callimachus</span>
           <nav className="flex gap-1">
-            {tabs.map((t) => (
+            {TABS.map((t) => (
               <Button
                 key={t.id}
                 size="sm"
@@ -68,23 +63,67 @@ function App() {
             ))}
           </nav>
         </div>
-        <div className="flex items-center gap-3">
-          {stats && (
-            <span className="text-xs text-muted-foreground">
-              {stats.threads.toLocaleString()} threads · {stats.messages.toLocaleString()} messages
-            </span>
-          )}
+        <div className="flex items-center gap-1">
           <button
             type="button"
             onClick={() => setCommandOpen(true)}
             title="Command palette"
-            className="hidden cursor-pointer items-center gap-1 rounded-md border px-2 py-1 text-[0.7rem] text-muted-foreground transition-colors hover:bg-muted hover:text-foreground sm:flex"
+            className="mr-1 hidden cursor-pointer items-center gap-1 rounded-md border px-2 py-1 text-[0.7rem] text-muted-foreground transition-colors hover:bg-muted hover:text-foreground sm:flex"
           >
             <kbd className="font-sans">⌘K</kbd>
           </button>
-          <Button size="icon" variant="ghost" onClick={toggleTheme} aria-label="Toggle theme">
-            {theme === "dark" ? <Sun /> : <Moon />}
-          </Button>
+          <TooltipProvider delay={200}>
+            <Tooltip>
+              <TooltipTrigger
+                render={
+                  <Button
+                    size="icon"
+                    variant={view === "stats" ? "secondary" : "ghost"}
+                    onClick={() => setView("stats")}
+                    aria-label="Stats"
+                  />
+                }
+              >
+                <BarChart3 />
+              </TooltipTrigger>
+              <TooltipContent>
+                Stats
+                {stats
+                  ? ` · ${stats.threads.toLocaleString()} threads, ${stats.messages.toLocaleString()} messages`
+                  : ""}
+              </TooltipContent>
+            </Tooltip>
+            <Tooltip>
+              <TooltipTrigger
+                render={
+                  <Button
+                    size="icon"
+                    variant={view === "settings" ? "secondary" : "ghost"}
+                    onClick={() => setView("settings")}
+                    aria-label="Settings"
+                  />
+                }
+              >
+                <Settings />
+              </TooltipTrigger>
+              <TooltipContent>Settings</TooltipContent>
+            </Tooltip>
+            <Tooltip>
+              <TooltipTrigger
+                render={
+                  <Button
+                    size="icon"
+                    variant="ghost"
+                    onClick={toggleTheme}
+                    aria-label="Toggle theme"
+                  />
+                }
+              >
+                {theme === "dark" ? <Sun /> : <Moon />}
+              </TooltipTrigger>
+              <TooltipContent>{theme === "dark" ? "Light mode" : "Dark mode"}</TooltipContent>
+            </Tooltip>
+          </TooltipProvider>
         </div>
       </header>
 
