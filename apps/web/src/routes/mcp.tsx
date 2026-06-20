@@ -19,7 +19,7 @@ export const Route = createFileRoute("/mcp")({
   component: McpPage,
 });
 
-const TOOLS = [
+const TOOLS: { name: string; note: string; write?: boolean }[] = [
   { name: "search_threads", note: "Keyword + optional semantic search of the whole index" },
   { name: "search_current_project", note: "Scope search to the launching repo" },
   { name: "recent_threads", note: "The most recently updated threads" },
@@ -29,6 +29,12 @@ const TOOLS = [
   { name: "get_thread_knowledge", note: "Distilled summary, decisions, gotchas for a thread" },
   { name: "recall_decisions", note: "Semantically recall past decisions and why" },
   { name: "recall_gotchas", note: "Semantically recall known pitfalls to avoid" },
+  { name: "project_memory", note: "A project's durable memory: decisions, gotchas, open TODOs" },
+  { name: "ask_history", note: "A synthesized, cited answer over your own history (RAG)" },
+  { name: "threads_for_file", note: "Which past sessions touched a file path" },
+  { name: "complete_todo", note: "Mark an open TODO done — persists across re-index", write: true },
+  { name: "record_decision", note: "Persist a decision into a project's memory", write: true },
+  { name: "record_gotcha", note: "Persist a gotcha into a project's memory", write: true },
 ];
 
 function McpPage() {
@@ -37,7 +43,7 @@ function McpPage() {
       no="04"
       kicker="MCP server"
       title="Give every agent a memory."
-      description="callimachus-mcp exposes your local history to any MCP client through nine tools. Instead of re-explaining context, your agent can look it up — searching your own past sessions, recalling settled decisions and known gotchas, and pulling the exact thread it needs."
+      description="callimachus-mcp exposes your local history to any MCP client through fifteen tools — and now reads and writes the memory layer. Instead of re-explaining context, your agent can look it up: searching past sessions, recalling settled decisions and known gotchas, asking your history a cited question, and pulling the exact thread it needs. It can also write back — closing TODOs and recording new decisions and gotchas — but only ever touches Callimachus's own index and memory, never your files."
     >
       <div className="grid gap-10 lg:grid-cols-2">
         <div className="flex flex-col gap-4">
@@ -74,11 +80,25 @@ function McpPage() {
                 key={t.name}
                 className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1 border-b border-border py-3.5"
               >
-                <code className="font-mono text-sm text-link">{t.name}</code>
+                <code className="font-mono text-sm text-link">
+                  {t.name}
+                  {t.write && (
+                    <span className="ml-2 align-middle font-mono text-[10px] uppercase tracking-wide text-amber-500">
+                      write
+                    </span>
+                  )}
+                </code>
                 <span className="text-sm text-muted-foreground">{t.note}</span>
               </li>
             ))}
           </ul>
+          <p className="text-sm leading-relaxed text-muted-foreground">
+            Twelve read tools and three <span className="font-mono text-amber-500">write</span>{" "}
+            tools (<code className="font-mono">complete_todo</code>,{" "}
+            <code className="font-mono">record_decision</code>,{" "}
+            <code className="font-mono">record_gotcha</code>) that update Callimachus's own memory —
+            never your project files.
+          </p>
         </div>
       </div>
     </ProductLayout>

@@ -10,7 +10,7 @@ export const Route = createFileRoute("/cli")({
     meta: seo({
       title: "cal — the Callimachus CLI",
       description:
-        "Search your AI coding history from the terminal. cal search, recent, cat, ask, files, stats, and export — pipe-friendly, reading the same local index as the desktop app.",
+        "Search your AI coding history from the terminal. cal search, recent, cat, ask, files, memory, remember, stats, and export — pipe-friendly, reading the same local index as the desktop app.",
       path: "/cli",
     }),
     links: [{ rel: "canonical", href: `${SITE_URL}/cli` }],
@@ -62,6 +62,12 @@ function CliPage() {
               'cal ask "how did we handle the write-lock contention?"',
               "# every thread that touched a file path",
               "cal files embed/mod.rs",
+              "# a project's durable memory (decisions / gotchas / open TODOs)",
+              "cal memory",
+              "# record a decision into the current repo's memory",
+              'cal remember decision "use sqlite-vec for the KNN index"',
+              "# close out a leftover TODO",
+              "cal done 137",
             ]}
           />
         </div>
@@ -88,6 +94,13 @@ function CliPage() {
           gotchas, and <code className="font-mono">cal decisions</code> /{" "}
           <code className="font-mono">cal gotchas</code> recall them semantically across your whole
           history.
+        </p>
+        <p className="mt-4 max-w-[60ch] leading-relaxed text-muted-foreground">
+          Each project keeps a durable memory: <code className="font-mono">cal memory</code> prints
+          its aggregated decisions, gotchas, and open TODOs (defaults to the current repo). And it
+          writes back too — <code className="font-mono">cal remember decision|gotcha</code> pins a
+          new fact into that memory, and <code className="font-mono">cal done</code> closes a
+          leftover TODO. These only ever touch Callimachus's own index and memory, never your files.
         </p>
       </div>
     </ProductLayout>

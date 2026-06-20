@@ -1,13 +1,15 @@
 import { useRef, useState } from "react";
-import { keepPreviousData, useQuery } from "@tanstack/react-query";
+import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { useDebouncedCallback } from "@tanstack/react-pacer";
-import { api, SOURCE_LABELS, type SourceKind } from "../lib/api";
+import { Check } from "lucide-react";
+import { api, SOURCE_LABELS, type SourceKind, type TodoFact } from "../lib/api";
 import { useUi } from "../store/ui";
 import { shortPath } from "../lib/format";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Item, ItemActions, ItemContent, ItemDescription, ItemTitle } from "@/components/ui/item";
 import { Loading } from "./Loading";
 
 type Mode = "todos" | "decision" | "gotcha";
@@ -40,6 +42,27 @@ export function KnowledgeView() {
   const setView = useUi((s) => s.setView);
   // Recall embeds the query (model inference), so debounce it.
   const commit = useDebouncedCallback((v: string) => setCommitted(v.trim()), { wait: 350 });
+  const qc = useQueryClient();
+  // Optimistically drop the todo so the check feels instant (no spinner waiting on
+  // the write + refetch); roll back if the write fails.
+  const markDone = useMutation({
+    mutationFn: (id: number) => api.setTodoDone(id, true),
+    onMutate: async (id: number) => {
+      const key = ["open_todos", committed];
+      await qc.cancelQueries({ queryKey: ["open_todos"] });
+      const prev = qc.getQueryData<TodoFact[]>(key);
+      if (prev)
+        qc.setQueryData<TodoFact[]>(
+          key,
+          prev.filter((t) => t.id !== id),
+        );
+      return { key, prev };
+    },
+    onError: (_e, _id, ctx) => {
+      if (ctx?.prev) qc.setQueryData(ctx.key, ctx.prev);
+    },
+    onSettled: () => qc.invalidateQueries({ queryKey: ["open_todos"] }),
+  });
 
   // Server-side text search so it scales past the page limit (users with lots of todos).
   const todos = useQuery({
@@ -149,7 +172,11 @@ export function KnowledgeView() {
                   className="absolute left-0 top-0 w-full pb-2"
                   style={{ transform: `translateY(${vrow.start}px)` }}
                 >
-                  <Row item={item} onClick={() => open(item.threadId)} />
+                  <Row
+                    item={item}
+                    onClick={() => open(item.threadId)}
+                    onDone={mode === "todos" ? () => markDone.mutate(item.id) : undefined}
+                  />
                 </div>
               );
             })}
@@ -175,27 +202,68 @@ function Empty({ mode, filtering }: { mode: Mode; filtering: boolean }) {
   }
   return (
     <p className="px-1 text-sm text-muted-foreground">
-      Nothing recalled. Distillation must be on and some threads distilled (open a thread → Distill).
+      Nothing recalled. Distillation must be on and some threads distilled (open a thread →
+      Distill).
     </p>
   );
 }
 
-function Row({ item, onClick }: { item: RowItem; onClick: () => void }) {
+function Row({
+  item,
+  onClick,
+  onDone,
+}: {
+  item: RowItem;
+  onClick: () => void;
+  onDone?: () => void;
+}) {
   return (
-    <button
-      type="button"
+    <Item
+      variant="outline"
+      role="button"
+      tabIndex={0}
       onClick={onClick}
-      className="block w-full cursor-pointer rounded-lg border px-3 py-2.5 text-left transition-colors hover:bg-muted/50"
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          onClick();
+        }
+      }}
+      className="cursor-pointer items-start gap-2.5 transition-colors hover:bg-muted/40 focus-visible:bg-muted/40"
     >
-      <div className="text-sm">{item.text}</div>
-      <div className="mt-1.5 flex items-center gap-2 text-[0.72rem] text-muted-foreground">
-        <Badge variant="outline" className="shrink-0 text-[0.6rem] uppercase">
-          {SOURCE_LABELS[item.source]}
-        </Badge>
-        <span className="truncate">{item.title || "Untitled thread"}</span>
-        {item.projectPath && <span className="shrink-0">· {shortPath(item.projectPath)}</span>}
-        {item.meta && <span className="ml-auto shrink-0">{item.meta}</span>}
-      </div>
-    </button>
+      <ItemContent className="min-w-0 gap-1">
+        {/* overflow-wrap:anywhere so a long unbroken token (URL/path) can't force x-scroll */}
+        <ItemTitle className="block w-full text-sm font-normal leading-snug wrap-anywhere">
+          {item.text}
+        </ItemTitle>
+        <ItemDescription className="flex min-w-0 items-center gap-2 text-[0.72rem]">
+          <Badge variant="outline" className="shrink-0 text-[0.6rem] uppercase">
+            {SOURCE_LABELS[item.source]}
+          </Badge>
+          <span className="min-w-0 flex-1 truncate">
+            {item.title || "Untitled thread"}
+            {item.projectPath ? ` · ${shortPath(item.projectPath)}` : ""}
+          </span>
+        </ItemDescription>
+      </ItemContent>
+      <ItemActions className="shrink-0 gap-1 self-start">
+        {item.meta && (
+          <span className="text-xs tabular-nums text-muted-foreground">{item.meta}</span>
+        )}
+        {onDone && (
+          <button
+            type="button"
+            title="Mark done"
+            onClick={(e) => {
+              e.stopPropagation();
+              onDone();
+            }}
+            className="grid size-7 place-items-center rounded-md text-muted-foreground transition-colors hover:bg-emerald-500/15 hover:text-emerald-600 dark:hover:text-emerald-400"
+          >
+            <Check className="size-4" />
+          </button>
+        )}
+      </ItemActions>
+    </Item>
   );
 }

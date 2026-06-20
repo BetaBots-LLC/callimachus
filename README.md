@@ -24,12 +24,14 @@ Grab the latest signed build from **[Releases](../../releases/latest)** — macO
 - **Indexes** every conversation from 11 coding agents into one local SQLite store — Claude Code, Codex, Cursor, Gemini CLI, Qwen Code, Goose, OpenCode, Continue, Cline, Roo Code, and Kilo Code. Adding another source is a [small, documented contract](apps/desktop/src-tauri/src/indexer/README.md).
 - **Searches** them with hybrid ranking: keyword (SQLite FTS5 / BM25) fused with on-device semantic similarity (sqlite-vec KNN, no cloud) via Reciprocal Rank Fusion. Filter by source, project, subagents, starred, and tags.
 - **Finds code-aware** — type `file:embed/mod.rs` in the search bar (or `cal files <path>`) to find every thread that touched a path; backed by a file-mention index built at index time.
-- **Distills knowledge** — free heuristic TODO extraction, plus opt-in LLM distillation of decisions, gotchas, and summaries, with cross-thread semantic recall of past decisions/gotchas. Needs local Ollama (keyless) or a cloud API key.
+- **Distills knowledge** — free heuristic TODO extraction, plus opt-in LLM distillation of decisions, gotchas, and summaries, with cross-thread semantic recall of past decisions/gotchas. Optional **auto-distillation** drains new/changed threads in the background so memory self-populates. Needs local Ollama (keyless) or a cloud API key.
+- **Curates the facts** — pin, edit, or delete distilled facts so your edits survive re-distilling, plus an LLM **"Review conflicts"** pass that flags decisions that contradict each other.
+- **Remembers per project** — a **Projects** tab aggregates each repo's decisions, gotchas, and open TODOs into durable memory, with an LLM brief and a managed `.callimachus/memory.md`; that memory is prepended when you "Open in CLI" so the agent starts with what was already decided.
 - **Asks your history (RAG)** — a synthesized, cited answer over your own threads, with `[thread N]` citations back to the sources it used. Needs an LLM engine (Knowledge/distillation enabled).
 - **Organizes into collections** — star threads and attach free-form tags, then filter the list by starred or by tag.
 - **Chats** with an in-app agent (Anthropic / OpenAI / Gemini / OpenRouter / Ollama — your key, your choice) that can **search your own history** and **run shell commands with your approval**; streaming, cancellable, with live model lists. Chats are saved and become searchable too.
 - **Carries context across tools** — open any thread in any agent CLI ("Open in Claude / Codex / Gemini …", seeded with the packed transcript), resume a Claude Code / Codex thread in its native CLI, copy context, or export a thread to Obsidian (optionally AI-summarized with decisions / gotchas / TODOs).
-- **Surfaces to your agents** — a bundled MCP server (`callimachus-mcp`) exposes the index as tools any agent can call mid-session; the `/recall` skill teaches them when to use it.
+- **Surfaces to your agents** — a bundled MCP server (`callimachus-mcp`) exposes the index as tools any agent can call mid-session, and it's two-way: agents can write back into Callimachus's own memory (close TODOs, record decisions/gotchas) without ever touching your files. The `/recall` skill teaches them when to use it.
 - **Stays current** via a background file watcher; **stays private** — API keys live in the OS keychain, nothing is sent anywhere except the LLM provider you pick.
 
 ## Stack
@@ -93,7 +95,7 @@ claude mcp add callimachus -- callimachus-mcp        # or any MCP client
 
 Building from a checkout instead? `cargo install --path apps/desktop/src-tauri --bin callimachus-mcp`.
 
-Tools (9): `search_threads`, `search_current_project` (auto-scoped to the repo it runs in), `recent_threads`, `get_thread`, `list_tags`, `list_open_todos`, `get_thread_knowledge`, `recall_decisions`, and `recall_gotchas`. The bundled `/recall` skill ([.claude/skills/recall](.claude/skills/recall/SKILL.md)) tells agents when to reach for them.
+Tools (15) — now read **and** write. Reads: `search_threads`, `search_current_project` (auto-scoped to the repo it runs in), `recent_threads`, `get_thread`, `list_tags`, `list_open_todos`, `get_thread_knowledge`, `recall_decisions`, `recall_gotchas`, `project_memory` (a project's aggregated decisions / gotchas / open TODOs), `ask_history` (a cited RAG answer over your history), and `threads_for_file` (which sessions touched a path). Writes (into Callimachus's own memory, never your code): `complete_todo` (close an open TODO), `record_decision`, and `record_gotcha` (persist a fact into a project's memory). The bundled `/recall` skill ([.claude/skills/recall](.claude/skills/recall/SKILL.md)) tells agents when to reach for them.
 
 **CLI** — `cal`, pipe-friendly. Ships with the desktop app (on your PATH); or build from a checkout with `cargo install --path apps/desktop/src-tauri --bin cal`.
 
@@ -105,9 +107,12 @@ cal stats                                  # index totals + per-source breakdown
 cal export 42 --vault ~/Obsidian           # write a thread as an Obsidian note
 cal ask "how did we set up releases?"      # cited RAG answer over your history
 cal files embed/mod.rs                     # threads that touched a file path
+cal memory                                 # this repo's distilled memory (decisions/gotchas/TODOs)
+cal done 17                                # mark an open TODO done (id from `cal todos`)
+cal remember decision "use sqlite-vec for KNN"  # record a fact into the repo's memory
 ```
 
-`star`, `tag`, `tags`, `todos`, `knowledge`, `distill`, `decisions`, `gotchas`, and `related` also exist — run `cal help` for all 18.
+`star`, `tag`, `tags`, `todos`, `knowledge`, `distill`, `decisions`, `gotchas`, and `related` also exist — run `cal help` for all 19.
 
 **VS Code / Cursor** — the extension adds a "Callimachus History" sidebar, a status-bar search button, and commands to search / insert / copy threads (it shells out to `cal`). Install from the **[VS Code Marketplace](https://marketplace.visualstudio.com/)** or **[Open VSX](https://open-vsx.org/)** (the registry **Cursor** and VSCodium use), or grab the `.vsix` from [Releases](../../releases). See [apps/vscode/README.md](apps/vscode/README.md).
 

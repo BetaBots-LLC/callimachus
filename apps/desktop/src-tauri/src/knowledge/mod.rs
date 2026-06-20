@@ -122,8 +122,11 @@ pub fn clear_heuristic(conn: &Connection) -> Result<()> {
 /// Re-derive a single thread's heuristic todos from its already-stored messages,
 /// inside the caller's transaction. Shared by the indexer and the backfill.
 fn rebuild_thread_todos(tx: &Connection, thread_id: i64, now: i64) -> Result<()> {
+    // Keep CURATED todos (done / dismissed / pinned) so closing a TODO survives re-index;
+    // only the open, untouched ones are re-derived.
     tx.execute(
-        "DELETE FROM facts WHERE thread_id = ?1 AND extractor = 'heuristic'",
+        "DELETE FROM facts WHERE thread_id = ?1 AND extractor = 'heuristic'
+            AND status = 'open' AND hidden = 0 AND pinned = 0",
         [thread_id],
     )?;
     let mut sel = tx.prepare(
@@ -140,6 +143,17 @@ fn rebuild_thread_todos(tx: &Connection, thread_id: i64, now: i64) -> Result<()>
          VALUES (?1, 'todo', ?2, ?3, 'open', 'heuristic', ?4)",
     )?;
     let mut seen = std::collections::HashSet::new();
+    // Seed with kept curated todos so we don't insert an open duplicate of a closed one.
+    {
+        let mut kept =
+            tx.prepare("SELECT text FROM facts WHERE thread_id = ?1 AND extractor = 'heuristic'")?;
+        for t in kept
+            .query_map([thread_id], |r| r.get::<_, String>(0))?
+            .flatten()
+        {
+            seen.insert(t.to_ascii_lowercase());
+        }
+    }
     let mut per = 0usize;
     'outer: for (mid, text) in rows {
         if per >= MAX_TODOS_PER_THREAD {
@@ -408,6 +422,16 @@ pub fn set_fact_hidden(conn: &Connection, fact_id: i64, hidden: bool) -> Result<
     conn.execute(
         "UPDATE facts SET hidden = ?2 WHERE id = ?1",
         params![fact_id, i64::from(hidden)],
+    )?;
+    Ok(())
+}
+
+/// Mark a TODO done (or reopen it). Done todos drop out of the open lists but persist
+/// across re-index (the heuristic re-derive keeps curated/closed rows).
+pub fn set_todo_done(conn: &Connection, fact_id: i64, done: bool) -> Result<()> {
+    conn.execute(
+        "UPDATE facts SET status = ?2 WHERE id = ?1 AND kind = 'todo'",
+        params![fact_id, if done { "done" } else { "open" }],
     )?;
     Ok(())
 }
@@ -748,6 +772,44 @@ pub fn project_pending_threads(conn: &Connection, project: &str) -> Result<Vec<i
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+/// Record an agent- or user-authored fact (kind must be 'decision' or 'gotcha') for a
+/// project. Stored in a synthetic per-project "Recorded memory" thread, pinned + ready to
+/// embed, so it flows through Project Memory and cross-thread recall like a distilled fact.
+/// Returns the new fact id (the caller embeds via embed_pending_facts).
+pub fn record_fact(
+    conn: &Connection,
+    project: &str,
+    kind: &str,
+    text: &str,
+    now: i64,
+) -> Result<i64> {
+    if !matches!(kind, "decision" | "gotcha") {
+        anyhow::bail!("record_fact kind must be 'decision' or 'gotcha'");
+    }
+    let source_id: i64 =
+        conn.query_row("SELECT id FROM sources WHERE kind = 'in_app'", [], |r| {
+            r.get(0)
+        })?;
+    let ext = format!("callimachus-notes:{project}");
+    conn.execute(
+        "INSERT INTO threads (source_id, external_id, title, project_path, created_at, updated_at)
+         VALUES (?1, ?2, 'Recorded memory', ?3, ?4, ?4)
+         ON CONFLICT(source_id, external_id) DO UPDATE SET updated_at = ?4",
+        params![source_id, ext, project, now],
+    )?;
+    let tid: i64 = conn.query_row(
+        "SELECT id FROM threads WHERE source_id = ?1 AND external_id = ?2",
+        params![source_id, ext],
+        |r| r.get(0),
+    )?;
+    conn.execute(
+        "INSERT INTO facts (thread_id, kind, text, status, extractor, pinned, created_at)
+         VALUES (?1, ?2, ?3, 'open', 'agent', 1, ?4)",
+        params![tid, kind, text.trim(), now],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
 /// Visible (non-hidden) distilled decisions for a project, id + text — for conflict review.
 pub fn project_decisions(conn: &Connection, project: &str) -> Result<Vec<(i64, String)>> {
     let mut stmt = conn.prepare(
@@ -981,6 +1043,85 @@ mod tests {
             !mem.decisions.iter().any(|f| f.text == "use sqlite"),
             "hidden fact stays hidden"
         );
+    }
+
+    #[test]
+    fn recorded_fact_surfaces_in_project_memory() {
+        let conn = temp_db();
+        let fid = record_fact(&conn, "/proj/r", "decision", "use the read pool", 100).unwrap();
+        assert!(fid > 0);
+        let mem = get_project_memory(&conn, "/proj/r", 60).unwrap();
+        assert!(
+            mem.decisions
+                .iter()
+                .any(|d| d.text == "use the read pool" && d.pinned),
+            "recorded decision is pinned + shown in project memory"
+        );
+        // A second record reuses the one synthetic notes thread for the project.
+        record_fact(&conn, "/proj/r", "gotcha", "watch the WAL", 101).unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM threads WHERE external_id LIKE 'callimachus-notes:%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "one notes thread per project");
+        // Invalid kind is rejected.
+        assert!(record_fact(&conn, "/proj/r", "note", "x", 102).is_err());
+    }
+
+    #[test]
+    fn todo_done_survives_reindex() {
+        use crate::indexer::{source_id, upsert_thread, ParsedMessage, ParsedThread};
+        let mut conn = temp_db();
+        set_config(&conn, true, Some("ollama"), Some("m")).unwrap(); // enable todo extraction
+        let sid = source_id(&conn, "claude_code").unwrap();
+        let m = |t: &str| ParsedMessage {
+            role: "user".into(),
+            text: t.into(),
+            tool_name: None,
+            ts: Some(1),
+        };
+        let thread = ParsedThread {
+            external_id: "td1".into(),
+            title: Some("t".into()),
+            created_at: Some(1),
+            updated_at: Some(2),
+            messages: vec![m("TODO: wire auth"), m("- [ ] add tests")],
+            ..Default::default()
+        };
+        upsert_thread(&mut conn, sid, &thread).unwrap();
+        let tid: i64 = conn
+            .query_row("SELECT id FROM threads WHERE external_id='td1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let todo_id: i64 = conn
+            .query_row(
+                "SELECT id FROM facts WHERE thread_id=?1 AND kind='todo' AND text LIKE 'wire auth%'",
+                [tid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        set_todo_done(&conn, todo_id, true).unwrap();
+
+        // Re-index (re-derives heuristic todos): the closed one must persist, not duplicate.
+        upsert_thread(&mut conn, sid, &thread).unwrap();
+        let status: String = conn
+            .query_row("SELECT status FROM facts WHERE id=?1", [todo_id], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(status, "done", "todo stayed done across re-index");
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM facts WHERE thread_id=?1 AND kind='todo' AND text LIKE 'wire auth%'",
+                [tid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "no duplicate open todo re-added");
     }
 
     #[test]

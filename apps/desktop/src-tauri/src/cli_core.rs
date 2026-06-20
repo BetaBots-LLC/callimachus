@@ -31,6 +31,8 @@ pub const COMMANDS: &[&str] = &[
     "ask",
     "files",
     "memory",
+    "done",
+    "remember",
 ];
 
 const USAGE: &str = "\
@@ -61,6 +63,10 @@ USAGE:
   cal memory [<project>] [-n LIMIT] [--json]
                                 a project's distilled memory (decisions / gotchas /
                                 open TODOs); defaults to the current repo
+  cal done <todo-id>            mark an open TODO done (id from `cal todos`)
+  cal remember <decision|gotcha> <text…>
+                                record a fact for the current repo (-p PROJECT to
+                                override), pinned into its project memory
   cal help
 
 OPTIONS:
@@ -113,6 +119,8 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
         "ask" => cmd_ask(rest),
         "files" => cmd_files(rest),
         "memory" => cmd_memory(rest),
+        "done" => cmd_done(rest),
+        "remember" => cmd_remember(rest),
         "help" | "-h" | "--help" => {
             println!("{USAGE}");
             Ok(())
@@ -494,6 +502,33 @@ fn cmd_memory(args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn cmd_done(args: &[String]) -> anyhow::Result<()> {
+    let o = parse(args)?;
+    let id = thread_id_arg(&o, "done")?; // a TODO fact id from `cal todos --json`
+    let conn = open_db_write()?;
+    knowledge::set_todo_done(&conn, id, true)?;
+    eprintln!("todo {id} marked done");
+    Ok(())
+}
+
+fn cmd_remember(args: &[String]) -> anyhow::Result<()> {
+    let o = parse(args)?;
+    if o.positional.len() < 2 {
+        anyhow::bail!("usage: cal remember <decision|gotcha> <text…>  [-p PROJECT]");
+    }
+    let kind = o.positional[0].to_ascii_lowercase();
+    let text = o.positional[1..].join(" ");
+    let project = o.project.clone().unwrap_or_else(cwd_project_root);
+    let mut conn = open_db_write()?;
+    let now = chrono::Utc::now().timestamp();
+    knowledge::record_fact(&conn, &project, &kind, &text, now)?;
+    // Embed so it is immediately recallable.
+    let embedder = embed::Embedder::default();
+    embed::embed_pending_facts_conn(&mut conn, &embedder)?;
+    eprintln!("remembered {kind} for {project}");
+    Ok(())
+}
+
 fn cmd_files(args: &[String]) -> anyhow::Result<()> {
     let o = parse(args)?;
     let path = o.positional.join(" ");
@@ -523,47 +558,29 @@ fn cmd_ask(args: &[String]) -> anyhow::Result<()> {
         anyhow::bail!("usage: cal ask <question…>");
     }
     let conn = open_db()?;
-    let (provider, model, key) = crate::resolve_distill_engine(&conn)?;
     let embedder = embed::Embedder::default();
     let qv = embed::embed_query(&embedder, &question)?;
-    let filters = search::SearchFilters {
-        limit: Some(30),
-        ..Default::default()
-    };
-    let hits = search::hybrid_vec(&conn, &question, qv.as_deref(), &filters)?;
-
-    let mut seen = std::collections::HashSet::new();
-    let mut context = String::new();
-    let mut sources: Vec<(i64, String)> = Vec::new();
-    for h in &hits {
-        if !seen.insert(h.thread_id) {
-            continue;
-        }
-        if sources.len() >= 5 {
-            break;
-        }
-        let excerpt = context::pack_thread(&conn, h.thread_id, 2500)?.unwrap_or_default();
-        let title = h.title.clone().unwrap_or_else(|| "untitled".into());
-        context.push_str(&format!("[thread {}] {title}\n{excerpt}\n\n", h.thread_id));
-        sources.push((h.thread_id, title));
-    }
-    if sources.is_empty() {
+    let Some(prep) = crate::prepare_ask(&conn, &question, qv.as_deref())? else {
         eprintln!("nothing relevant found in your history");
         return Ok(());
-    }
-    eprintln!("asking {provider}/{model}…");
+    };
+    eprintln!("asking {}/{}…", prep.provider, prep.model);
     let rt = tokio::runtime::Runtime::new()?;
     let answer = rt.block_on(agent::answer(
-        &provider,
-        &model,
-        key.as_deref(),
+        &prep.provider,
+        &prep.model,
+        prep.key.as_deref(),
         &question,
-        &context,
+        &prep.context,
     ))?;
     println!("{answer}\n");
     println!("Sources:");
-    for (id, title) in &sources {
-        println!("  [thread {id}] {title}");
+    for s in &prep.sources {
+        println!(
+            "  [thread {}] {}",
+            s.thread_id,
+            s.title.as_deref().unwrap_or("untitled")
+        );
     }
     Ok(())
 }

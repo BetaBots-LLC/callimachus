@@ -174,8 +174,11 @@ pub fn upsert_thread(
     // opt-in: when knowledge is off we don't write todo facts at all.
     if crate::knowledge::get_config(&tx)?.enabled {
         const MAX_TODOS_PER_THREAD: usize = 25;
+        // Keep CURATED todos (done / dismissed / pinned) so closing one survives re-index;
+        // re-derive only the open, untouched ones.
         tx.execute(
-            "DELETE FROM facts WHERE thread_id = ?1 AND extractor = 'heuristic'",
+            "DELETE FROM facts WHERE thread_id = ?1 AND extractor = 'heuristic'
+                AND status = 'open' AND hidden = 0 AND pinned = 0",
             [thread_id],
         )?;
         let mut fstmt = tx.prepare(
@@ -183,6 +186,18 @@ pub fn upsert_thread(
              VALUES (?1, 'todo', ?2, ?3, 'open', 'heuristic', ?4)",
         )?;
         let mut seen = std::collections::HashSet::new();
+        // Seed with kept curated todos so we don't re-add an open copy of a closed one.
+        {
+            let mut kept = tx.prepare(
+                "SELECT text FROM facts WHERE thread_id = ?1 AND extractor = 'heuristic'",
+            )?;
+            for t in kept
+                .query_map([thread_id], |r| r.get::<_, String>(0))?
+                .flatten()
+            {
+                seen.insert(t.to_ascii_lowercase());
+            }
+        }
         let mut count = 0usize;
         'outer: for (mid, role, text) in &inserted {
             if *role != "user" && *role != "assistant" {

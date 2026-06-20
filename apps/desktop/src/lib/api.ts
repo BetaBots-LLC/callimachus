@@ -289,6 +289,7 @@ export const api = {
   setFactPinned: (factId: number, pinned: boolean) =>
     invoke<void>("set_fact_pinned", { factId, pinned }),
   hideFact: (factId: number, hidden: boolean) => invoke<void>("hide_fact", { factId, hidden }),
+  setTodoDone: (factId: number, done: boolean) => invoke<void>("set_todo_done", { factId, done }),
   editFact: (factId: number, text: string) => invoke<void>("edit_fact", { factId, text }),
   detectConflicts: (project: string) => invoke<Conflict[]>("detect_conflicts", { project }),
   getThread: (threadId: number) => invoke<ThreadDetail | null>("get_thread", { threadId }),

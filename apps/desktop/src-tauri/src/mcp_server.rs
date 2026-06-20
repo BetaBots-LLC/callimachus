@@ -85,6 +85,32 @@ struct ThreadKnowledgeArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+struct CompleteTodoArgs {
+    /// The TODO's id (the `id` field from list_open_todos).
+    id: i64,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct AskArgs {
+    /// The question to answer from the user's history.
+    question: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct FilePathArgs {
+    /// A file path or substring (e.g. "embed/mod.rs").
+    path: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct RememberArgs {
+    /// What to remember (one concrete sentence).
+    text: String,
+    /// Project-path substring to attach it to; omit to use the repo the server runs in.
+    project: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 struct RecallArgs {
     /// What to recall about (e.g. "auth token refresh", "database migration approach").
     query: String,
@@ -325,9 +351,139 @@ impl Callimachus {
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
+
+    #[tool(
+        description = "Find every past thread that mentioned a file path (e.g. 'embed/mod.rs') — which sessions touched this file. Substring match over indexed file references. Returns thread summaries."
+    )]
+    async fn threads_for_file(
+        &self,
+        Parameters(args): Parameters<FilePathArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let hits = crate::search::threads_with_file(&conn, &args.path, 50)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let json = serde_json::to_string_pretty(&hits)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(
+        description = "Mark a TODO done so it drops out of the open-TODO lists. Pass the `id` from list_open_todos. The completion persists across re-indexing."
+    )]
+    async fn complete_todo(
+        &self,
+        Parameters(args): Parameters<CompleteTodoArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        crate::knowledge::set_todo_done(&conn, args.id, true)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "TODO {} marked done",
+            args.id
+        ))]))
+    }
+
+    #[tool(
+        description = "Answer a question from the user's OWN past sessions (RAG): retrieves the most relevant threads and returns a synthesized answer with [thread N] citations + the source list. Use for 'how did we...' / 'what did I decide about...' instead of reading many threads. Needs an LLM engine configured (distillation enabled)."
+    )]
+    async fn ask_history(
+        &self,
+        Parameters(args): Parameters<AskArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let q = args.question.trim().to_string();
+        if q.is_empty() {
+            return Err(ErrorData::internal_error("question is required", None));
+        }
+        // Embed outside the lock; prepare under it; LLM after the conn is dropped.
+        let qv = embed::embed_query(&self.embedder, &q)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let prep = {
+            let conn = self
+                .conn
+                .lock()
+                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+            crate::prepare_ask(&conn, &q, qv.as_deref())
+                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
+        };
+        let Some(prep) = prep else {
+            return Ok(CallToolResult::success(vec![Content::text(
+                "No relevant threads found in history.".to_string(),
+            )]));
+        };
+        let answer = crate::agent::answer(
+            &prep.provider,
+            &prep.model,
+            prep.key.as_deref(),
+            &q,
+            &prep.context,
+        )
+        .await
+        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let mut out = answer;
+        out.push_str("\n\nSources:\n");
+        for s in &prep.sources {
+            out.push_str(&format!(
+                "- [thread {}] {}\n",
+                s.thread_id,
+                s.title.as_deref().unwrap_or("untitled")
+            ));
+        }
+        Ok(CallToolResult::success(vec![Content::text(out)]))
+    }
+
+    #[tool(
+        description = "Record a DECISION you/the user just made for a project, so it persists in the project's memory and future cross-thread recall. Omit `project` to use the repo the server runs in. Use when you settle a technical choice worth remembering."
+    )]
+    async fn record_decision(
+        &self,
+        Parameters(args): Parameters<RememberArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.record(args, "decision")
+    }
+
+    #[tool(
+        description = "Record a GOTCHA / pitfall just discovered for a project, so it persists in the project's memory and future recall. Omit `project` to use the current repo."
+    )]
+    async fn record_gotcha(
+        &self,
+        Parameters(args): Parameters<RememberArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.record(args, "gotcha")
+    }
 }
 
 impl Callimachus {
+    /// Shared write-back path for record_decision/record_gotcha: record the fact for the
+    /// project (synthetic notes thread) and embed it so it surfaces in recall immediately.
+    fn record(&self, args: RememberArgs, kind: &str) -> Result<CallToolResult, ErrorData> {
+        let text = args.text.trim().to_string();
+        if text.is_empty() {
+            return Err(ErrorData::internal_error("text is required", None));
+        }
+        let project = args
+            .project
+            .or_else(current_project_root)
+            .unwrap_or_default();
+        let now = chrono::Utc::now().timestamp();
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        crate::knowledge::record_fact(&conn, &project, kind, &text, now)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        crate::embed::embed_pending_facts_conn(&mut conn, &self.embedder)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "Recorded {kind} for {project}"
+        ))]))
+    }
+
     /// Shared recall path for the recall_decisions/recall_gotchas tools: embed the query,
     /// then run the SQL KNN over `vec_facts`.
     fn recall_facts(&self, args: RecallArgs, kind: &str) -> Result<CallToolResult, ErrorData> {
