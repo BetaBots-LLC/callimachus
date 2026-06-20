@@ -500,6 +500,154 @@ pub fn recall(
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+// ---------------------------------------------------------------------------
+// Project Memory — distilled knowledge aggregated across a project's threads.
+// ---------------------------------------------------------------------------
+
+/// A thread is "distillable" (worth an LLM pass / counted in coverage) if it's a real
+/// top-level thread with enough substance. Keeps batch distill off trivial/subagent rows.
+const DISTILLABLE: &str = "is_subagent = 0 AND message_count >= 4";
+
+/// One distilled fact in a project's aggregated memory, with its source thread.
+#[derive(Debug, Serialize)]
+pub struct MemoryFact {
+    pub id: i64,
+    #[serde(rename = "threadId")]
+    pub thread_id: i64,
+    pub text: String,
+    pub title: Option<String>,
+    #[serde(rename = "createdAt")]
+    pub created_at: i64,
+}
+
+/// Durable, aggregated knowledge for one project: decisions + gotchas + open TODOs
+/// distilled across all its threads, plus coverage so callers can prompt to distill more.
+#[derive(Debug, Serialize)]
+pub struct ProjectMemory {
+    pub project: String,
+    pub decisions: Vec<MemoryFact>,
+    pub gotchas: Vec<MemoryFact>,
+    #[serde(rename = "openTodos")]
+    pub open_todos: Vec<MemoryFact>,
+    #[serde(rename = "threadCount")]
+    pub thread_count: i64,
+    #[serde(rename = "distilledCount")]
+    pub distilled_count: i64,
+    #[serde(rename = "pendingCount")]
+    pub pending_count: i64,
+}
+
+/// A project (by path) with its thread + distillation-coverage counts, for the picker.
+#[derive(Debug, Serialize)]
+pub struct ProjectInfo {
+    pub project: String,
+    #[serde(rename = "threadCount")]
+    pub thread_count: i64,
+    #[serde(rename = "distilledCount")]
+    pub distilled_count: i64,
+    #[serde(rename = "lastActivity")]
+    pub last_activity: i64,
+}
+
+/// Distinct projects (by `project_path`), newest-active first, with distillation coverage.
+pub fn list_projects(conn: &Connection) -> Result<Vec<ProjectInfo>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT project_path,
+                COUNT(*) AS threads,
+                SUM(CASE WHEN knowledge_extracted = 1 THEN 1 ELSE 0 END) AS distilled,
+                MAX(updated_at) AS last
+         FROM threads
+         WHERE project_path IS NOT NULL AND project_path != '' AND {DISTILLABLE}
+         GROUP BY project_path
+         ORDER BY last DESC"
+    ))?;
+    let rows = stmt.query_map([], |r| {
+        Ok(ProjectInfo {
+            project: r.get(0)?,
+            thread_count: r.get(1)?,
+            distilled_count: r.get::<_, Option<i64>>(2)?.unwrap_or(0),
+            last_activity: r.get::<_, Option<i64>>(3)?.unwrap_or(0),
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Distilled facts of one `kind` across a project, newest first, deduped by text, capped.
+fn project_facts(
+    conn: &Connection,
+    kind: &str,
+    like: &str,
+    open_only: bool,
+    limit: usize,
+) -> Result<Vec<MemoryFact>> {
+    let mut sql = String::from(
+        "SELECT f.id, f.thread_id, f.text, t.title, f.created_at
+         FROM facts f JOIN threads t ON t.id = f.thread_id
+         WHERE f.kind = ?1 AND t.project_path LIKE ?2",
+    );
+    if open_only {
+        sql.push_str(" AND f.status = 'open'");
+    }
+    sql.push_str(" ORDER BY f.created_at DESC, f.id DESC");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params![kind, like], |r| {
+        Ok(MemoryFact {
+            id: r.get(0)?,
+            thread_id: r.get(1)?,
+            text: r.get(2)?,
+            title: r.get(3)?,
+            created_at: r.get(4)?,
+        })
+    })?;
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for row in rows {
+        let f = row?;
+        if seen.insert(f.text.trim().to_lowercase()) {
+            out.push(f);
+            if out.len() >= limit {
+                break;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Aggregate a project's distilled memory. `per_kind` caps each list (decisions/gotchas/
+/// todos). Coverage counts are over "distillable" threads so the UI can show N/M distilled.
+pub fn get_project_memory(conn: &Connection, project: &str, per_kind: usize) -> Result<ProjectMemory> {
+    let like = format!("%{project}%");
+    let count = |extra: &str| -> Result<i64> {
+        Ok(conn.query_row(
+            &format!("SELECT COUNT(*) FROM threads WHERE project_path LIKE ?1 AND {DISTILLABLE}{extra}"),
+            [&like],
+            |r| r.get(0),
+        )?)
+    };
+    let thread_count = count("")?;
+    let distilled_count = count(" AND knowledge_extracted = 1")?;
+    Ok(ProjectMemory {
+        decisions: project_facts(conn, "decision", &like, false, per_kind)?,
+        gotchas: project_facts(conn, "gotcha", &like, false, per_kind)?,
+        open_todos: project_facts(conn, "todo", &like, true, per_kind)?,
+        thread_count,
+        distilled_count,
+        pending_count: (thread_count - distilled_count).max(0),
+        project: project.to_string(),
+    })
+}
+
+/// IDs of a project's not-yet-distilled threads, newest first — the batch-distill worklist.
+pub fn project_pending_threads(conn: &Connection, project: &str) -> Result<Vec<i64>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id FROM threads
+         WHERE project_path LIKE ?1 AND knowledge_extracted = 0 AND {DISTILLABLE}
+         ORDER BY updated_at DESC"
+    ))?;
+    let rows = stmt.query_map([format!("%{project}%")], |r| r.get::<_, i64>(0))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

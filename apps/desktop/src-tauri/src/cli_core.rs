@@ -13,7 +13,7 @@ use rusqlite::Connection;
 /// Subcommands that identify a `cal` invocation when the app is launched directly.
 pub const COMMANDS: &[&str] = &[
     "search", "related", "recent", "cat", "show", "context", "stats", "export", "star", "tag",
-    "tags", "todos", "knowledge", "distill", "decisions", "gotchas", "ask", "files",
+    "tags", "todos", "knowledge", "distill", "decisions", "gotchas", "ask", "files", "memory",
 ];
 
 const USAGE: &str = "\
@@ -41,6 +41,9 @@ USAGE:
                                 semantic recall of distilled decisions/gotchas
   cal ask <question…>           answer a question from your history (RAG, cited)
   cal files <path>              threads that mention a file path (e.g. embed/mod.rs)
+  cal memory [<project>] [-n LIMIT] [--json]
+                                a project's distilled memory (decisions / gotchas /
+                                open TODOs); defaults to the current repo
   cal help
 
 OPTIONS:
@@ -91,6 +94,7 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
         "gotchas" => cmd_recall(rest, "gotcha"),
         "ask" => cmd_ask(rest),
         "files" => cmd_files(rest),
+        "memory" => cmd_memory(rest),
         "help" | "-h" | "--help" => {
             println!("{USAGE}");
             Ok(())
@@ -401,6 +405,54 @@ fn cmd_distill(args: &[String]) -> anyhow::Result<()> {
     let now = chrono::Utc::now().timestamp();
     knowledge::store_distilled(&mut conn, id, &distilled, now)?;
     print_knowledge(&knowledge::get_thread_knowledge(&conn, id)?);
+    Ok(())
+}
+
+/// The git repo root for the cwd (walks up for `.git`), else the cwd. For `cal memory`.
+fn cwd_project_root() -> String {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let mut dir = cwd.as_path();
+    loop {
+        if dir.join(".git").exists() {
+            return dir.to_string_lossy().into_owned();
+        }
+        match dir.parent() {
+            Some(p) => dir = p,
+            None => break,
+        }
+    }
+    cwd.to_string_lossy().into_owned()
+}
+
+fn cmd_memory(args: &[String]) -> anyhow::Result<()> {
+    let o = parse(args)?;
+    let project =
+        if o.positional.is_empty() { cwd_project_root() } else { o.positional.join(" ") };
+    let conn = open_db()?;
+    let mem = knowledge::get_project_memory(&conn, &project, o.limit.unwrap_or(40) as usize)?;
+    if o.json {
+        println!("{}", serde_json::to_string_pretty(&mem)?);
+        return Ok(());
+    }
+    println!(
+        "Project memory: {project}  ({}/{} threads distilled)",
+        mem.distilled_count, mem.thread_count
+    );
+    let section = |title: &str, facts: &[knowledge::MemoryFact]| {
+        if facts.is_empty() {
+            return;
+        }
+        println!("\n{title}:");
+        for f in facts {
+            println!("  - {}", f.text.trim());
+        }
+    };
+    section("Decisions", &mem.decisions);
+    section("Gotchas", &mem.gotchas);
+    section("Open TODOs", &mem.open_todos);
+    if mem.decisions.is_empty() && mem.gotchas.is_empty() && mem.open_todos.is_empty() {
+        eprintln!("\n(no distilled knowledge yet — distill this project's threads in the app)");
+    }
     Ok(())
 }
 
