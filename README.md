@@ -22,7 +22,11 @@ Grab the latest signed build from **[Releases](../../releases/latest)** — macO
 ## What it does
 
 - **Indexes** every conversation from 11 coding agents into one local SQLite store — Claude Code, Codex, Cursor, Gemini CLI, Qwen Code, Goose, OpenCode, Continue, Cline, Roo Code, and Kilo Code. Adding another source is a [small, documented contract](apps/desktop/src-tauri/src/indexer/README.md).
-- **Searches** them with hybrid ranking: keyword (SQLite FTS5 / BM25) fused with on-device semantic similarity (sqlite-vec KNN, no cloud) via Reciprocal Rank Fusion. Filter by source, project, and subagents.
+- **Searches** them with hybrid ranking: keyword (SQLite FTS5 / BM25) fused with on-device semantic similarity (sqlite-vec KNN, no cloud) via Reciprocal Rank Fusion. Filter by source, project, subagents, starred, and tags.
+- **Finds code-aware** — type `file:embed/mod.rs` in the search bar (or `cal files <path>`) to find every thread that touched a path; backed by a file-mention index built at index time.
+- **Distills knowledge** — free heuristic TODO extraction, plus opt-in LLM distillation of decisions, gotchas, and summaries, with cross-thread semantic recall of past decisions/gotchas. Needs local Ollama (keyless) or a cloud API key.
+- **Asks your history (RAG)** — a synthesized, cited answer over your own threads, with `[thread N]` citations back to the sources it used. Needs an LLM engine (Knowledge/distillation enabled).
+- **Organizes into collections** — star threads and attach free-form tags, then filter the list by starred or by tag.
 - **Chats** with an in-app agent (Anthropic / OpenAI / Gemini / OpenRouter / Ollama — your key, your choice) that can **search your own history** and **run shell commands with your approval**; streaming, cancellable, with live model lists. Chats are saved and become searchable too.
 - **Carries context across tools** — open any thread in any agent CLI ("Open in Claude / Codex / Gemini …", seeded with the packed transcript), resume a Claude Code / Codex thread in its native CLI, copy context, or export a thread to Obsidian (optionally AI-summarized with decisions / gotchas / TODOs).
 - **Surfaces to your agents** — a bundled MCP server (`callimachus-mcp`) exposes the index as tools any agent can call mid-session; the `/recall` skill teaches them when to use it.
@@ -65,7 +69,7 @@ pnpm build            # turbo: build every app's frontend
 pnpm typecheck        # turbo: typecheck every app
 ```
 
-First launch: the index is empty — open **Settings** (or hit **Reindex**) to index your sources, then **Build semantic index** to enable semantic search.
+First launch: the index is empty — open **Settings** (or hit **Reindex**) to index your sources, then **Build semantic index** to enable semantic search. **Reindex** runs as a background job with a per-source progress bar, separate from **Build semantic index** — the two are mutually exclusive (one pauses while the other holds the write lock).
 
 ### Tests
 
@@ -89,7 +93,7 @@ claude mcp add callimachus -- callimachus-mcp        # or any MCP client
 
 Building from a checkout instead? `cargo install --path apps/desktop/src-tauri --bin callimachus-mcp`.
 
-Tools: `search_threads`, `search_current_project` (auto-scoped to the repo it runs in), `recent_threads`, `get_thread`. The bundled `/recall` skill ([.claude/skills/recall](.claude/skills/recall/SKILL.md)) tells agents when to reach for them.
+Tools (9): `search_threads`, `search_current_project` (auto-scoped to the repo it runs in), `recent_threads`, `get_thread`, `list_tags`, `list_open_todos`, `get_thread_knowledge`, `recall_decisions`, and `recall_gotchas`. The bundled `/recall` skill ([.claude/skills/recall](.claude/skills/recall/SKILL.md)) tells agents when to reach for them.
 
 **CLI** — `cal`, pipe-friendly. Ships with the desktop app (on your PATH); or build from a checkout with `cargo install --path apps/desktop/src-tauri --bin cal`.
 
@@ -98,8 +102,12 @@ cal search "vector index migration" -y    # -y = hybrid (semantic + keyword)
 cal recent -n 10
 cal cat 42 | pbcopy                        # packed transcript → clipboard
 cal stats                                  # index totals + per-source breakdown
-cal export 42 --vault ~/Obsidian          # write a thread as an Obsidian note
+cal export 42 --vault ~/Obsidian           # write a thread as an Obsidian note
+cal ask "how did we set up releases?"      # cited RAG answer over your history
+cal files embed/mod.rs                     # threads that touched a file path
 ```
+
+`star`, `tag`, `tags`, `todos`, `knowledge`, `distill`, `decisions`, `gotchas`, and `related` also exist — run `cal help` for all 18.
 
 **VS Code / Cursor** — the extension adds a "Callimachus History" sidebar, a status-bar search button, and commands to search / insert / copy threads (it shells out to `cal`). Install from the **[VS Code Marketplace](https://marketplace.visualstudio.com/)** or **[Open VSX](https://open-vsx.org/)** (the registry **Cursor** and VSCodium use), or grab the `.vsix` from [Releases](../../releases). See [apps/vscode/README.md](apps/vscode/README.md).
 

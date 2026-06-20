@@ -1,5 +1,14 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { BookOpen, Boxes, FileDown, MessagesSquare, PieChart, Trash2 } from "lucide-react";
+import {
+  BookOpen,
+  Boxes,
+  FileDown,
+  Lightbulb,
+  MessageCircleQuestion,
+  MessagesSquare,
+  PieChart,
+  Trash2,
+} from "lucide-react";
 import { downloadData } from "@/server/releases";
 import { seo } from "@/lib/seo";
 import { ldScript, softwareApplicationLd } from "@/lib/jsonld";
@@ -14,7 +23,7 @@ export const Route = createFileRoute("/desktop")({
     meta: seo({
       title: "Callimachus Desktop — read & search your AI history",
       description:
-        "The Callimachus desktop app for macOS, Windows, and Linux: browse and search every AI coding thread, chat over your own history, and export to Obsidian. Local and private.",
+        "The Callimachus desktop app for macOS, Windows, and Linux: browse and search every AI coding thread, distill decisions and gotchas, ask your own history a cited question, and export to Obsidian. Local and private.",
       path: "/desktop",
     }),
     links: [{ rel: "canonical", href: `${SITE_URL}/desktop` }],
@@ -51,6 +60,25 @@ function DesktopPage() {
         >
           A built-in, provider-agnostic chat that can search your own history and run shell commands
           with your approval. Bring your own key — Anthropic, OpenAI, Gemini, OpenRouter, or Ollama.
+        </FeaturePanel>
+        <FeaturePanel
+          icon={Lightbulb}
+          label="Knowledge"
+          title="Distill what you learned"
+          className="lg:col-span-7"
+        >
+          Free heuristic TODO extraction, plus opt-in LLM distillation of decisions, gotchas, and
+          summaries — with cross-thread semantic recall of past decisions and gotchas. Needs local
+          Ollama (keyless) or a cloud API key.
+        </FeaturePanel>
+        <FeaturePanel
+          icon={MessageCircleQuestion}
+          label="Ask"
+          title="Ask your history"
+          className="lg:col-span-5"
+        >
+          A synthesized, cited answer over your own threads, with [thread N] citations back to the
+          sources it used. Needs an LLM engine — the same one that powers distillation.
         </FeaturePanel>
         <FeaturePanel
           icon={FileDown}

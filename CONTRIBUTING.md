@@ -26,7 +26,7 @@ This is a [Turborepo](https://turborepo.com) + pnpm workspace.
 ```
 apps/desktop/    Tauri 2 app + the `cal` CLI and `callimachus-mcp` server (src-tauri)
 apps/vscode/     VS Code extension (shells out to `cal`)
-apps/web/        marketing + download site (reserved)
+apps/web/        marketing + download site (TanStack Start)
 scripts/         version-sync, release tagging
 .changeset/      versioning + changelog
 ```
@@ -34,6 +34,7 @@ scripts/         version-sync, release tagging
 ## Checks before a PR
 
 ```bash
+pnpm check                             # Biome lint + format check
 pnpm typecheck                         # all apps (tsc)
 pnpm build                             # all apps
 cd apps/desktop/src-tauri && cargo test   # Rust unit tests
@@ -55,7 +56,8 @@ at [`apps/desktop/src-tauri/src/indexer/README.md`](apps/desktop/src-tauri/src/i
 - **Changesets:** if your change is user-facing, run `pnpm changeset` and commit
   the generated file so it lands in the changelog / version bump.
 - **Style:** functional and concise; validate at system boundaries; don't add
-  comments or type annotations to unchanged code.
+  comments or type annotations to unchanged code. Run `pnpm check` (Biome lint +
+  format, or `pnpm check:fix` to apply) before opening a PR.
 - **Releases:** maintainers cut releases via the flow in [RELEASING.md](RELEASING.md).
 
 ## License of contributions

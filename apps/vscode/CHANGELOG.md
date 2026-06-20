@@ -2,6 +2,10 @@
 
 ## 0.5.0
 
+### Minor Changes
+
+- Add **Ambient Recall**: the sidebar surfaces past threads related to your selection, the symbol under the cursor, or the nearest error (via `cal related`) with no searching. Toggle it with the **Callimachus: Toggle Ambient Recall** command or the `callimachus.ambientRecall` setting, and tune it with `ambientRecallThrottle`, `ambientRecallMinContext`, and `ambientRecallLimit`.
+
 ## 0.4.3
 
 ### Patch Changes

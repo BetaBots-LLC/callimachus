@@ -28,7 +28,7 @@ struct SearchArgs {
     /// The search query.
     query: String,
     /// Optional source filter: any of claude_code, codex, cursor, gemini, qwen,
-    /// goose, opencode, continue, cline, in_app. Empty = all sources.
+    /// goose, opencode, continue, cline, roo, kilo, in_app. Empty = all sources.
     #[serde(default)]
     sources: Vec<String>,
     /// Fuse keyword + on-device semantic search (higher recall; loads the embedding model).
@@ -116,7 +116,7 @@ impl Callimachus {
     }
 
     #[tool(
-        description = "Search the user's indexed AI coding-agent conversation threads across every tool they use (Claude Code, Codex, Cursor, Gemini, Qwen, Goose, OpenCode, Continue, Cline, and in-app chats). Keyword full-text by default; set hybrid=true to also use on-device semantic similarity. Returns matching threads with snippets and a threadId to fetch. Use this to recall past decisions, prior solutions, or earlier discussion before redoing work."
+        description = "Search the user's indexed AI coding-agent conversation threads across every tool they use (Claude Code, Codex, Cursor, Gemini, Qwen, Goose, OpenCode, Continue, Cline, Roo Code, Kilo Code, and in-app chats). Keyword full-text by default; set hybrid=true to also use on-device semantic similarity. Returns matching threads with snippets and a threadId to fetch. Use this to recall past decisions, prior solutions, or earlier discussion before redoing work."
     )]
     async fn search_threads(
         &self,

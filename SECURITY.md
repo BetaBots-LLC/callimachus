@@ -10,8 +10,13 @@ Callimachus is **local-first**. Specifically:
 - API keys are stored in the **OS keychain**, never in plaintext on disk or in the
   repo.
 - The only outbound network traffic is to the LLM provider **you explicitly pick**
-  (for chat, model lists, and optional Obsidian-note synthesis) and the one-time
-  embedding-model download on first index.
+  and the one-time embedding-model download on first index. Conversation content
+  leaves your machine **only** when you use a cloud provider for one of three
+  features: (1) the **in-app chat**, (2) **Knowledge distillation** (`agent::distill`)
+  of decisions, gotchas, and summaries, and (3) **Ask your history / RAG**
+  (`agent::answer`). Choosing **local Ollama** keeps distillation and Ask fully
+  on-device. Indexing, search, and embeddings are **always local** regardless of
+  which engine you pick.
 - The in-app agent's `run_shell` tool requires **explicit per-command approval**
   before anything executes.
 
