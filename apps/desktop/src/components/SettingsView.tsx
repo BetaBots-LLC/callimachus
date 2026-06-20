@@ -308,10 +308,20 @@ function DistillationCard() {
       enabled: merged.enabled,
       provider: merged.provider || null,
       model: merged.model || null,
+      autoDistill: c?.autoDistill ?? false,
     });
     debouncedSave(merged);
   };
   const local = provider === "ollama";
+  const autoDistill = c?.autoDistill ?? false;
+  const toggleAuto = useMutation({
+    mutationFn: (on: boolean) => api.setAutoDistill(on),
+    onMutate: (on: boolean) =>
+      queryClient.setQueryData<KnowledgeConfig>(["knowledge_config"], (prev) =>
+        prev ? { ...prev, autoDistill: on } : prev,
+      ),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["knowledge_config"] }),
+  });
 
   return (
     <Card>
@@ -366,6 +376,18 @@ function DistillationCard() {
                 : provider
                   ? `Sends thread text to ${provider} using your stored API key, on demand per thread.`
                   : "Uses the first provider you've added a key for. Sends thread text to that provider, on demand per thread."}
+            </p>
+            <div className="flex items-center gap-2 pt-1 text-sm">
+              <Switch checked={autoDistill} onCheckedChange={(v) => toggleAuto.mutate(v)} />
+              Auto-distill in the background
+            </div>
+            <p className="text-xs text-muted-foreground">
+              Distill new and changed threads automatically as they're indexed, so Ask, recall, and
+              Project Memory stay populated without clicking. Paced, cancellable, and yields to
+              indexing.{" "}
+              {local
+                ? "Free and on-device via Ollama."
+                : "Uses your provider key, so it has a per-thread cost."}
             </p>
           </>
         )}

@@ -264,6 +264,9 @@ pub struct KnowledgeConfig {
     pub enabled: bool,
     pub provider: Option<String>, // None = first available cloud key
     pub model: Option<String>,
+    /// Auto-distill new/changed threads in the background (opt-in; uses the engine).
+    #[serde(rename = "autoDistill")]
+    pub auto_distill: bool,
 }
 
 fn config_get(conn: &Connection, key: &str) -> Result<Option<String>> {
@@ -278,7 +281,19 @@ pub fn get_config(conn: &Connection) -> Result<KnowledgeConfig> {
         enabled: config_get(conn, "knowledge.enabled")?.as_deref() == Some("1"),
         provider: config_get(conn, "knowledge.provider")?.filter(|s| !s.is_empty()),
         model: config_get(conn, "knowledge.model")?.filter(|s| !s.is_empty()),
+        auto_distill: config_get(conn, "knowledge.auto_distill")?.as_deref() == Some("1"),
     })
+}
+
+/// Toggle background auto-distillation (separate from `set_config` so the consent flag
+/// and engine choice aren't disturbed). Only meaningful when distillation is enabled.
+pub fn set_auto_distill(conn: &Connection, on: bool) -> Result<()> {
+    conn.execute(
+        "INSERT INTO app_config (key, value) VALUES ('knowledge.auto_distill', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = ?1",
+        params![if on { "1" } else { "0" }],
+    )?;
+    Ok(())
 }
 
 /// Persist the distillation config. Enabling it is the user's consent to send thread
@@ -645,6 +660,21 @@ pub fn project_pending_threads(conn: &Connection, project: &str) -> Result<Vec<i
          ORDER BY updated_at DESC"
     ))?;
     let rows = stmt.query_map([format!("%{project}%")], |r| r.get::<_, i64>(0))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// IDs of threads ANYWHERE that need distilling — never distilled, or changed since their
+/// last distill. Newest first, capped. Skips threads that previously errored so a broken
+/// one isn't retried forever. The auto-distill worklist.
+pub fn pending_threads(conn: &Connection, limit: i64) -> Result<Vec<i64>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id FROM threads
+         WHERE {DISTILLABLE} AND knowledge_error IS NULL
+           AND (knowledge_extracted = 0 OR knowledge_msg_count != message_count)
+         ORDER BY updated_at DESC
+         LIMIT ?1"
+    ))?;
+    let rows = stmt.query_map([limit], |r| r.get::<_, i64>(0))?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 

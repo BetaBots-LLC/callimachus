@@ -113,6 +113,7 @@ export interface KnowledgeConfig {
   enabled: boolean;
   provider: string | null;
   model: string | null;
+  autoDistill: boolean; // auto-distill new/changed threads in the background
 }
 
 export interface KFact {
@@ -295,6 +296,8 @@ export const api = {
       provider: provider ?? null,
       model: model ?? null,
     }),
+  // Toggle background auto-distillation (turning on kicks an immediate drain).
+  setAutoDistill: (on: boolean) => invoke<void>("set_auto_distill", { on }),
   threadKnowledge: (threadId: number) => invoke<ThreadKnowledge>("thread_knowledge", { threadId }),
   distillThread: (threadId: number) => invoke<ThreadKnowledge>("distill_thread", { threadId }),
   // Cross-thread semantic recall of distilled facts.
