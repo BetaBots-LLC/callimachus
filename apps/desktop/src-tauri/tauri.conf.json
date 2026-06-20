@@ -12,9 +12,22 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "Callimachus",
         "width": 1100,
-        "height": 760
+        "height": 760,
+        "backgroundColor": "#0A0A0A",
+        "visible": false
+      },
+      {
+        "label": "splashscreen",
+        "url": "splashscreen.html",
+        "title": "Callimachus",
+        "width": 440,
+        "height": 300,
+        "resizable": false,
+        "center": true,
+        "decorations": false
       }
     ],
     "security": {

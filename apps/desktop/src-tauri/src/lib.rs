@@ -35,6 +35,49 @@ struct IndexJob(AtomicBool);
 #[derive(Default)]
 struct DistillJob(AtomicBool);
 
+/// Tracks frontend + backend startup readiness so the splash window is dismissed only
+/// once BOTH are ready (the Tauri splashscreen pattern).
+#[derive(Default)]
+struct SetupState(Mutex<SetupFlags>);
+#[derive(Default)]
+struct SetupFlags {
+    frontend: bool,
+    backend: bool,
+}
+
+/// Mark a startup task done; when BOTH frontend and backend are ready, close the splash
+/// window and reveal the main window.
+fn complete_setup(app: &AppHandle, task: &str) {
+    let reveal = {
+        let state = app.state::<SetupState>();
+        let mut flags = match state.0.lock() {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        match task {
+            "frontend" => flags.frontend = true,
+            "backend" => flags.backend = true,
+            _ => {}
+        }
+        flags.frontend && flags.backend
+    };
+    if reveal {
+        if let Some(splash) = app.get_webview_window("splashscreen") {
+            let _ = splash.close();
+        }
+        if let Some(main) = app.get_webview_window("main") {
+            let _ = main.show();
+            let _ = main.set_focus();
+        }
+    }
+}
+
+/// Frontend signals it has loaded its initial data (the other half of `complete_setup`).
+#[tauri::command]
+fn set_complete(app: AppHandle, task: String) {
+    complete_setup(&app, &task);
+}
+
 /// Cancellation token for the in-flight chat stream (one generation at a time).
 #[derive(Default)]
 struct ChatGeneration(Mutex<Option<tokio_util::sync::CancellationToken>>);
@@ -1706,6 +1749,7 @@ pub fn run() {
             app.manage(EmbedJob::default());
             app.manage(IndexJob::default());
             app.manage(DistillJob::default());
+            app.manage(SetupState::default());
             app.manage(ChatGeneration::default());
             app.manage(PendingApprovals::default());
             // Background watcher keeps the index fresh as agents write new threads.
@@ -1724,6 +1768,9 @@ pub fn run() {
                     auto_distill_kick(&app);
                 });
             }
+            // The blocking init (open + migrate + backfill + read pool) is done — the
+            // backend is ready. The splash stays up until the frontend also signals ready.
+            complete_setup(&app.handle(), "backend");
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1762,6 +1809,7 @@ pub fn run() {
             list_tags,
             list_open_todos,
             knowledge_config,
+            set_complete,
             set_knowledge_config,
             set_auto_distill,
             thread_knowledge,

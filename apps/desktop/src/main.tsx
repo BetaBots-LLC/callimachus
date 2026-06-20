@@ -1,9 +1,10 @@
-import React from "react";
+import React, { useEffect } from "react";
 import ReactDOM from "react-dom/client";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
+import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import App from "./App";
-import type { EmbedStatus, IndexProgress } from "./lib/api";
+import { api, type EmbedStatus, type IndexProgress } from "./lib/api";
 import "./index.css";
 
 const queryClient = new QueryClient({
@@ -55,10 +56,24 @@ void listen("index:done", () => {
   }
 });
 
+/** The main window is hidden at launch (tauri.conf) while the splash WINDOW shows. The
+ *  app loads here behind it; once our initial data settles we signal the backend, which
+ *  closes the splash and reveals this window only when its own setup is also done. The
+ *  db_stats query shares the header's ["db_stats"] cache, so this adds no extra fetch. */
+function AppShell() {
+  const stats = useQuery({ queryKey: ["db_stats"], queryFn: api.dbStats, retry: 0 });
+  useEffect(() => {
+    // Settled (success OR error) → frontend is ready. set_complete is idempotent, so an
+    // extra call is harmless; the backend reveals the window only when its half is done too.
+    if (!stats.isLoading) void invoke("set_complete", { task: "frontend" });
+  }, [stats.isLoading]);
+  return <App />;
+}
+
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>
     <QueryClientProvider client={queryClient}>
-      <App />
+      <AppShell />
     </QueryClientProvider>
   </React.StrictMode>,
 );
