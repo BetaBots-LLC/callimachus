@@ -224,7 +224,7 @@ pub fn list_open_todos(
          FROM facts f
          JOIN threads t ON t.id = f.thread_id
          JOIN sources s ON s.id = t.source_id
-         WHERE f.kind = 'todo' AND f.status = 'open'",
+         WHERE f.kind = 'todo' AND f.status = 'open' AND f.hidden = 0",
     );
     let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
     // Server-side text search (over the whole corpus, not just the loaded page) so it
@@ -343,8 +343,11 @@ pub fn store_distilled(
     now: i64,
 ) -> Result<()> {
     let tx = conn.transaction()?;
+    // Replace only the UN-curated LLM facts; pinned / edited / hidden ones are the user's
+    // now and survive re-distillation.
     tx.execute(
-        "DELETE FROM facts WHERE thread_id = ?1 AND extractor = 'llm'",
+        "DELETE FROM facts WHERE thread_id = ?1 AND extractor = 'llm'
+            AND pinned = 0 AND edited = 0 AND hidden = 0",
         [thread_id],
     )?;
     {
@@ -388,6 +391,38 @@ pub fn set_error(conn: &Connection, thread_id: i64, err: &str) -> Result<()> {
     Ok(())
 }
 
+// ---- fact curation (pin / edit / hide) — makes auto-generated memory trustworthy ----
+
+/// Pin or unpin a fact. Pinned facts rank first and survive re-distillation.
+pub fn set_fact_pinned(conn: &Connection, fact_id: i64, pinned: bool) -> Result<()> {
+    conn.execute(
+        "UPDATE facts SET pinned = ?2 WHERE id = ?1",
+        params![fact_id, i64::from(pinned)],
+    )?;
+    Ok(())
+}
+
+/// Hide or unhide a fact (soft delete). Hidden facts are never shown but kept as a
+/// tombstone so re-distillation's DELETE skips them (they won't be resurrected).
+pub fn set_fact_hidden(conn: &Connection, fact_id: i64, hidden: bool) -> Result<()> {
+    conn.execute(
+        "UPDATE facts SET hidden = ?2 WHERE id = ?1",
+        params![fact_id, i64::from(hidden)],
+    )?;
+    Ok(())
+}
+
+/// Edit a fact's text. Marks it edited (survives re-distill) and re-queues it for
+/// embedding (drops the stale vector) so cross-thread recall matches the new wording.
+pub fn edit_fact(conn: &Connection, fact_id: i64, text: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE facts SET text = ?2, edited = 1, embedded = 0 WHERE id = ?1",
+        params![fact_id, text.trim()],
+    )?;
+    conn.execute("DELETE FROM vec_facts WHERE fact_id = ?1", [fact_id])?;
+    Ok(())
+}
+
 /// Clear extraction state so a thread re-distills on next request (the "Re-distill" path).
 pub fn mark_for_redistill(conn: &Connection, thread_id: i64) -> Result<()> {
     conn.execute(
@@ -402,6 +437,7 @@ pub fn mark_for_redistill(conn: &Connection, thread_id: i64) -> Result<()> {
 pub struct KFact {
     pub id: i64,
     pub text: String,
+    pub pinned: bool,
 }
 
 /// All distilled knowledge for one thread, grouped by kind, with freshness flags.
@@ -449,24 +485,27 @@ pub fn get_thread_knowledge(conn: &Connection, thread_id: i64) -> Result<ThreadK
             |r| Ok((r.get::<_, i64>(0)? != 0, r.get(1)?, r.get(2)?, r.get(3)?)),
         )?;
 
-    let mut stmt =
-        conn.prepare("SELECT id, kind, text FROM facts WHERE thread_id = ?1 ORDER BY seq, id")?;
+    let mut stmt = conn.prepare(
+        "SELECT id, kind, text, pinned FROM facts
+         WHERE thread_id = ?1 AND hidden = 0 ORDER BY pinned DESC, seq, id",
+    )?;
     let rows = stmt.query_map([thread_id], |r| {
         Ok((
             r.get::<_, i64>(0)?,
             r.get::<_, String>(1)?,
             r.get::<_, String>(2)?,
+            r.get::<_, i64>(3)? != 0,
         ))
     })?;
     let mut summary = None;
     let (mut decisions, mut gotchas, mut todos) = (Vec::new(), Vec::new(), Vec::new());
     for row in rows {
-        let (id, kind, text) = row?;
+        let (id, kind, text, pinned) = row?;
         match kind.as_str() {
             "summary" => summary = Some(text),
-            "decision" => decisions.push(KFact { id, text }),
-            "gotcha" => gotchas.push(KFact { id, text }),
-            "todo" => todos.push(KFact { id, text }),
+            "decision" => decisions.push(KFact { id, text, pinned }),
+            "gotcha" => gotchas.push(KFact { id, text, pinned }),
+            "todo" => todos.push(KFact { id, text, pinned }),
             _ => {}
         }
     }
@@ -520,7 +559,7 @@ pub fn recall(
          JOIN facts f ON f.id = knn.fact_id
          JOIN threads t ON t.id = f.thread_id
          JOIN sources s ON s.id = t.source_id
-         WHERE f.kind = ?2"
+         WHERE f.kind = ?2 AND f.hidden = 0"
     );
     let mut args: Vec<Box<dyn rusqlite::ToSql>> = vec![
         Box::new(crate::embed::vec_to_bytes(qv)),
@@ -569,6 +608,7 @@ pub struct MemoryFact {
     pub title: Option<String>,
     #[serde(rename = "createdAt")]
     pub created_at: i64,
+    pub pinned: bool,
 }
 
 /// Durable, aggregated knowledge for one project: decisions + gotchas + open TODOs
@@ -634,14 +674,15 @@ fn project_facts(
     // Exact project_path match (the picker / cwd pass the canonical path) so this uses
     // idx_threads_project + idx_facts_thread_kind instead of scanning a kind-partition.
     let mut sql = String::from(
-        "SELECT f.id, f.thread_id, f.text, t.title, f.created_at
+        "SELECT f.id, f.thread_id, f.text, t.title, f.created_at, f.pinned
          FROM facts f JOIN threads t ON t.id = f.thread_id
-         WHERE f.kind = ?1 AND t.project_path = ?2",
+         WHERE f.kind = ?1 AND t.project_path = ?2 AND f.hidden = 0",
     );
     if open_only {
         sql.push_str(" AND f.status = 'open'");
     }
-    sql.push_str(" ORDER BY f.created_at DESC, f.id DESC");
+    // Pinned facts first, then newest. Pinned ones are the user's trusted set.
+    sql.push_str(" ORDER BY f.pinned DESC, f.created_at DESC, f.id DESC");
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(rusqlite::params![kind, project], |r| {
         Ok(MemoryFact {
@@ -650,6 +691,7 @@ fn project_facts(
             text: r.get(2)?,
             title: r.get(3)?,
             created_at: r.get(4)?,
+            pinned: r.get::<_, i64>(5)? != 0,
         })
     })?;
     let mut seen = std::collections::HashSet::new();
@@ -703,6 +745,19 @@ pub fn project_pending_threads(conn: &Connection, project: &str) -> Result<Vec<i
          ORDER BY updated_at DESC"
     ))?;
     let rows = stmt.query_map([project], |r| r.get::<_, i64>(0))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Visible (non-hidden) distilled decisions for a project, id + text — for conflict review.
+pub fn project_decisions(conn: &Connection, project: &str) -> Result<Vec<(i64, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT f.id, f.text FROM facts f JOIN threads t ON t.id = f.thread_id
+         WHERE f.kind = 'decision' AND t.project_path = ?1 AND f.hidden = 0
+         ORDER BY f.created_at DESC",
+    )?;
+    let rows = stmt.query_map([project], |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+    })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
@@ -847,6 +902,85 @@ mod tests {
         assert!(!k2.extracted, "changed message count must reset extraction");
         assert!(k2.decisions.is_empty(), "llm facts cleared on invalidation");
         assert!(needs_distill(&conn, id).unwrap());
+    }
+
+    #[test]
+    fn curation_survives_redistill_and_hides() {
+        use crate::agent::Distilled;
+        use crate::indexer::{source_id, upsert_thread, ParsedMessage, ParsedThread};
+
+        let mut conn = temp_db();
+        let sid = source_id(&conn, "claude_code").unwrap();
+        let m = |r: &str, t: &str| ParsedMessage {
+            role: r.into(),
+            text: t.into(),
+            tool_name: None,
+            ts: Some(1),
+        };
+        upsert_thread(
+            &mut conn,
+            sid,
+            &ParsedThread {
+                external_id: "pin1".into(),
+                title: Some("p".into()),
+                project_path: Some("/proj/p".into()),
+                created_at: Some(1),
+                updated_at: Some(2),
+                messages: vec![m("user", "hi"), m("assistant", "yo")],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let tid: i64 = conn
+            .query_row("SELECT id FROM threads WHERE external_id='pin1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+
+        let d = |dec: &str| Distilled {
+            summary: String::new(),
+            decisions: vec![dec.into()],
+            gotchas: vec![],
+        };
+        store_distilled(&mut conn, tid, &d("use sqlite"), 1).unwrap();
+        let fid: i64 = conn
+            .query_row(
+                "SELECT id FROM facts WHERE thread_id=?1 AND kind='decision'",
+                [tid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        set_fact_pinned(&conn, fid, true).unwrap();
+
+        // Re-distill with a DIFFERENT decision: the pinned one must survive.
+        store_distilled(&mut conn, tid, &d("use postgres"), 2).unwrap();
+        let texts: Vec<String> = {
+            let mut s = conn
+                .prepare(
+                    "SELECT text FROM facts WHERE thread_id=?1 AND kind='decision' ORDER BY id",
+                )
+                .unwrap();
+            s.query_map([tid], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        assert!(
+            texts.contains(&"use sqlite".to_string()),
+            "pinned decision survived: {texts:?}"
+        );
+        assert!(
+            texts.contains(&"use postgres".to_string()),
+            "re-distill added the new decision"
+        );
+
+        // Hidden facts don't surface in project memory.
+        set_fact_hidden(&conn, fid, true).unwrap();
+        let mem = get_project_memory(&conn, "/proj/p", 60).unwrap();
+        assert!(
+            !mem.decisions.iter().any(|f| f.text == "use sqlite"),
+            "hidden fact stays hidden"
+        );
     }
 
     #[test]

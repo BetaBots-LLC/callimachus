@@ -244,8 +244,10 @@ pub fn upsert_thread(
                 "UPDATE threads SET knowledge_extracted = 0, knowledge_error = NULL WHERE id = ?1",
                 [thread_id],
             )?;
+            // Keep curated facts (pinned / edited / hidden) even when the thread changed.
             tx.execute(
-                "DELETE FROM facts WHERE thread_id = ?1 AND extractor = 'llm'",
+                "DELETE FROM facts WHERE thread_id = ?1 AND extractor = 'llm'
+                    AND pinned = 0 AND edited = 0 AND hidden = 0",
                 [thread_id],
             )?;
         }

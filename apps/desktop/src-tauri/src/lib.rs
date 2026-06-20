@@ -696,6 +696,97 @@ async fn distill_thread(
     }
 }
 
+// ---- fact curation (pin / edit / hide) ----
+
+/// Pin or unpin a distilled fact (pinned ranks first + survives re-distill).
+#[tauri::command]
+fn set_fact_pinned(db: tauri::State<'_, db::Db>, fact_id: i64, pinned: bool) -> AppResult<()> {
+    let conn = lock(&db)?;
+    knowledge::set_fact_pinned(&conn, fact_id, pinned)?;
+    Ok(())
+}
+
+/// Hide (soft-delete) or restore a fact. Hidden facts are kept as a tombstone so
+/// re-distillation won't bring them back.
+#[tauri::command]
+fn hide_fact(db: tauri::State<'_, db::Db>, fact_id: i64, hidden: bool) -> AppResult<()> {
+    let conn = lock(&db)?;
+    knowledge::set_fact_hidden(&conn, fact_id, hidden)?;
+    Ok(())
+}
+
+/// Edit a fact's text. Re-embeds it so cross-thread recall matches the new wording.
+#[tauri::command]
+fn edit_fact(
+    db: tauri::State<'_, db::Db>,
+    embedder: tauri::State<'_, embed::Embedder>,
+    fact_id: i64,
+    text: String,
+) -> AppResult<()> {
+    {
+        let conn = lock(&db)?;
+        knowledge::edit_fact(&conn, fact_id, &text)?;
+    }
+    if let Err(e) = embed::embed_pending_facts(&db, &embedder) {
+        eprintln!("[knowledge] re-embed edited fact: {e}");
+    }
+    Ok(())
+}
+
+/// A pair of distilled decisions the LLM flagged as conflicting or superseding.
+#[derive(Debug, Serialize)]
+struct Conflict {
+    #[serde(rename = "aId")]
+    a_id: i64,
+    #[serde(rename = "aText")]
+    a_text: String,
+    #[serde(rename = "bId")]
+    b_id: i64,
+    #[serde(rename = "bText")]
+    b_text: String,
+    reason: String,
+}
+
+/// Review a project's distilled decisions for conflicts / supersessions via the LLM.
+#[tauri::command]
+async fn detect_conflicts(
+    pool: tauri::State<'_, db::ReadPool>,
+    project: String,
+) -> AppResult<Vec<Conflict>> {
+    let (provider, model, key, decisions) = {
+        let conn = read(&pool)?;
+        let (provider, model, key) = resolve_distill_engine(&conn)?;
+        let decisions = knowledge::project_decisions(&conn, &project)?;
+        (provider, model, key, decisions)
+    };
+    if decisions.len() < 2 {
+        return Ok(Vec::new());
+    }
+    let texts: Vec<String> = decisions.iter().map(|(_, t)| t.clone()).collect();
+    let pairs = agent::find_conflicts(&provider, &model, key.as_deref(), &texts).await?;
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for p in pairs {
+        if p.a < 1 || p.b < 1 || p.a > decisions.len() || p.b > decisions.len() || p.a == p.b {
+            continue;
+        }
+        let (a, b) = if p.a < p.b { (p.a, p.b) } else { (p.b, p.a) };
+        if !seen.insert((a, b)) {
+            continue;
+        }
+        let (a_id, a_text) = decisions[a - 1].clone();
+        let (b_id, b_text) = decisions[b - 1].clone();
+        out.push(Conflict {
+            a_id,
+            a_text,
+            b_id,
+            b_text,
+            reason: p.reason,
+        });
+    }
+    Ok(out)
+}
+
 // ---- project memory ----
 
 /// Distinct projects with distillation coverage, for the Project Memory picker.
@@ -1571,7 +1662,11 @@ pub fn run() {
             write_project_memory_file,
             distilling_status,
             cancel_distill,
-            distill_project
+            distill_project,
+            set_fact_pinned,
+            hide_fact,
+            edit_fact,
+            detect_conflicts
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
