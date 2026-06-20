@@ -18,7 +18,7 @@ Recall the user's prior work from their **Callimachus** index — one local, sea
 
 **Prefer the MCP tools** if the `callimachus` MCP server is connected. The server exposes 15 tools — 12 read, 3 write.
 
-**Read:** `search_threads`, `search_current_project`, `recent_threads`, `get_thread`, `list_tags`, `list_open_todos`, `get_thread_knowledge`, `recall_decisions`, `recall_gotchas`, `project_memory`, `ask_history`, `threads_for_file`.
+**Read:** `search_threads`, `search_current_project`, `recent_threads`, `get_thread`, `list_tags`, `list_open_todos`, `get_thread_knowledge`, `recall_decisions`, `recall_gotchas`, `find_prior_work`, `project_memory`, `ask_history`, `threads_for_file`.
 **Write (to Callimachus's own memory only):** `complete_todo`, `record_decision`, `record_gotcha`.
 
 1. **Load the project's memory FIRST** -- `project_memory(project?)` returns a project's durable memory: the decisions, gotchas, and open TODOs distilled across ALL past sessions on it, with coverage counts. Omit `project` to use the repo the server runs in. Call this at the START of work on a repo to recall what was already decided and what to watch out for.
@@ -28,6 +28,7 @@ Recall the user's prior work from their **Callimachus** index — one local, sea
 5. **Ask a question over history (cited RAG)** -- `ask_history(question)` retrieves the most relevant threads and returns a synthesized answer with `[thread N]` citations plus the source list. Use for "how did we…" / "what did I decide about…" instead of reading many threads yourself.
 6. **Recall past decisions BEFORE re-deciding** -- `recall_decisions(query, project?, limit?)` does cross-thread semantic recall of concrete decisions the user already made (and why). Call it before settling anything the user may have settled already.
 7. **Recall known gotchas** -- `recall_gotchas(query, project?, limit?)` surfaces pitfalls and non-obvious constraints the user hit before, so you don't repeat a known mistake.
+8. **Check for prior work BEFORE starting a task** -- `find_prior_work(query, project?, limit?)` returns past SESSIONS where the user did something similar (each with its most-relevant decision/gotcha and threadId). Use it at the start of a task to reuse an earlier solution instead of redoing it. Searches all projects unless `project` is given.
 8. **Find which sessions touched a file** -- `threads_for_file(path)` returns the past sessions that mentioned a file path (e.g. `embed/mod.rs`). Handy before editing a file to pull up its prior history.
 9. **Get a high-signal recap of one thread** -- `get_thread_knowledge(thread_id)` returns a short summary plus key decisions, gotchas, and open TODOs for that thread. Prefer it over reading the full transcript when you just need the gist.
 10. **Optionally orient with tags / TODOs** -- `list_tags()` lists the user's topic labels (collections) with counts; pass one to `recent_threads` to filter. `list_open_todos(project?, source?, limit?)` lists unfinished action items left across sessions.
@@ -47,6 +48,7 @@ cal recent -n 10                            # most recent threads
 cal cat 42                                  # full thread -> stdout (pipe/quote it)
 cal decisions "auth flow"                   # recall past decisions (semantic)
 cal gotchas "rate limiting"                 # recall known gotchas/pitfalls
+cal similar "add stripe webhooks"           # prior sessions like this task
 cal knowledge 42                            # distilled recap of one thread
 cal memory [project]                        # a project's durable memory (decisions/gotchas/TODOs)
 cal ask "how did we wire the embedder?"     # cited RAG answer over your history

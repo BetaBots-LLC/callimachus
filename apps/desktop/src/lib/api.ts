@@ -250,6 +250,19 @@ export interface CoachOverview {
   since: number;
 }
 
+// A prior session similar to a task ("have I done this before?"), rolled up from its
+// matching decisions/gotchas.
+export interface PriorWork {
+  threadId: number;
+  title: string | null;
+  projectPath: string | null;
+  source: string;
+  kind: string;
+  snippet: string;
+  similarity: number;
+  matches: number;
+}
+
 // A thread in the storage-cleanup list (oldest-first, with size).
 export interface CleanupRow {
   id: number;
@@ -265,6 +278,12 @@ export const api = {
   dbStats: () => invoke<DbStats>("db_stats"),
   indexStats: () => invoke<Stats>("index_stats"),
   coachOverview: () => invoke<CoachOverview>("coach_overview"),
+  findPriorWork: (query: string, opts?: { project?: string; limit?: number }) =>
+    invoke<PriorWork[]>("find_prior_work", {
+      query,
+      project: opts?.project ?? null,
+      limit: opts?.limit ?? null,
+    }),
   // Oldest-first threads with size, for cleanup. before = epoch secs upper bound.
   cleanupCandidates: (opts?: { before?: number; sources?: string[]; limit?: number }) =>
     invoke<CleanupRow[]>("cleanup_candidates", {

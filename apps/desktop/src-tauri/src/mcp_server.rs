@@ -331,6 +331,36 @@ impl Callimachus {
     }
 
     #[tool(
+        description = "Find PRIOR SESSIONS where the user already worked on something similar to a task you're about to start — the 'have I done this before?' guard. Pass a short description of the task/problem as `query`; returns past threads (each with its most-relevant decision or gotcha and the threadId) so you can reuse the earlier solution instead of redoing or re-deciding it. Searches ALL projects unless `project` is given. Call at the START of a task. Requires distilled threads."
+    )]
+    async fn find_prior_work(
+        &self,
+        Parameters(args): Parameters<RecallArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let qv = embed::embed_query(&self.embedder, &args.query)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let Some(qv) = qv else {
+            return Ok(CallToolResult::success(vec![Content::text(
+                "[]".to_string(),
+            )]));
+        };
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let hits = crate::knowledge::find_prior_work(
+            &conn,
+            &qv,
+            args.project.as_deref(),
+            args.limit.unwrap_or(8) as usize,
+        )
+        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let json = serde_json::to_string_pretty(&hits)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(
         description = "Get a project's durable MEMORY: the decisions, gotchas, and open TODOs distilled across ALL past AI-coding sessions on it, with coverage counts. Omit `project` to use the repo the server runs in. Call this at the START of work on a project to recall what was already decided and what to watch out for. Decisions/gotchas need the user to have distilled threads; TODOs are always available."
     )]
     async fn project_memory(

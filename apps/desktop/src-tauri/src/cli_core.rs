@@ -28,6 +28,7 @@ pub const COMMANDS: &[&str] = &[
     "distill",
     "decisions",
     "gotchas",
+    "similar",
     "ask",
     "files",
     "memory",
@@ -60,6 +61,9 @@ USAGE:
   cal decisions <query…> [-p PROJECT] [-n LIMIT] [--json]
   cal gotchas <query…> [-p PROJECT] [-n LIMIT] [--json]
                                 semantic recall of distilled decisions/gotchas
+  cal similar <task…> [-p PROJECT] [-n LIMIT] [--json]
+                                prior SESSIONS where you did something similar
+                                (the have-I-done-this-before guard)
   cal ask <question…>           answer a question from your history (RAG, cited)
   cal files <path>              threads that mention a file path (e.g. embed/mod.rs)
   cal memory [<project>] [-n LIMIT] [--json]
@@ -123,6 +127,7 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
         "distill" => cmd_distill(rest),
         "decisions" => cmd_recall(rest, "decision"),
         "gotchas" => cmd_recall(rest, "gotcha"),
+        "similar" => cmd_similar(rest),
         "ask" => cmd_ask(rest),
         "files" => cmd_files(rest),
         "memory" => cmd_memory(rest),
@@ -673,6 +678,41 @@ fn cmd_recall(args: &[String], kind: &str) -> anyhow::Result<()> {
             h.thread_id,
             h.similarity * 100.0
         );
+    }
+    Ok(())
+}
+
+/// `cal similar <task…>` — the "have I done this before?" guard: prior SESSIONS where the
+/// user worked on something like `task`, each with the most-relevant decision/gotcha.
+fn cmd_similar(args: &[String]) -> anyhow::Result<()> {
+    let o = parse(args)?;
+    let query = o.positional.join(" ");
+    if query.trim().is_empty() {
+        anyhow::bail!("usage: cal similar <task description…>  [-p <project>]");
+    }
+    let conn = open_db()?;
+    let embedder = embed::Embedder::default();
+    let Some(qv) = embed::embed_query(&embedder, &query)? else {
+        return Ok(());
+    };
+    let limit = o.limit.unwrap_or(8) as usize;
+    let hits = knowledge::find_prior_work(&conn, &qv, o.project.as_deref(), limit)?;
+    if o.json {
+        println!("{}", serde_json::to_string_pretty(&hits)?);
+        return Ok(());
+    }
+    if hits.is_empty() {
+        eprintln!("no prior work found — distill some threads first (`cal distill <id>`)");
+        return Ok(());
+    }
+    for h in &hits {
+        println!(
+            "• {} · thread {} · {:.0}% match",
+            h.title.as_deref().unwrap_or("untitled"),
+            h.thread_id,
+            h.similarity * 100.0
+        );
+        println!("    {}: {}", h.kind, h.snippet);
     }
     Ok(())
 }
