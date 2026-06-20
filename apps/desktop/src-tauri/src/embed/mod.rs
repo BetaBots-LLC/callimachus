@@ -65,7 +65,13 @@ impl Embedder {
     }
 }
 
-/// Split text into overlapping char-windows. Short text stays a single chunk.
+/// Cap chunks per message. A giant pasted log (a 600 KB message is ~430 chunks at
+/// CHUNK_CHARS) would otherwise stall the embed job and bloat the vector index; the
+/// first N chunks capture the semantic gist, and FTS still searches the full text.
+const MAX_CHUNKS_PER_MESSAGE: usize = 16;
+
+/// Split text into overlapping char-windows. Short text stays a single chunk. Capped at
+/// MAX_CHUNKS_PER_MESSAGE so one huge message can't dominate a batch.
 fn chunk_text(s: &str) -> Vec<String> {
     let chars: Vec<char> = s.chars().collect();
     if chars.len() <= CHUNK_CHARS {
@@ -77,7 +83,7 @@ fn chunk_text(s: &str) -> Vec<String> {
     while start < chars.len() {
         let end = (start + CHUNK_CHARS).min(chars.len());
         out.push(chars[start..end].iter().collect());
-        if end == chars.len() {
+        if end == chars.len() || out.len() >= MAX_CHUNKS_PER_MESSAGE {
             break;
         }
         start += step;
@@ -144,6 +150,21 @@ pub fn store_batch(
         }
     }
     tx.commit()?;
+    Ok(())
+}
+
+/// Mark messages embedded WITHOUT storing vectors — for a batch that failed to embed, so
+/// the job advances past it instead of retrying it forever. They stay FTS-searchable.
+pub fn mark_embedded(conn: &Connection, ids: &[i64]) -> Result<()> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let params: Vec<&dyn rusqlite::ToSql> = ids.iter().map(|i| i as &dyn rusqlite::ToSql).collect();
+    conn.execute(
+        &format!("UPDATE messages SET embedded = 1 WHERE id IN ({placeholders})"),
+        params.as_slice(),
+    )?;
     Ok(())
 }
 
@@ -337,6 +358,15 @@ mod tests {
         let chunks = chunk_text(&s);
         assert!(chunks.len() >= 3, "got {}", chunks.len());
         assert!(chunks.iter().all(|c| c.chars().count() <= CHUNK_CHARS));
+    }
+
+    #[test]
+    fn chunks_capped_for_giant_message() {
+        // A 600KB pasted-log message must not explode into hundreds of chunks (which
+        // stalled the embed job). Capped at MAX_CHUNKS_PER_MESSAGE.
+        let s = "abcd efgh ".repeat(60_000); // ~600KB
+        let chunks = chunk_text(&s);
+        assert_eq!(chunks.len(), MAX_CHUNKS_PER_MESSAGE, "giant message capped");
     }
 
     /// Real model + vec0 path. Downloads bge-small on first run (needs network):

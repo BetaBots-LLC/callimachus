@@ -454,8 +454,17 @@ fn build_embeddings(app: AppHandle) -> AppResult<()> {
             let vecs = match embedder.embed(texts) {
                 Ok(v) => v,
                 Err(e) => {
-                    eprintln!("[embed] {e}");
-                    break;
+                    // Don't let one bad batch stall the whole job: mark these messages
+                    // embedded (they just won't have vectors — FTS still finds them) and
+                    // move on, instead of aborting at this point forever.
+                    eprintln!("[embed] batch failed, skipping: {e}");
+                    let ids: Vec<i64> = rows.iter().map(|(id, _)| *id).collect();
+                    if let Ok(conn) = db.0.lock() {
+                        let _ = embed::mark_embedded(&conn, &ids);
+                    }
+                    done += rows.len() as i64;
+                    let _ = app.emit("embed:progress", EmbedProgressEvent { done, total });
+                    continue;
                 }
             };
             // 3. Locked, fast: persist the vectors + mark the messages embedded.
