@@ -119,6 +119,16 @@ export interface KnowledgeConfig {
 export interface KFact {
   id: number;
   text: string;
+  pinned: boolean;
+}
+
+/** Two distilled decisions the LLM flagged as conflicting / superseding. */
+export interface Conflict {
+  aId: number;
+  aText: string;
+  bId: number;
+  bText: string;
+  reason: string;
 }
 
 /** A distilled fact in a project's aggregated memory, with its source thread. */
@@ -128,6 +138,7 @@ export interface MemoryFact {
   text: string;
   title: string | null;
   createdAt: number;
+  pinned: boolean;
 }
 
 /** Durable, aggregated knowledge for one project + distillation coverage. */
@@ -274,6 +285,12 @@ export const api = {
   cancelDistill: () => invoke<void>("cancel_distill"),
   writeProjectMemoryFile: (project: string, withBrief: boolean) =>
     invoke<string>("write_project_memory_file", { project, withBrief }),
+  // Fact curation: pin / edit / hide distilled facts; LLM conflict review.
+  setFactPinned: (factId: number, pinned: boolean) =>
+    invoke<void>("set_fact_pinned", { factId, pinned }),
+  hideFact: (factId: number, hidden: boolean) => invoke<void>("hide_fact", { factId, hidden }),
+  editFact: (factId: number, text: string) => invoke<void>("edit_fact", { factId, text }),
+  detectConflicts: (project: string) => invoke<Conflict[]>("detect_conflicts", { project }),
   getThread: (threadId: number) => invoke<ThreadDetail | null>("get_thread", { threadId }),
   // Stars & tags ("collections").
   setStar: (threadId: number, starred: boolean) => invoke<void>("set_star", { threadId, starred }),

@@ -239,6 +239,76 @@ pub async fn project_brief(
     Ok(text.trim().to_string())
 }
 
+/// System prompt for conflict review over a project's distilled decisions.
+const CONFLICT_SYSTEM: &str = "You review a numbered list of technical decisions distilled \
+from one project's history. Find pairs that CONFLICT, or where one SUPERSEDES the other (the \
+project changed its mind). Output ONLY a JSON array; each element is \
+{\"a\": <number>, \"b\": <number>, \"reason\": <one terse sentence>} where a and b are the \
+1-based numbers of the two decisions. Include ONLY genuine conflicts or supersessions, not \
+merely related or similar decisions. Output [] if there are none. No prose, no code fences.";
+
+/// One conflicting / superseding decision pair (1-based indices into the input list).
+#[derive(Debug, Deserialize)]
+pub struct ConflictPair {
+    pub a: usize,
+    pub b: usize,
+    #[serde(default)]
+    pub reason: String,
+}
+
+/// Ask the LLM which of a project's decisions conflict or supersede each other. Returns
+/// 1-based index pairs; the caller maps them back to fact ids. Same provider plumbing.
+pub async fn find_conflicts(
+    provider: &str,
+    model: &str,
+    api_key: Option<&str>,
+    decisions: &[String],
+) -> Result<Vec<ConflictPair>> {
+    let adapter = adapter_for(provider)?;
+    let key = api_key.map(str::to_string);
+    let client = Client::builder()
+        .with_adapter_kind(adapter)
+        .with_auth_resolver_fn(move |_iden: genai::ModelIden| {
+            Ok(key.clone().map(AuthData::from_single))
+        })
+        .build();
+    let list = decisions
+        .iter()
+        .enumerate()
+        .map(|(i, d)| format!("{}. {}", i + 1, d.trim()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let req = ChatRequest::new(Vec::new())
+        .with_system(CONFLICT_SYSTEM)
+        .append_message(GMessage::user(format!("Decisions:\n{list}")));
+    let options = ChatOptions::default()
+        .with_temperature(0.1)
+        .with_max_tokens(800);
+    let resp = client
+        .exec_chat(model, req, Some(&options))
+        .await
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    Ok(parse_conflicts(&resp.into_first_text().unwrap_or_default()))
+}
+
+/// Lenient parse of the model's JSON array of conflict pairs (tolerates fences/prose).
+fn parse_conflicts(raw: &str) -> Vec<ConflictPair> {
+    let trimmed = raw
+        .trim()
+        .trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim();
+    if let (Some(s), Some(e)) = (trimmed.find('['), trimmed.rfind(']')) {
+        if e > s {
+            if let Ok(v) = serde_json::from_str::<Vec<ConflictPair>>(&trimmed[s..=e]) {
+                return v;
+            }
+        }
+    }
+    Vec::new()
+}
+
 /// System prompt for STRUCTURED distillation into the knowledge `facts` table. We ask
 /// for plain JSON and parse leniently (works identically across cloud and local Ollama
 /// — no adapter-specific response-format API). TODOs are intentionally NOT requested:

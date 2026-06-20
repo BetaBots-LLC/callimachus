@@ -33,5 +33,7 @@ pub static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
         M::up(include_str!("../../migrations/0013_file_mentions.sql")),
         // 0014 — perf: composite list indexes, facts(thread_id,kind), trigram path FTS.
         M::up(include_str!("../../migrations/0014_perf.sql")),
+        // 0015 — fact curation: pin / edit / hide distilled facts.
+        M::up(include_str!("../../migrations/0015_fact_curation.sql")),
     ])
 });
