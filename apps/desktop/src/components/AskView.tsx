@@ -8,6 +8,12 @@ import { Input } from "@/components/ui/input";
 import { Loading } from "./Loading";
 import { Markdown } from "./Markdown";
 
+const ASK_EXAMPLES = [
+  "How did we handle authentication?",
+  "What did we decide about the database schema?",
+  "Have we hit this kind of error before?",
+];
+
 /**
  * Ask-your-history (RAG): a question → Callimachus retrieves the most relevant past
  * threads, has the configured LLM answer with [thread N] citations, and lists the
@@ -81,10 +87,30 @@ export function AskView() {
             )}
           </div>
         ) : (
-          <p className="px-1 text-sm text-muted-foreground">
-            Ask a question — Callimachus searches your past sessions and answers with citations to
-            the threads it used. Needs distillation enabled (an LLM engine) in Settings.
-          </p>
+          <div className="space-y-3 px-1">
+            <p className="text-sm text-muted-foreground">
+              Ask a question — Callimachus searches your past sessions and answers with citations to
+              the threads it used. Needs distillation enabled (an LLM engine) in Settings.
+            </p>
+            <div className="space-y-1.5">
+              <p className="text-[0.7rem] font-medium uppercase tracking-wide text-muted-foreground">
+                Try
+              </p>
+              {ASK_EXAMPLES.map((ex) => (
+                <button
+                  key={ex}
+                  type="button"
+                  onClick={() => {
+                    setQuestion(ex);
+                    ask.mutate(ex);
+                  }}
+                  className="block w-fit cursor-pointer rounded-md border px-2.5 py-1.5 text-left text-sm transition-colors hover:bg-muted/50"
+                >
+                  {ex}
+                </button>
+              ))}
+            </div>
+          </div>
         )}
       </div>
     </div>

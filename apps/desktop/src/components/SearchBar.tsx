@@ -133,7 +133,7 @@ export function SearchBar() {
     <div className="flex flex-col gap-2 border-b px-4 py-3">
       <div className="flex gap-2">
         <Input
-          placeholder="Search every thread…"
+          placeholder="Search every thread…  (try file:embed/mod.rs)"
           value={text}
           autoFocus
           onChange={(e) => onChange(e.currentTarget.value)}
