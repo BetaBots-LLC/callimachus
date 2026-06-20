@@ -36,14 +36,14 @@ pub fn storage_root() -> Option<PathBuf> {
     Some(base.join("opencode/storage"))
 }
 
-pub fn scan(conn: &mut Connection) -> Result<IndexReport> {
+pub fn scan(conn: &mut Connection, tick: &mut dyn FnMut()) -> Result<IndexReport> {
     let Some(root) = storage_root() else {
         return Ok(IndexReport::default());
     };
-    scan_root(conn, &root)
+    scan_root(conn, &root, tick)
 }
 
-fn scan_root(conn: &mut Connection, root: &Path) -> Result<IndexReport> {
+fn scan_root(conn: &mut Connection, root: &Path, tick: &mut dyn FnMut()) -> Result<IndexReport> {
     let mut report = IndexReport::default();
     let session_dir = root.join("session");
     if !session_dir.is_dir() {
@@ -55,6 +55,7 @@ fn scan_root(conn: &mut Connection, root: &Path) -> Result<IndexReport> {
     collect_session_files(&session_dir, &mut session_files);
 
     for sf in session_files {
+        tick();
         match index_session(conn, sid, root, &sf) {
             Ok(Some(n)) => {
                 report.threads_indexed += 1;
@@ -298,7 +299,7 @@ mod tests {
         let dst = temp_dir("oc_dst");
         create_dir_all(&dst).unwrap();
         let mut conn = crate::db::open(&dst.join("db.sqlite")).unwrap();
-        let report = scan_root(&mut conn, &root).unwrap();
+        let report = scan_root(&mut conn, &root, &mut || {}).unwrap();
         assert_eq!(report.threads_indexed, 1);
         assert_eq!(report.messages_indexed, 2);
 
@@ -315,7 +316,7 @@ mod tests {
         assert_eq!(detail.project_path.as_deref(), Some("/Users/me/proj"));
 
         // Second scan with no changes is skipped (fingerprint match).
-        let report2 = scan_root(&mut conn, &root).unwrap();
+        let report2 = scan_root(&mut conn, &root, &mut || {}).unwrap();
         assert_eq!(report2.threads_indexed, 0);
         assert_eq!(report2.threads_skipped, 1);
     }
@@ -324,6 +325,6 @@ mod tests {
     #[ignore]
     fn real_opencode_index() {
         let mut conn = crate::db::open(&temp_dir("oc_real").join("db.sqlite")).unwrap();
-        eprintln!("{:?}", scan(&mut conn).unwrap());
+        eprintln!("{:?}", scan(&mut conn, &mut || {}).unwrap());
     }
 }

@@ -135,7 +135,7 @@ pub fn store_batch(
     owners: &[i64],
     vecs: &[Vec<f32>],
 ) -> Result<()> {
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     {
         let mut ins =
             tx.prepare("INSERT INTO vec_chunks (message_id, embedding) VALUES (?1, ?2)")?;
@@ -213,7 +213,7 @@ pub fn embed_pending_facts(db: &crate::db::Db, embedder: &Embedder) -> Result<()
         // 3. Locked, fast: persist vectors + mark embedded.
         {
             let mut conn = db.0.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
-            let tx = conn.transaction()?;
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             {
                 let mut ins =
                     tx.prepare("INSERT INTO vec_facts (fact_id, embedding) VALUES (?1, ?2)")?;
@@ -246,7 +246,7 @@ pub fn embed_pending_facts_conn(conn: &mut Connection, embedder: &Embedder) -> R
             break;
         }
         let vecs = embedder.embed(rows.iter().map(|(_, t)| t.clone()).collect())?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         {
             let mut ins =
                 tx.prepare("INSERT INTO vec_facts (fact_id, embedding) VALUES (?1, ?2)")?;

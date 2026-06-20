@@ -82,7 +82,7 @@ pub fn delete_threads(conn: &mut Connection, ids: &[i64]) -> Result<usize> {
     if ids.is_empty() {
         return Ok(0);
     }
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let mut n = 0;
     {
         let mut stmt = tx.prepare("DELETE FROM threads WHERE id = ?1")?;

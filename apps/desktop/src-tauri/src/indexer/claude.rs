@@ -35,7 +35,7 @@ fn collect_jsonl(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 /// Walk every project dir, (re)indexing thread files whose mtime/size changed.
-pub fn scan(conn: &mut Connection) -> Result<IndexReport> {
+pub fn scan(conn: &mut Connection, tick: &mut dyn FnMut()) -> Result<IndexReport> {
     let mut report = IndexReport::default();
     let Some(root) = projects_root() else {
         return Ok(report);
@@ -49,6 +49,7 @@ pub fn scan(conn: &mut Connection) -> Result<IndexReport> {
     collect_jsonl(&root, &mut files);
 
     for path in files {
+        tick();
         match index_file(conn, sid, &root, &path) {
             Ok(Some(n)) => {
                 report.threads_indexed += 1;
@@ -363,7 +364,7 @@ mod tests {
     #[ignore]
     fn real_claude_index() {
         let mut conn = crate::db::open(&temp_path("real.db")).unwrap();
-        let report = scan(&mut conn).unwrap();
+        let report = scan(&mut conn, &mut || {}).unwrap();
         eprintln!("{report:?}");
         assert!(
             report.threads_indexed > 0,

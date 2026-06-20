@@ -234,14 +234,30 @@ export function SearchBar() {
         </span>
       </div>
 
-      {jobActive && (
-        <Progress value={jobPct} className="gap-1.5">
-          <ProgressLabel className="text-xs font-normal text-muted-foreground">
-            {jobLabel}
-          </ProgressLabel>
-          <ProgressValue className="text-xs" />
-        </Progress>
-      )}
+      {jobActive &&
+        (indexing.data ? (
+          // Reindex total is estimated from the existing thread count (accurate on a
+          // re-index, indeterminate on a first run). The live "N scanned" count keeps a
+          // long source (e.g. Claude Code) from ever looking stuck.
+          <Progress
+            value={ip && ip.total > 0 ? Math.min(99, Math.round((ip.done / ip.total) * 100)) : null}
+            className="gap-1.5"
+          >
+            <ProgressLabel className="text-xs font-normal text-muted-foreground">
+              {jobLabel}
+            </ProgressLabel>
+            <span className="ml-auto text-xs text-muted-foreground tabular-nums">
+              {(ip?.done ?? 0).toLocaleString()} scanned
+            </span>
+          </Progress>
+        ) : (
+          <Progress value={jobPct} className="gap-1.5">
+            <ProgressLabel className="text-xs font-normal text-muted-foreground">
+              {jobLabel}
+            </ProgressLabel>
+            <ProgressValue className="text-xs" />
+          </Progress>
+        ))}
     </div>
   );
 }

@@ -35,7 +35,12 @@ function ProgressIndicator({ className, ...props }: ProgressPrimitive.Indicator.
   return (
     <ProgressPrimitive.Indicator
       data-slot="progress-indicator"
-      className={cn("h-full bg-primary transition-all", className)}
+      className={cn(
+        "h-full rounded-full bg-primary transition-all",
+        // Indeterminate (value={null}, e.g. indexing with no known total): a looping sweep.
+        "data-indeterminate:w-1/3 data-indeterminate:animate-[indeterminate-bar_1.1s_ease-in-out_infinite] data-indeterminate:transition-none",
+        className,
+      )}
       {...props}
     />
   );

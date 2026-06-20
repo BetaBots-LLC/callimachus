@@ -223,3 +223,9 @@
 ::-webkit-scrollbar-thumb:hover {
   background-color: color-mix(in oklab, var(--muted-foreground) 50%, transparent);
 }
+
+/* Indeterminate progress sweep — used while indexing, whose total isn't known up front. */
+@keyframes indeterminate-bar {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(300%); }
+}

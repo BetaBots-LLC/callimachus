@@ -50,13 +50,13 @@ pub fn task_roots() -> Vec<PathBuf> {
     task_roots_for(EXT_ID)
 }
 
-pub fn scan(conn: &mut Connection) -> Result<IndexReport> {
-    scan_ext(conn, KIND, EXT_ID)
+pub fn scan(conn: &mut Connection, tick: &mut dyn FnMut()) -> Result<IndexReport> {
+    scan_ext(conn, KIND, EXT_ID, tick)
 }
 
 /// Index a Cline-architecture agent's tasks under `ext_id` into source `kind`.
 /// Shared by Cline, Roo Code, and Kilo Code.
-pub fn scan_ext(conn: &mut Connection, kind: &str, ext_id: &str) -> Result<IndexReport> {
+pub fn scan_ext(conn: &mut Connection, kind: &str, ext_id: &str, tick: &mut dyn FnMut()) -> Result<IndexReport> {
     let mut report = IndexReport::default();
     let roots = task_roots_for(ext_id);
     if roots.is_empty() {
@@ -71,6 +71,7 @@ pub fn scan_ext(conn: &mut Connection, kind: &str, ext_id: &str) -> Result<Index
             continue;
         };
         for task in tasks.flatten() {
+            tick();
             let dir = task.path();
             if !dir.is_dir() {
                 continue;
@@ -329,6 +330,6 @@ mod tests {
     fn real_cline_index() {
         let mut conn = crate::db::open(&temp_path("cline_real.db")).unwrap();
         eprintln!("roots: {:?}", task_roots());
-        eprintln!("{:?}", scan(&mut conn).unwrap());
+        eprintln!("{:?}", scan(&mut conn, &mut || {}).unwrap());
     }
 }

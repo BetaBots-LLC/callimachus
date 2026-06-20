@@ -58,9 +58,9 @@ pub struct IndexReport {
 /// background reindex can drive a progress bar. Pass `|_, _, _| {}` to ignore progress.
 pub fn scan_all_with_progress(
     conn: &mut Connection,
-    mut on_progress: impl FnMut(usize, usize, &str),
+    mut on_progress: impl FnMut(usize, &str),
 ) -> Result<IndexReport> {
-    type Scan = fn(&mut Connection) -> Result<IndexReport>;
+    type Scan = fn(&mut Connection, &mut dyn FnMut()) -> Result<IndexReport>;
     let sources: [(&str, Scan); 11] = [
         ("claude_code", claude::scan),
         ("codex", codex::scan),
@@ -74,17 +74,27 @@ pub fn scan_all_with_progress(
         ("roo", roo::scan),
         ("kilo", kilo::scan),
     ];
-    let n = sources.len();
+    // Progress is THREAD-granular, not source-granular: each source ticks once per thread
+    // it processes (indexed OR skipped), so the bar keeps moving even while one big source
+    // (usually Claude Code) churns through thousands of files. `seen` is the running count
+    // across all sources; the total isn't known up front, so the UI renders it indeterminate.
     let mut total = IndexReport::default();
-    for (i, (name, scan)) in sources.into_iter().enumerate() {
-        on_progress(i, n, name);
-        let r = scan(conn)?;
+    let mut seen = 0usize;
+    for (name, scan) in sources.into_iter() {
+        on_progress(seen, name);
+        let r = scan(conn, &mut || {
+            seen += 1;
+            // Emit the first 50 per-thread (so movement is obviously live), then every 10.
+            if seen <= 50 || seen % 10 == 0 {
+                on_progress(seen, name);
+            }
+        })?;
         total.threads_indexed += r.threads_indexed;
         total.threads_skipped += r.threads_skipped;
         total.messages_indexed += r.messages_indexed;
         total.errors += r.errors;
     }
-    on_progress(n, n, "");
+    on_progress(seen, "");
     Ok(total)
 }
 
@@ -166,11 +176,12 @@ pub fn upsert_thread(
     if thread.messages.is_empty() {
         return Ok(0);
     }
+    let t0 = std::time::Instant::now();
     let now = chrono::Utc::now().timestamp();
     // UTF-8 byte size of all message text (String::len is byte length) — stored so the
     // cleanup list reads a column instead of SUM(LENGTH(text)) across every message.
     let bytes: i64 = thread.messages.iter().map(|m| m.text.len() as i64).sum();
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
     let project_key = thread.project_path.as_deref().and_then(canonical_project);
     tx.execute(
@@ -333,6 +344,18 @@ pub fn upsert_thread(
     }
 
     tx.commit()?;
+    // A re-index does a full message replace; on a huge changed thread (FTS re-tokenizes
+    // everything) that can take seconds. Log the slow ones so a stall is visible/explained
+    // in the terminal rather than looking like a hang.
+    let elapsed = t0.elapsed();
+    if elapsed.as_millis() > 1500 {
+        eprintln!(
+            "[index] slow thread: {} messages, {} KB took {:.1}s",
+            thread.messages.len(),
+            bytes / 1024,
+            elapsed.as_secs_f64(),
+        );
+    }
     Ok(thread.messages.len())
 }
 

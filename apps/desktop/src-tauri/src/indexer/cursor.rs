@@ -28,16 +28,16 @@ struct Composer {
 }
 
 /// Index all Cursor composer threads from the global DB.
-pub fn scan(conn: &mut Connection) -> Result<IndexReport> {
+pub fn scan(conn: &mut Connection, tick: &mut dyn FnMut()) -> Result<IndexReport> {
     let Some(db) = global_db_path() else {
         return Ok(IndexReport::default());
     };
-    scan_path(conn, &db)
+    scan_path(conn, &db, tick)
 }
 
 /// Index Cursor threads from a specific state.vscdb. Skips entirely if the file is
 /// unchanged since the last pass (the whole store is one file).
-fn scan_path(conn: &mut Connection, db: &Path) -> Result<IndexReport> {
+fn scan_path(conn: &mut Connection, db: &Path, tick: &mut dyn FnMut()) -> Result<IndexReport> {
     let mut report = IndexReport::default();
     if !db.exists() {
         return Ok(report);
@@ -65,6 +65,7 @@ fn scan_path(conn: &mut Connection, db: &Path) -> Result<IndexReport> {
     )?;
 
     for c in composers {
+        tick();
         let lo = format!("bubbleId:{}:", c.id);
         let hi = format!("bubbleId:{}:\u{10FFFF}", c.id);
         let mut messages: Vec<ParsedMessage> = Vec::new();
@@ -195,7 +196,7 @@ mod tests {
         let mut db = std::env::temp_dir();
         db.push(format!("callimachus_cursordst_{}.db", std::process::id()));
         let mut conn = crate::db::open(&db).unwrap();
-        let report = scan_path(&mut conn, &path).unwrap();
+        let report = scan_path(&mut conn, &path, &mut || {}).unwrap();
         assert_eq!(report.threads_indexed, 1);
         assert_eq!(report.messages_indexed, 2);
 
@@ -219,7 +220,7 @@ mod tests {
         let mut p = std::env::temp_dir();
         p.push(format!("callimachus_cursor_real_{}.db", std::process::id()));
         let mut conn = crate::db::open(&p).unwrap();
-        let report = scan(&mut conn).unwrap();
+        let report = scan(&mut conn, &mut || {}).unwrap();
         eprintln!("{report:?}");
         let n: i64 = conn
             .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))

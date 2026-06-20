@@ -35,7 +35,7 @@ struct ThreadMeta {
 }
 
 /// Index all Codex threads whose rollout file changed since the last pass.
-pub fn scan(conn: &mut Connection) -> Result<IndexReport> {
+pub fn scan(conn: &mut Connection, tick: &mut dyn FnMut()) -> Result<IndexReport> {
     let mut report = IndexReport::default();
     let Some(state_db) = state_db_path() else {
         return Ok(report);
@@ -49,6 +49,7 @@ pub fn scan(conn: &mut Connection) -> Result<IndexReport> {
     let metas = read_thread_metas(&state_db)?;
 
     for meta in metas {
+        tick();
         match index_rollout(conn, sid, &meta) {
             Ok(Some(n)) => {
                 report.threads_indexed += 1;
@@ -276,7 +277,7 @@ mod tests {
         let mut p = std::env::temp_dir();
         p.push(format!("callimachus_codex_real_{}.db", std::process::id()));
         let mut conn = crate::db::open(&p).unwrap();
-        let report = scan(&mut conn).unwrap();
+        let report = scan(&mut conn, &mut || {}).unwrap();
         eprintln!("{report:?}");
     }
 }

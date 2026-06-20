@@ -21,7 +21,7 @@ pub fn sessions_root() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".continue").join("sessions"))
 }
 
-pub fn scan(conn: &mut Connection) -> Result<IndexReport> {
+pub fn scan(conn: &mut Connection, tick: &mut dyn FnMut()) -> Result<IndexReport> {
     let mut report = IndexReport::default();
     let Some(root) = sessions_root() else {
         return Ok(report);
@@ -39,6 +39,7 @@ pub fn scan(conn: &mut Connection) -> Result<IndexReport> {
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
+        tick();
         match index_file(conn, sid, &path) {
             Ok(Some(n)) => {
                 report.threads_indexed += 1;
@@ -227,6 +228,6 @@ mod tests {
     #[ignore]
     fn real_continue_index() {
         let mut conn = crate::db::open(&temp_path("cn_real.db")).unwrap();
-        eprintln!("{:?}", scan(&mut conn).unwrap());
+        eprintln!("{:?}", scan(&mut conn, &mut || {}).unwrap());
     }
 }

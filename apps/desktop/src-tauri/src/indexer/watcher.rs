@@ -130,7 +130,7 @@ fn run(app: AppHandle) -> anyhow::Result<()> {
 /// Re-scan the affected sources and notify the frontend. Writes on its own `conn`, so
 /// the UI's shared connection is never blocked across the scan.
 fn reindex(app: &AppHandle, conn: &mut Connection, kinds: &[&str]) {
-    type Scan = fn(&mut Connection) -> anyhow::Result<super::IndexReport>;
+    type Scan = fn(&mut Connection, &mut dyn FnMut()) -> anyhow::Result<super::IndexReport>;
     for &kind in kinds {
         let scan: Scan = match kind {
             k if k == super::claude::KIND => super::claude::scan,
@@ -149,12 +149,12 @@ fn reindex(app: &AppHandle, conn: &mut Connection, kinds: &[&str]) {
         // The watcher is a SECOND writer (alongside the app's shared connection). If it
         // loses a write-lock race past busy_timeout, retry instead of silently dropping
         // the thread — re-scanning is cheap + idempotent (file_state skips done threads).
-        let mut report = scan(conn);
+        let mut report = scan(conn, &mut || {});
         for _ in 0..2 {
             match &report {
                 Err(e) if is_db_locked(e) => {
                     std::thread::sleep(std::time::Duration::from_millis(500));
-                    report = scan(conn);
+                    report = scan(conn, &mut || {});
                 }
                 _ => break,
             }

@@ -200,7 +200,7 @@ pub fn backfill_todos(db: &crate::db::Db, now: i64) -> Result<()> {
         if !get_config(&conn)?.enabled {
             return Ok(());
         }
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         for &tid in chunk {
             rebuild_thread_todos(&tx, tid, now)?;
         }
@@ -356,7 +356,7 @@ pub fn store_distilled(
     d: &Distilled,
     now: i64,
 ) -> Result<()> {
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     // Replace only the UN-curated LLM facts; pinned / edited / hidden ones are the user's
     // now and survive re-distillation.
     tx.execute(
