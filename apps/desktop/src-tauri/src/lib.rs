@@ -426,7 +426,9 @@ fn write_retry<T>(
             Err(e) => return Err(e.into()),
         }
     }
-    Err(last.unwrap_or_else(|| anyhow::anyhow!("database stayed locked")).into())
+    Err(last
+        .unwrap_or_else(|| anyhow::anyhow!("database stayed locked"))
+        .into())
 }
 
 /// Kick off (or no-op if already running) a background job that embeds all pending
@@ -726,14 +728,43 @@ async fn distill_thread(
 /// Pin or unpin a distilled fact (pinned ranks first + survives re-distill).
 #[tauri::command]
 fn set_fact_pinned(db: tauri::State<'_, db::Db>, fact_id: i64, pinned: bool) -> AppResult<()> {
-    write_retry(&db, |conn| knowledge::set_fact_pinned(conn, fact_id, pinned))
+    write_retry(&db, |conn| {
+        knowledge::set_fact_pinned(conn, fact_id, pinned)
+    })
 }
 
 /// Hide (soft-delete) or restore a fact. Hidden facts are kept as a tombstone so
 /// re-distillation won't bring them back.
 #[tauri::command]
 fn hide_fact(db: tauri::State<'_, db::Db>, fact_id: i64, hidden: bool) -> AppResult<()> {
-    write_retry(&db, |conn| knowledge::set_fact_hidden(conn, fact_id, hidden))
+    write_retry(&db, |conn| {
+        knowledge::set_fact_hidden(conn, fact_id, hidden)
+    })
+}
+
+/// Mark a TODO done (drops out of open lists) or reopen it.
+#[tauri::command]
+fn set_todo_done(db: tauri::State<'_, db::Db>, fact_id: i64, done: bool) -> AppResult<()> {
+    write_retry(&db, |conn| knowledge::set_todo_done(conn, fact_id, done))
+}
+
+/// Write-back: record a decision or gotcha for a project, then embed it for recall.
+#[tauri::command]
+fn remember(
+    db: tauri::State<'_, db::Db>,
+    embedder: tauri::State<'_, embed::Embedder>,
+    project: String,
+    kind: String,
+    text: String,
+) -> AppResult<()> {
+    write_retry(&db, |conn| {
+        knowledge::record_fact(conn, &project, &kind, &text, chrono::Utc::now().timestamp())
+            .map(|_| ())
+    })?;
+    if let Err(e) = embed::embed_pending_facts(&db, &embedder) {
+        eprintln!("[remember] embed: {e}");
+    }
+    Ok(())
 }
 
 /// Edit a fact's text. Re-embeds it so cross-thread recall matches the new wording.
@@ -1114,20 +1145,79 @@ fn recall_facts(
 }
 
 /// A thread cited as a source in an "ask your history" answer.
-#[derive(Debug, Serialize)]
-struct AskSource {
+#[derive(Debug, Clone, Serialize)]
+pub struct AskSource {
     #[serde(rename = "threadId")]
-    thread_id: i64,
-    title: Option<String>,
-    source: String,
+    pub thread_id: i64,
+    pub title: Option<String>,
+    pub source: String,
     #[serde(rename = "projectPath")]
-    project_path: Option<String>,
+    pub project_path: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 struct AskAnswer {
     answer: String,
     sources: Vec<AskSource>,
+}
+
+/// Prepared RAG inputs: the resolved engine + packed cited context, ready for the LLM.
+pub struct AskPrep {
+    pub provider: String,
+    pub model: String,
+    pub key: Option<String>,
+    pub context: String,
+    pub sources: Vec<AskSource>,
+}
+
+/// Retrieve + pack the top threads for a question and resolve the distill engine. SYNC (no
+/// LLM call) so callers run it under a lock, drop the conn, then await `agent::answer`.
+/// `qv` is the PRE-EMBEDDED query vector (embed before locking). None = no engine or no
+/// relevant threads. Shared by the desktop command, `cal ask`, and the MCP ask tool.
+pub fn prepare_ask(
+    conn: &rusqlite::Connection,
+    question: &str,
+    qv: Option<&[f32]>,
+) -> anyhow::Result<Option<AskPrep>> {
+    let (provider, model, key) = resolve_distill_engine(conn)?;
+    let filters = SearchFilters {
+        limit: Some(30),
+        ..Default::default()
+    };
+    let hits = search::hybrid_vec(conn, question, qv, &filters)?;
+    let mut seen = std::collections::HashSet::new();
+    let mut sources: Vec<AskSource> = Vec::new();
+    let mut context = String::new();
+    for h in &hits {
+        if !seen.insert(h.thread_id) {
+            continue;
+        }
+        if sources.len() >= 5 {
+            break;
+        }
+        let excerpt = context::pack_thread(conn, h.thread_id, 2500)?.unwrap_or_default();
+        context.push_str(&format!(
+            "[thread {}] {}\n{excerpt}\n\n",
+            h.thread_id,
+            h.title.as_deref().unwrap_or("untitled")
+        ));
+        sources.push(AskSource {
+            thread_id: h.thread_id,
+            title: h.title.clone(),
+            source: h.source.clone(),
+            project_path: h.project_path.clone(),
+        });
+    }
+    if sources.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(AskPrep {
+        provider,
+        model,
+        key,
+        context,
+        sources,
+    }))
 }
 
 /// "Ask your history" (RAG): retrieve the most relevant threads for a question, pack
@@ -1142,50 +1232,30 @@ async fn ask_history(
     if q.is_empty() {
         return Err(anyhow::anyhow!("ask needs a question").into());
     }
-    // Embed the query OUTSIDE the DB; retrieve + pack excerpts on a pooled read conn
-    // (concurrent, never touches the writer); LLM after the conn is dropped.
+    // Embed OUTSIDE the DB; retrieve + pack on a pooled read conn; LLM after the conn drops.
     let qv = embed::embed_query(&embedder, &q)?;
-    let (provider, model, key, context, sources) = {
+    let prep = {
         let conn = read(&pool)?;
-        let (provider, model, key) = resolve_distill_engine(&conn)?;
-        let filters = SearchFilters {
-            limit: Some(30),
-            ..Default::default()
-        };
-        let hits = search::hybrid_vec(&conn, &q, qv.as_deref(), &filters)?;
-        let mut seen = std::collections::HashSet::new();
-        let mut sources: Vec<AskSource> = Vec::new();
-        let mut context = String::new();
-        for h in &hits {
-            if !seen.insert(h.thread_id) {
-                continue;
-            }
-            if sources.len() >= 5 {
-                break;
-            }
-            let excerpt = context::pack_thread(&conn, h.thread_id, 2500)?.unwrap_or_default();
-            context.push_str(&format!(
-                "[thread {}] {}\n{excerpt}\n\n",
-                h.thread_id,
-                h.title.as_deref().unwrap_or("untitled")
-            ));
-            sources.push(AskSource {
-                thread_id: h.thread_id,
-                title: h.title.clone(),
-                source: h.source.clone(),
-                project_path: h.project_path.clone(),
-            });
-        }
-        (provider, model, key, context, sources)
+        prepare_ask(&conn, &q, qv.as_deref())?
     };
-    if sources.is_empty() {
+    let Some(prep) = prep else {
         return Ok(AskAnswer {
             answer: "I couldn't find anything relevant in your history.".into(),
             sources: Vec::new(),
         });
-    }
-    let answer = agent::answer(&provider, &model, key.as_deref(), &q, &context).await?;
-    Ok(AskAnswer { answer, sources })
+    };
+    let answer = agent::answer(
+        &prep.provider,
+        &prep.model,
+        prep.key.as_deref(),
+        &q,
+        &prep.context,
+    )
+    .await?;
+    Ok(AskAnswer {
+        answer,
+        sources: prep.sources,
+    })
 }
 
 /// Code-aware search: threads that mention a file path (substring, case-insensitive).
@@ -1683,6 +1753,8 @@ pub fn run() {
             distill_project,
             set_fact_pinned,
             hide_fact,
+            set_todo_done,
+            remember,
             edit_fact,
             detect_conflicts
         ])

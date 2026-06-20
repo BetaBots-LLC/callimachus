@@ -10,8 +10,9 @@ fn main() {
     if argv.iter().any(|a| a == "--mcp") {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         let result = rt.block_on(async {
-            let conn =
-                callimachus_lib::db::open_readonly(&callimachus_lib::db::default_index_path())?;
+            // Writable: the MCP server has write tools now (complete_todo, record_*).
+            // WAL + busy_timeout let it coexist with the desktop app's writer.
+            let conn = callimachus_lib::db::open(&callimachus_lib::db::default_index_path())?;
             callimachus_lib::mcp_server::serve(conn).await
         });
         if let Err(e) = result {

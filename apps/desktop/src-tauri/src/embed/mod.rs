@@ -229,6 +229,38 @@ pub fn embed_pending_facts(db: &crate::db::Db, embedder: &Embedder) -> Result<()
     Ok(())
 }
 
+/// Embed all un-embedded recall facts on a RAW connection — for the sidecars (`cal`, MCP)
+/// which hold a `Connection`, not the app's `Mutex<Db>`. One pass; small (facts are short).
+pub fn embed_pending_facts_conn(conn: &mut Connection, embedder: &Embedder) -> Result<()> {
+    loop {
+        let rows: Vec<(i64, String)> = {
+            let mut stmt = conn.prepare(
+                "SELECT id, text FROM facts WHERE embedded = 0 AND kind IN ('decision', 'gotcha') LIMIT 64",
+            )?;
+            let r = stmt
+                .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            r
+        };
+        if rows.is_empty() {
+            break;
+        }
+        let vecs = embedder.embed(rows.iter().map(|(_, t)| t.clone()).collect())?;
+        let tx = conn.transaction()?;
+        {
+            let mut ins =
+                tx.prepare("INSERT INTO vec_facts (fact_id, embedding) VALUES (?1, ?2)")?;
+            let mut done = tx.prepare("UPDATE facts SET embedded = 1 WHERE id = ?1")?;
+            for ((id, _), v) in rows.iter().zip(vecs.iter()) {
+                ins.execute(params![id, vec_to_bytes(v)])?;
+                done.execute([*id])?;
+            }
+        }
+        tx.commit()?;
+    }
+    Ok(())
+}
+
 /// Embed a search query (with bge's query instruction prefix) into a single vector.
 /// Runs the model — call this WITHOUT holding the DB lock so inference never blocks
 /// other UI queries. Returns None for an empty/unembeddable query.

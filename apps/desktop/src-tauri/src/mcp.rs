@@ -10,7 +10,9 @@ use callimachus_lib::{db, mcp_server};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let conn = db::open_readonly(&db::default_index_path())?;
+    // Writable: the server exposes write tools (complete_todo, record_*). WAL +
+    // busy_timeout let it coexist with the desktop app's writer.
+    let conn = db::open(&db::default_index_path())?;
     mcp_server::serve(conn).await?;
     Ok(())
 }

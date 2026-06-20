@@ -3,6 +3,7 @@ import {
   BookOpen,
   Boxes,
   FileDown,
+  FolderGit2,
   Lightbulb,
   MessageCircleQuestion,
   MessagesSquare,
@@ -23,7 +24,7 @@ export const Route = createFileRoute("/desktop")({
     meta: seo({
       title: "Callimachus Desktop — read & search your AI history",
       description:
-        "The Callimachus desktop app for macOS, Windows, and Linux: browse and search every AI coding thread, distill decisions and gotchas, ask your own history a cited question, and export to Obsidian. Local and private.",
+        "The Callimachus desktop app for macOS, Windows, and Linux: browse and search every AI coding thread, distill decisions and gotchas, keep a durable per-project memory, ask your own history a cited question, and export to Obsidian. Local and private.",
       path: "/desktop",
     }),
     links: [{ rel: "canonical", href: `${SITE_URL}/desktop` }],
@@ -79,6 +80,18 @@ function DesktopPage() {
         >
           A synthesized, cited answer over your own threads, with [thread N] citations back to the
           sources it used. Needs an LLM engine — the same one that powers distillation.
+        </FeaturePanel>
+        <FeaturePanel
+          icon={FolderGit2}
+          label="Projects"
+          title="Per-project memory"
+          className="lg:col-span-7"
+        >
+          Each repo gets a durable memory — its decisions, gotchas, and open TODOs aggregated across
+          every session, with an LLM brief and a managed{" "}
+          <code className="font-mono">.callimachus/memory.md</code> agents can read. Curate facts by
+          hand, and let agents write back: close TODOs and record new decisions and gotchas, in the
+          app, the CLI, or over MCP.
         </FeaturePanel>
         <FeaturePanel
           icon={FileDown}
