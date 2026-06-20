@@ -7,7 +7,10 @@
 //! read-only and pull only the fields we need with SQL `json_extract`, never the
 //! full blobs. We upsert per-composer to keep memory bounded.
 
-use super::{file_unchanged, source_id, upsert_thread, IndexReport, ParsedMessage, ParsedThread};
+use super::{
+    file_change_state, set_file_state, source_id, upsert_thread, IndexReport, ParsedMessage,
+    ParsedThread,
+};
 use anyhow::Result;
 use rusqlite::{params, Connection};
 use std::path::{Path, PathBuf};
@@ -44,7 +47,8 @@ fn scan_path(conn: &mut Connection, db: &Path, tick: &mut dyn FnMut()) -> Result
     }
     let sid = source_id(conn, KIND)?;
 
-    if file_unchanged(conn, db, KIND)? {
+    let (unchanged, mtime, size) = file_change_state(conn, db)?;
+    if unchanged {
         return Ok(report); // nothing changed
     }
 
@@ -126,6 +130,10 @@ fn scan_path(conn: &mut Connection, db: &Path, tick: &mut dyn FnMut()) -> Result
         report.messages_indexed += n;
     }
 
+    // Record the DB file as indexed ONLY after every composer upserted without error: a
+    // mid-pass failure returns above via `?`, leaving the file "changed" so the watcher's
+    // retry re-indexes it instead of skipping the dropped threads.
+    set_file_state(conn, &db.to_string_lossy(), KIND, mtime, size)?;
     Ok(report)
 }
 

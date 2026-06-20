@@ -8,7 +8,10 @@
 //!
 //! Schema verified against block/goose `session_manager.rs`.
 
-use super::{file_unchanged, source_id, upsert_thread, IndexReport, ParsedMessage, ParsedThread};
+use super::{
+    file_change_state, set_file_state, source_id, upsert_thread, IndexReport, ParsedMessage,
+    ParsedThread,
+};
 use anyhow::Result;
 use rusqlite::{params, Connection};
 use serde_json::Value;
@@ -45,7 +48,8 @@ fn scan_path(conn: &mut Connection, db: &Path, tick: &mut dyn FnMut()) -> Result
         return Ok(report);
     }
     let sid = source_id(conn, KIND)?;
-    if file_unchanged(conn, db, KIND)? {
+    let (unchanged, mtime, size) = file_change_state(conn, db)?;
+    if unchanged {
         return Ok(report);
     }
 
@@ -127,6 +131,10 @@ fn scan_path(conn: &mut Connection, db: &Path, tick: &mut dyn FnMut()) -> Result
         report.messages_indexed += n;
     }
 
+    // Record the DB file as indexed ONLY after every session upserted without error: a
+    // mid-pass failure (e.g. a transient write-lock) returns above via `?`, leaving the file
+    // "changed" so the watcher's retry re-indexes it instead of skipping dropped sessions.
+    set_file_state(conn, &db.to_string_lossy(), KIND, mtime, size)?;
     Ok(report)
 }
 

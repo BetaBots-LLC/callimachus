@@ -52,10 +52,9 @@ pub struct IndexReport {
     pub errors: usize,
 }
 
-/// Run every source indexer and sum the reports.
-/// Index every source, one at a time. Calls `on_progress(done, total, next_source)`
-/// before each — `done` sources already finished, `next_source` about to scan — so a
-/// background reindex can drive a progress bar. Pass `|_, _, _| {}` to ignore progress.
+/// Index every source, one at a time, summing the reports. Calls `on_progress(threads_seen,
+/// current_source)` thread-granularly (throttled) so a background reindex can drive a live
+/// progress bar even while one big source churns. Pass `|_, _| {}` to ignore progress.
 pub fn scan_all_with_progress(
     conn: &mut Connection,
     mut on_progress: impl FnMut(usize, &str),
@@ -221,16 +220,62 @@ pub fn upsert_thread(
         |r| r.get(0),
     )?;
 
-    // Full replace: clear existing messages (FTS triggers keep the index in sync).
-    tx.execute("DELETE FROM messages WHERE thread_id = ?1", [thread_id])?;
+    // Incremental indexing: agent transcripts are append-only, so when the stored messages
+    // are an EXACT prefix of the new parse we insert ONLY the new tail instead of re-inserting
+    // and re-FTS-ing the whole thread (the dominant cost on long, actively-growing sessions).
+    // We verify the prefix by reading every stored message and comparing it to the new parse:
+    // a read-only scan with no FTS work, still far cheaper than the full rewrite, and unlike
+    // point-sampling it can never keep a stale in-place edit — any mismatch or shrink falls
+    // back to a correct full replace (also covers rewritten / DB-backed sources). When
+    // n == existing_count and the prefix matches, the tail is empty: a clean no-op.
+    let existing_count: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM messages WHERE thread_id = ?1",
+        [thread_id],
+        |r| r.get(0),
+    )?;
+    let n = thread.messages.len() as i64;
+    let incremental = existing_count > 0 && n >= existing_count && {
+        let mut stmt =
+            tx.prepare("SELECT seq, text FROM messages WHERE thread_id = ?1 ORDER BY seq")?;
+        let mut matched = 0i64;
+        let mut ok = true;
+        let rows = stmt.query_map([thread_id], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (seq, text) = row?;
+            if seq < 0
+                || seq as usize >= thread.messages.len()
+                || thread.messages[seq as usize].text != text
+            {
+                ok = false;
+                break;
+            }
+            matched += 1;
+        }
+        ok && matched == existing_count
+    };
 
-    let mut inserted: Vec<(i64, &str, &str)> = Vec::with_capacity(thread.messages.len());
+    if !incremental {
+        // Full replace: clear existing messages (FTS triggers keep the index in sync).
+        tx.execute("DELETE FROM messages WHERE thread_id = ?1", [thread_id])?;
+    }
+    // On an append, continue the seq numbering after the stored prefix and only touch the
+    // tail; on a full replace, (re)insert everything from seq 0.
+    let start_seq = if incremental {
+        existing_count as usize
+    } else {
+        0
+    };
+
+    let mut inserted: Vec<(i64, &str, &str)> =
+        Vec::with_capacity(thread.messages.len().saturating_sub(start_seq));
     {
         let mut stmt = tx.prepare(
             "INSERT INTO messages (thread_id, seq, role, text, tool_name, ts)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         )?;
-        for (seq, m) in thread.messages.iter().enumerate() {
+        for (seq, m) in thread.messages.iter().enumerate().skip(start_seq) {
             stmt.execute(params![
                 thread_id,
                 seq as i64,
@@ -251,11 +296,15 @@ pub fn upsert_thread(
         const MAX_TODOS_PER_THREAD: usize = 25;
         // Keep CURATED todos (done / dismissed / pinned) so closing one survives re-index;
         // re-derive only the open, untouched ones.
-        tx.execute(
-            "DELETE FROM facts WHERE thread_id = ?1 AND extractor = 'heuristic'
-                AND status = 'open' AND hidden = 0 AND pinned = 0",
-            [thread_id],
-        )?;
+        // Full replace re-derives open heuristic todos from scratch; an append keeps the
+        // existing ones (the `seen` seed below dedups) and scans only the new tail.
+        if !incremental {
+            tx.execute(
+                "DELETE FROM facts WHERE thread_id = ?1 AND extractor = 'heuristic'
+                    AND status = 'open' AND hidden = 0 AND pinned = 0",
+                [thread_id],
+            )?;
+        }
         let mut fstmt = tx.prepare(
             "INSERT INTO facts (thread_id, kind, text, source_message_id, status, extractor, created_at)
              VALUES (?1, 'todo', ?2, ?3, 'open', 'heuristic', ?4)",
@@ -273,7 +322,18 @@ pub fn upsert_thread(
                 seen.insert(t.to_ascii_lowercase());
             }
         }
-        let mut count = 0usize;
+        // The cap is a per-thread TOTAL; on an append the existing open todos weren't deleted,
+        // so they still count toward it — seed the counter instead of starting at 0.
+        let mut count: usize = if incremental {
+            tx.query_row(
+                "SELECT COUNT(*) FROM facts WHERE thread_id = ?1
+                    AND extractor = 'heuristic' AND status = 'open'",
+                [thread_id],
+                |r| r.get::<_, i64>(0),
+            )? as usize
+        } else {
+            0
+        };
         'outer: for (mid, role, text) in &inserted {
             if *role != "user" && *role != "assistant" {
                 continue;
@@ -292,15 +352,30 @@ pub fn upsert_thread(
 
     // Code-aware search: re-derive this thread's file-path mentions (delete + rescan,
     // every index). Only user/assistant text — tool RESULTS (ls output) would be noise.
-    tx.execute(
-        "DELETE FROM file_mentions WHERE thread_id = ?1",
-        [thread_id],
-    )?;
+    // Full replace re-derives file mentions; an append keeps existing + adds the tail's
+    // (INSERT OR IGNORE dedups at the unique constraint).
+    if !incremental {
+        tx.execute(
+            "DELETE FROM file_mentions WHERE thread_id = ?1",
+            [thread_id],
+        )?;
+    }
     {
         const MAX_PATHS_PER_THREAD: usize = 200;
         let mut pstmt =
             tx.prepare("INSERT OR IGNORE INTO file_mentions (thread_id, path) VALUES (?1, ?2)")?;
         let mut seen = std::collections::HashSet::new();
+        // On an append the existing mentions are kept, so seed `seen` with them — both to
+        // dedup and so the per-thread cap counts the thread total, not just the new tail.
+        if incremental {
+            let mut existing = tx.prepare("SELECT path FROM file_mentions WHERE thread_id = ?1")?;
+            for p in existing
+                .query_map([thread_id], |r| r.get::<_, String>(0))?
+                .flatten()
+            {
+                seen.insert(p.to_ascii_lowercase());
+            }
+        }
         'paths: for (_mid, role, text) in &inserted {
             if *role != "user" && *role != "assistant" {
                 continue;
@@ -319,7 +394,10 @@ pub fn upsert_thread(
     // Invalidate LLM-distilled knowledge when the message set actually changed. The
     // upsert above doesn't touch knowledge_msg_count (set at distillation time), so it
     // still holds the prior count here; only threads that were distilled AND changed
-    // get reset, so unchanged re-indexes never wipe distilled facts.
+    // get reset, so unchanged re-indexes never wipe distilled facts. A full replace of an
+    // existing thread (prefix mismatch / shrink) means the content changed even if the
+    // count didn't (e.g. an in-place edit), so treat that as changed too.
+    let content_changed = existing_count > 0 && !incremental;
     let prev_kcount: Option<i64> = tx
         .query_row(
             "SELECT knowledge_msg_count FROM threads WHERE id = ?1",
@@ -329,7 +407,7 @@ pub fn upsert_thread(
         .optional()?
         .flatten();
     if let Some(pc) = prev_kcount {
-        if pc != thread.messages.len() as i64 {
+        if pc != thread.messages.len() as i64 || content_changed {
             tx.execute(
                 "UPDATE threads SET knowledge_extracted = 0, knowledge_error = NULL WHERE id = ?1",
                 [thread_id],
@@ -468,9 +546,12 @@ pub fn open_external_readonly(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
-/// Check a single source file's (mtime, size) against `index_state`; returns true
-/// if unchanged since last pass. Used by SQLite-backed sources (one DB file).
-pub fn file_unchanged(conn: &Connection, path: &Path, kind: &str) -> Result<bool> {
+/// Read-only change check for a single-file source (Cursor/Goose DBs). Returns
+/// `(unchanged, mtime, size)`. Unlike a write-on-check, this NEVER advances `index_state`:
+/// the caller must persist the new state with `set_file_state` only AFTER its upserts
+/// succeed. Writing it here (before the work) would let the watcher's retry skip threads
+/// that failed mid-pass on a transient write-lock, silently dropping them.
+pub fn file_change_state(conn: &Connection, path: &Path) -> Result<(bool, i64, i64)> {
     let meta = std::fs::metadata(path)?;
     let size = meta.len() as i64;
     let mtime = meta
@@ -481,15 +562,133 @@ pub fn file_unchanged(conn: &Connection, path: &Path, kind: &str) -> Result<bool
         .unwrap_or(0);
     let path_str = path.to_string_lossy().to_string();
     let unchanged = matches!(file_state(conn, &path_str)?, Some((m, s)) if m == mtime && s == size);
-    if !unchanged {
-        set_file_state(conn, &path_str, kind, mtime, size)?;
-    }
-    Ok(unchanged)
+    Ok((unchanged, mtime, size))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{canonical_project, extract_paths};
+    use super::{
+        canonical_project, extract_paths, source_id, upsert_thread, ParsedMessage, ParsedThread,
+    };
+
+    fn thread_with(texts: &[&str]) -> ParsedThread {
+        ParsedThread {
+            external_id: "t1".into(),
+            title: Some("t".into()),
+            project_path: None,
+            git_branch: None,
+            created_at: None,
+            updated_at: None,
+            is_subagent: false,
+            messages: texts
+                .iter()
+                .enumerate()
+                .map(|(i, t)| ParsedMessage {
+                    role: "user".into(),
+                    text: (*t).to_string(),
+                    tool_name: None,
+                    ts: Some(i as i64),
+                })
+                .collect(),
+        }
+    }
+
+    fn message_rowids(conn: &rusqlite::Connection, tid: i64) -> Vec<i64> {
+        conn.prepare("SELECT id FROM messages WHERE thread_id = ?1 ORDER BY seq")
+            .unwrap()
+            .query_map([tid], |r| r.get(0))
+            .unwrap()
+            .flatten()
+            .collect()
+    }
+
+    #[test]
+    fn incremental_reindex_appends_tail_only() {
+        let p = std::env::temp_dir().join(format!("calli_incr_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        let mut conn = crate::db::open(&p).unwrap();
+        let sid = source_id(&conn, "claude_code").unwrap();
+
+        // Initial index: 3 messages, all inserted.
+        upsert_thread(&mut conn, sid, &thread_with(&["alpha", "beta", "gamma"])).unwrap();
+        let tid: i64 = conn
+            .query_row("SELECT id FROM threads WHERE external_id = 't1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let before = message_rowids(&conn, tid);
+        assert_eq!(before.len(), 3);
+
+        // Re-index after two messages were appended: the new tail is inserted, the existing
+        // three rows are reused (rowids unchanged) — proof we didn't re-insert the prefix.
+        upsert_thread(
+            &mut conn,
+            sid,
+            &thread_with(&["alpha", "beta", "gamma", "delta", "epsilon"]),
+        )
+        .unwrap();
+        let after = message_rowids(&conn, tid);
+        assert_eq!(after.len(), 5);
+        assert_eq!(
+            &after[..3],
+            &before[..],
+            "prefix rows must be reused on append"
+        );
+
+        // A shrink falls back to a full replace: count drops to 3 and the new content lands.
+        // (Rowid identity can't be asserted here — SQLite reuses rowids after a full delete.)
+        upsert_thread(&mut conn, sid, &thread_with(&["alpha", "CHANGED", "gamma"])).unwrap();
+        assert_eq!(message_rowids(&conn, tid).len(), 3, "shrink → full replace");
+        let seq1: String = conn
+            .query_row(
+                "SELECT text FROM messages WHERE thread_id = ?1 AND seq = 1",
+                [tid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(seq1, "CHANGED", "full replace applies the edit");
+
+        // A same-length in-place edit of a prefix message forces a full replace (the prefix
+        // no longer matches), so the new text lands instead of being kept stale.
+        upsert_thread(&mut conn, sid, &thread_with(&["alpha", "EDITED", "gamma"])).unwrap();
+        let seq1b: String = conn
+            .query_row(
+                "SELECT text FROM messages WHERE thread_id = ?1 AND seq = 1",
+                [tid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(seq1b, "EDITED", "same-length middle edit is not missed");
+
+        // Regression for the sampling bug: a thread with >=4 messages whose UNSAMPLED interior
+        // message is edited in place (same length) must still full-replace. Grow to 5, then
+        // edit seq 3 ("dddd" -> "DDDD"); point-sampling {0,2,4} would have missed seq 3.
+        upsert_thread(
+            &mut conn,
+            sid,
+            &thread_with(&["alpha", "EDITED", "gamma", "dddd", "eeee"]),
+        )
+        .unwrap();
+        upsert_thread(
+            &mut conn,
+            sid,
+            &thread_with(&["alpha", "EDITED", "gamma", "DDDD", "eeee"]),
+        )
+        .unwrap();
+        let seq3: String = conn
+            .query_row(
+                "SELECT text FROM messages WHERE thread_id = ?1 AND seq = 3",
+                [tid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            seq3, "DDDD",
+            "interior same-length edit on a long thread is not missed"
+        );
+
+        let _ = std::fs::remove_file(&p);
+    }
 
     #[test]
     fn canonical_project_normalizes_and_groups() {
