@@ -90,12 +90,18 @@ pub fn scan_all_with_progress(
 
 /// Resolve the numeric source id for a source kind (rows are seeded by migration).
 pub fn source_id(conn: &Connection, kind: &str) -> Result<i64> {
-    conn.query_row("SELECT id FROM sources WHERE kind = ?1", [kind], |r| r.get(0))
-        .with_context(|| format!("unknown source kind {kind}"))
+    conn.query_row("SELECT id FROM sources WHERE kind = ?1", [kind], |r| {
+        r.get(0)
+    })
+    .with_context(|| format!("unknown source kind {kind}"))
 }
 
 /// Insert or fully replace a thread and all its messages. Empty threads are dropped.
-pub fn upsert_thread(conn: &mut Connection, source_id: i64, thread: &ParsedThread) -> Result<usize> {
+pub fn upsert_thread(
+    conn: &mut Connection,
+    source_id: i64,
+    thread: &ParsedThread,
+) -> Result<usize> {
     if thread.messages.is_empty() {
         return Ok(0);
     }
@@ -168,7 +174,10 @@ pub fn upsert_thread(conn: &mut Connection, source_id: i64, thread: &ParsedThrea
     // opt-in: when knowledge is off we don't write todo facts at all.
     if crate::knowledge::get_config(&tx)?.enabled {
         const MAX_TODOS_PER_THREAD: usize = 25;
-        tx.execute("DELETE FROM facts WHERE thread_id = ?1 AND extractor = 'heuristic'", [thread_id])?;
+        tx.execute(
+            "DELETE FROM facts WHERE thread_id = ?1 AND extractor = 'heuristic'",
+            [thread_id],
+        )?;
         let mut fstmt = tx.prepare(
             "INSERT INTO facts (thread_id, kind, text, source_message_id, status, extractor, created_at)
              VALUES (?1, 'todo', ?2, ?3, 'open', 'heuristic', ?4)",
@@ -193,7 +202,10 @@ pub fn upsert_thread(conn: &mut Connection, source_id: i64, thread: &ParsedThrea
 
     // Code-aware search: re-derive this thread's file-path mentions (delete + rescan,
     // every index). Only user/assistant text — tool RESULTS (ls output) would be noise.
-    tx.execute("DELETE FROM file_mentions WHERE thread_id = ?1", [thread_id])?;
+    tx.execute(
+        "DELETE FROM file_mentions WHERE thread_id = ?1",
+        [thread_id],
+    )?;
     {
         const MAX_PATHS_PER_THREAD: usize = 200;
         let mut pstmt =
@@ -219,9 +231,11 @@ pub fn upsert_thread(conn: &mut Connection, source_id: i64, thread: &ParsedThrea
     // still holds the prior count here; only threads that were distilled AND changed
     // get reset, so unchanged re-indexes never wipe distilled facts.
     let prev_kcount: Option<i64> = tx
-        .query_row("SELECT knowledge_msg_count FROM threads WHERE id = ?1", [thread_id], |r| {
-            r.get::<_, Option<i64>>(0)
-        })
+        .query_row(
+            "SELECT knowledge_msg_count FROM threads WHERE id = ?1",
+            [thread_id],
+            |r| r.get::<_, Option<i64>>(0),
+        )
         .optional()?
         .flatten();
     if let Some(pc) = prev_kcount {
@@ -230,7 +244,10 @@ pub fn upsert_thread(conn: &mut Connection, source_id: i64, thread: &ParsedThrea
                 "UPDATE threads SET knowledge_extracted = 0, knowledge_error = NULL WHERE id = ?1",
                 [thread_id],
             )?;
-            tx.execute("DELETE FROM facts WHERE thread_id = ?1 AND extractor = 'llm'", [thread_id])?;
+            tx.execute(
+                "DELETE FROM facts WHERE thread_id = ?1 AND extractor = 'llm'",
+                [thread_id],
+            )?;
         }
     }
 
@@ -253,7 +270,23 @@ pub fn extract_paths(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     for raw in text.split(|c: char| {
         c.is_whitespace()
-            || matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | '"' | '\'' | '`' | ',' | ';' | '<' | '>' | '|' | '=')
+            || matches!(
+                c,
+                '(' | ')'
+                    | '['
+                    | ']'
+                    | '{'
+                    | '}'
+                    | '"'
+                    | '\''
+                    | '`'
+                    | ','
+                    | ';'
+                    | '<'
+                    | '>'
+                    | '|'
+                    | '='
+            )
     }) {
         let t = raw.trim_matches(|c: char| matches!(c, '.' | ':' | '*' | '#' | '!' | '?' | '@'));
         if t.len() < 3 || t.len() > 200 || t.contains("://") {
@@ -289,7 +322,13 @@ pub fn file_state(conn: &Connection, path: &str) -> Result<Option<(i64, i64)>> {
 }
 
 /// Record that we've indexed a file at its current (mtime, size).
-pub fn set_file_state(conn: &Connection, path: &str, kind: &str, mtime: i64, size: i64) -> Result<()> {
+pub fn set_file_state(
+    conn: &Connection,
+    path: &str,
+    kind: &str,
+    mtime: i64,
+    size: i64,
+) -> Result<()> {
     conn.execute(
         "INSERT INTO index_state (path, source_kind, mtime, size, updated_at)
          VALUES (?1, ?2, ?3, ?4, ?5)

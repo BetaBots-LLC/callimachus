@@ -12,8 +12,25 @@ use rusqlite::Connection;
 
 /// Subcommands that identify a `cal` invocation when the app is launched directly.
 pub const COMMANDS: &[&str] = &[
-    "search", "related", "recent", "cat", "show", "context", "stats", "export", "star", "tag",
-    "tags", "todos", "knowledge", "distill", "decisions", "gotchas", "ask", "files", "memory",
+    "search",
+    "related",
+    "recent",
+    "cat",
+    "show",
+    "context",
+    "stats",
+    "export",
+    "star",
+    "tag",
+    "tags",
+    "todos",
+    "knowledge",
+    "distill",
+    "decisions",
+    "gotchas",
+    "ask",
+    "files",
+    "memory",
 ];
 
 const USAGE: &str = "\
@@ -129,9 +146,11 @@ fn parse(args: &[String]) -> anyhow::Result<Opts> {
             "-s" | "--source" => o.source = Some(next(&mut it, "--source")?),
             "-p" | "--project" => o.project = Some(next(&mut it, "--project")?),
             "-n" | "--limit" => {
-                o.limit = Some(next(&mut it, "--limit")?.parse().map_err(|_| {
-                    anyhow::anyhow!("--limit needs a number")
-                })?)
+                o.limit = Some(
+                    next(&mut it, "--limit")?
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("--limit needs a number"))?,
+                )
             }
             "-V" | "--vault" => o.vault = Some(next(&mut it, "--vault")?),
             "-o" | "--out" => o.out = Some(next(&mut it, "--out")?),
@@ -149,7 +168,9 @@ fn parse(args: &[String]) -> anyhow::Result<Opts> {
 }
 
 fn next(it: &mut std::slice::Iter<'_, String>, flag: &str) -> anyhow::Result<String> {
-    it.next().cloned().ok_or_else(|| anyhow::anyhow!("{flag} needs a value"))
+    it.next()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("{flag} needs a value"))
 }
 
 fn open_db() -> anyhow::Result<Connection> {
@@ -157,6 +178,13 @@ fn open_db() -> anyhow::Result<Connection> {
     // runs safely while the app writes (WAL readers never block). open_readonly
     // returns a clear "no index" error if the app hasn't built one yet.
     db::open_readonly(&db::default_index_path())
+}
+
+/// Writable connection for the few `cal` subcommands that mutate (star/tag/distill).
+/// A read-only connection rejects writes with SQLITE_READONLY; WAL still lets this
+/// coexist with the app's writes (busy_timeout waits out the rare overlap).
+fn open_db_write() -> anyhow::Result<Connection> {
+    db::open(&db::default_index_path())
 }
 
 fn filters(o: &Opts) -> search::SearchFilters {
@@ -235,7 +263,10 @@ fn cmd_related(args: &[String]) -> anyhow::Result<()> {
     }
     for t in &rows {
         let title = t.title.as_deref().unwrap_or("(untitled)");
-        println!("[{}] {:<11} {}  ({} msgs)", t.id, t.source, title, t.message_count);
+        println!(
+            "[{}] {:<11} {}  ({} msgs)",
+            t.id, t.source, title, t.message_count
+        );
     }
     Ok(())
 }
@@ -278,9 +309,12 @@ fn thread_id_arg(o: &Opts, cmd: &str) -> anyhow::Result<i64> {
 fn cmd_star(args: &[String]) -> anyhow::Result<()> {
     let o = parse(args)?;
     let id = thread_id_arg(&o, "star")?;
-    let conn = open_db()?;
+    let conn = open_db_write()?;
     search::set_star(&conn, id, !o.off)?;
-    eprintln!("thread {id} {}", if o.off { "unstarred" } else { "starred" });
+    eprintln!(
+        "thread {id} {}",
+        if o.off { "unstarred" } else { "starred" }
+    );
     Ok(())
 }
 
@@ -289,7 +323,7 @@ fn cmd_tag(args: &[String]) -> anyhow::Result<()> {
     let id = thread_id_arg(&o, "tag")?;
     // Tags are the positionals after the id; passing none clears the thread's tags.
     let tags: Vec<String> = o.positional[1..].to_vec();
-    let mut conn = open_db()?;
+    let mut conn = open_db_write()?;
     let now = chrono::Utc::now().timestamp();
     search::set_thread_tags(&mut conn, id, &tags, now)?;
     let current = search::thread_tags(&conn, id)?;
@@ -396,7 +430,7 @@ fn cmd_knowledge(args: &[String]) -> anyhow::Result<()> {
 fn cmd_distill(args: &[String]) -> anyhow::Result<()> {
     let o = parse(args)?;
     let id = thread_id_arg(&o, "distill")?;
-    let mut conn = open_db()?;
+    let mut conn = open_db_write()?;
     let (provider, model, key) = crate::resolve_distill_engine(&conn)?;
     let packed = context::pack_thread(&conn, id, context::DEFAULT_BUDGET_CHARS)?
         .ok_or_else(|| anyhow::anyhow!("thread {id} not found"))?;
@@ -427,8 +461,11 @@ fn cwd_project_root() -> String {
 
 fn cmd_memory(args: &[String]) -> anyhow::Result<()> {
     let o = parse(args)?;
-    let project =
-        if o.positional.is_empty() { cwd_project_root() } else { o.positional.join(" ") };
+    let project = if o.positional.is_empty() {
+        cwd_project_root()
+    } else {
+        o.positional.join(" ")
+    };
     let conn = open_db()?;
     let mem = knowledge::get_project_memory(&conn, &project, o.limit.unwrap_or(40) as usize)?;
     if o.json {
@@ -489,7 +526,10 @@ fn cmd_ask(args: &[String]) -> anyhow::Result<()> {
     let (provider, model, key) = crate::resolve_distill_engine(&conn)?;
     let embedder = embed::Embedder::default();
     let qv = embed::embed_query(&embedder, &question)?;
-    let filters = search::SearchFilters { limit: Some(30), ..Default::default() };
+    let filters = search::SearchFilters {
+        limit: Some(30),
+        ..Default::default()
+    };
     let hits = search::hybrid_vec(&conn, &question, qv.as_deref(), &filters)?;
 
     let mut seen = std::collections::HashSet::new();
@@ -513,7 +553,13 @@ fn cmd_ask(args: &[String]) -> anyhow::Result<()> {
     }
     eprintln!("asking {provider}/{model}…");
     let rt = tokio::runtime::Runtime::new()?;
-    let answer = rt.block_on(agent::answer(&provider, &model, key.as_deref(), &question, &context))?;
+    let answer = rt.block_on(agent::answer(
+        &provider,
+        &model,
+        key.as_deref(),
+        &question,
+        &context,
+    ))?;
     println!("{answer}\n");
     println!("Sources:");
     for (id, title) in &sources {
@@ -526,7 +572,11 @@ fn cmd_recall(args: &[String], kind: &str) -> anyhow::Result<()> {
     let o = parse(args)?;
     let query = o.positional.join(" ");
     if query.trim().is_empty() {
-        let cmd = if kind == "decision" { "decisions" } else { "gotchas" };
+        let cmd = if kind == "decision" {
+            "decisions"
+        } else {
+            "gotchas"
+        };
         anyhow::bail!("usage: cal {cmd} <query…>");
     }
     let conn = open_db()?;
@@ -581,15 +631,25 @@ fn cmd_stats(args: &[String]) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let pct = if s.embeddable > 0 { s.embedded * 100 / s.embeddable } else { 0 };
+    let pct = if s.embeddable > 0 {
+        s.embedded * 100 / s.embeddable
+    } else {
+        0
+    };
     println!("{} threads · {} messages", s.threads, s.messages);
-    println!("semantic: {}/{} embedded ({pct}%)", s.embedded, s.embeddable);
+    println!(
+        "semantic: {}/{} embedded ({pct}%)",
+        s.embedded, s.embeddable
+    );
     println!("range: {} → {}", fmt_time(s.earliest), fmt_time(s.latest));
 
     println!("\nby source:");
     for src in &s.per_source {
         if src.threads > 0 || src.messages > 0 {
-            println!("  {:<12} {:>6} threads · {:>7} msgs", src.kind, src.threads, src.messages);
+            println!(
+                "  {:<12} {:>6} threads · {:>7} msgs",
+                src.kind, src.threads, src.messages
+            );
         }
     }
     println!("\nby role:");

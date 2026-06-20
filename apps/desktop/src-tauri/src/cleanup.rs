@@ -40,16 +40,24 @@ pub fn candidates(
     let mut args: Vec<Box<dyn ToSql>> = Vec::new();
     if let Some(b) = before {
         args.push(Box::new(b));
-        sql.push_str(&format!(" AND (t.updated_at IS NULL OR t.updated_at <= ?{})", args.len()));
+        sql.push_str(&format!(
+            " AND (t.updated_at IS NULL OR t.updated_at <= ?{})",
+            args.len()
+        ));
     }
     if !sources.is_empty() {
-        let ph: Vec<String> = (0..sources.len()).map(|i| format!("?{}", args.len() + 1 + i)).collect();
+        let ph: Vec<String> = (0..sources.len())
+            .map(|i| format!("?{}", args.len() + 1 + i))
+            .collect();
         sql.push_str(&format!(" AND s.kind IN ({})", ph.join(", ")));
         for s in sources {
             args.push(Box::new(s.clone()));
         }
     }
-    sql.push_str(&format!(" ORDER BY t.updated_at ASC LIMIT ?{}", args.len() + 1));
+    sql.push_str(&format!(
+        " ORDER BY t.updated_at ASC LIMIT ?{}",
+        args.len() + 1
+    ));
     args.push(Box::new(limit));
 
     let arg_refs: Vec<&dyn ToSql> = args.iter().map(|b| b.as_ref()).collect();
@@ -111,7 +119,11 @@ mod tests {
             created_at: Some(updated),
             messages: (0..msgs)
                 .map(|i| ParsedMessage {
-                    role: if i % 2 == 0 { "user".into() } else { "assistant".into() },
+                    role: if i % 2 == 0 {
+                        "user".into()
+                    } else {
+                        "assistant".into()
+                    },
                     text: format!("message {i} body text"),
                     tool_name: None,
                     ts: Some(updated),
@@ -141,9 +153,13 @@ mod tests {
         // Delete it; messages + FTS + (would-be) chunks go with it via cascade/triggers.
         let removed = delete_threads(&mut conn, &[old_only[0].id]).unwrap();
         assert_eq!(removed, 1);
-        let left: i64 = conn.query_row("SELECT COUNT(*) FROM threads", [], |r| r.get(0)).unwrap();
+        let left: i64 = conn
+            .query_row("SELECT COUNT(*) FROM threads", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(left, 1);
-        let msgs: i64 = conn.query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0)).unwrap();
+        let msgs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(msgs, 2, "deleted thread's messages cascaded away");
     }
 }

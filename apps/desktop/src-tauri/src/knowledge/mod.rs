@@ -103,7 +103,11 @@ fn clean(s: &str) -> Option<String> {
 /// Heuristic junk filter: literal escaped newlines, table pipes, or JSON/code braces
 /// mean this "line" is really structured output, not a human action item.
 fn is_noise(t: &str) -> bool {
-    t.contains("\\n") || t.contains('|') || t.contains("\",\"") || t.contains('{') || t.contains('}')
+    t.contains("\\n")
+        || t.contains('|')
+        || t.contains("\",\"")
+        || t.contains('{')
+        || t.contains('}')
 }
 
 /// Cap on heuristic todos kept per thread (matches the indexer).
@@ -118,13 +122,18 @@ pub fn clear_heuristic(conn: &Connection) -> Result<()> {
 /// Re-derive a single thread's heuristic todos from its already-stored messages,
 /// inside the caller's transaction. Shared by the indexer and the backfill.
 fn rebuild_thread_todos(tx: &Connection, thread_id: i64, now: i64) -> Result<()> {
-    tx.execute("DELETE FROM facts WHERE thread_id = ?1 AND extractor = 'heuristic'", [thread_id])?;
+    tx.execute(
+        "DELETE FROM facts WHERE thread_id = ?1 AND extractor = 'heuristic'",
+        [thread_id],
+    )?;
     let mut sel = tx.prepare(
         "SELECT id, text FROM messages WHERE thread_id = ?1 AND role IN ('user', 'assistant')
          ORDER BY seq, id",
     )?;
     let rows: Vec<(i64, String)> = sel
-        .query_map([thread_id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+        .query_map([thread_id], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })?
         .collect::<rusqlite::Result<_>>()?;
     let mut ins = tx.prepare(
         "INSERT INTO facts (thread_id, kind, text, source_message_id, status, extractor, created_at)
@@ -163,7 +172,9 @@ pub fn backfill_todos(db: &crate::db::Db, now: i64) -> Result<()> {
     let thread_ids: Vec<i64> = {
         let conn = lock()?;
         let mut stmt = conn.prepare("SELECT id FROM threads ORDER BY id")?;
-        let ids: Vec<i64> = stmt.query_map([], |r| r.get::<_, i64>(0))?.collect::<rusqlite::Result<_>>()?;
+        let ids: Vec<i64> = stmt
+            .query_map([], |r| r.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<_>>()?;
         ids
     };
 
@@ -235,7 +246,10 @@ pub fn list_open_todos(
         sql.push_str(&format!(" AND s.kind = ?{}", args.len()));
     }
     args.push(Box::new(limit));
-    sql.push_str(&format!(" ORDER BY f.created_at DESC, f.id DESC LIMIT ?{}", args.len()));
+    sql.push_str(&format!(
+        " ORDER BY f.created_at DESC, f.id DESC LIMIT ?{}",
+        args.len()
+    ));
 
     let arg_refs: Vec<&dyn rusqlite::ToSql> = args.iter().map(|b| b.as_ref()).collect();
     let mut stmt = conn.prepare(&sql)?;
@@ -271,7 +285,9 @@ pub struct KnowledgeConfig {
 
 fn config_get(conn: &Connection, key: &str) -> Result<Option<String>> {
     Ok(conn
-        .query_row("SELECT value FROM app_config WHERE key = ?1", [key], |r| r.get::<_, String>(0))
+        .query_row("SELECT value FROM app_config WHERE key = ?1", [key], |r| {
+            r.get::<_, String>(0)
+        })
         .optional()?)
 }
 
@@ -320,9 +336,17 @@ pub fn set_config(
 
 /// Replace a thread's LLM-distilled facts with a fresh set and mark it extracted at
 /// the current message count. Heuristic todos (extractor='heuristic') are untouched.
-pub fn store_distilled(conn: &mut Connection, thread_id: i64, d: &Distilled, now: i64) -> Result<()> {
+pub fn store_distilled(
+    conn: &mut Connection,
+    thread_id: i64,
+    d: &Distilled,
+    now: i64,
+) -> Result<()> {
     let tx = conn.transaction()?;
-    tx.execute("DELETE FROM facts WHERE thread_id = ?1 AND extractor = 'llm'", [thread_id])?;
+    tx.execute(
+        "DELETE FROM facts WHERE thread_id = ?1 AND extractor = 'llm'",
+        [thread_id],
+    )?;
     {
         let mut ins = tx.prepare(
             "INSERT INTO facts (thread_id, kind, text, status, extractor, seq, created_at)
@@ -357,7 +381,10 @@ pub fn store_distilled(conn: &mut Connection, thread_id: i64, d: &Distilled, now
 /// Record a distillation failure so the UI can show it and lazy-on-open won't retry it
 /// in a loop (a manual re-distill clears it). Leaves knowledge_extracted = 0.
 pub fn set_error(conn: &Connection, thread_id: i64, err: &str) -> Result<()> {
-    conn.execute("UPDATE threads SET knowledge_error = ?2 WHERE id = ?1", params![thread_id, err])?;
+    conn.execute(
+        "UPDATE threads SET knowledge_error = ?2 WHERE id = ?1",
+        params![thread_id, err],
+    )?;
     Ok(())
 }
 
@@ -405,24 +432,31 @@ pub fn needs_distill(conn: &Connection, thread_id: i64) -> Result<bool> {
             |r| Ok((r.get::<_, i64>(0)? != 0, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .optional()?;
-    let Some((extracted, kmsg, error, mcount)) = row else { return Ok(false) };
+    let Some((extracted, kmsg, error, mcount)) = row else {
+        return Ok(false);
+    };
     let stale = extracted && kmsg != Some(mcount);
     Ok(error.is_none() && (!extracted || stale))
 }
 
 /// Read the distilled knowledge for one thread (cached; does not run the model).
 pub fn get_thread_knowledge(conn: &Connection, thread_id: i64) -> Result<ThreadKnowledge> {
-    let (extracted, kmsg, error, mcount): (bool, Option<i64>, Option<String>, i64) = conn.query_row(
-        "SELECT knowledge_extracted, knowledge_msg_count, knowledge_error, message_count
+    let (extracted, kmsg, error, mcount): (bool, Option<i64>, Option<String>, i64) = conn
+        .query_row(
+            "SELECT knowledge_extracted, knowledge_msg_count, knowledge_error, message_count
          FROM threads WHERE id = ?1",
-        [thread_id],
-        |r| Ok((r.get::<_, i64>(0)? != 0, r.get(1)?, r.get(2)?, r.get(3)?)),
-    )?;
+            [thread_id],
+            |r| Ok((r.get::<_, i64>(0)? != 0, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )?;
 
     let mut stmt =
         conn.prepare("SELECT id, kind, text FROM facts WHERE thread_id = ?1 ORDER BY seq, id")?;
     let rows = stmt.query_map([thread_id], |r| {
-        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+        ))
     })?;
     let mut summary = None;
     let (mut decisions, mut gotchas, mut todos) = (Vec::new(), Vec::new(), Vec::new());
@@ -488,8 +522,10 @@ pub fn recall(
          JOIN sources s ON s.id = t.source_id
          WHERE f.kind = ?2"
     );
-    let mut args: Vec<Box<dyn rusqlite::ToSql>> =
-        vec![Box::new(crate::embed::vec_to_bytes(qv)), Box::new(kind.to_string())];
+    let mut args: Vec<Box<dyn rusqlite::ToSql>> = vec![
+        Box::new(crate::embed::vec_to_bytes(qv)),
+        Box::new(kind.to_string()),
+    ];
     if let Some(p) = project.filter(|p| !p.is_empty()) {
         args.push(Box::new(format!("%{p}%")));
         sql.push_str(&format!(" AND t.project_path LIKE ?{}", args.len()));
@@ -591,21 +627,23 @@ pub fn list_projects(conn: &Connection) -> Result<Vec<ProjectInfo>> {
 fn project_facts(
     conn: &Connection,
     kind: &str,
-    like: &str,
+    project: &str,
     open_only: bool,
     limit: usize,
 ) -> Result<Vec<MemoryFact>> {
+    // Exact project_path match (the picker / cwd pass the canonical path) so this uses
+    // idx_threads_project + idx_facts_thread_kind instead of scanning a kind-partition.
     let mut sql = String::from(
         "SELECT f.id, f.thread_id, f.text, t.title, f.created_at
          FROM facts f JOIN threads t ON t.id = f.thread_id
-         WHERE f.kind = ?1 AND t.project_path LIKE ?2",
+         WHERE f.kind = ?1 AND t.project_path = ?2",
     );
     if open_only {
         sql.push_str(" AND f.status = 'open'");
     }
     sql.push_str(" ORDER BY f.created_at DESC, f.id DESC");
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(rusqlite::params![kind, like], |r| {
+    let rows = stmt.query_map(rusqlite::params![kind, project], |r| {
         Ok(MemoryFact {
             id: r.get(0)?,
             thread_id: r.get(1)?,
@@ -630,21 +668,26 @@ fn project_facts(
 
 /// Aggregate a project's distilled memory. `per_kind` caps each list (decisions/gotchas/
 /// todos). Coverage counts are over "distillable" threads so the UI can show N/M distilled.
-pub fn get_project_memory(conn: &Connection, project: &str, per_kind: usize) -> Result<ProjectMemory> {
-    let like = format!("%{project}%");
+pub fn get_project_memory(
+    conn: &Connection,
+    project: &str,
+    per_kind: usize,
+) -> Result<ProjectMemory> {
     let count = |extra: &str| -> Result<i64> {
         Ok(conn.query_row(
-            &format!("SELECT COUNT(*) FROM threads WHERE project_path LIKE ?1 AND {DISTILLABLE}{extra}"),
-            [&like],
+            &format!(
+                "SELECT COUNT(*) FROM threads WHERE project_path = ?1 AND {DISTILLABLE}{extra}"
+            ),
+            [project],
             |r| r.get(0),
         )?)
     };
     let thread_count = count("")?;
     let distilled_count = count(" AND knowledge_extracted = 1")?;
     Ok(ProjectMemory {
-        decisions: project_facts(conn, "decision", &like, false, per_kind)?,
-        gotchas: project_facts(conn, "gotcha", &like, false, per_kind)?,
-        open_todos: project_facts(conn, "todo", &like, true, per_kind)?,
+        decisions: project_facts(conn, "decision", project, false, per_kind)?,
+        gotchas: project_facts(conn, "gotcha", project, false, per_kind)?,
+        open_todos: project_facts(conn, "todo", project, true, per_kind)?,
         thread_count,
         distilled_count,
         pending_count: (thread_count - distilled_count).max(0),
@@ -656,10 +699,10 @@ pub fn get_project_memory(conn: &Connection, project: &str, per_kind: usize) -> 
 pub fn project_pending_threads(conn: &Connection, project: &str) -> Result<Vec<i64>> {
     let mut stmt = conn.prepare(&format!(
         "SELECT id FROM threads
-         WHERE project_path LIKE ?1 AND knowledge_extracted = 0 AND {DISTILLABLE}
+         WHERE project_path = ?1 AND knowledge_extracted = 0 AND {DISTILLABLE}
          ORDER BY updated_at DESC"
     ))?;
-    let rows = stmt.query_map([format!("%{project}%")], |r| r.get::<_, i64>(0))?;
+    let rows = stmt.query_map([project], |r| r.get::<_, i64>(0))?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
@@ -721,8 +764,11 @@ mod tests {
     fn temp_db() -> Connection {
         use std::sync::atomic::{AtomicU64, Ordering};
         static N: AtomicU64 = AtomicU64::new(0);
-        let p = std::env::temp_dir()
-            .join(format!("calli_know_{}_{}.db", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
+        let p = std::env::temp_dir().join(format!(
+            "calli_know_{}_{}.db",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
         for ext in ["db", "db-wal", "db-shm"] {
             let _ = std::fs::remove_file(p.with_extension(ext));
         }
@@ -750,9 +796,17 @@ mod tests {
             messages: msgs,
             ..Default::default()
         };
-        upsert_thread(&mut conn, sid, &seed(vec![msg("user", "hi"), msg("assistant", "yo")])).unwrap();
-        let id: i64 =
-            conn.query_row("SELECT id FROM threads WHERE external_id = 'k1'", [], |r| r.get(0)).unwrap();
+        upsert_thread(
+            &mut conn,
+            sid,
+            &seed(vec![msg("user", "hi"), msg("assistant", "yo")]),
+        )
+        .unwrap();
+        let id: i64 = conn
+            .query_row("SELECT id FROM threads WHERE external_id = 'k1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
 
         // Off by default → never distills.
         assert!(!get_config(&conn).unwrap().enabled);
@@ -782,7 +836,11 @@ mod tests {
         upsert_thread(
             &mut conn,
             sid,
-            &seed(vec![msg("user", "hi"), msg("assistant", "yo"), msg("user", "more")]),
+            &seed(vec![
+                msg("user", "hi"),
+                msg("assistant", "yo"),
+                msg("user", "more"),
+            ]),
         )
         .unwrap();
         let k2 = get_thread_knowledge(&conn, id).unwrap();
@@ -814,8 +872,11 @@ mod tests {
             },
         )
         .unwrap();
-        let tid: i64 =
-            conn.query_row("SELECT id FROM threads WHERE external_id = 'r1'", [], |r| r.get(0)).unwrap();
+        let tid: i64 = conn
+            .query_row("SELECT id FROM threads WHERE external_id = 'r1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
         conn.execute(
             "INSERT INTO facts (thread_id, kind, text, status, extractor, created_at)
              VALUES (?1, 'decision', 'use jwt for auth', 'open', 'llm', 1)",

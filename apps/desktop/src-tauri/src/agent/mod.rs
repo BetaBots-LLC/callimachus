@@ -10,7 +10,8 @@ use anyhow::{bail, Result};
 use futures_util::StreamExt;
 use genai::adapter::AdapterKind;
 use genai::chat::{
-    ChatMessage as GMessage, ChatOptions, ChatRequest, ChatStreamEvent, Tool, ToolCall, ToolResponse,
+    ChatMessage as GMessage, ChatOptions, ChatRequest, ChatStreamEvent, Tool, ToolCall,
+    ToolResponse,
 };
 use genai::resolver::AuthData;
 use genai::Client;
@@ -48,7 +49,12 @@ pub struct ChatChunk {
 
 impl ChatChunk {
     pub fn text(kind: &'static str, text: impl Into<String>) -> Self {
-        Self { kind, text: text.into(), tool_id: None, tool_name: None }
+        Self {
+            kind,
+            text: text.into(),
+            tool_id: None,
+            tool_name: None,
+        }
     }
 }
 
@@ -71,7 +77,9 @@ pub fn default_tools() -> Vec<Tool> {
                 "required": ["query"]
             })),
         Tool::new("get_thread")
-            .with_description("Fetch one indexed thread as a packed markdown transcript by threadId.")
+            .with_description(
+                "Fetch one indexed thread as a packed markdown transcript by threadId.",
+            )
             .with_schema(json!({
                 "type": "object",
                 "properties": { "thread_id": { "type": "integer" } },
@@ -133,7 +141,9 @@ pub async fn synthesize(
     let req = ChatRequest::new(Vec::new())
         .with_system(SYNTH_SYSTEM)
         .append_message(GMessage::user(format!("Transcript:\n\n{transcript}")));
-    let options = ChatOptions::default().with_temperature(0.2).with_max_tokens(1500);
+    let options = ChatOptions::default()
+        .with_temperature(0.2)
+        .with_max_tokens(1500);
     let resp = client
         .exec_chat(model, req, Some(&options))
         .await
@@ -163,19 +173,25 @@ pub async fn answer(
     let key = api_key.map(str::to_string);
     let client = Client::builder()
         .with_adapter_kind(adapter)
-        .with_auth_resolver_fn(move |_iden: genai::ModelIden| Ok(key.clone().map(AuthData::from_single)))
+        .with_auth_resolver_fn(move |_iden: genai::ModelIden| {
+            Ok(key.clone().map(AuthData::from_single))
+        })
         .build();
     let req = ChatRequest::new(Vec::new())
         .with_system(ANSWER_SYSTEM)
         .append_message(GMessage::user(format!(
             "Question: {question}\n\nExcerpts from past sessions:\n\n{context}"
         )));
-    let options = ChatOptions::default().with_temperature(0.2).with_max_tokens(900);
+    let options = ChatOptions::default()
+        .with_temperature(0.2)
+        .with_max_tokens(900);
     let resp = client
         .exec_chat(model, req, Some(&options))
         .await
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-    let text = resp.into_first_text().ok_or_else(|| anyhow::anyhow!("no answer returned"))?;
+    let text = resp
+        .into_first_text()
+        .ok_or_else(|| anyhow::anyhow!("no answer returned"))?;
     Ok(text.trim().to_string())
 }
 
@@ -201,17 +217,25 @@ pub async fn project_brief(
     let key = api_key.map(str::to_string);
     let client = Client::builder()
         .with_adapter_kind(adapter)
-        .with_auth_resolver_fn(move |_iden: genai::ModelIden| Ok(key.clone().map(AuthData::from_single)))
+        .with_auth_resolver_fn(move |_iden: genai::ModelIden| {
+            Ok(key.clone().map(AuthData::from_single))
+        })
         .build();
     let req = ChatRequest::new(Vec::new())
         .with_system(BRIEF_SYSTEM)
-        .append_message(GMessage::user(format!("Project: {project}\n\nDistilled notes:\n\n{notes}")));
-    let options = ChatOptions::default().with_temperature(0.2).with_max_tokens(900);
+        .append_message(GMessage::user(format!(
+            "Project: {project}\n\nDistilled notes:\n\n{notes}"
+        )));
+    let options = ChatOptions::default()
+        .with_temperature(0.2)
+        .with_max_tokens(900);
     let resp = client
         .exec_chat(model, req, Some(&options))
         .await
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-    let text = resp.into_first_text().ok_or_else(|| anyhow::anyhow!("brief returned no text"))?;
+    let text = resp
+        .into_first_text()
+        .ok_or_else(|| anyhow::anyhow!("brief returned no text"))?;
     Ok(text.trim().to_string())
 }
 
@@ -253,12 +277,16 @@ pub async fn distill(
     let key = api_key.map(str::to_string);
     let client = Client::builder()
         .with_adapter_kind(adapter)
-        .with_auth_resolver_fn(move |_iden: genai::ModelIden| Ok(key.clone().map(AuthData::from_single)))
+        .with_auth_resolver_fn(move |_iden: genai::ModelIden| {
+            Ok(key.clone().map(AuthData::from_single))
+        })
         .build();
     let req = ChatRequest::new(Vec::new())
         .with_system(DISTILL_SYSTEM)
         .append_message(GMessage::user(format!("Transcript:\n\n{transcript}")));
-    let options = ChatOptions::default().with_temperature(0.1).with_max_tokens(1200);
+    let options = ChatOptions::default()
+        .with_temperature(0.1)
+        .with_max_tokens(1200);
     let resp = client
         .exec_chat(model, req, Some(&options))
         .await
@@ -286,7 +314,11 @@ pub fn parse_distilled(raw: &str) -> Distilled {
         }
     }
     let summary: String = trimmed.chars().take(2000).collect();
-    Distilled { summary, decisions: Vec::new(), gotchas: Vec::new() }
+    Distilled {
+        summary,
+        decisions: Vec::new(),
+        gotchas: Vec::new(),
+    }
 }
 
 /// Stream a chat completion via the genai crate (multi-provider, native protocols,
@@ -440,17 +472,14 @@ pub fn persist_chat(
     let sid = indexer::source_id(conn, "in_app")?;
     let now = chrono::Utc::now().timestamp();
 
-    let title = messages
-        .iter()
-        .find(|m| m.role == "user")
-        .map(|m| {
-            let t = m.content.trim();
-            if t.chars().count() > 80 {
-                format!("{}…", t.chars().take(80).collect::<String>())
-            } else {
-                t.to_string()
-            }
-        });
+    let title = messages.iter().find(|m| m.role == "user").map(|m| {
+        let t = m.content.trim();
+        if t.chars().count() > 80 {
+            format!("{}…", t.chars().take(80).collect::<String>())
+        } else {
+            t.to_string()
+        }
+    });
 
     let mut parsed: Vec<ParsedMessage> = messages
         .iter()
@@ -603,12 +632,9 @@ mod tests {
         }];
         persist_chat(&mut conn, "chat-1", &msgs, "Channels stream events.").unwrap();
 
-        let hits = crate::search::search(
-            &conn,
-            "channels",
-            &crate::search::SearchFilters::default(),
-        )
-        .unwrap();
+        let hits =
+            crate::search::search(&conn, "channels", &crate::search::SearchFilters::default())
+                .unwrap();
         assert!(!hits.is_empty());
         assert_eq!(hits[0].source, "in_app");
     }

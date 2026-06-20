@@ -88,18 +88,23 @@ pub fn launch(
 
 /// Write packed context to a file and open it in a fresh CLI agent session.
 /// Works for any source (unlike resume) since it just feeds context.
-pub fn launch_with_context(program: &str, context_md: &str, project_path: Option<&str>) -> Result<String> {
+pub fn launch_with_context(
+    program: &str,
+    context_md: &str,
+    project_path: Option<&str>,
+) -> Result<String> {
     let home = std::env::var("HOME").map_err(|_| anyhow::anyhow!("HOME unset"))?;
-    let dir = std::path::Path::new(&home).join(".callimachus").join("context");
+    let dir = std::path::Path::new(&home)
+        .join(".callimachus")
+        .join("context");
     std::fs::create_dir_all(&dir)?;
     let ts = chrono::Utc::now().timestamp_millis();
     let file = dir.join(format!("ctx-{ts}.md"));
     std::fs::write(&file, context_md)?;
     let file_str = file.to_string_lossy().to_string();
 
-    let prompt = format!(
-        "Read the conversation context in @{file_str} and help me continue from it."
-    );
+    let prompt =
+        format!("Read the conversation context in @{file_str} and help me continue from it.");
     let cmd = ResumeCommand {
         program: program.to_string(),
         args: vec![prompt],
@@ -112,7 +117,10 @@ pub fn launch_with_context(program: &str, context_md: &str, project_path: Option
             "tell application \"Terminal\"\n  do script \"{}\"\n  activate\nend tell",
             applescript_escape(&shell)
         );
-        std::process::Command::new("osascript").arg("-e").arg(script).spawn()?;
+        std::process::Command::new("osascript")
+            .arg("-e")
+            .arg(script)
+            .spawn()?;
         Ok(file_str)
     }
     #[cfg(not(target_os = "macos"))]
@@ -201,7 +209,10 @@ mod tests {
             cwd: Some("/Users/me/my project".into()),
         };
         let shell = build_shell_command(&cmd);
-        assert_eq!(shell, "cd '/Users/me/my project' && 'claude' '--resume' 'abc'");
+        assert_eq!(
+            shell,
+            "cd '/Users/me/my project' && 'claude' '--resume' 'abc'"
+        );
     }
 
     #[test]

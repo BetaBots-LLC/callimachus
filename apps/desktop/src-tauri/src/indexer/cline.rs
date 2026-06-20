@@ -34,7 +34,13 @@ pub fn task_roots_for(ext_id: &str) -> Vec<PathBuf> {
     let support = PathBuf::from(home).join("Library/Application Support");
     EDITORS
         .iter()
-        .map(|ed| support.join(ed).join("User/globalStorage").join(ext_id).join("tasks"))
+        .map(|ed| {
+            support
+                .join(ed)
+                .join("User/globalStorage")
+                .join(ext_id)
+                .join("tasks")
+        })
         .filter(|p| p.is_dir())
         .collect()
 }
@@ -183,11 +189,21 @@ pub fn parse_history(
 }
 
 /// Anthropic content: a string or an array of text / tool_use / tool_result blocks.
-fn extract_blocks(out: &mut Vec<ParsedMessage>, role: &str, content: Option<&Value>, ts: Option<i64>) {
+fn extract_blocks(
+    out: &mut Vec<ParsedMessage>,
+    role: &str,
+    content: Option<&Value>,
+    ts: Option<i64>,
+) {
     let push = |out: &mut Vec<ParsedMessage>, role: &str, text: String, tool: Option<String>| {
         let text = text.trim().to_string();
         if !text.is_empty() {
-            out.push(ParsedMessage { role: role.to_string(), text, tool_name: tool, ts });
+            out.push(ParsedMessage {
+                role: role.to_string(),
+                text,
+                tool_name: tool,
+                ts,
+            });
         }
     };
     match content {
@@ -201,7 +217,11 @@ fn extract_blocks(out: &mut Vec<ParsedMessage>, role: &str, content: Option<&Val
                         }
                     }
                     Some("tool_use") => {
-                        let name = b.get("name").and_then(Value::as_str).unwrap_or("tool").to_string();
+                        let name = b
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("tool")
+                            .to_string();
                         let input = b.get("input").map(|v| v.to_string()).unwrap_or_default();
                         push(out, "assistant", format!("{name}: {input}"), Some(name));
                     }
@@ -231,7 +251,10 @@ fn stringify_tool_result(content: Option<&Value>) -> String {
 /// Pull a `cwd` out of Cline's task_metadata.json if present.
 fn read_cwd(meta_path: &Path) -> Option<String> {
     let v: Value = serde_json::from_str(&fs::read_to_string(meta_path).ok()?).ok()?;
-    v.get("cwd").and_then(Value::as_str).filter(|c| !c.is_empty()).map(str::to_string)
+    v.get("cwd")
+        .and_then(Value::as_str)
+        .filter(|c| !c.is_empty())
+        .map(str::to_string)
 }
 
 fn truncate_title(s: String) -> String {
@@ -264,14 +287,24 @@ mod tests {
     fn parses_history() {
         let path = temp_path("cline_hist.json");
         std::fs::write(&path, HISTORY).unwrap();
-        let thread = parse_history(&path, "Code/1780000000000", Some(1780000000), Some(1780000000), Some("/Users/me/proj".into()))
-            .unwrap()
-            .expect("non-empty");
+        let thread = parse_history(
+            &path,
+            "Code/1780000000000",
+            Some(1780000000),
+            Some(1780000000),
+            Some("/Users/me/proj".into()),
+        )
+        .unwrap()
+        .expect("non-empty");
         assert_eq!(thread.external_id, "Code/1780000000000");
         assert_eq!(thread.project_path.as_deref(), Some("/Users/me/proj"));
         // user text, assistant text, tool_use, tool_result = 4
         assert_eq!(thread.messages.len(), 4);
-        let tool = thread.messages.iter().find(|m| m.tool_name.is_some()).unwrap();
+        let tool = thread
+            .messages
+            .iter()
+            .find(|m| m.tool_name.is_some())
+            .unwrap();
         assert_eq!(tool.tool_name.as_deref(), Some("execute_command"));
     }
 
@@ -281,7 +314,9 @@ mod tests {
         std::fs::write(&path, HISTORY).unwrap();
         let mut conn = crate::db::open(&temp_path("cline_rt.db")).unwrap();
         let sid = source_id(&conn, KIND).unwrap();
-        let thread = parse_history(&path, "Code/1", None, None, None).unwrap().unwrap();
+        let thread = parse_history(&path, "Code/1", None, None, None)
+            .unwrap()
+            .unwrap();
         upsert_thread(&mut conn, sid, &thread).unwrap();
         let hits =
             crate::search::search(&conn, "fts5", &crate::search::SearchFilters::default()).unwrap();

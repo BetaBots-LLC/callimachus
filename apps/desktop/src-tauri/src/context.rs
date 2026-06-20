@@ -53,16 +53,30 @@ pub fn pack_thread(
     };
 
     // 1. Full.
-    let full: String = detail.messages.iter().map(render_message).collect::<Vec<_>>().join("\n");
+    let full: String = detail
+        .messages
+        .iter()
+        .map(render_message)
+        .collect::<Vec<_>>()
+        .join("\n");
     if envelope(&detail, &full, None).len() <= budget_chars {
         return Ok(Some(envelope(&detail, &full, None)));
     }
 
     // 2. Drop tool noise.
-    let no_tools: Vec<&search::MessageRow> = detail.messages.iter().filter(|m| !is_tool(m)).collect();
-    let no_tools_body = no_tools.iter().map(|m| render_message(m)).collect::<Vec<_>>().join("\n");
+    let no_tools: Vec<&search::MessageRow> =
+        detail.messages.iter().filter(|m| !is_tool(m)).collect();
+    let no_tools_body = no_tools
+        .iter()
+        .map(|m| render_message(m))
+        .collect::<Vec<_>>()
+        .join("\n");
     if envelope(&detail, &no_tools_body, Some("tool calls/output omitted")).len() <= budget_chars {
-        return Ok(Some(envelope(&detail, &no_tools_body, Some("tool calls/output omitted"))));
+        return Ok(Some(envelope(
+            &detail,
+            &no_tools_body,
+            Some("tool calls/output omitted"),
+        )));
     }
 
     // 3. Head/tail elision over the tool-free turns, with each kept turn truncated
@@ -82,14 +96,24 @@ pub fn pack_thread(
         }
         format!("### {}\n{}\n", m.role, t)
     };
-    let mut body = head.iter().map(|m| render_capped(m)).collect::<Vec<_>>().join("\n");
+    let mut body = head
+        .iter()
+        .map(|m| render_capped(m))
+        .collect::<Vec<_>>()
+        .join("\n");
     let elided = n.saturating_sub(head.len() + tail.len());
     if elided > 0 {
         body.push_str(&format!("\n\n### … {elided} turns elided …\n\n"));
     }
     if !tail.is_empty() {
         body.push('\n');
-        body.push_str(&tail.iter().map(|m| render_capped(m)).collect::<Vec<_>>().join("\n"));
+        body.push_str(
+            &tail
+                .iter()
+                .map(|m| render_capped(m))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
     }
     let note = format!("trimmed to fit budget; {elided} middle turns elided, tools omitted");
     let mut out = envelope(&detail, &body, Some(&note));
@@ -97,7 +121,11 @@ pub fn pack_thread(
         // Final hard cap (char-safe), preserving the closing tag.
         let target = budget_chars.saturating_sub(64);
         let truncated: String = body.chars().take(target).collect();
-        out = envelope(&detail, &format!("{truncated}\n… (truncated) …"), Some(&note));
+        out = envelope(
+            &detail,
+            &format!("{truncated}\n… (truncated) …"),
+            Some(&note),
+        );
     }
     Ok(Some(out))
 }
@@ -114,10 +142,19 @@ mod tests {
         .unwrap();
         let tid = conn.last_insert_rowid();
         for i in 0..n_turns {
-            let text = if big { "x".repeat(5000) } else { format!("turn {i} content") };
+            let text = if big {
+                "x".repeat(5000)
+            } else {
+                format!("turn {i} content")
+            };
             conn.execute(
                 "INSERT INTO messages (thread_id, seq, role, text) VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![tid, i as i64, if i % 2 == 0 { "user" } else { "assistant" }, text],
+                rusqlite::params![
+                    tid,
+                    i as i64,
+                    if i % 2 == 0 { "user" } else { "assistant" },
+                    text
+                ],
             )
             .unwrap();
         }
@@ -134,7 +171,9 @@ mod tests {
     fn full_when_small() {
         let conn = crate::db::open(std::path::Path::new(":memory:")).unwrap();
         let tid = seed(&conn, 4, false);
-        let out = pack_thread(&conn, tid, DEFAULT_BUDGET_CHARS).unwrap().unwrap();
+        let out = pack_thread(&conn, tid, DEFAULT_BUDGET_CHARS)
+            .unwrap()
+            .unwrap();
         assert!(out.starts_with("<reference_thread"));
         assert!(out.contains("My Thread"));
         assert!(out.contains("### tool: Bash")); // tools kept when it fits
@@ -146,7 +185,10 @@ mod tests {
         let tid = seed(&conn, 40, true); // ~200k chars of body
         let out = pack_thread(&conn, tid, 30_000).unwrap().unwrap();
         assert!(out.len() <= 30_000 + 500, "len {}", out.len());
-        assert!(!out.contains("### tool: Bash"), "tools should be dropped under budget");
+        assert!(
+            !out.contains("### tool: Bash"),
+            "tools should be dropped under budget"
+        );
         assert!(out.contains("turns elided"));
     }
 }

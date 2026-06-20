@@ -200,8 +200,9 @@ impl Callimachus {
         &self,
         Parameters(args): Parameters<ProjectSearchArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let project = current_project_root()
-            .ok_or_else(|| ErrorData::invalid_params("could not determine current project dir", None))?;
+        let project = current_project_root().ok_or_else(|| {
+            ErrorData::invalid_params("could not determine current project dir", None)
+        })?;
         let filters = search::SearchFilters {
             project: Some(project),
             hybrid: args.hybrid,
@@ -234,8 +235,8 @@ impl Callimachus {
             .conn
             .lock()
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-        let tags = search::list_tags(&conn)
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let tags =
+            search::list_tags(&conn).map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         let json = serde_json::to_string_pretty(&tags)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         Ok(CallToolResult::success(vec![Content::text(json)]))
@@ -310,7 +311,10 @@ impl Callimachus {
         &self,
         Parameters(args): Parameters<ProjectMemoryArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let project = args.project.or_else(current_project_root).unwrap_or_default();
+        let project = args
+            .project
+            .or_else(current_project_root)
+            .unwrap_or_default();
         let conn = self
             .conn
             .lock()
@@ -330,7 +334,9 @@ impl Callimachus {
         let qv = embed::embed_query(&self.embedder, &args.query)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         let Some(qv) = qv else {
-            return Ok(CallToolResult::success(vec![Content::text("[]".to_string())]));
+            return Ok(CallToolResult::success(vec![Content::text(
+                "[]".to_string(),
+            )]));
         };
         let conn = self
             .conn

@@ -31,5 +31,7 @@ pub static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
         M::up(include_str!("../../migrations/0012_knowledge_llm.sql")),
         // 0013 — file-path mentions for code-aware search.
         M::up(include_str!("../../migrations/0013_file_mentions.sql")),
+        // 0014 — perf: composite list indexes, facts(thread_id,kind), trigram path FTS.
+        M::up(include_str!("../../migrations/0014_perf.sql")),
     ])
 });

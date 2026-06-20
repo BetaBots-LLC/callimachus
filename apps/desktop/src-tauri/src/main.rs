@@ -10,7 +10,8 @@ fn main() {
     if argv.iter().any(|a| a == "--mcp") {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         let result = rt.block_on(async {
-            let conn = callimachus_lib::db::open_readonly(&callimachus_lib::db::default_index_path())?;
+            let conn =
+                callimachus_lib::db::open_readonly(&callimachus_lib::db::default_index_path())?;
             callimachus_lib::mcp_server::serve(conn).await
         });
         if let Err(e) = result {

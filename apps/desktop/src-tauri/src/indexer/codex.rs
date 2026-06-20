@@ -173,10 +173,7 @@ fn ingest_payload(out: &mut Vec<ParsedMessage>, payload: &Value, ts: Option<i64>
             push(out, "assistant", format!("{name}: {args}"), Some(name), ts);
         }
         Some("function_call_output") => {
-            let output = payload
-                .get("output")
-                .map(value_to_text)
-                .unwrap_or_default();
+            let output = payload.get("output").map(value_to_text).unwrap_or_default();
             push(out, "tool", output, None, ts);
         }
         _ => {} // reasoning, etc. — skipped
@@ -209,7 +206,13 @@ fn value_to_text(v: &Value) -> String {
     }
 }
 
-fn push(out: &mut Vec<ParsedMessage>, role: &str, text: String, tool: Option<String>, ts: Option<i64>) {
+fn push(
+    out: &mut Vec<ParsedMessage>,
+    role: &str,
+    text: String,
+    tool: Option<String>,
+    ts: Option<i64>,
+) {
     let text = text.trim().to_string();
     if !text.is_empty() {
         out.push(ParsedMessage {

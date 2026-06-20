@@ -140,7 +140,12 @@ fn index_session(conn: &mut Connection, sid: i64, root: &Path, sf: &Path) -> Res
         if role == "user" && first_user.is_none() {
             first_user = Some(text.clone());
         }
-        messages.push(ParsedMessage { role: role.to_string(), text, tool_name: None, ts });
+        messages.push(ParsedMessage {
+            role: role.to_string(),
+            text,
+            tool_name: None,
+            ts,
+        });
     }
 
     set_file_state(conn, &key, KIND, fp_mtime, fp_count)?;
@@ -210,7 +215,11 @@ fn read_dir_sorted(dir: &Path) -> Vec<PathBuf> {
     let Ok(entries) = fs::read_dir(dir) else {
         return Vec::new();
     };
-    entries.flatten().map(|e| e.path()).filter(|p| p.is_file()).collect()
+    entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_file())
+        .collect()
 }
 
 /// (max mtime secs, file count) of a directory's immediate files.
@@ -298,7 +307,9 @@ mod tests {
         assert_eq!(hits.len(), 2);
         assert!(hits.iter().all(|h| h.source == "opencode"));
 
-        let tid: i64 = conn.query_row("SELECT id FROM threads", [], |r| r.get(0)).unwrap();
+        let tid: i64 = conn
+            .query_row("SELECT id FROM threads", [], |r| r.get(0))
+            .unwrap();
         let detail = crate::search::thread_detail(&conn, tid).unwrap().unwrap();
         assert_eq!(detail.title.as_deref(), Some("FTS5 work"));
         assert_eq!(detail.project_path.as_deref(), Some("/Users/me/proj"));

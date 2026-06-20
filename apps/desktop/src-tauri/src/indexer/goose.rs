@@ -77,7 +77,10 @@ fn scan_path(conn: &mut Connection, db: &Path) -> Result<IndexReport> {
                 Some("assistant") => "assistant",
                 _ => "user",
             };
-            let text = content_json.as_deref().map(extract_text).unwrap_or_default();
+            let text = content_json
+                .as_deref()
+                .map(extract_text)
+                .unwrap_or_default();
             let text = text.trim().to_string();
             if text.is_empty() {
                 continue;
@@ -90,7 +93,12 @@ fn scan_path(conn: &mut Connection, db: &Path) -> Result<IndexReport> {
             if role == "user" && first_user.is_none() {
                 first_user = Some(text.clone());
             }
-            messages.push(ParsedMessage { role: role.to_string(), text, tool_name: None, ts });
+            messages.push(ParsedMessage {
+                role: role.to_string(),
+                text,
+                tool_name: None,
+                ts,
+            });
         }
 
         if messages.is_empty() {
@@ -122,8 +130,7 @@ fn scan_path(conn: &mut Connection, db: &Path) -> Result<IndexReport> {
 }
 
 fn list_sessions(ro: &Connection) -> Result<Vec<Session>> {
-    let mut stmt =
-        ro.prepare("SELECT id, name, description, working_dir FROM sessions")?;
+    let mut stmt = ro.prepare("SELECT id, name, description, working_dir FROM sessions")?;
     let rows = stmt.query_map([], |r| {
         Ok(Session {
             id: r.get(0)?,
@@ -211,7 +218,10 @@ mod tests {
         assert_eq!(extract_text(r#"{"text":"hello"}"#), "hello");
         assert_eq!(extract_text(r#"[{"text":"a"},{"text":"b"}]"#), "a\nb");
         assert_eq!(extract_text(r#"{"Text":{"text":"tagged"}}"#), "tagged");
-        assert_eq!(extract_text("plain string not json"), "plain string not json");
+        assert_eq!(
+            extract_text("plain string not json"),
+            "plain string not json"
+        );
     }
 
     /// Build a Goose-shaped sessions.db and verify extraction.
@@ -244,7 +254,9 @@ mod tests {
         assert_eq!(hits.len(), 2);
         assert!(hits.iter().all(|h| h.source == "goose"));
 
-        let tid: i64 = conn.query_row("SELECT id FROM threads", [], |r| r.get(0)).unwrap();
+        let tid: i64 = conn
+            .query_row("SELECT id FROM threads", [], |r| r.get(0))
+            .unwrap();
         let detail = crate::search::thread_detail(&conn, tid).unwrap().unwrap();
         assert_eq!(detail.title.as_deref(), Some("Add FTS5 search")); // description fallback
         assert_eq!(detail.project_path.as_deref(), Some("/Users/me/proj"));

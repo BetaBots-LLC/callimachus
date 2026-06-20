@@ -38,7 +38,10 @@ impl Embedder {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
-        let mut guard = self.0.lock().map_err(|e| anyhow::anyhow!("embedder lock: {e}"))?;
+        let mut guard = self
+            .0
+            .lock()
+            .map_err(|e| anyhow::anyhow!("embedder lock: {e}"))?;
         if guard.is_none() {
             // Cap ONNX intra-op parallelism so a build doesn't pin every core and
             // starve the UI thread. fastembed counts logical cores; leave 2 free.
@@ -54,7 +57,10 @@ impl Embedder {
         }
         let model = guard.as_mut().unwrap();
         let out = model.embed(texts, None)?;
-        debug_assert!(out.iter().all(|v| v.len() == DIM), "unexpected embedding dim");
+        debug_assert!(
+            out.iter().all(|v| v.len() == DIM),
+            "unexpected embedding dim"
+        );
         Ok(out)
     }
 }
@@ -94,7 +100,9 @@ pub fn pending_batch(conn: &Connection, batch: usize) -> Result<Vec<(i64, String
          LIMIT ?1"
     ))?;
     let rows = stmt
-        .query_map([batch as i64], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+        .query_map([batch as i64], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
 }
@@ -123,7 +131,8 @@ pub fn store_batch(
 ) -> Result<()> {
     let tx = conn.transaction()?;
     {
-        let mut ins = tx.prepare("INSERT INTO vec_chunks (message_id, embedding) VALUES (?1, ?2)")?;
+        let mut ins =
+            tx.prepare("INSERT INTO vec_chunks (message_id, embedding) VALUES (?1, ?2)")?;
         for (mid, v) in owners.iter().zip(vecs.iter()) {
             ins.execute(params![mid, vec_to_bytes(v)])?;
         }
@@ -169,7 +178,9 @@ pub fn embed_pending_facts(db: &crate::db::Db, embedder: &Embedder) -> Result<()
                  WHERE embedded = 0 AND kind IN ('decision', 'gotcha') LIMIT ?1",
             )?;
             let r = stmt
-                .query_map([BATCH as i64], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+                .query_map([BATCH as i64], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+                })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             r
         };
@@ -334,7 +345,9 @@ mod tests {
     #[ignore]
     fn embed_smoke() {
         let e = Embedder::default();
-        let vecs = e.embed(vec!["how do I activate a python virtualenv".to_string()]).unwrap();
+        let vecs = e
+            .embed(vec!["how do I activate a python virtualenv".to_string()])
+            .unwrap();
         assert_eq!(vecs[0].len(), DIM);
     }
 
@@ -355,7 +368,10 @@ mod tests {
         let tid = conn.last_insert_rowid();
         for (i, (role, text)) in [
             ("user", "how do I activate a python virtualenv"),
-            ("assistant", "run source .venv/bin/activate to enter the environment"),
+            (
+                "assistant",
+                "run source .venv/bin/activate to enter the environment",
+            ),
             ("user", "the cat sat on the mat in the sun"),
         ]
         .iter()
@@ -371,16 +387,29 @@ mod tests {
         let embedder = Embedder::default();
         while embed_batch(&mut conn, &embedder, 8).unwrap() > 0 {}
 
-        let sem = semantic_search(&conn, &embedder, "enter the shell environment", false, &[], 3)
-            .unwrap();
+        let sem = semantic_search(
+            &conn,
+            &embedder,
+            "enter the shell environment",
+            false,
+            &[],
+            3,
+        )
+        .unwrap();
         assert!(!sem.is_empty());
         let top_text: String = conn
-            .query_row("SELECT text FROM messages WHERE id = ?1", [sem[0].0], |r| r.get(0))
+            .query_row("SELECT text FROM messages WHERE id = ?1", [sem[0].0], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert!(top_text.contains("venv") || top_text.contains("environment"));
 
-        let filters = crate::search::SearchFilters { hybrid: true, ..Default::default() };
-        let hits = crate::search::hybrid(&conn, &embedder, "activate environment", &filters).unwrap();
+        let filters = crate::search::SearchFilters {
+            hybrid: true,
+            ..Default::default()
+        };
+        let hits =
+            crate::search::hybrid(&conn, &embedder, "activate environment", &filters).unwrap();
         assert!(!hits.is_empty());
     }
 }

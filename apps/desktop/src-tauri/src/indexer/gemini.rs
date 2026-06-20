@@ -86,7 +86,11 @@ fn index_file(conn: &mut Connection, sid: i64, root: &Path, path: &Path) -> Resu
     }
 
     // external_id = path relative to the tmp root: stable and unique per file.
-    let rel = path.strip_prefix(root).unwrap_or(path).to_string_lossy().to_string();
+    let rel = path
+        .strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .to_string();
 
     let mut thread = parse_file(path, &rel).with_context(|| format!("parsing {path_str}"))?;
     if let Some(t) = thread.as_mut() {
@@ -152,7 +156,11 @@ pub fn parse_file(path: &Path, external_id: &str) -> Result<Option<ParsedThread>
 fn ingest_line(thread: &mut ParsedThread, obj: &Value, first_user_text: &mut Option<String>) {
     // Session metadata (first line): pick up the project dir from `directories`.
     if let Some(dirs) = obj.get("directories").and_then(Value::as_array) {
-        if let Some(dir) = dirs.iter().filter_map(Value::as_str).find(|s| !s.is_empty()) {
+        if let Some(dir) = dirs
+            .iter()
+            .filter_map(Value::as_str)
+            .find(|s| !s.is_empty())
+        {
             thread.project_path = Some(dir.to_string());
         }
     }
@@ -165,7 +173,10 @@ fn ingest_line(thread: &mut ParsedThread, obj: &Value, first_user_text: &mut Opt
         }
     }
 
-    let ts = obj.get("timestamp").and_then(Value::as_str).and_then(parse_ts);
+    let ts = obj
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .and_then(parse_ts);
     let role = match obj.get("type").and_then(Value::as_str) {
         Some("user") => "user",
         Some("gemini") => "assistant",
@@ -184,7 +195,12 @@ fn ingest_line(thread: &mut ParsedThread, obj: &Value, first_user_text: &mut Opt
 }
 
 /// Turn a record's `content` (a string or an array of Gemini parts) into messages.
-fn extract_content(thread: &mut ParsedThread, role: &str, content: Option<&Value>, ts: Option<i64>) {
+fn extract_content(
+    thread: &mut ParsedThread,
+    role: &str,
+    content: Option<&Value>,
+    ts: Option<i64>,
+) {
     let push = |thread: &mut ParsedThread, role: &str, text: String, tool: Option<String>| {
         let text = text.trim().to_string();
         if !text.is_empty() {
@@ -226,7 +242,9 @@ fn extract_content(thread: &mut ParsedThread, role: &str, content: Option<&Value
 
 /// ISO-8601 / RFC-3339 timestamp -> epoch seconds.
 fn parse_ts(s: &str) -> Option<i64> {
-    chrono::DateTime::parse_from_rfc3339(s).ok().map(|d| d.timestamp())
+    chrono::DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|d| d.timestamp())
 }
 
 #[cfg(test)]
@@ -250,14 +268,19 @@ mod tests {
 
     fn write_sample(name: &str) -> PathBuf {
         let path = temp_path(name);
-        std::fs::File::create(&path).unwrap().write_all(SAMPLE.as_bytes()).unwrap();
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(SAMPLE.as_bytes())
+            .unwrap();
         path
     }
 
     #[test]
     fn parses_sample_thread() {
         let path = write_sample("gem_sample.jsonl");
-        let thread = parse_file(&path, "abc/chats/session-x.jsonl").unwrap().expect("non-empty");
+        let thread = parse_file(&path, "abc/chats/session-x.jsonl")
+            .unwrap()
+            .expect("non-empty");
         assert_eq!(thread.external_id, "abc/chats/session-x.jsonl");
         // directories -> project_path
         assert_eq!(thread.project_path.as_deref(), Some("/Users/me/proj"));
@@ -265,8 +288,15 @@ mod tests {
         assert!(thread.created_at.is_some() && thread.updated_at.is_some());
         // user text, gemini text, gemini functionCall, functionResponse = 4 (info skipped)
         assert_eq!(thread.messages.len(), 4);
-        assert_eq!(thread.title.as_deref(), Some("index gemini threads with sqlite fts5"));
-        let tool = thread.messages.iter().find(|m| m.tool_name.is_some()).unwrap();
+        assert_eq!(
+            thread.title.as_deref(),
+            Some("index gemini threads with sqlite fts5")
+        );
+        let tool = thread
+            .messages
+            .iter()
+            .find(|m| m.tool_name.is_some())
+            .unwrap();
         assert_eq!(tool.tool_name.as_deref(), Some("run_shell_command"));
         assert!(tool.text.contains("cargo build"));
     }
@@ -274,7 +304,10 @@ mod tests {
     #[test]
     fn subagent_detection_by_depth() {
         assert_eq!(segments_after_chats("id/chats/session-x.jsonl"), 1);
-        assert_eq!(segments_after_chats("id/chats/parent-sess/child-sess.jsonl"), 2);
+        assert_eq!(
+            segments_after_chats("id/chats/parent-sess/child-sess.jsonl"),
+            2
+        );
     }
 
     #[test]
