@@ -9,11 +9,15 @@ export const FAQ: { q: string; a: string }[] = [
   },
   {
     q: "How is the search better than grep?",
-    a: "It's hybrid. Keyword search (SQLite FTS5) is fused with on-device semantic search (a small embedding model running locally) so you can find a thread by what it was about, not just the exact words you typed. Filter by source, project, or recency.",
+    a: "It's hybrid. Keyword search (SQLite FTS5) is fused with on-device semantic search (a small embedding model running locally) so you can find a thread by what it was about, not just the exact words you typed. Filter by source, project, recency, starred, tag, or subagents — or type file:embed/mod.rs to find every thread that touched a code path.",
   },
   {
     q: "What do I actually need to run it?",
     a: "The desktop app on macOS, Windows, or Linux — that's it; it bundles the index and the cal CLI. The editor extension and MCP server both read the same local index, so run the app once and everything else just works.",
+  },
+  {
+    q: "Can it summarize decisions or answer questions about my history?",
+    a: "Yes. TODOs are extracted for free with no key. Turn on distillation (local Ollama, keyless, or a cloud API key) and Callimachus distills each thread into a summary plus key decisions and gotchas, then recalls them semantically across every thread. The Ask tab goes further: it answers a question over your own history with a synthesized, cited response that links [thread N] back to the sources it used.",
   },
   {
     q: "How do I get a past thread back into my agent?",

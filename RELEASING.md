@@ -2,8 +2,9 @@
 
 How versions, changelogs, and release candidates work for both shippable
 artifacts in this monorepo — the **desktop app** (macOS / Windows / Linux
-installers + auto-updater) and the **VS Code / Cursor extension** (`.vsix` on the
-marketplaces).
+installers + standalone `cal` / `callimachus-mcp` binaries + auto-updater) and the
+**VS Code / Cursor extension** (`.vsix` on the marketplaces). Both ship together
+on **one shared version**.
 
 ## How it fits together
 
@@ -13,24 +14,28 @@ PR with a changeset ─┐
    push to main → version.yml ──(changesets)──► opens "Version Packages" PR
                                                          │ merge
                                                          ▼
-                       changeset version  → bumps each changed package
+                       changeset version  → bumps the version (desktop + extension
+                                            together, via the Changesets fixed group)
                        sync-versions.mjs  → tauri.conf.json + Cargo.toml (desktop)
-                       release-tag.mjs    → one tag per bumped artifact:
-                                              v<ver>         (desktop)
-                                              vscode-v<ver>  (extension)
-              ┌───────────────────────────────┴───────────────────────────────┐
-              ▼ v<ver>                                                          ▼ vscode-v<ver>
-      build.yml → tauri-action                                  publish-extension.yml
-        → signed mac/win/linux installers                        → VS Code Marketplace (vsce)
-        → GitHub Release                                          → Open VSX  (Cursor / VSCodium)
-              │                                                   → GitHub Release (.vsix)
+                       release-tag.mjs    → one tag: v<ver>
+                                                       │
+              ┌────────────────────────────────────── ┴ v<ver> ──────────────────────────────┐
+              ▼                                                                                ▼
+      build.yml → tauri-action                                              publish-extension.yml
+        → signed mac/win/linux installers                                     → VS Code Marketplace (vsce)
+        → standalone cal-<triple> / callimachus-mcp-<triple> binaries         → Open VSX  (Cursor / VSCodium)
+        → GitHub Release                                                      → same GitHub Release (.vsix)
+              │
               ▼
       installed apps auto-update
 ```
 
-**Each artifact has its own version** (independent). A release that only touches
-the extension pushes only `vscode-v<ver>`; one that only touches the desktop
-pushes only `v<ver>`. `scripts/sync-versions.mjs` keeps the desktop version in
+**The desktop app and the extension share one version** and ride a single `v<ver>`
+tag. They are kept in lockstep by the Changesets **fixed** group
+(`["callimachus", "callimachus-vscode"]`): any changeset that bumps one bumps both,
+so every release pushes exactly one `v<ver>` tag that fans out to **both**
+`build.yml` (desktop) and `publish-extension.yml` (extension).
+`scripts/sync-versions.mjs` then keeps the desktop version in
 `apps/desktop/package.json` in lockstep with `tauri.conf.json` + `Cargo.toml` so
 the installer, the updater manifest, and the git tag never drift.
 
@@ -68,7 +73,7 @@ Settings → Secrets and variables → Actions:
 | --- | --- |
 | `TAURI_SIGNING_PRIVATE_KEY` | Contents of `~/.tauri/callimachus.key` |
 | `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | The password you set (empty string if none) |
-| `RELEASE_TOKEN` | A PAT with `contents: write` + `workflows`. Lets the auto-pushed tags trigger `build.yml` / `publish-extension.yml` (the default `GITHUB_TOKEN` cannot trigger another workflow). |
+| `RELEASE_TOKEN` | A PAT with `contents: write` + `workflows`. Lets the auto-pushed `v<ver>` tag trigger `build.yml` + `publish-extension.yml` (the default `GITHUB_TOKEN` cannot trigger another workflow). |
 | `VSCE_PAT` | *(optional)* Azure DevOps PAT for the VS Code Marketplace. Absent → that publish step is skipped. |
 | `OVSX_PAT` | *(optional)* [Open VSX](https://open-vsx.org) access token — this is the registry **Cursor** & VSCodium install from. Absent → that publish step is skipped. |
 
@@ -84,25 +89,30 @@ Settings → Secrets and variables → Actions:
    Commit the generated `.changeset/*.md` file.
 2. Merge PRs to `main`. `version.yml` opens (and keeps updating) a
    **"Version Packages"** PR that accumulates the pending changesets.
-3. **Merge the Version Packages PR.** That bumps the version, writes
-   `CHANGELOG.md`, and pushes `vX.Y.Z`.
-4. The pushed tags fan out:
-   - `v<ver>` → `build.yml` builds signed installers for **macOS (Apple Silicon),
-     Windows (x64) and Linux (x64)**, publishes one GitHub Release, uploads
-     `latest.json`. Installed apps auto-update.
-   - `vscode-v<ver>` → `publish-extension.yml` packages the extension and pushes it
-     to the VS Code Marketplace + Open VSX, and attaches the `.vsix` to a Release.
+3. **Merge the Version Packages PR.** That bumps the (shared) version, writes
+   `CHANGELOG.md`, and pushes a single `vX.Y.Z` tag.
+4. That one `v<ver>` tag fans out to **both** workflows:
+   - `build.yml` builds signed installers for **macOS (Apple Silicon),
+     Windows (x64) and Linux (x64)**, also builds the standalone
+     `cal-<triple>` / `callimachus-mcp-<triple>` binaries (for CLI/MCP-only users),
+     publishes one GitHub Release, and uploads `latest.json`. Installed apps
+     auto-update.
+   - `publish-extension.yml` packages the extension and pushes it to the VS Code
+     Marketplace + Open VSX, then attaches the `.vsix` to **that same Release**.
 
 ## Extensions (VS Code & Cursor)
 
 There is one extension (`apps/vscode`) published to two registries — **Cursor and
 VSCodium install from Open VSX**, official VS Code from the Marketplace.
 
-- It versions independently of the desktop app: add a changeset that bumps
-  `callimachus-vscode`, and the Version Packages merge pushes only `vscode-v<ver>`.
+- It shares the desktop app's version (the Changesets **fixed** group bumps both
+  together), so it ships on the same `v<ver>` tag — there is no separate extension
+  tag. `publish-extension.yml` triggers on `v[0-9]*` alongside `build.yml`.
 - `publish-extension.yml` runs `vsce` (Marketplace) and `ovsx` (Open VSX); each is
   skipped if its token secret is missing, and the `.vsix` is always attached to the
-  GitHub Release for manual install.
+  same GitHub Release for manual install.
+- The extension publish is skipped on `-rc` / `-beta` tags (the Marketplace doesn't
+  accept prerelease versions), so RCs ship the desktop installers only.
 - One-time, before the first publish: create the `BetaBotsLLC` publisher on the
   [VS Code Marketplace](https://marketplace.visualstudio.com/manage) and the
   matching namespace on [Open VSX](https://open-vsx.org), then add `VSCE_PAT` /
@@ -117,7 +127,8 @@ RC versioning rides on Changesets' prerelease mode.
 pnpm rc:enter            # = changeset pre enter rc
 
 # From here, every Version Packages merge produces vX.Y.Z-rc.0, -rc.1, …
-# build.yml marks these as GitHub *prereleases* automatically.
+# (e.g. v0.6.0-rc.1). build.yml marks these as GitHub *prereleases* automatically,
+# and publish-extension.yml skips them (no extension prerelease channel).
 
 # When the RC is good, leave prerelease mode:
 pnpm rc:exit             # = changeset pre exit
@@ -134,16 +145,17 @@ pnpm rc:exit             # = changeset pre exit
 
 ## Manual / re-run build
 
-Tag exists but the run failed or you skipped automation:
+Tag exists but the run failed or you skipped automation. Both workflows take the
+same `v<ver>` tag:
 
-- Desktop — Actions → **Build & Release** → Run workflow → enter the tag (e.g. `v0.2.0-rc.1`).
-- Extension — Actions → **Publish Extension** → Run workflow → enter the tag (e.g. `vscode-v0.1.1`).
+- Desktop — Actions → **Build & Release** → Run workflow → enter the tag (e.g. `v0.5.0`).
+- Extension — Actions → **Publish Extension** → Run workflow → enter the same tag (e.g. `v0.5.0`).
 
-Or cut tags by hand:
+Or cut the tag by hand — one tag triggers **both** `build.yml` and
+`publish-extension.yml`:
 
 ```bash
-git tag v0.2.0        && git push origin v0.2.0           # → build.yml (desktop)
-git tag vscode-v0.1.1 && git push origin vscode-v0.1.1    # → publish-extension.yml
+git tag v0.5.0 && git push origin v0.5.0    # → build.yml + publish-extension.yml
 ```
 
 ## Adding an RC auto-update channel (later)

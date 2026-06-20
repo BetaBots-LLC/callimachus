@@ -1,5 +1,15 @@
 import { Link, createFileRoute } from "@tanstack/react-router";
-import { ArrowRight, Blocks, RefreshCw, Search, Share2, ShieldCheck, Terminal } from "lucide-react";
+import {
+  ArrowRight,
+  Blocks,
+  Lightbulb,
+  MessageCircleQuestion,
+  RefreshCw,
+  Search,
+  Share2,
+  ShieldCheck,
+  Terminal,
+} from "lucide-react";
 import { GithubMark } from "@/components/site/icons";
 import { downloadData } from "@/server/releases";
 import { seo } from "@/lib/seo";
@@ -124,7 +134,9 @@ function Home() {
             >
               Keyword search (SQLite FTS5) fused with on-device semantic similarity, so a vague
               memory — “that vector index migration” — surfaces the right thread even when you've
-              forgotten the exact words. Filter by source, project, or recency.
+              forgotten the exact words. Filter by source, project, recency, starred, or tag — or
+              type <code className="font-mono">file:embed/mod.rs</code> to find every thread that
+              touched a path. Subagent transcripts stay out of the way until you ask for them.
             </FeaturePanel>
             <FeaturePanel
               icon={ShieldCheck}
@@ -153,6 +165,26 @@ function Home() {
               Copy a thread's packed context, insert it into your editor, export it to Obsidian, or
               let the MCP server feed it to an agent on demand. Your history becomes raw material
               again, not just a read-only archive.
+            </FeaturePanel>
+            <FeaturePanel
+              icon={Lightbulb}
+              label="Knowledge layer"
+              title="Distill the lessons, not just the logs"
+              className="lg:col-span-7"
+            >
+              Free heuristic TODO extraction, plus opt-in LLM distillation of decisions, gotchas,
+              and summaries — with cross-thread semantic recall of past decisions and gotchas. Needs
+              local Ollama (keyless) or a cloud API key.
+            </FeaturePanel>
+            <FeaturePanel
+              icon={MessageCircleQuestion}
+              label="Ask your history"
+              title="A cited answer over your own threads"
+              className="lg:col-span-5"
+            >
+              Ask a question and get a synthesized, cited answer drawn from your own sessions, with
+              [thread N] citations back to the sources it used. Retrieval-augmented over the local
+              index; needs an LLM engine enabled.
             </FeaturePanel>
           </div>
         </Container>

@@ -20,10 +20,15 @@ export const Route = createFileRoute("/mcp")({
 });
 
 const TOOLS = [
-  { name: "search_threads", note: "Search the whole index" },
-  { name: "search_current_project", note: "Scope search to the working repo" },
+  { name: "search_threads", note: "Keyword + optional semantic search of the whole index" },
+  { name: "search_current_project", note: "Scope search to the launching repo" },
   { name: "recent_threads", note: "The most recently updated threads" },
-  { name: "get_thread", note: "Fetch a full thread by id" },
+  { name: "get_thread", note: "Fetch a full thread as a packed transcript" },
+  { name: "list_tags", note: "Discover the user's tags / collections" },
+  { name: "list_open_todos", note: "Unfinished TODOs across past sessions (no key needed)" },
+  { name: "get_thread_knowledge", note: "Distilled summary, decisions, gotchas for a thread" },
+  { name: "recall_decisions", note: "Semantically recall past decisions and why" },
+  { name: "recall_gotchas", note: "Semantically recall known pitfalls to avoid" },
 ];
 
 function McpPage() {
@@ -32,7 +37,7 @@ function McpPage() {
       no="04"
       kicker="MCP server"
       title="Give every agent a memory."
-      description="callimachus-mcp exposes your local history to any MCP client. Instead of re-explaining context, your agent can look it up — searching your own past sessions and pulling the exact thread it needs."
+      description="callimachus-mcp exposes your local history to any MCP client through nine tools. Instead of re-explaining context, your agent can look it up — searching your own past sessions, recalling settled decisions and known gotchas, and pulling the exact thread it needs."
     >
       <div className="grid gap-10 lg:grid-cols-2">
         <div className="flex flex-col gap-4">

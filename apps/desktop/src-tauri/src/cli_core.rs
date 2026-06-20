@@ -20,8 +20,8 @@ const USAGE: &str = "\
 cal — search your indexed AI coding-agent history
 
 USAGE:
-  cal search <query…> [-s SOURCE] [-y|--hybrid] [-n LIMIT] [--json]
-  cal related [<text…>] [-s SOURCE] [-p PROJECT] [-n LIMIT] [--json]
+  cal search <query…> [-s SOURCE] [-y|--hybrid] [--starred] [-t TAG] [-n LIMIT] [--json]
+  cal related [<text…>] [-s SOURCE] [-p PROJECT] [--starred] [-t TAG] [-n LIMIT] [--json]
                                 (text via args or stdin; semantic only)
   cal recent [-s SOURCE] [-p PROJECT] [--starred] [-t TAG] [-n LIMIT] [--json]
   cal cat <thread-id>            (aliases: show, context)
@@ -48,12 +48,13 @@ USAGE:
 
 OPTIONS:
   -s, --source SOURCE   filter by source kind (claude_code, codex, cursor,
-                        gemini, qwen, goose, opencode, continue, cline, in_app)
+                        gemini, qwen, goose, opencode, continue, cline, roo,
+                        kilo, in_app)
   -p, --project PATH    substring-match the project path
       --starred         only starred threads (recent/related/search)
   -t, --tag TAG         only threads with this tag (repeatable)
   -y, --hybrid          fuse keyword + on-device semantic search
-  -n, --limit N         max results (default 20)
+  -n, --limit N         max results (default 20; todos 50, files 40)
   -V, --vault DIR       Obsidian vault dir for `export` (else CALLIMACHUS_VAULT)
   -o, --out FILE        write `export` output to FILE instead of a vault/stdout
   -S, --synthesize      prepend an LLM summary / decisions / gotchas / TODOs

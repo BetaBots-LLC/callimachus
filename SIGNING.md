@@ -8,7 +8,7 @@ just mean an unsigned artifact, never a failed build.
 | Updater (`*.sig` + `latest.json`) | minisign (`TAURI_SIGNING_PRIVATE_KEY`) | ✅ live |
 | Linux `.AppImage` | GPG (this doc) | ⏳ add secrets |
 | macOS `.dmg`/`.app` | Apple notarization | ☐ TODO (needs Apple Developer membership) |
-| Windows `.exe`/`.msi` | Authenticode | ☐ TODO (needs a code-signing cert) |
+| Windows `.exe`/`.msi` | Authenticode via Azure Trusted Signing | ⏳ add secrets (wired; needs Azure creds) |
 | Linux `.deb` | not signed by Tauri | n/a (apt repos sign at the repo level) |
 
 ---
@@ -50,8 +50,9 @@ Settings → Secrets and variables → Actions:
 | `LINUX_GPG_KEY_ID` | *(optional)* The long key ID. If omitted, the only imported key is used. |
 
 `build.yml` imports the key on the Linux runner and sets `SIGN=1` +
-`APPIMAGETOOL_SIGN_PASSPHRASE` + `APPIMAGETOOL_FORCE_SIGN=1` automatically — only on
-Linux, and only when `LINUX_GPG_PRIVATE_KEY` is set.
+`SIGN_KEY` (from `LINUX_GPG_KEY_ID`) + `APPIMAGETOOL_SIGN_PASSPHRASE` +
+`APPIMAGETOOL_FORCE_SIGN=1` automatically — only on Linux, and only when
+`LINUX_GPG_PRIVATE_KEY` is set.
 
 ### 4. Verify a build
 
@@ -75,12 +76,17 @@ Confirm the reported key ID matches the one published at
 
 ---
 
-## macOS / Windows (TODO)
+## macOS / Windows
 
-Added on this branch as the certs become available:
-
-- **macOS** — needs an Apple Developer membership (Developer ID Application cert);
-  set `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`,
-  `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID`. tauri-action notarizes when present.
-- **Windows** — needs a code-signing cert (Azure Trusted Signing is cheapest);
-  wire `windows.signCommand` in `tauri.conf.json` or the action's signing inputs.
+- **macOS (TODO)** — needs an Apple Developer membership (Developer ID Application
+  cert); set `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`,
+  `APPLE_SIGNING_IDENTITY`, `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID`.
+  tauri-action notarizes when present.
+- **Windows (wired — add secrets)** — Authenticode via [Azure Trusted
+  Signing](https://learn.microsoft.com/azure/trusted-signing/). The
+  `windows.signCommand` in `tauri.conf.json` invokes `trusted-signing-cli`, and
+  `build.yml` installs that CLI on the Windows leg (gated on `AZURE_CLIENT_ID`) and
+  passes the Azure creds through to tauri-action. To turn it on, add the three repo
+  secrets `AZURE_TENANT_ID` / `AZURE_CLIENT_ID` / `AZURE_CLIENT_SECRET` (a service
+  principal with access to the Trusted Signing account). Absent → unsigned `.exe` /
+  `.msi`, no failure.

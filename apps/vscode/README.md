@@ -18,7 +18,11 @@ This extension is a thin client over the **`cal`** CLI, so it shares the exact s
 
 Click the **Callimachus** icon in the Activity Bar to open the **History** panel — a live search box over your whole AI-history index, with source/project scope, a recent-threads list, and a corpus-stats footer. It themes itself to your editor (light/dark/high-contrast).
 
-Pick any result to open its full transcript as a rich tab, with one-click **Insert**, **Copy**, **Export**, and **Open in CLI** actions. Hover a row in the sidebar to insert or copy without opening it.
+Pick any result to open its full transcript as a rich tab, with one-click **Insert**, **Copy**, **Export**, and **Open in CLI** actions. Hover a row in the sidebar to insert or copy without opening it. **Export** writes a markdown note to your `callimachus.vaultPath` (or, if that's unset, opens it as an untitled document), and **Open in CLI** seeds the `callimachus.openCommand` agent with the thread's context.
+
+## Ambient Recall
+
+The sidebar can also work *without* you searching. With **Ambient Recall** on, it watches what you're looking at — the current selection, the symbol under the cursor, or the nearest error — and surfaces past threads related to it (via `cal related`), so prior context finds you instead of the other way around. Toggle it with the **Callimachus: Toggle Ambient Recall** command or the `callimachus.ambientRecall` setting; tune its timing and volume with the `ambientRecall*` settings below.
 
 ## Commands
 
@@ -30,13 +34,20 @@ Pick any result to open its full transcript as a rich tab, with one-click **Inse
 | **Callimachus: Recent Threads** | Browse the most recently updated threads. |
 | **Callimachus: Insert Thread into Editor** | Insert a thread's transcript at the cursor (seed a chat / notes). |
 | **Callimachus: Copy Thread Context** | Copy a thread's packed transcript to the clipboard. |
+| **Callimachus: Toggle Ambient Recall** | Turn the sidebar's ambient-recall section on or off. |
 
 There's also a **status-bar** button (`$(history) Callimachus`) that opens search.
 
 ## Settings
 
-- `callimachus.calPath` — path to the `cal` binary (default `cal`).
-- `callimachus.resultLimit` — max results per search (default 40).
+- `callimachus.calPath` — path to the `cal` binary (default `cal`). Leave as `cal` if it's on your `PATH`.
+- `callimachus.resultLimit` — max results to fetch per search (default `40`).
+- `callimachus.vaultPath` — Obsidian vault folder for the **Export** action (default empty). When empty, Export opens the note as an untitled document instead of writing to a vault.
+- `callimachus.openCommand` — CLI agent the **Open in CLI** action seeds with a thread's context (default `claude`; e.g. `codex`, `gemini`). Must be on your `PATH`.
+- `callimachus.ambientRecall` — surface past threads related to your selection / symbol / nearest error in the sidebar, with no searching (default `true`).
+- `callimachus.ambientRecallThrottle` — milliseconds to wait after the cursor/selection settles before querying for related threads (default `500`).
+- `callimachus.ambientRecallMinContext` — minimum length of the editor context (selection or symbol) before ambient recall runs (default `10`).
+- `callimachus.ambientRecallLimit` — max related threads to show in the ambient-recall section (default `5`).
 
 ## Develop
 
