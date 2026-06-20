@@ -614,6 +614,66 @@ pub fn recall(
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+/// One past session relevant to what you're about to do — the "you solved this before"
+/// guard. Distinct from `recall` (which returns individual decision/gotcha facts): this
+/// rolls the matching facts UP to their thread, so the answer is a short list of prior
+/// SESSIONS to revisit, each with the single most-relevant decision/gotcha as the reason.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PriorWork {
+    pub thread_id: i64,
+    pub title: Option<String>,
+    pub project_path: Option<String>,
+    pub source: String,
+    pub kind: String,    // kind of the best-matching fact ('decision' | 'gotcha')
+    pub snippet: String, // the best-matching fact text (why this thread is relevant)
+    pub similarity: f32,
+    pub matches: i64, // how many decision/gotcha facts in this thread matched
+}
+
+/// Find prior sessions semantically similar to `qv` (an embedded task description), by
+/// recalling decisions + gotchas and grouping them by thread. `project` optionally scopes
+/// to one repo; pass None to search everything. Returns up to `k` threads, best match first.
+pub fn find_prior_work(
+    conn: &Connection,
+    qv: &[f32],
+    project: Option<&str>,
+    k: usize,
+) -> Result<Vec<PriorWork>> {
+    let over = (k * 3).max(15);
+    let mut hits = recall(conn, qv, "decision", project, over)?;
+    hits.extend(recall(conn, qv, "gotcha", project, over)?);
+
+    let mut by_thread: std::collections::HashMap<i64, PriorWork> = std::collections::HashMap::new();
+    for h in hits {
+        let e = by_thread.entry(h.thread_id).or_insert_with(|| PriorWork {
+            thread_id: h.thread_id,
+            title: h.title.clone(),
+            project_path: h.project_path.clone(),
+            source: h.source.clone(),
+            kind: h.kind.clone(),
+            snippet: h.text.clone(),
+            similarity: h.similarity,
+            matches: 0,
+        });
+        e.matches += 1;
+        if h.similarity > e.similarity {
+            e.similarity = h.similarity;
+            e.snippet = h.text.clone();
+            e.kind = h.kind.clone();
+        }
+    }
+
+    let mut out: Vec<PriorWork> = by_thread.into_values().collect();
+    out.sort_by(|a, b| {
+        b.similarity
+            .partial_cmp(&a.similarity)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    out.truncate(k);
+    Ok(out)
+}
+
 // ---------------------------------------------------------------------------
 // Project Memory — distilled knowledge aggregated across a project's threads.
 // ---------------------------------------------------------------------------

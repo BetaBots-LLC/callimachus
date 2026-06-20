@@ -1,8 +1,12 @@
-import { useQuery } from "@tanstack/react-query";
+import { useState } from "react";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import { api, type CoachFact } from "../lib/api";
 import { useUi } from "../store/ui";
 import { shortPath } from "../lib/format";
 import { Loading } from "./Loading";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Spinner } from "@/components/ui/spinner";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 
 const SECS_PER_DAY = 86_400;
@@ -73,6 +77,75 @@ function FactList({
   );
 }
 
+/** The "have I done this before?" guard: describe a task → prior sessions that solved
+ *  something similar, each with its most-relevant decision/gotcha. */
+function PriorWorkSearch({ onOpen }: { onOpen: (threadId: number) => void }) {
+  const [q, setQ] = useState("");
+  const find = useMutation({
+    mutationFn: (query: string) => api.findPriorWork(query, { limit: 8 }),
+  });
+  return (
+    <section className="mb-8">
+      <h2 className="mb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+        Have you done this before?
+      </h2>
+      <form
+        onSubmit={(e) => {
+          e.preventDefault();
+          const v = q.trim();
+          if (v) find.mutate(v);
+        }}
+        className="flex gap-2"
+      >
+        <Input
+          value={q}
+          onChange={(e) => setQ(e.currentTarget.value)}
+          placeholder="Describe what you're about to work on…"
+        />
+        <Button type="submit" disabled={find.isPending || !q.trim()}>
+          {find.isPending ? <Spinner /> : "Check"}
+        </Button>
+      </form>
+      {find.data &&
+        (find.data.length === 0 ? (
+          <p className="mt-3 text-sm text-muted-foreground">
+            No prior work found — needs distilled decisions / gotchas (enable Knowledge in
+            Settings).
+          </p>
+        ) : (
+          <ul className="mt-3 space-y-1.5">
+            {find.data.map((h) => (
+              <li key={h.threadId}>
+                <button
+                  type="button"
+                  onClick={() => onOpen(h.threadId)}
+                  className="w-full cursor-pointer rounded-lg border px-3 py-2 text-left transition-colors hover:bg-muted/50"
+                >
+                  <span className="flex items-center gap-2">
+                    <span className="truncate text-sm font-medium text-foreground">
+                      {h.title || `Thread #${h.threadId}`}
+                    </span>
+                    {h.projectPath ? (
+                      <span className="shrink-0 text-[0.7rem] text-muted-foreground">
+                        · {shortPath(h.projectPath)}
+                      </span>
+                    ) : null}
+                    <span className="ml-auto shrink-0 text-[0.7rem] text-muted-foreground">
+                      {Math.round(h.similarity * 100)}% match
+                    </span>
+                  </span>
+                  <span className="mt-1 block text-xs text-muted-foreground">
+                    <span className="uppercase">{h.kind}</span> · {h.snippet}
+                  </span>
+                </button>
+              </li>
+            ))}
+          </ul>
+        ))}
+    </section>
+  );
+}
+
 export function CoachView() {
   const selectThread = useUi((s) => s.selectThread);
   const setView = useUi((s) => s.setView);
@@ -110,6 +183,13 @@ export function CoachView() {
           What your history is telling you — recent activity and the decisions worth remembering.
         </p>
       </div>
+
+      <PriorWorkSearch
+        onOpen={(id) => {
+          selectThread(id);
+          setView("search");
+        }}
+      />
 
       {/* Activity heatmap */}
       <section className="mb-8">

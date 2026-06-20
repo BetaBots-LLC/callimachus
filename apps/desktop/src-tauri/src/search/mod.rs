@@ -597,7 +597,10 @@ pub fn coach_overview(conn: &Connection, now: i64) -> Result<CoachOverview> {
         )?;
         let rows = stmt
             .query_map([heatmap_since], |r| {
-                Ok(DayActivity { day: r.get(0)?, messages: r.get(1)? })
+                Ok(DayActivity {
+                    day: r.get(0)?,
+                    messages: r.get(1)?,
+                })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         rows

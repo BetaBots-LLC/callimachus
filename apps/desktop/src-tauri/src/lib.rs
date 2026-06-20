@@ -266,7 +266,10 @@ fn index_stats(pool: tauri::State<'_, db::ReadPool>) -> AppResult<search::Stats>
 #[tauri::command]
 fn coach_overview(pool: tauri::State<'_, db::ReadPool>) -> AppResult<search::CoachOverview> {
     let conn = read(&pool)?;
-    Ok(search::coach_overview(&conn, chrono::Utc::now().timestamp())?)
+    Ok(search::coach_overview(
+        &conn,
+        chrono::Utc::now().timestamp(),
+    )?)
 }
 
 /// Oldest-first list of threads with their size, for the storage-cleanup UI.
@@ -1201,6 +1204,28 @@ fn recall_gotchas(
     )
 }
 
+/// "Have I done this before?" — prior SESSIONS similar to a task description, each rolled up
+/// from its matching decisions/gotchas. Embed OUTSIDE the DB, then KNN on the read pool.
+#[tauri::command]
+fn find_prior_work(
+    pool: tauri::State<'_, db::ReadPool>,
+    embedder: tauri::State<'_, embed::Embedder>,
+    query: String,
+    project: Option<String>,
+    limit: Option<u32>,
+) -> AppResult<Vec<knowledge::PriorWork>> {
+    let Some(qv) = embed::embed_query(&embedder, &query)? else {
+        return Ok(Vec::new());
+    };
+    let conn = read(&pool)?;
+    Ok(knowledge::find_prior_work(
+        &conn,
+        &qv,
+        project.as_deref(),
+        limit.unwrap_or(8) as usize,
+    )?)
+}
+
 /// Shared recall path: embed the query OUTSIDE the DB, then run the SQL KNN on the pool.
 fn recall_facts(
     pool: &db::ReadPool,
@@ -1838,6 +1863,7 @@ pub fn run() {
             distill_thread,
             recall_decisions,
             recall_gotchas,
+            find_prior_work,
             ask_history,
             search_by_file,
             list_projects,
