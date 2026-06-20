@@ -41,6 +41,18 @@ export function ProjectMemoryView() {
     queryFn: api.distillingStatus,
     refetchInterval: (q) => (q.state.data ? 1200 : false),
   });
+  // Distill is mutually exclusive with the embedding build + reindex (they share the
+  // write lock). Track them so the Build-memory button disables instead of no-op'ing.
+  const embed = useQuery({
+    queryKey: ["embed_status"],
+    queryFn: api.embeddingStatus,
+    refetchInterval: (q) => (q.state.data?.running ? 3000 : false),
+  });
+  const indexing = useQuery({
+    queryKey: ["index_status"],
+    queryFn: api.indexingStatus,
+    refetchInterval: (q) => (q.state.data ? 2000 : false),
+  });
   const progress = useQuery<{ done: number; total: number } | null>({
     queryKey: ["distill_progress"],
     queryFn: () => qc.getQueryData<{ done: number; total: number }>(["distill_progress"]) ?? null,
@@ -67,6 +79,9 @@ export function ProjectMemoryView() {
       ? Math.round((progress.data.done / progress.data.total) * 100)
       : 0;
   const empty = mem && !mem.decisions.length && !mem.gotchas.length && !mem.openTodos.length;
+  // A reindex / embedding build is running → distill would no-op (shared write lock).
+  const otherBusy = embed.data?.running || indexing.data;
+  const otherBusyLabel = embed.data?.running ? "Embedding… (wait)" : "Indexing… (wait)";
   const openInSearch = (threadId: number) => {
     selectThread(threadId);
     setView("search");
@@ -104,11 +119,13 @@ export function ProjectMemoryView() {
             <Button
               size="sm"
               onClick={() => build.mutate()}
-              disabled={!project || !mem || mem.pendingCount === 0}
+              disabled={!project || !mem || mem.pendingCount === 0 || otherBusy}
             >
-              {mem && mem.pendingCount > 0
-                ? `Build memory (${mem.pendingCount} to distill)`
-                : "Memory up to date"}
+              {otherBusy
+                ? otherBusyLabel
+                : mem && mem.pendingCount > 0
+                  ? `Build memory (${mem.pendingCount} to distill)`
+                  : "Memory up to date"}
             </Button>
           )}
           <Button

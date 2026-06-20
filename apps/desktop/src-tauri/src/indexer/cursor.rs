@@ -17,8 +17,7 @@ pub const KIND: &str = "cursor";
 /// Path to Cursor's global state DB (macOS).
 pub fn global_db_path() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|h| {
-        PathBuf::from(h)
-            .join("Library/Application Support/Cursor/User/globalStorage/state.vscdb")
+        PathBuf::from(h).join("Library/Application Support/Cursor/User/globalStorage/state.vscdb")
     })
 }
 
@@ -74,9 +73,9 @@ fn scan_path(conn: &mut Connection, db: &Path) -> Result<IndexReport> {
 
         let rows = bubble_stmt.query_map(params![lo, hi], |r| {
             Ok((
-                r.get::<_, Option<i64>>(0)?,           // type
-                r.get::<_, Option<String>>(1)?,        // text
-                r.get::<_, Option<i64>>(2)?,           // clientStartTime (ms)
+                r.get::<_, Option<i64>>(0)?,    // type
+                r.get::<_, Option<String>>(1)?, // text
+                r.get::<_, Option<i64>>(2)?,    // clientStartTime (ms)
             ))
         })?;
 
@@ -167,7 +166,10 @@ mod tests {
     #[test]
     fn extracts_from_cursor_shaped_db() {
         let mut path = std::env::temp_dir();
-        path.push(format!("callimachus_cursorsrc_{}.vscdb", std::process::id()));
+        path.push(format!(
+            "callimachus_cursorsrc_{}.vscdb",
+            std::process::id()
+        ));
         let _ = std::fs::remove_file(&path);
         {
             let src = Connection::open(&path).unwrap();
@@ -199,7 +201,8 @@ mod tests {
 
         let detail = crate::search::thread_detail(
             &conn,
-            conn.query_row("SELECT id FROM threads", [], |r| r.get(0)).unwrap(),
+            conn.query_row("SELECT id FROM threads", [], |r| r.get(0))
+                .unwrap(),
         )
         .unwrap()
         .unwrap();

@@ -80,7 +80,11 @@ fn index_file(conn: &mut Connection, sid: i64, root: &Path, path: &Path) -> Resu
     }
 
     // external_id = path relative to projects root: stable and unique per file.
-    let rel = path.strip_prefix(root).unwrap_or(path).to_string_lossy().to_string();
+    let rel = path
+        .strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .to_string();
     // Project fallback: top-level dir name is the cwd-slug (used when a subagent
     // file carries no cwd of its own).
     let project_fallback = rel.split('/').next().map(decode_slug);
@@ -194,7 +198,12 @@ fn ingest_line(thread: &mut ParsedThread, obj: &Value, first_user_text: &mut Opt
 }
 
 /// Turn a message's `content` (string or array of blocks) into ParsedMessages.
-fn extract_messages(thread: &mut ParsedThread, role: &str, content: Option<&Value>, ts: Option<i64>) {
+fn extract_messages(
+    thread: &mut ParsedThread,
+    role: &str,
+    content: Option<&Value>,
+    ts: Option<i64>,
+) {
     let push = |thread: &mut ParsedThread, role: &str, text: String, tool: Option<String>| {
         let text = text.trim().to_string();
         if !text.is_empty() {
@@ -223,7 +232,10 @@ fn extract_messages(thread: &mut ParsedThread, role: &str, content: Option<&Valu
                             .and_then(Value::as_str)
                             .unwrap_or("tool")
                             .to_string();
-                        let input = block.get("input").map(|v| v.to_string()).unwrap_or_default();
+                        let input = block
+                            .get("input")
+                            .map(|v| v.to_string())
+                            .unwrap_or_default();
                         push(thread, "assistant", format!("{name}: {input}"), Some(name));
                     }
                     Some("tool_result") => {
@@ -298,7 +310,11 @@ mod tests {
         assert_eq!(thread.git_branch.as_deref(), Some("main"));
         // user text, assistant text, assistant tool_use, tool result = 4 (thinking skipped)
         assert_eq!(thread.messages.len(), 4);
-        let tool = thread.messages.iter().find(|m| m.tool_name.is_some()).unwrap();
+        let tool = thread
+            .messages
+            .iter()
+            .find(|m| m.tool_name.is_some())
+            .unwrap();
         assert_eq!(tool.tool_name.as_deref(), Some("Bash"));
         assert!(tool.text.contains("cargo build"));
     }
@@ -349,15 +365,18 @@ mod tests {
         let mut conn = crate::db::open(&temp_path("real.db")).unwrap();
         let report = scan(&mut conn).unwrap();
         eprintln!("{report:?}");
-        assert!(report.threads_indexed > 0, "indexed at least one real thread");
+        assert!(
+            report.threads_indexed > 0,
+            "indexed at least one real thread"
+        );
 
         let n: i64 = conn
             .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
             .unwrap();
         assert!(n > 0, "indexed real messages");
 
-        let hits =
-            crate::search::search(&conn, "tauri", &crate::search::SearchFilters::default()).unwrap();
+        let hits = crate::search::search(&conn, "tauri", &crate::search::SearchFilters::default())
+            .unwrap();
         eprintln!("'tauri' hits: {}", hits.len());
     }
 }

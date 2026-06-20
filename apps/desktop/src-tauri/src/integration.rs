@@ -18,7 +18,9 @@ pub const SKILL_MD: &str = include_str!("../resources/recall/SKILL.md");
 const MCP_NAME: &str = "callimachus";
 
 fn home() -> Result<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| anyhow::anyhow!("HOME unset"))
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("HOME unset"))
 }
 
 /// `~/.claude/skills/recall/SKILL.md`
@@ -85,7 +87,9 @@ pub fn status(app_exe: &Path) -> IntegrationStatus {
         mcp_registered,
         cal_installed,
         skill_path: skill.map(|p| p.display().to_string()).unwrap_or_default(),
-        config_path: claude_config_path().map(|p| p.display().to_string()).unwrap_or_default(),
+        config_path: claude_config_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default(),
     }
 }
 
@@ -143,7 +147,9 @@ fn install_cal(app_exe: &Path) -> Result<()> {
     if app_exe.file_stem().and_then(|s| s.to_str()) == Some("cal") {
         return Ok(());
     }
-    let dir = app_exe.parent().context("app exe has no parent directory")?;
+    let dir = app_exe
+        .parent()
+        .context("app exe has no parent directory")?;
     let link = dir.join("cal.exe");
     let _ = std::fs::remove_file(&link); // replace any stale link/copy
     std::fs::hard_link(app_exe, &link)
@@ -217,10 +223,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
         let cfg = tmp.join(".claude.json");
-        std::fs::write(&cfg, r#"{"numStartups":7,"mcpServers":{"other":{"command":"x"}}}"#).unwrap();
+        std::fs::write(
+            &cfg,
+            r#"{"numStartups":7,"mcpServers":{"other":{"command":"x"}}}"#,
+        )
+        .unwrap();
 
         // Hand-run the merge against this specific file (mirrors register_mcp).
-        let mut root: Value = serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+        let mut root: Value =
+            serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
         let servers = root
             .as_object_mut()
             .unwrap()
@@ -228,7 +239,10 @@ mod tests {
             .or_insert_with(|| Value::Object(Map::new()))
             .as_object_mut()
             .unwrap();
-        servers.insert(MCP_NAME.into(), json!({"type":"stdio","command":"/app","args":["--mcp"]}));
+        servers.insert(
+            MCP_NAME.into(),
+            json!({"type":"stdio","command":"/app","args":["--mcp"]}),
+        );
         std::fs::write(&cfg, serde_json::to_string_pretty(&root).unwrap()).unwrap();
 
         let back: Value = serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();

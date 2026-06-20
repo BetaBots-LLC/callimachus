@@ -56,6 +56,15 @@ pub fn open(path: &Path) -> Result<Connection> {
     // the same file from separate processes; a `cal star`/`cal tag` write shouldn't
     // error just because the app is mid-write.
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    // Performance pragmas (defaults are tiny). cache_size is the biggest single win:
+    // -65536 = 64 MiB page cache. mmap maps the file for read; temp_store keeps
+    // sorts/CTEs in RAM; the WAL caps keep the -wal file from growing unbounded and
+    // checkpoints small. See db-perf audit.
+    conn.pragma_update(None, "cache_size", -65536_i64)?; // 64 MiB
+    conn.pragma_update(None, "mmap_size", 268_435_456_i64)?; // 256 MiB
+    conn.pragma_update(None, "temp_store", "MEMORY")?;
+    conn.pragma_update(None, "wal_autocheckpoint", 2000_i64)?; // ~8 MiB
+    conn.pragma_update(None, "journal_size_limit", 67_108_864_i64)?; // cap -wal at 64 MiB
 
     migrations::MIGRATIONS
         .to_latest(&mut conn)
@@ -85,7 +94,73 @@ pub fn open_readonly(path: &Path) -> Result<Connection> {
     .with_context(|| format!("opening {} read-only", path.display()))?;
     // Still honor a busy wait for the rare moment a WAL checkpoint is in flight.
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    // Reader pragmas: readers benefit most from mmap; smaller cache since these are
+    // short-lived (sidecars) or pooled (the in-process read pool). query_only is a
+    // belt-and-suspenders guard. NO autocheckpoint — readers must not checkpoint.
+    conn.pragma_update(None, "mmap_size", 268_435_456_i64)?; // 256 MiB
+    conn.pragma_update(None, "temp_store", "MEMORY")?;
+    conn.pragma_update(None, "cache_size", -16384_i64)?; // 16 MiB
+    conn.pragma_update(None, "query_only", "ON")?;
     Ok(conn)
+}
+
+// ---------------------------------------------------------------------------
+// Read pool — concurrent read-only connections (WAL allows unlimited readers), so
+// UI read commands run in parallel instead of serializing behind the writer mutex.
+// ---------------------------------------------------------------------------
+
+/// r2d2 manager that opens read-only connections to the index (reader pragmas applied).
+pub struct ReadManager {
+    path: PathBuf,
+}
+
+impl r2d2::ManageConnection for ReadManager {
+    type Connection = Connection;
+    type Error = rusqlite::Error;
+
+    fn connect(&self) -> std::result::Result<Connection, rusqlite::Error> {
+        let conn = Connection::open_with_flags(
+            &self.path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+        )?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.pragma_update(None, "mmap_size", 268_435_456_i64)?;
+        conn.pragma_update(None, "temp_store", "MEMORY")?;
+        conn.pragma_update(None, "cache_size", -16384_i64)?;
+        conn.pragma_update(None, "query_only", "ON")?;
+        Ok(conn)
+    }
+
+    fn is_valid(&self, conn: &mut Connection) -> std::result::Result<(), rusqlite::Error> {
+        conn.execute_batch("SELECT 1;")
+    }
+
+    fn has_broken(&self, _conn: &mut Connection) -> bool {
+        false
+    }
+}
+
+/// Managed Tauri state: the pool of read-only connections.
+pub struct ReadPool(pub r2d2::Pool<ReadManager>);
+pub type ReadConn = r2d2::PooledConnection<ReadManager>;
+
+/// Build the read pool. Call AFTER the writer has opened + migrated the DB (read-only
+/// connections cannot migrate). `size` ~ cpu cores.
+pub fn read_pool(path: &Path, size: u32) -> Result<ReadPool> {
+    register_vec(); // vec0 must be loaded for the KNN (vec_chunks/vec_facts) reads
+    if !path.exists() {
+        anyhow::bail!(
+            "no index at {} — open the app to build it first",
+            path.display()
+        );
+    }
+    let pool = r2d2::Pool::builder()
+        .max_size(size.max(2))
+        .build(ReadManager {
+            path: path.to_path_buf(),
+        })
+        .context("building read pool")?;
+    Ok(ReadPool(pool))
 }
 
 #[cfg(test)]
@@ -99,8 +174,37 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("callimachus_test_{}_{n}.db", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("callimachus_test_{}_{n}.db", std::process::id()));
         open(&path).expect("open + migrate")
+    }
+
+    #[test]
+    fn read_pool_opens_queries_and_has_vec0() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(9000);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("calli_pool_{}_{n}.db", std::process::id()));
+        for ext in ["db", "db-wal", "db-shm"] {
+            let _ = std::fs::remove_file(path.with_extension(ext));
+        }
+        let _writer = open(&path).unwrap(); // create + migrate first (readers can't)
+        let pool = read_pool(&path, 3).unwrap();
+        let conn = pool.0.get().unwrap();
+        let sources: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sources", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(sources, 12, "pooled read sees the migrated schema");
+        // vec0 must be loaded on pooled connections for KNN reads.
+        let ver: String = conn
+            .query_row("SELECT vec_version()", [], |r| r.get(0))
+            .unwrap();
+        assert!(ver.starts_with('v'), "vec0 on pooled conn: {ver}");
+        // A second checkout works (pool serves concurrent readers).
+        let c2 = pool.0.get().unwrap();
+        let _: i64 = c2
+            .query_row("SELECT COUNT(*) FROM threads", [], |r| r.get(0))
+            .unwrap();
     }
 
     #[test]
@@ -116,12 +220,13 @@ mod tests {
     fn vec0_knn_works() {
         let conn = temp_db();
         // vec0 extension registered + migration created the virtual table.
-        let ver: String = conn.query_row("SELECT vec_version()", [], |r| r.get(0)).unwrap();
+        let ver: String = conn
+            .query_row("SELECT vec_version()", [], |r| r.get(0))
+            .unwrap();
         assert!(ver.starts_with('v'), "vec_version: {ver}");
 
-        let to_blob = |v: &[f32]| -> Vec<u8> {
-            v.iter().flat_map(|f| f.to_le_bytes()).collect::<Vec<u8>>()
-        };
+        let to_blob =
+            |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect::<Vec<u8>>() };
         let mut a = vec![0.0_f32; 384];
         a[0] = 1.0;
         let mut b = vec![0.0_f32; 384];
@@ -219,8 +324,11 @@ mod tests {
         assert_eq!(hits, 1, "FTS5 external-content trigger indexed the message");
 
         // And deletion should remove it from the index.
-        conn.execute("DELETE FROM messages WHERE id = (SELECT MAX(id) FROM messages)", [])
-            .unwrap();
+        conn.execute(
+            "DELETE FROM messages WHERE id = (SELECT MAX(id) FROM messages)",
+            [],
+        )
+        .unwrap();
         let hits_after: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'sqlite'",

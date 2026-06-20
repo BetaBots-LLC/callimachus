@@ -31,7 +31,9 @@ fn watch_targets() -> Vec<(PathBuf, &'static str)> {
     if let Some(p) = super::qwen::tmp_root() {
         v.push((p, super::qwen::KIND));
     }
-    if let Some(p) = super::goose::sessions_db_path().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
+    if let Some(p) =
+        super::goose::sessions_db_path().and_then(|p| p.parent().map(|d| d.to_path_buf()))
+    {
         v.push((p, super::goose::KIND));
     }
     if let Some(p) = super::opencode::storage_root() {
@@ -128,26 +130,48 @@ fn run(app: AppHandle) -> anyhow::Result<()> {
 /// Re-scan the affected sources and notify the frontend. Writes on its own `conn`, so
 /// the UI's shared connection is never blocked across the scan.
 fn reindex(app: &AppHandle, conn: &mut Connection, kinds: &[&str]) {
+    type Scan = fn(&mut Connection) -> anyhow::Result<super::IndexReport>;
     for &kind in kinds {
-        let report = match kind {
-            k if k == super::claude::KIND => super::claude::scan(conn),
-            k if k == super::codex::KIND => super::codex::scan(conn),
-            k if k == super::cursor::KIND => super::cursor::scan(conn),
-            k if k == super::gemini::KIND => super::gemini::scan(conn),
-            k if k == super::qwen::KIND => super::qwen::scan(conn),
-            k if k == super::goose::KIND => super::goose::scan(conn),
-            k if k == super::opencode::KIND => super::opencode::scan(conn),
-            k if k == super::continue_cli::KIND => super::continue_cli::scan(conn),
-            k if k == super::cline::KIND => super::cline::scan(conn),
-            k if k == super::roo::KIND => super::roo::scan(conn),
-            k if k == super::kilo::KIND => super::kilo::scan(conn),
+        let scan: Scan = match kind {
+            k if k == super::claude::KIND => super::claude::scan,
+            k if k == super::codex::KIND => super::codex::scan,
+            k if k == super::cursor::KIND => super::cursor::scan,
+            k if k == super::gemini::KIND => super::gemini::scan,
+            k if k == super::qwen::KIND => super::qwen::scan,
+            k if k == super::goose::KIND => super::goose::scan,
+            k if k == super::opencode::KIND => super::opencode::scan,
+            k if k == super::continue_cli::KIND => super::continue_cli::scan,
+            k if k == super::cline::KIND => super::cline::scan,
+            k if k == super::roo::KIND => super::roo::scan,
+            k if k == super::kilo::KIND => super::kilo::scan,
             _ => continue,
         };
-        if let Ok(r) = report {
-            if r.threads_indexed > 0 {
+        // The watcher is a SECOND writer (alongside the app's shared connection). If it
+        // loses a write-lock race past busy_timeout, retry instead of silently dropping
+        // the thread — re-scanning is cheap + idempotent (file_state skips done threads).
+        let mut report = scan(conn);
+        for _ in 0..2 {
+            match &report {
+                Err(e) if is_db_locked(e) => {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    report = scan(conn);
+                }
+                _ => break,
+            }
+        }
+        match report {
+            Ok(r) if r.threads_indexed > 0 => {
                 // Best-effort nudge; the frontend also refetches on window focus.
                 let _ = app.emit("index:updated", kind);
             }
+            Err(e) => eprintln!("[watcher] {kind}: {e}"),
+            _ => {}
         }
     }
+}
+
+/// Whether an error is SQLite's transient "database is locked" (busy) race.
+fn is_db_locked(e: &anyhow::Error) -> bool {
+    let s = e.to_string().to_ascii_lowercase();
+    s.contains("database is locked") || s.contains("database table is locked")
 }

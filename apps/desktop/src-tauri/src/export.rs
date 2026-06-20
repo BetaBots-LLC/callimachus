@@ -10,7 +10,10 @@ use crate::search::ThreadDetail;
 /// when present, is the LLM-extracted decisions/gotchas/TODOs block (already
 /// `##`-headed Markdown) and is placed above the transcript — the knowledge layer.
 pub fn to_obsidian(detail: &ThreadDetail, synthesis: Option<&str>) -> String {
-    let title = detail.title.clone().unwrap_or_else(|| format!("Thread {}", detail.id));
+    let title = detail
+        .title
+        .clone()
+        .unwrap_or_else(|| format!("Thread {}", detail.id));
     let created = fmt_date(detail.created_at);
     let updated = fmt_date(detail.updated_at);
     let project = project_basename(detail.project_path.as_deref());
@@ -51,7 +54,10 @@ pub fn to_obsidian(detail: &ThreadDetail, synthesis: Option<&str>) -> String {
     if let Some(u) = &updated {
         crumbs.push(u.clone());
     }
-    out.push_str(&format!("> {} — indexed by Callimachus\n\n", crumbs.join(" · ")));
+    out.push_str(&format!(
+        "> {} — indexed by Callimachus\n\n",
+        crumbs.join(" · ")
+    ));
 
     if let Some(s) = synthesis.map(str::trim).filter(|s| !s.is_empty()) {
         out.push_str(s);
@@ -83,15 +89,30 @@ fn project_basename(project_path: Option<&str>) -> Option<String> {
     if p.is_empty() {
         return None;
     }
-    std::path::Path::new(p).file_name()?.to_str().map(str::to_string)
+    std::path::Path::new(p)
+        .file_name()?
+        .to_str()
+        .map(str::to_string)
 }
 
 /// A filesystem-safe note filename (no extension), unique via the thread id.
 pub fn note_filename(detail: &ThreadDetail) -> String {
-    let base = detail.title.clone().unwrap_or_else(|| format!("Thread {}", detail.id));
+    let base = detail
+        .title
+        .clone()
+        .unwrap_or_else(|| format!("Thread {}", detail.id));
     let safe: String = base
         .chars()
-        .map(|c| if matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\n' | '\r' | '\t') { ' ' } else { c })
+        .map(|c| {
+            if matches!(
+                c,
+                '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\n' | '\r' | '\t'
+            ) {
+                ' '
+            } else {
+                c
+            }
+        })
         .collect();
     let safe = safe.split_whitespace().collect::<Vec<_>>().join(" ");
     let safe = if safe.chars().count() > 80 {
@@ -104,7 +125,10 @@ pub fn note_filename(detail: &ThreadDetail) -> String {
 
 /// Quote a YAML scalar if it contains characters that would break a bare value.
 fn yaml_str(s: &str) -> String {
-    if s.is_empty() || s.contains([':', '#', '"', '\'', '\n']) || s.starts_with([' ', '-', '[', '{']) {
+    if s.is_empty()
+        || s.contains([':', '#', '"', '\'', '\n'])
+        || s.starts_with([' ', '-', '[', '{'])
+    {
         format!("{:?}", s) // Rust debug quoting is valid YAML double-quoted form
     } else {
         s.to_string()
@@ -135,7 +159,10 @@ pub fn project_memory_md(
         }
         out.push('\n');
     }
-    let base = project.rsplit(['/', '\\']).find(|s| !s.is_empty()).unwrap_or(project);
+    let base = project
+        .rsplit(['/', '\\'])
+        .find(|s| !s.is_empty())
+        .unwrap_or(project);
     let mut out = String::new();
     out.push_str(&format!("# Project memory: {base}\n\n"));
     out.push_str(&format!(
@@ -173,9 +200,27 @@ mod tests {
             starred: false,
             tags: vec![],
             messages: vec![
-                MessageRow { id: 1, role: "user".into(), text: "how do I add fts5".into(), tool_name: None, ts: None },
-                MessageRow { id: 2, role: "assistant".into(), text: "use an external-content table".into(), tool_name: None, ts: None },
-                MessageRow { id: 3, role: "tool".into(), text: "ok".into(), tool_name: Some("Bash".into()), ts: None },
+                MessageRow {
+                    id: 1,
+                    role: "user".into(),
+                    text: "how do I add fts5".into(),
+                    tool_name: None,
+                    ts: None,
+                },
+                MessageRow {
+                    id: 2,
+                    role: "assistant".into(),
+                    text: "use an external-content table".into(),
+                    tool_name: None,
+                    ts: None,
+                },
+                MessageRow {
+                    id: 3,
+                    role: "tool".into(),
+                    text: "ok".into(),
+                    tool_name: Some("Bash".into()),
+                    ts: None,
+                },
             ],
         }
     }
@@ -199,10 +244,16 @@ mod tests {
 
     #[test]
     fn places_synthesis_above_transcript() {
-        let md = to_obsidian(&detail(), Some("## Decisions\n- used external-content table"));
+        let md = to_obsidian(
+            &detail(),
+            Some("## Decisions\n- used external-content table"),
+        );
         let synth = md.find("## Decisions").unwrap();
         let transcript = md.find("## Transcript").unwrap();
-        assert!(synth < transcript, "synthesis must sit above the transcript");
+        assert!(
+            synth < transcript,
+            "synthesis must sit above the transcript"
+        );
         assert!(md.contains("used external-content table"));
     }
 

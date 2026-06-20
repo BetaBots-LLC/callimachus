@@ -58,4 +58,5 @@ genai = "0.6.5"
 rmcp = { version = "1.7.0", features = ["server", "transport-io", "macros"] }
 schemars = "1"
 tokio-util = "0.7.18"
+r2d2 = "0.8.10"
 

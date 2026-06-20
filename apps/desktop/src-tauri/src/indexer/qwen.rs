@@ -82,7 +82,11 @@ fn index_file(conn: &mut Connection, sid: i64, root: &Path, path: &Path) -> Resu
         }
     }
 
-    let rel = path.strip_prefix(root).unwrap_or(path).to_string_lossy().to_string();
+    let rel = path
+        .strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .to_string();
     let thread = parse_file(path, &rel).with_context(|| format!("parsing {path_str}"))?;
     let n = if let Some(t) = thread {
         upsert_thread(conn, sid, &t)?
@@ -139,7 +143,10 @@ fn ingest_line(thread: &mut ParsedThread, obj: &Value, first_user_text: &mut Opt
             thread.git_branch = Some(branch.to_string());
         }
     }
-    let ts = obj.get("timestamp").and_then(Value::as_str).and_then(parse_ts);
+    let ts = obj
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .and_then(parse_ts);
     if let Some(ts) = ts {
         thread.created_at = Some(thread.created_at.map_or(ts, |c| c.min(ts)));
         thread.updated_at = Some(thread.updated_at.map_or(ts, |u| u.max(ts)));
@@ -186,11 +193,18 @@ fn extract_parts(thread: &mut ParsedThread, role: &str, parts: Option<&Value>, t
                 if let Some(t) = part.get("text").and_then(Value::as_str) {
                     push(thread, role, t.to_string(), None);
                 } else if let Some(call) = part.get("functionCall") {
-                    let name = call.get("name").and_then(Value::as_str).unwrap_or("tool").to_string();
+                    let name = call
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("tool")
+                        .to_string();
                     let args = call.get("args").map(|v| v.to_string()).unwrap_or_default();
                     push(thread, "assistant", format!("{name}: {args}"), Some(name));
                 } else if let Some(resp) = part.get("functionResponse") {
-                    let text = resp.get("response").map(|v| v.to_string()).unwrap_or_else(|| resp.to_string());
+                    let text = resp
+                        .get("response")
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| resp.to_string());
                     push(thread, "tool", text, None);
                 }
             }
@@ -200,7 +214,9 @@ fn extract_parts(thread: &mut ParsedThread, role: &str, parts: Option<&Value>, t
 }
 
 fn parse_ts(s: &str) -> Option<i64> {
-    chrono::DateTime::parse_from_rfc3339(s).ok().map(|d| d.timestamp())
+    chrono::DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|d| d.timestamp())
 }
 
 #[cfg(test)]
@@ -223,20 +239,32 @@ mod tests {
 
     fn write_sample(name: &str) -> PathBuf {
         let path = temp_path(name);
-        std::fs::File::create(&path).unwrap().write_all(SAMPLE.as_bytes()).unwrap();
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(SAMPLE.as_bytes())
+            .unwrap();
         path
     }
 
     #[test]
     fn parses_sample_thread() {
         let path = write_sample("qwen_sample.jsonl");
-        let thread = parse_file(&path, "hash/chats/sess-q.jsonl").unwrap().expect("non-empty");
+        let thread = parse_file(&path, "hash/chats/sess-q.jsonl")
+            .unwrap()
+            .expect("non-empty");
         assert_eq!(thread.project_path.as_deref(), Some("/Users/me/proj"));
         assert_eq!(thread.git_branch.as_deref(), Some("main"));
         // user text, assistant text, assistant functionCall, tool_result = 4 (system skipped)
         assert_eq!(thread.messages.len(), 4);
-        assert_eq!(thread.title.as_deref(), Some("index qwen threads with sqlite fts5"));
-        let tool = thread.messages.iter().find(|m| m.tool_name.is_some()).unwrap();
+        assert_eq!(
+            thread.title.as_deref(),
+            Some("index qwen threads with sqlite fts5")
+        );
+        let tool = thread
+            .messages
+            .iter()
+            .find(|m| m.tool_name.is_some())
+            .unwrap();
         assert_eq!(tool.tool_name.as_deref(), Some("run_shell"));
     }
 

@@ -67,8 +67,12 @@ fn index_file(conn: &mut Connection, sid: i64, path: &Path) -> Result<Option<usi
         }
     }
 
-    let fallback_id = path.file_stem().and_then(|s| s.to_str()).unwrap_or("session");
-    let thread = parse_file(path, fallback_id, mtime).with_context(|| format!("parsing {path_str}"))?;
+    let fallback_id = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("session");
+    let thread =
+        parse_file(path, fallback_id, mtime).with_context(|| format!("parsing {path_str}"))?;
     let n = if let Some(t) = thread {
         upsert_thread(conn, sid, &t)?
     } else {
@@ -108,7 +112,12 @@ pub fn parse_file(path: &Path, fallback_id: &str, mtime: i64) -> Result<Option<P
             if role == "user" && first_user.is_none() {
                 first_user = Some(text.clone());
             }
-            messages.push(ParsedMessage { role: role.to_string(), text, tool_name: None, ts });
+            messages.push(ParsedMessage {
+                role: role.to_string(),
+                text,
+                tool_name: None,
+                ts,
+            });
         }
     }
 
@@ -182,8 +191,13 @@ mod tests {
     #[test]
     fn parses_sample_thread() {
         let path = temp_path("cn_sample.json");
-        std::fs::File::create(&path).unwrap().write_all(SAMPLE.as_bytes()).unwrap();
-        let thread = parse_file(&path, "fallback", 1780000000).unwrap().expect("non-empty");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(SAMPLE.as_bytes())
+            .unwrap();
+        let thread = parse_file(&path, "fallback", 1780000000)
+            .unwrap()
+            .expect("non-empty");
         assert_eq!(thread.external_id, "sess-cn");
         assert_eq!(thread.title.as_deref(), Some("FTS5 work"));
         assert_eq!(thread.project_path.as_deref(), Some("/Users/me/proj"));
@@ -195,7 +209,10 @@ mod tests {
     #[test]
     fn index_then_search_roundtrip() {
         let path = temp_path("cn_rt.json");
-        std::fs::File::create(&path).unwrap().write_all(SAMPLE.as_bytes()).unwrap();
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(SAMPLE.as_bytes())
+            .unwrap();
         let mut conn = crate::db::open(&temp_path("cn_rt.db")).unwrap();
         let sid = source_id(&conn, KIND).unwrap();
         let thread = parse_file(&path, "fallback", 1780000000).unwrap().unwrap();

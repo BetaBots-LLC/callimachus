@@ -39,7 +39,9 @@ mod tests {
         let mut conn = crate::db::open(&dbp).unwrap();
 
         let sid = source_id(&conn, KIND).unwrap();
-        let thread = cline::parse_history(&hp, "Code/1", None, None, None).unwrap().unwrap();
+        let thread = cline::parse_history(&hp, "Code/1", None, None, None)
+            .unwrap()
+            .unwrap();
         upsert_thread(&mut conn, sid, &thread).unwrap();
 
         let hits =

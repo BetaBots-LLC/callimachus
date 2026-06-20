@@ -42,7 +42,9 @@ struct ChatGeneration(Mutex<Option<tokio_util::sync::CancellationToken>>);
 /// Pending shell-command approvals, keyed by tool call id. `approve_tool` resolves
 /// the matching one-shot, unblocking the awaiting tool execution.
 #[derive(Default)]
-struct PendingApprovals(Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<bool>>>);
+struct PendingApprovals(
+    Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<bool>>>,
+);
 
 /// Execute one tool call requested by the in-app agent. Read-only index tools run
 /// immediately; `run_shell` emits an approval request and waits for the user.
@@ -53,12 +55,20 @@ async fn run_tool(
 ) -> anyhow::Result<String> {
     let name = call.fn_name.clone();
     let args = call.fn_arguments.clone();
-    let arg_str = |k: &str| args.get(k).and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    let arg_str = |k: &str| {
+        args.get(k)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
 
     // Announce the call.
     let announce = match name.as_str() {
         "search_history" => format!("search: {}", arg_str("query")),
-        "get_thread" => format!("thread #{}", args.get("thread_id").and_then(|v| v.as_i64()).unwrap_or(0)),
+        "get_thread" => format!(
+            "thread #{}",
+            args.get("thread_id").and_then(|v| v.as_i64()).unwrap_or(0)
+        ),
         "run_shell" => arg_str("command"),
         _ => name.clone(),
     };
@@ -81,27 +91,42 @@ async fn run_tool(
             let query = arg_str("query");
             let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as u32;
             let json = {
-                let db = app.state::<db::Db>();
-                let conn = db.0.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+                let pool = app.state::<db::ReadPool>();
+                let conn = pool
+                    .0
+                    .get()
+                    .map_err(|e| anyhow::anyhow!("read pool: {e}"))?;
                 let hits = search::search(
                     &conn,
                     &query,
-                    &SearchFilters { limit: Some(limit), ..Default::default() },
+                    &SearchFilters {
+                        limit: Some(limit),
+                        ..Default::default()
+                    },
                 )?;
                 serde_json::to_string(&hits)?
             };
-            let _ = ch.send(result(format!("{} results", json.matches("\"threadId\"").count())));
+            let _ = ch.send(result(format!(
+                "{} results",
+                json.matches("\"threadId\"").count()
+            )));
             Ok(json)
         }
         "get_thread" => {
             let tid = args.get("thread_id").and_then(|v| v.as_i64()).unwrap_or(0);
             let packed = {
-                let db = app.state::<db::Db>();
-                let conn = db.0.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+                let pool = app.state::<db::ReadPool>();
+                let conn = pool
+                    .0
+                    .get()
+                    .map_err(|e| anyhow::anyhow!("read pool: {e}"))?;
                 context::pack_thread(&conn, tid, context::DEFAULT_BUDGET_CHARS)?
                     .unwrap_or_else(|| "thread not found".to_string())
             };
-            let _ = ch.send(result(format!("loaded thread #{tid} ({} chars)", packed.len())));
+            let _ = ch.send(result(format!(
+                "loaded thread #{tid} ({} chars)",
+                packed.len()
+            )));
             Ok(packed)
         }
         "run_shell" => {
@@ -135,7 +160,10 @@ async fn run_tool(
                 out.push_str(&err);
             }
             if out.chars().count() > 12_000 {
-                out = format!("{}\n…(truncated)", out.chars().take(12_000).collect::<String>());
+                out = format!(
+                    "{}\n…(truncated)",
+                    out.chars().take(12_000).collect::<String>()
+                );
             }
             let _ = ch.send(result(out.clone()));
             Ok(out)
@@ -159,12 +187,21 @@ fn lock<'a>(db: &'a db::Db) -> AppResult<std::sync::MutexGuard<'a, rusqlite::Con
 
 /// Same as [`lock`] but anyhow-typed, for the background `run_project_distill` helper.
 fn lock_anyhow(db: &db::Db) -> anyhow::Result<std::sync::MutexGuard<'_, rusqlite::Connection>> {
-    db.0.lock().map_err(|e| anyhow::anyhow!("db lock poisoned: {e}"))
+    db.0.lock()
+        .map_err(|e| anyhow::anyhow!("db lock poisoned: {e}"))
+}
+
+/// Check out a pooled READ-ONLY connection. Use in read commands so they run concurrently
+/// (WAL) instead of serializing behind the single writer mutex. Writes must use [`lock`].
+fn read(pool: &db::ReadPool) -> AppResult<db::ReadConn> {
+    pool.0
+        .get()
+        .map_err(|e| anyhow::anyhow!("read pool: {e}").into())
 }
 
 #[tauri::command]
-fn db_stats(db: tauri::State<'_, db::Db>) -> AppResult<DbStats> {
-    let conn = lock(&db)?;
+fn db_stats(pool: tauri::State<'_, db::ReadPool>) -> AppResult<DbStats> {
+    let conn = read(&pool)?;
     let count = |sql: &str| -> rusqlite::Result<i64> { conn.query_row(sql, [], |r| r.get(0)) };
     Ok(DbStats {
         threads: count("SELECT COUNT(*) FROM threads").map_err(anyhow::Error::from)?,
@@ -176,21 +213,26 @@ fn db_stats(db: tauri::State<'_, db::Db>) -> AppResult<DbStats> {
 /// Rich index analytics for the dashboard: per-source / per-role breakdowns,
 /// date range, embedding coverage, and top projects.
 #[tauri::command]
-fn index_stats(db: tauri::State<'_, db::Db>) -> AppResult<search::Stats> {
-    let conn = lock(&db)?;
+fn index_stats(pool: tauri::State<'_, db::ReadPool>) -> AppResult<search::Stats> {
+    let conn = read(&pool)?;
     Ok(search::stats(&conn)?)
 }
 
 /// Oldest-first list of threads with their size, for the storage-cleanup UI.
 #[tauri::command]
 fn cleanup_candidates(
-    db: tauri::State<'_, db::Db>,
+    pool: tauri::State<'_, db::ReadPool>,
     before: Option<i64>,
     sources: Option<Vec<String>>,
     limit: Option<i64>,
 ) -> AppResult<Vec<cleanup::CleanupRow>> {
-    let conn = lock(&db)?;
-    Ok(cleanup::candidates(&conn, before, &sources.unwrap_or_default(), limit.unwrap_or(200))?)
+    let conn = read(&pool)?;
+    Ok(cleanup::candidates(
+        &conn,
+        before,
+        &sources.unwrap_or_default(),
+        limit.unwrap_or(200),
+    )?)
 }
 
 /// Permanently delete the given threads (cascades to messages, FTS, vectors).
@@ -200,11 +242,19 @@ fn delete_threads(db: tauri::State<'_, db::Db>, ids: Vec<i64>) -> AppResult<usiz
     Ok(cleanup::delete_threads(&mut conn, &ids)?)
 }
 
-/// Reclaim disk space freed by deletes (VACUUM).
+/// Reclaim disk space freed by deletes (VACUUM). Runs on a DEDICATED connection: VACUUM
+/// rewrites the whole file and would otherwise hold the shared mutex for the entire
+/// (multi-second) rewrite, freezing every other command. On its own connection it still
+/// takes SQLite's write lock but never the Rust mutex, so the rest of the UI stays live.
 #[tauri::command]
-fn vacuum_db(db: tauri::State<'_, db::Db>) -> AppResult<()> {
-    let conn = lock(&db)?;
-    cleanup::vacuum(&conn)?;
+async fn vacuum_db() -> AppResult<()> {
+    tauri::async_runtime::spawn_blocking(|| -> anyhow::Result<()> {
+        let conn = db::open(&db::default_index_path())?;
+        cleanup::vacuum(&conn)?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("vacuum task: {e}"))??;
     Ok(())
 }
 
@@ -225,12 +275,20 @@ fn index_all(app: AppHandle) -> AppResult<()> {
         // the lock every other UI query needs — WAL lets readers proceed while we write.
         let prog = app.clone();
         let report = db::open(&db::default_index_path()).and_then(|mut c| {
-            indexer::scan_all_with_progress(&mut c, |done, total, current| {
+            let r = indexer::scan_all_with_progress(&mut c, |done, total, current| {
                 let _ = prog.emit(
                     "index:progress",
-                    IndexProgressEvent { done: done as i64, total: total as i64, current: current.to_string() },
+                    IndexProgressEvent {
+                        done: done as i64,
+                        total: total as i64,
+                        current: current.to_string(),
+                    },
                 );
-            })
+            })?;
+            // Fold the WAL back into the main db so the -wal file doesn't grow unbounded
+            // across reindex runs. PASSIVE never blocks readers.
+            let _ = c.execute_batch("PRAGMA wal_checkpoint(PASSIVE);");
+            Ok(r)
         });
         app.state::<IndexJob>().0.store(false, Ordering::SeqCst);
         let report = report.unwrap_or_else(|e| {
@@ -273,21 +331,21 @@ fn index_source(kind: String) -> AppResult<indexer::IndexReport> {
 
 #[tauri::command]
 fn search_threads(
-    db: tauri::State<'_, db::Db>,
+    pool: tauri::State<'_, db::ReadPool>,
     embedder: tauri::State<'_, embed::Embedder>,
     query: String,
     filters: Option<SearchFilters>,
 ) -> AppResult<Vec<SearchHit>> {
     let filters = filters.unwrap_or_default();
     let hits = if filters.hybrid {
-        // Embed the query BEFORE locking the DB so the (multi-second on first call)
-        // inference never holds the single connection and freezes other UI commands —
-        // especially while a background embedding build is running.
+        // Embed the query BEFORE touching the DB so the (multi-second on first call)
+        // inference never pins a connection. Then read on the pool — concurrent with
+        // other reads and the writer.
         let qv = embed::embed_query(&embedder, &query)?;
-        let conn = lock(&db)?;
+        let conn = read(&pool)?;
         search::hybrid_vec(&conn, &query, qv.as_deref(), &filters)?
     } else {
-        let conn = lock(&db)?;
+        let conn = read(&pool)?;
         search::search(&conn, &query, &filters)?
     };
     Ok(hits)
@@ -327,10 +385,10 @@ struct DistillProgressEvent {
 
 #[tauri::command]
 fn embedding_status(
-    db: tauri::State<'_, db::Db>,
+    pool: tauri::State<'_, db::ReadPool>,
     job: tauri::State<'_, EmbedJob>,
 ) -> AppResult<EmbedStatus> {
-    let conn = lock(&db)?;
+    let conn = read(&pool)?;
     let (done, total) = embed::embed_progress(&conn)?;
     Ok(EmbedStatus {
         done,
@@ -396,8 +454,17 @@ fn build_embeddings(app: AppHandle) -> AppResult<()> {
             let vecs = match embedder.embed(texts) {
                 Ok(v) => v,
                 Err(e) => {
-                    eprintln!("[embed] {e}");
-                    break;
+                    // Don't let one bad batch stall the whole job: mark these messages
+                    // embedded (they just won't have vectors — FTS still finds them) and
+                    // move on, instead of aborting at this point forever.
+                    eprintln!("[embed] batch failed, skipping: {e}");
+                    let ids: Vec<i64> = rows.iter().map(|(id, _)| *id).collect();
+                    if let Ok(conn) = db.0.lock() {
+                        let _ = embed::mark_embedded(&conn, &ids);
+                    }
+                    done += rows.len() as i64;
+                    let _ = app.emit("embed:progress", EmbedProgressEvent { done, total });
+                    continue;
                 }
             };
             // 3. Locked, fast: persist the vectors + mark the messages embedded.
@@ -439,6 +506,10 @@ fn build_embeddings(app: AppHandle) -> AppResult<()> {
             let _ = app.emit("embed:progress", EmbedProgressEvent { done, total });
         }
         app.state::<EmbedJob>().0.store(false, Ordering::SeqCst);
+        // Fold the WAL back after the build's many small writes (PASSIVE never blocks).
+        if let Ok(conn) = db.0.lock() {
+            let _ = conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);");
+        }
         let _ = app.emit("embed:done", ());
     });
     Ok(())
@@ -446,16 +517,19 @@ fn build_embeddings(app: AppHandle) -> AppResult<()> {
 
 #[tauri::command]
 fn recent_threads(
-    db: tauri::State<'_, db::Db>,
+    pool: tauri::State<'_, db::ReadPool>,
     filters: Option<SearchFilters>,
 ) -> AppResult<Vec<ThreadSummary>> {
-    let conn = lock(&db)?;
+    let conn = read(&pool)?;
     Ok(search::recent_threads(&conn, &filters.unwrap_or_default())?)
 }
 
 #[tauri::command]
-fn get_thread(db: tauri::State<'_, db::Db>, thread_id: i64) -> AppResult<Option<ThreadDetail>> {
-    let conn = lock(&db)?;
+fn get_thread(
+    pool: tauri::State<'_, db::ReadPool>,
+    thread_id: i64,
+) -> AppResult<Option<ThreadDetail>> {
+    let conn = read(&pool)?;
     Ok(search::thread_detail(&conn, thread_id)?)
 }
 
@@ -482,8 +556,8 @@ fn set_thread_tags(
 
 /// All tags in the index with their thread counts, for the filter chips.
 #[tauri::command]
-fn list_tags(db: tauri::State<'_, db::Db>) -> AppResult<Vec<(String, i64)>> {
-    let conn = lock(&db)?;
+fn list_tags(pool: tauri::State<'_, db::ReadPool>) -> AppResult<Vec<(String, i64)>> {
+    let conn = read(&pool)?;
     Ok(search::list_tags(&conn)?)
 }
 
@@ -491,12 +565,12 @@ fn list_tags(db: tauri::State<'_, db::Db>) -> AppResult<Vec<(String, i64)>> {
 /// optionally scoped to a project-path substring and/or a source kind.
 #[tauri::command]
 fn list_open_todos(
-    db: tauri::State<'_, db::Db>,
+    pool: tauri::State<'_, db::ReadPool>,
     query: Option<String>,
     project: Option<String>,
     source: Option<String>,
 ) -> AppResult<Vec<knowledge::TodoFact>> {
-    let conn = lock(&db)?;
+    let conn = read(&pool)?;
     Ok(knowledge::list_open_todos(
         &conn,
         query.as_deref(),
@@ -508,8 +582,8 @@ fn list_open_todos(
 
 /// Current distillation engine config (enabled + provider/model).
 #[tauri::command]
-fn knowledge_config(db: tauri::State<'_, db::Db>) -> AppResult<knowledge::KnowledgeConfig> {
-    let conn = lock(&db)?;
+fn knowledge_config(pool: tauri::State<'_, db::ReadPool>) -> AppResult<knowledge::KnowledgeConfig> {
+    let conn = read(&pool)?;
     Ok(knowledge::get_config(&conn)?)
 }
 
@@ -565,10 +639,10 @@ fn set_knowledge_config(
 /// Cached distilled knowledge (summary/decisions/gotchas/todos) for one thread.
 #[tauri::command]
 fn thread_knowledge(
-    db: tauri::State<'_, db::Db>,
+    pool: tauri::State<'_, db::ReadPool>,
     thread_id: i64,
 ) -> AppResult<knowledge::ThreadKnowledge> {
-    let conn = lock(&db)?;
+    let conn = read(&pool)?;
     Ok(knowledge::get_thread_knowledge(&conn, thread_id)?)
 }
 
@@ -608,8 +682,14 @@ async fn distill_thread(
             let conn = lock(&db)?;
             // Store a short, sanitized summary — not the raw provider error, which can
             // echo HTTP status / URLs / response bodies.
-            let msg: String =
-                e.to_string().lines().next().unwrap_or("distillation failed").chars().take(160).collect();
+            let msg: String = e
+                .to_string()
+                .lines()
+                .next()
+                .unwrap_or("distillation failed")
+                .chars()
+                .take(160)
+                .collect();
             knowledge::set_error(&conn, thread_id, &msg)?;
             Err(e.into())
         }
@@ -620,18 +700,18 @@ async fn distill_thread(
 
 /// Distinct projects with distillation coverage, for the Project Memory picker.
 #[tauri::command]
-fn list_projects(db: tauri::State<'_, db::Db>) -> AppResult<Vec<knowledge::ProjectInfo>> {
-    let conn = lock(&db)?;
+fn list_projects(pool: tauri::State<'_, db::ReadPool>) -> AppResult<Vec<knowledge::ProjectInfo>> {
+    let conn = read(&pool)?;
     Ok(knowledge::list_projects(&conn)?)
 }
 
 /// Aggregated, durable memory (decisions/gotchas/open todos + coverage) for one project.
 #[tauri::command]
 fn project_memory(
-    db: tauri::State<'_, db::Db>,
+    pool: tauri::State<'_, db::ReadPool>,
     project: String,
 ) -> AppResult<knowledge::ProjectMemory> {
-    let conn = lock(&db)?;
+    let conn = read(&pool)?;
     Ok(knowledge::get_project_memory(&conn, &project, 60)?)
 }
 
@@ -657,9 +737,9 @@ fn format_memory_notes(m: &knowledge::ProjectMemory) -> String {
 /// LLM-synthesized orientation brief from a project's aggregated facts. Needs distillation
 /// enabled (it reuses the distill engine). Returns "" if there are no facts yet.
 #[tauri::command]
-async fn project_brief(db: tauri::State<'_, db::Db>, project: String) -> AppResult<String> {
+async fn project_brief(pool: tauri::State<'_, db::ReadPool>, project: String) -> AppResult<String> {
     let (provider, model, key, notes) = {
-        let conn = lock(&db)?;
+        let conn = read(&pool)?;
         let (provider, model, key) = resolve_distill_engine(&conn)?;
         let mem = knowledge::get_project_memory(&conn, &project, 80)?;
         (provider, model, key, format_memory_notes(&mem))
@@ -674,14 +754,18 @@ async fn project_brief(db: tauri::State<'_, db::Db>, project: String) -> AppResu
 /// memory.md` so agents can be pointed at it. Returns the written path.
 #[tauri::command]
 async fn write_project_memory_file(
-    db: tauri::State<'_, db::Db>,
+    pool: tauri::State<'_, db::ReadPool>,
     project: String,
     with_brief: bool,
 ) -> AppResult<String> {
     let (mem, engine) = {
-        let conn = lock(&db)?;
+        let conn = read(&pool)?;
         let mem = knowledge::get_project_memory(&conn, &project, 200)?;
-        let engine = if with_brief { resolve_distill_engine(&conn).ok() } else { None };
+        let engine = if with_brief {
+            resolve_distill_engine(&conn).ok()
+        } else {
+            None
+        };
         (mem, engine)
     };
     let brief = match engine {
@@ -690,7 +774,9 @@ async fn write_project_memory_file(
             if notes.trim().is_empty() {
                 None
             } else {
-                agent::project_brief(&provider, &model, key.as_deref(), &project, &notes).await.ok()
+                agent::project_brief(&provider, &model, key.as_deref(), &project, &notes)
+                    .await
+                    .ok()
             }
         }
         None => None,
@@ -735,7 +821,9 @@ fn distill_project(app: AppHandle, project: String) -> AppResult<()> {
     tauri::async_runtime::spawn(async move {
         let ids = {
             let db = app.state::<db::Db>();
-            db.0.lock().ok().and_then(|c| knowledge::project_pending_threads(&c, &project).ok())
+            db.0.lock()
+                .ok()
+                .and_then(|c| knowledge::project_pending_threads(&c, &project).ok())
         };
         if let Some(ids) = ids {
             if let Err(e) = run_distill(&app, ids).await {
@@ -780,7 +868,12 @@ async fn run_distill(app: &AppHandle, ids: Vec<i64>) -> anyhow::Result<()> {
             Ok(distilled) => {
                 {
                     let mut conn = lock_anyhow(&db)?;
-                    knowledge::store_distilled(&mut conn, tid, &distilled, chrono::Utc::now().timestamp())?;
+                    knowledge::store_distilled(
+                        &mut conn,
+                        tid,
+                        &distilled,
+                        chrono::Utc::now().timestamp(),
+                    )?;
                 }
                 if let Err(e) = embed::embed_pending_facts(&db, &embedder) {
                     eprintln!("[distill] embed facts: {e}");
@@ -788,12 +881,24 @@ async fn run_distill(app: &AppHandle, ids: Vec<i64>) -> anyhow::Result<()> {
             }
             Err(e) => {
                 let conn = lock_anyhow(&db)?;
-                let msg: String =
-                    e.to_string().lines().next().unwrap_or("distillation failed").chars().take(160).collect();
+                let msg: String = e
+                    .to_string()
+                    .lines()
+                    .next()
+                    .unwrap_or("distillation failed")
+                    .chars()
+                    .take(160)
+                    .collect();
                 let _ = knowledge::set_error(&conn, tid, &msg);
             }
         }
-        let _ = app.emit("distill:progress", DistillProgressEvent { done: (i as i64) + 1, total });
+        let _ = app.emit(
+            "distill:progress",
+            DistillProgressEvent {
+                done: (i as i64) + 1,
+                total,
+            },
+        );
         // Gentle pacing so a cloud provider isn't hammered.
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
@@ -813,7 +918,9 @@ fn auto_distill_kick(app: &AppHandle) {
     let ids = {
         let db = app.state::<db::Db>();
         let Ok(conn) = db.0.lock() else { return };
-        let Ok(cfg) = knowledge::get_config(&conn) else { return };
+        let Ok(cfg) = knowledge::get_config(&conn) else {
+            return;
+        };
         if !cfg.enabled || !cfg.auto_distill {
             return;
         }
@@ -840,30 +947,44 @@ fn auto_distill_kick(app: &AppHandle) {
 /// Cross-thread semantic recall of distilled DECISIONS, matched to a query.
 #[tauri::command]
 fn recall_decisions(
-    db: tauri::State<'_, db::Db>,
+    pool: tauri::State<'_, db::ReadPool>,
     embedder: tauri::State<'_, embed::Embedder>,
     query: String,
     project: Option<String>,
     limit: Option<u32>,
 ) -> AppResult<Vec<knowledge::RecallHit>> {
-    recall_facts(&db, &embedder, "decision", &query, project.as_deref(), limit)
+    recall_facts(
+        &pool,
+        &embedder,
+        "decision",
+        &query,
+        project.as_deref(),
+        limit,
+    )
 }
 
 /// Cross-thread semantic recall of distilled GOTCHAS, matched to a query.
 #[tauri::command]
 fn recall_gotchas(
-    db: tauri::State<'_, db::Db>,
+    pool: tauri::State<'_, db::ReadPool>,
     embedder: tauri::State<'_, embed::Embedder>,
     query: String,
     project: Option<String>,
     limit: Option<u32>,
 ) -> AppResult<Vec<knowledge::RecallHit>> {
-    recall_facts(&db, &embedder, "gotcha", &query, project.as_deref(), limit)
+    recall_facts(
+        &pool,
+        &embedder,
+        "gotcha",
+        &query,
+        project.as_deref(),
+        limit,
+    )
 }
 
-/// Shared recall path: embed the query OUTSIDE the DB lock, then run the SQL KNN.
+/// Shared recall path: embed the query OUTSIDE the DB, then run the SQL KNN on the pool.
 fn recall_facts(
-    db: &db::Db,
+    pool: &db::ReadPool,
     embedder: &embed::Embedder,
     kind: &str,
     query: &str,
@@ -873,8 +994,14 @@ fn recall_facts(
     let Some(qv) = embed::embed_query(embedder, query)? else {
         return Ok(Vec::new());
     };
-    let conn = lock(db)?;
-    Ok(knowledge::recall(&conn, &qv, kind, project, limit.unwrap_or(20) as usize)?)
+    let conn = read(pool)?;
+    Ok(knowledge::recall(
+        &conn,
+        &qv,
+        kind,
+        project,
+        limit.unwrap_or(20) as usize,
+    )?)
 }
 
 /// A thread cited as a source in an "ask your history" answer.
@@ -898,7 +1025,7 @@ struct AskAnswer {
 /// excerpts, and have the configured LLM answer with [thread N] citations.
 #[tauri::command]
 async fn ask_history(
-    db: tauri::State<'_, db::Db>,
+    pool: tauri::State<'_, db::ReadPool>,
     embedder: tauri::State<'_, embed::Embedder>,
     question: String,
 ) -> AppResult<AskAnswer> {
@@ -906,12 +1033,16 @@ async fn ask_history(
     if q.is_empty() {
         return Err(anyhow::anyhow!("ask needs a question").into());
     }
-    // Embed the query OUTSIDE the lock; retrieve + pack excerpts under it; LLM after.
+    // Embed the query OUTSIDE the DB; retrieve + pack excerpts on a pooled read conn
+    // (concurrent, never touches the writer); LLM after the conn is dropped.
     let qv = embed::embed_query(&embedder, &q)?;
     let (provider, model, key, context, sources) = {
-        let conn = lock(&db)?;
+        let conn = read(&pool)?;
         let (provider, model, key) = resolve_distill_engine(&conn)?;
-        let filters = SearchFilters { limit: Some(30), ..Default::default() };
+        let filters = SearchFilters {
+            limit: Some(30),
+            ..Default::default()
+        };
         let hits = search::hybrid_vec(&conn, &q, qv.as_deref(), &filters)?;
         let mut seen = std::collections::HashSet::new();
         let mut sources: Vec<AskSource> = Vec::new();
@@ -950,8 +1081,11 @@ async fn ask_history(
 
 /// Code-aware search: threads that mention a file path (substring, case-insensitive).
 #[tauri::command]
-fn search_by_file(db: tauri::State<'_, db::Db>, path: String) -> AppResult<Vec<ThreadSummary>> {
-    let conn = lock(&db)?;
+fn search_by_file(
+    pool: tauri::State<'_, db::ReadPool>,
+    path: String,
+) -> AppResult<Vec<ThreadSummary>> {
+    let conn = read(&pool)?;
     Ok(search::threads_with_file(&conn, &path, 200)?)
 }
 
@@ -1070,8 +1204,8 @@ async fn list_models(provider: String, base_url: Option<String>) -> AppResult<Ve
 
 /// Pack a thread into an LLM-ready context blob (markdown + XML envelope, budgeted).
 #[tauri::command]
-fn thread_context(db: tauri::State<'_, db::Db>, thread_id: i64) -> AppResult<String> {
-    let conn = lock(&db)?;
+fn thread_context(pool: tauri::State<'_, db::ReadPool>, thread_id: i64) -> AppResult<String> {
+    let conn = read(&pool)?;
     let packed = context::pack_thread(&conn, thread_id, context::DEFAULT_BUDGET_CHARS)?
         .ok_or_else(|| anyhow::anyhow!("thread not found"))?;
     Ok(packed)
@@ -1092,9 +1226,15 @@ fn obsidian_vaults() -> Vec<String> {
         configs.push(std::path::PathBuf::from(appdata).join("obsidian/obsidian.json"));
     }
     for cfg in configs {
-        let Ok(text) = std::fs::read_to_string(&cfg) else { continue };
-        let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
-        let Some(vaults) = json.get("vaults").and_then(|v| v.as_object()) else { continue };
+        let Ok(text) = std::fs::read_to_string(&cfg) else {
+            continue;
+        };
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        let Some(vaults) = json.get("vaults").and_then(|v| v.as_object()) else {
+            continue;
+        };
         let mut paths: Vec<String> = vaults
             .values()
             .filter_map(|v| v.get("path").and_then(|p| p.as_str()))
@@ -1112,10 +1252,15 @@ fn obsidian_vaults() -> Vec<String> {
 
 /// Render `detail` (optionally with a synthesis block) to an Obsidian note inside
 /// `vault_dir`, returning the written path. Shared by quick + synthesized export.
-fn write_note(detail: &ThreadDetail, synthesis: Option<&str>, vault_dir: &str) -> AppResult<String> {
+fn write_note(
+    detail: &ThreadDetail,
+    synthesis: Option<&str>,
+    vault_dir: &str,
+) -> AppResult<String> {
     let md = export::to_obsidian(detail, synthesis);
     std::fs::create_dir_all(vault_dir).map_err(anyhow::Error::from)?;
-    let path = std::path::Path::new(vault_dir).join(format!("{}.md", export::note_filename(detail)));
+    let path =
+        std::path::Path::new(vault_dir).join(format!("{}.md", export::note_filename(detail)));
     std::fs::write(&path, md).map_err(anyhow::Error::from)?;
     Ok(path.to_string_lossy().into_owned())
 }
@@ -1123,12 +1268,12 @@ fn write_note(detail: &ThreadDetail, synthesis: Option<&str>, vault_dir: &str) -
 /// Quick export: a thread → Obsidian note (transcript + `[[project]]` link), no LLM.
 #[tauri::command]
 fn export_thread(
-    db: tauri::State<'_, db::Db>,
+    pool: tauri::State<'_, db::ReadPool>,
     thread_id: i64,
     vault_dir: String,
 ) -> AppResult<String> {
     let detail = {
-        let conn = lock(&db)?;
+        let conn = read(&pool)?;
         search::thread_detail(&conn, thread_id)?
             .ok_or_else(|| anyhow::anyhow!("thread not found"))?
     };
@@ -1148,11 +1293,17 @@ const SYNTH_MODELS: &[(&str, &str)] = &[
 
 /// First provider with a stored key (Ollama is keyless, so never auto-picked).
 pub fn pick_synth_provider() -> Option<(&'static str, &'static str)> {
-    SYNTH_MODELS.iter().copied().find(|(p, _)| secrets::has_key(p))
+    SYNTH_MODELS
+        .iter()
+        .copied()
+        .find(|(p, _)| secrets::has_key(p))
 }
 
 fn synth_default_model(provider: &str) -> Option<&'static str> {
-    SYNTH_MODELS.iter().find(|(p, _)| *p == provider).map(|(_, m)| *m)
+    SYNTH_MODELS
+        .iter()
+        .find(|(p, _)| *p == provider)
+        .map(|(_, m)| *m)
 }
 
 /// Resolve (provider, model) from an optional pinned choice, else auto-pick. A
@@ -1171,8 +1322,9 @@ fn resolve_synth(provider: Option<&str>, model: Option<&str>) -> AppResult<(Stri
             Ok((p.to_string(), model))
         }
         None => {
-            let (p, m) = pick_synth_provider()
-                .ok_or_else(|| anyhow::anyhow!("no API key set — add one in Settings to synthesize"))?;
+            let (p, m) = pick_synth_provider().ok_or_else(|| {
+                anyhow::anyhow!("no API key set — add one in Settings to synthesize")
+            })?;
             Ok((p.to_string(), m.to_string()))
         }
     }
@@ -1196,7 +1348,11 @@ pub fn resolve_distill_engine(
     }
     let (provider, model) = resolve_synth(cfg.provider.as_deref(), cfg.model.as_deref())
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-    let key = if provider == "ollama" { None } else { secrets::get_key(&provider)? };
+    let key = if provider == "ollama" {
+        None
+    } else {
+        secrets::get_key(&provider)?
+    };
     Ok((provider, model, key))
 }
 
@@ -1205,16 +1361,16 @@ pub fn resolve_distill_engine(
 /// Obsidian note (synthesis above the transcript) into `vault_dir`.
 #[tauri::command]
 async fn synthesize_export(
-    db: tauri::State<'_, db::Db>,
+    pool: tauri::State<'_, db::ReadPool>,
     thread_id: i64,
     vault_dir: String,
     provider: Option<String>,
     model: Option<String>,
 ) -> AppResult<String> {
     let (provider, model) = resolve_synth(provider.as_deref(), model.as_deref())?;
-    // Pull detail + packed transcript, then drop the DB lock before the network call.
+    // Pull detail + packed transcript on a pooled read conn, dropped before the network call.
     let (detail, packed) = {
-        let conn = lock(&db)?;
+        let conn = read(&pool)?;
         let detail = search::thread_detail(&conn, thread_id)?
             .ok_or_else(|| anyhow::anyhow!("thread not found"))?;
         let packed = context::pack_thread(&conn, thread_id, context::DEFAULT_BUDGET_CHARS)?
@@ -1229,12 +1385,12 @@ async fn synthesize_export(
 /// Pack a thread and open it as context in a fresh CLI agent session (default: claude).
 #[tauri::command]
 fn open_thread_in_cli(
-    db: tauri::State<'_, db::Db>,
+    pool: tauri::State<'_, db::ReadPool>,
     thread_id: i64,
     program: Option<String>,
 ) -> AppResult<String> {
     let (packed, project): (String, Option<String>) = {
-        let conn = lock(&db)?;
+        let conn = read(&pool)?;
         let packed = context::pack_thread(&conn, thread_id, context::DEFAULT_BUDGET_CHARS)?
             .ok_or_else(|| anyhow::anyhow!("thread not found"))?;
         let project = conn
@@ -1250,9 +1406,15 @@ fn open_thread_in_cli(
     // decided + the gotchas to avoid, not just this one thread's transcript.
     let packed = match project.as_deref().filter(|p| !p.is_empty()) {
         Some(proj) => {
-            let mem = lock(&db).ok().and_then(|c| knowledge::get_project_memory(&c, proj, 25).ok());
+            let mem = read(&pool)
+                .ok()
+                .and_then(|c| knowledge::get_project_memory(&c, proj, 25).ok());
             match mem {
-                Some(m) if !(m.decisions.is_empty() && m.gotchas.is_empty() && m.open_todos.is_empty()) => {
+                Some(m)
+                    if !(m.decisions.is_empty()
+                        && m.gotchas.is_empty()
+                        && m.open_todos.is_empty()) =>
+                {
                     format!(
                         "<project_memory project=\"{proj}\">\n{}</project_memory>\n\n{packed}",
                         format_memory_notes(&m)
@@ -1270,21 +1432,14 @@ fn open_thread_in_cli(
 
 /// Relaunch the original CLI agent on an indexed thread (Claude Code / Codex).
 #[tauri::command]
-fn resume_thread(db: tauri::State<'_, db::Db>, thread_id: i64) -> AppResult<()> {
+fn resume_thread(pool: tauri::State<'_, db::ReadPool>, thread_id: i64) -> AppResult<()> {
     let (source, external_id, is_subagent, project): (String, String, bool, Option<String>) = {
-        let conn = lock(&db)?;
+        let conn = read(&pool)?;
         conn.query_row(
             "SELECT s.kind, t.external_id, t.is_subagent, t.project_path
              FROM threads t JOIN sources s ON s.id = t.source_id WHERE t.id = ?1",
             [thread_id],
-            |r| {
-                Ok((
-                    r.get(0)?,
-                    r.get(1)?,
-                    r.get::<_, i64>(2)? != 0,
-                    r.get(3)?,
-                ))
-            },
+            |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? != 0, r.get(3)?)),
         )
         .map_err(anyhow::Error::from)?
     };
@@ -1333,8 +1488,15 @@ pub fn run() {
         .setup(|app| {
             let dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&dir)?;
-            let conn = db::open(&dir.join("index.db"))?;
+            let db_path = dir.join("index.db");
+            let conn = db::open(&db_path)?; // single WRITER; also runs migrations
             app.manage(db::Db(Mutex::new(conn)));
+            // Read pool (after the writer migrated): UI read commands run concurrently
+            // here instead of serializing behind the writer mutex.
+            let pool_size = std::thread::available_parallelism()
+                .map(|n| n.get() as u32)
+                .unwrap_or(4);
+            app.manage(db::read_pool(&db_path, pool_size.clamp(2, 6))?);
             app.manage(embed::Embedder::default());
             app.manage(EmbedJob::default());
             app.manage(IndexJob::default());
