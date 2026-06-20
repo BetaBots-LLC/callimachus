@@ -35,5 +35,7 @@ pub static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
         M::up(include_str!("../../migrations/0014_perf.sql")),
         // 0015 — fact curation: pin / edit / hide distilled facts.
         M::up(include_str!("../../migrations/0015_fact_curation.sql")),
+        // 0016 — canonical project key for stable per-project grouping.
+        M::up(include_str!("../../migrations/0016_project_key.sql")),
     ])
 });

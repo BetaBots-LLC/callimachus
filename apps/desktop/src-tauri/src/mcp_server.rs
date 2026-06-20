@@ -337,10 +337,11 @@ impl Callimachus {
         &self,
         Parameters(args): Parameters<ProjectMemoryArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let project = args
+        let raw = args
             .project
             .or_else(current_project_root)
             .unwrap_or_default();
+        let project = crate::indexer::canonical_project(&raw).unwrap_or(raw);
         let conn = self
             .conn
             .lock()
@@ -466,10 +467,11 @@ impl Callimachus {
         if text.is_empty() {
             return Err(ErrorData::internal_error("text is required", None));
         }
-        let project = args
+        let raw = args
             .project
             .or_else(current_project_root)
             .unwrap_or_default();
+        let project = crate::indexer::canonical_project(&raw).unwrap_or(raw);
         let now = chrono::Utc::now().timestamp();
         let mut conn = self
             .conn

@@ -88,6 +88,67 @@ pub fn scan_all_with_progress(
     Ok(total)
 }
 
+/// Normalize a project path into a STABLE key, so one repo doesn't fragment into separate
+/// memories across `~` vs absolute, trailing slashes, symlinks, or a subdir vs the repo
+/// root. When the path exists on disk we resolve it and walk up to the nearest git root;
+/// otherwise we apply a light string normalization. Returns None for an empty path. The
+/// result is what Project Memory / recall scoping group on (column `threads.project_key`).
+pub fn canonical_project(path: &str) -> Option<String> {
+    use std::path::PathBuf;
+    let p = path.trim();
+    if p.is_empty() {
+        return None;
+    }
+    // Expand a leading `~`.
+    let expanded: PathBuf = match p.strip_prefix("~/") {
+        Some(rest) => std::env::var("HOME")
+            .map(|h| PathBuf::from(h).join(rest))
+            .unwrap_or_else(|_| PathBuf::from(p)),
+        None => PathBuf::from(p),
+    };
+    // If it exists: resolve symlinks + absolutize, then walk up to the git root.
+    if let Ok(abs) = std::fs::canonicalize(&expanded) {
+        let mut dir = abs.as_path();
+        loop {
+            if dir.join(".git").exists() {
+                return Some(dir.to_string_lossy().trim_end_matches('/').to_string());
+            }
+            match dir.parent() {
+                Some(par) => dir = par,
+                None => break,
+            }
+        }
+        return Some(abs.to_string_lossy().trim_end_matches('/').to_string());
+    }
+    // Doesn't exist on this machine: light normalization only.
+    Some(expanded.to_string_lossy().trim_end_matches('/').to_string())
+}
+
+/// Compute `project_key` for threads that don't have one yet (post-0016 backfill). Groups
+/// by distinct project_path so canonicalization runs once per path. Fast (paths are few).
+pub fn backfill_project_keys(conn: &Connection) -> Result<usize> {
+    let paths: Vec<String> = {
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT project_path FROM threads
+             WHERE project_key IS NULL AND project_path IS NOT NULL AND project_path != ''",
+        )?;
+        let r = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        r
+    };
+    let mut n = 0;
+    for path in paths {
+        if let Some(key) = canonical_project(&path) {
+            n += conn.execute(
+                "UPDATE threads SET project_key = ?1 WHERE project_path = ?2 AND project_key IS NULL",
+                params![key, path],
+            )?;
+        }
+    }
+    Ok(n)
+}
+
 /// Resolve the numeric source id for a source kind (rows are seeded by migration).
 pub fn source_id(conn: &Connection, kind: &str) -> Result<i64> {
     conn.query_row("SELECT id FROM sources WHERE kind = ?1", [kind], |r| {
@@ -111,10 +172,11 @@ pub fn upsert_thread(
     let bytes: i64 = thread.messages.iter().map(|m| m.text.len() as i64).sum();
     let tx = conn.transaction()?;
 
+    let project_key = thread.project_path.as_deref().and_then(canonical_project);
     tx.execute(
         "INSERT INTO threads (source_id, external_id, title, project_path, git_branch,
-            created_at, updated_at, message_count, last_indexed_at, is_subagent, bytes)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            created_at, updated_at, message_count, last_indexed_at, is_subagent, bytes, project_key)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
          ON CONFLICT (source_id, external_id) DO UPDATE SET
             title = excluded.title,
             project_path = excluded.project_path,
@@ -124,7 +186,8 @@ pub fn upsert_thread(
             message_count = excluded.message_count,
             last_indexed_at = excluded.last_indexed_at,
             is_subagent = excluded.is_subagent,
-            bytes = excluded.bytes",
+            bytes = excluded.bytes,
+            project_key = excluded.project_key",
         params![
             source_id,
             thread.external_id,
@@ -137,6 +200,7 @@ pub fn upsert_thread(
             now,
             thread.is_subagent as i64,
             bytes,
+            project_key,
         ],
     )?;
 
@@ -402,7 +466,36 @@ pub fn file_unchanged(conn: &Connection, path: &Path, kind: &str) -> Result<bool
 
 #[cfg(test)]
 mod tests {
-    use super::extract_paths;
+    use super::{canonical_project, extract_paths};
+
+    #[test]
+    fn canonical_project_normalizes_and_groups() {
+        assert_eq!(canonical_project(""), None);
+        assert_eq!(canonical_project("   "), None);
+        // Nonexistent path: trailing slash trimmed, otherwise unchanged.
+        assert_eq!(
+            canonical_project("/no/such/proj/"),
+            Some("/no/such/proj".to_string())
+        );
+        assert_eq!(
+            canonical_project("/no/such/proj"),
+            Some("/no/such/proj".to_string())
+        );
+
+        // A real git repo: a subdir resolves to the SAME key as the repo root.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!("cp_{}_{n}", std::process::id()));
+        let deep = root.join("a/b");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let k_root = canonical_project(root.to_str().unwrap());
+        let k_deep = canonical_project(deep.to_str().unwrap());
+        assert!(k_root.is_some());
+        assert_eq!(k_root, k_deep, "subdir groups with the repo root");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn extract_paths_finds_real_paths_only() {

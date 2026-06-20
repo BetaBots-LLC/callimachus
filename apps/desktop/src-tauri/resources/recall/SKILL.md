@@ -53,7 +53,11 @@ cal ask "how did we wire the embedder?"     # cited RAG answer over your history
 cal files embed/mod.rs                      # which sessions touched a file path
 cal done <todo-id>                          # mark an open TODO done (id from `cal todos --json`)
 cal remember decision "use sqlite-vec for KNN"   # persist a decision (or: remember gotcha "...")
+cal agents                                  # write the repo's memory into AGENTS.md (any agent reads it)
+cal hook                                    # print the repo's memory (Claude Code SessionStart hook)
 ```
+
+The repo's `AGENTS.md` / `CLAUDE.md` may already contain a Callimachus-managed memory block (it's kept fresh by `cal agents` / a SessionStart hook), so prior decisions and gotchas can already be in your context before you call any tool.
 
 ## Workflow
 

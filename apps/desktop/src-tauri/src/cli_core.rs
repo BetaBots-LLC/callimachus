@@ -33,6 +33,8 @@ pub const COMMANDS: &[&str] = &[
     "memory",
     "done",
     "remember",
+    "hook",
+    "agents",
 ];
 
 const USAGE: &str = "\
@@ -67,6 +69,11 @@ USAGE:
   cal remember <decision|gotcha> <text…>
                                 record a fact for the current repo (-p PROJECT to
                                 override), pinned into its project memory
+  cal hook [<project>]          print the current repo's memory for injection (use as a
+                                Claude Code SessionStart hook command)
+  cal agents [<project>] [-o FILE]
+                                write/refresh the memory block in AGENTS.md (or -o
+                                CLAUDE.md) so any agent reading it opens with the memory
   cal help
 
 OPTIONS:
@@ -121,6 +128,8 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
         "memory" => cmd_memory(rest),
         "done" => cmd_done(rest),
         "remember" => cmd_remember(rest),
+        "hook" => cmd_hook(rest),
+        "agents" => cmd_agents(rest),
         "help" | "-h" | "--help" => {
             println!("{USAGE}");
             Ok(())
@@ -469,11 +478,13 @@ fn cwd_project_root() -> String {
 
 fn cmd_memory(args: &[String]) -> anyhow::Result<()> {
     let o = parse(args)?;
-    let project = if o.positional.is_empty() {
+    let raw = if o.positional.is_empty() {
         cwd_project_root()
     } else {
         o.positional.join(" ")
     };
+    // Normalize to the canonical project key so we match however the threads were indexed.
+    let project = crate::indexer::canonical_project(&raw).unwrap_or(raw);
     let conn = open_db()?;
     let mem = knowledge::get_project_memory(&conn, &project, o.limit.unwrap_or(40) as usize)?;
     if o.json {
@@ -511,6 +522,48 @@ fn cmd_done(args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Resolve the project arg (positional or cwd) to its canonical key.
+fn project_arg(o: &Opts) -> String {
+    let raw = if o.positional.is_empty() {
+        cwd_project_root()
+    } else {
+        o.positional.join(" ")
+    };
+    crate::indexer::canonical_project(&raw).unwrap_or(raw)
+}
+
+fn cmd_hook(args: &[String]) -> anyhow::Result<()> {
+    let o = parse(args)?;
+    let project = project_arg(&o);
+    let conn = open_db()?;
+    let mem = knowledge::get_project_memory(&conn, &project, 40)?;
+    // Emit nothing when there's no memory — a SessionStart hook shouldn't add noise.
+    if mem.decisions.is_empty() && mem.gotchas.is_empty() && mem.open_todos.is_empty() {
+        return Ok(());
+    }
+    println!("{}", export::agent_memory_md(&project, &mem, None));
+    Ok(())
+}
+
+fn cmd_agents(args: &[String]) -> anyhow::Result<()> {
+    let o = parse(args)?;
+    let project = project_arg(&o);
+    let filename = o.out.clone().unwrap_or_else(|| "AGENTS.md".into());
+    let conn = open_db()?;
+    let mem = knowledge::get_project_memory(&conn, &project, 100)?;
+    let body = export::agent_memory_md(&project, &mem, None);
+    let path = std::path::Path::new(&project).join(&filename);
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    std::fs::write(&path, export::upsert_managed_block(&existing, &body))?;
+    eprintln!(
+        "wrote {} ({}/{} threads distilled)",
+        path.display(),
+        mem.distilled_count,
+        mem.thread_count
+    );
+    Ok(())
+}
+
 fn cmd_remember(args: &[String]) -> anyhow::Result<()> {
     let o = parse(args)?;
     if o.positional.len() < 2 {
@@ -518,7 +571,8 @@ fn cmd_remember(args: &[String]) -> anyhow::Result<()> {
     }
     let kind = o.positional[0].to_ascii_lowercase();
     let text = o.positional[1..].join(" ");
-    let project = o.project.clone().unwrap_or_else(cwd_project_root);
+    let raw = o.project.clone().unwrap_or_else(cwd_project_root);
+    let project = crate::indexer::canonical_project(&raw).unwrap_or(raw);
     let mut conn = open_db_write()?;
     let now = chrono::Utc::now().timestamp();
     knowledge::record_fact(&conn, &project, &kind, &text, now)?;
