@@ -2,6 +2,7 @@ import { useEffect } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   BarChart3,
+  Compass,
   Database,
   FolderGit2,
   Lightbulb,
@@ -28,6 +29,7 @@ import { useTheme } from "../store/theme";
 const NAV: { id: View; label: string; icon: typeof Search }[] = [
   { id: "search", label: "Search", icon: Search },
   { id: "chat", label: "Chat", icon: MessagesSquare },
+  { id: "coach", label: "Coach", icon: Compass },
   { id: "knowledge", label: "Knowledge", icon: Lightbulb },
   { id: "ask", label: "Ask your history", icon: Sparkles },
   { id: "projects", label: "Project Memory", icon: FolderGit2 },

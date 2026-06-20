@@ -227,6 +227,29 @@ export interface Stats {
   topProjects: ProjectStat[];
 }
 
+// One day's message activity, for the Coach coding heatmap.
+export interface DayActivity {
+  day: number; // unix seconds at UTC midnight
+  messages: number;
+}
+
+// A distilled decision or gotcha in the Coach "this week" digest.
+export interface CoachFact {
+  id: number;
+  threadId: number;
+  text: string;
+  title: string | null;
+  project: string | null;
+  createdAt: number;
+}
+
+export interface CoachOverview {
+  heatmap: DayActivity[];
+  decisions: CoachFact[];
+  gotchas: CoachFact[];
+  since: number;
+}
+
 // A thread in the storage-cleanup list (oldest-first, with size).
 export interface CleanupRow {
   id: number;
@@ -241,6 +264,7 @@ export interface CleanupRow {
 export const api = {
   dbStats: () => invoke<DbStats>("db_stats"),
   indexStats: () => invoke<Stats>("index_stats"),
+  coachOverview: () => invoke<CoachOverview>("coach_overview"),
   // Oldest-first threads with size, for cleanup. before = epoch secs upper bound.
   cleanupCandidates: (opts?: { before?: number; sources?: string[]; limit?: number }) =>
     invoke<CleanupRow[]>("cleanup_candidates", {
