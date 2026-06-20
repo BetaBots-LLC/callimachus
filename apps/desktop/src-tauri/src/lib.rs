@@ -318,12 +318,18 @@ fn index_all(app: AppHandle) -> AppResult<()> {
         // the lock every other UI query needs — WAL lets readers proceed while we write.
         let prog = app.clone();
         let report = db::open(&db::default_index_path()).and_then(|mut c| {
-            let r = indexer::scan_all_with_progress(&mut c, |done, total, current| {
+            // Estimate the total from the existing thread count: on a re-index that's
+            // accurate (≈ one file per thread), giving a real %; on a first run it's 0, so
+            // the UI falls back to an indeterminate bar until rows start landing.
+            let total_est: i64 = c
+                .query_row("SELECT COUNT(*) FROM threads", [], |r| r.get(0))
+                .unwrap_or(0);
+            let r = indexer::scan_all_with_progress(&mut c, |seen, current| {
                 let _ = prog.emit(
                     "index:progress",
                     IndexProgressEvent {
-                        done: done as i64,
-                        total: total as i64,
+                        done: seen as i64,
+                        total: total_est,
                         current: current.to_string(),
                     },
                 );
@@ -355,18 +361,19 @@ fn indexing_status(job: tauri::State<'_, IndexJob>) -> bool {
 #[tauri::command]
 fn index_source(kind: String) -> AppResult<indexer::IndexReport> {
     let mut conn = db::open(&db::default_index_path())?;
+    let noop = &mut || {};
     let report = match kind.as_str() {
-        "claude_code" => indexer::claude::scan(&mut conn)?,
-        "codex" => indexer::codex::scan(&mut conn)?,
-        "cursor" => indexer::cursor::scan(&mut conn)?,
-        "gemini" => indexer::gemini::scan(&mut conn)?,
-        "qwen" => indexer::qwen::scan(&mut conn)?,
-        "goose" => indexer::goose::scan(&mut conn)?,
-        "opencode" => indexer::opencode::scan(&mut conn)?,
-        "continue" => indexer::continue_cli::scan(&mut conn)?,
-        "cline" => indexer::cline::scan(&mut conn)?,
-        "roo" => indexer::roo::scan(&mut conn)?,
-        "kilo" => indexer::kilo::scan(&mut conn)?,
+        "claude_code" => indexer::claude::scan(&mut conn, noop)?,
+        "codex" => indexer::codex::scan(&mut conn, noop)?,
+        "cursor" => indexer::cursor::scan(&mut conn, noop)?,
+        "gemini" => indexer::gemini::scan(&mut conn, noop)?,
+        "qwen" => indexer::qwen::scan(&mut conn, noop)?,
+        "goose" => indexer::goose::scan(&mut conn, noop)?,
+        "opencode" => indexer::opencode::scan(&mut conn, noop)?,
+        "continue" => indexer::continue_cli::scan(&mut conn, noop)?,
+        "cline" => indexer::cline::scan(&mut conn, noop)?,
+        "roo" => indexer::roo::scan(&mut conn, noop)?,
+        "kilo" => indexer::kilo::scan(&mut conn, noop)?,
         other => return Err(anyhow::anyhow!("unknown source kind: {other}").into()),
     };
     Ok(report)
@@ -1730,9 +1737,15 @@ pub fn run() {
 
     builder
         .setup(|app| {
-            let dir = app.path().app_data_dir()?;
-            std::fs::create_dir_all(&dir)?;
-            let db_path = dir.join("index.db");
+            // Resolve the DB the SAME way as the indexer, read pool, watcher, and sidecars
+            // (default_index_path: honors CALLIMACHUS_DB, else the app data dir) so every
+            // component opens one consistent file. Pointing CALLIMACHUS_DB at a throwaway
+            // path is how you exercise a clean first-run / onboarding without touching the
+            // real index.
+            let db_path = db::default_index_path();
+            if let Some(parent) = db_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
             let conn = db::open(&db_path)?; // single WRITER; also runs migrations
                                             // Post-migration: fill canonical project keys for existing threads (fast).
             if let Err(e) = indexer::backfill_project_keys(&conn) {

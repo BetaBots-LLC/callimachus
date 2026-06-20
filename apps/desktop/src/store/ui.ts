@@ -16,6 +16,8 @@ interface UiState {
   targetMessageId: number | null; // scroll-to target when opening from a search hit
   selectedProject: string | null; // active project in the Projects view
   openProject: (project: string) => void; // jump to a project's memory
+  commandOpen: boolean; // the Cmd-K command palette
+  setCommandOpen: (open: boolean) => void;
   setQuery: (q: string) => void;
   toggleSource: (s: SourceKind) => void;
   toggleSubagents: () => void;
@@ -40,6 +42,8 @@ export const useUi = create<UiState>((set) => ({
   targetMessageId: null,
   selectedProject: null,
   openProject: (project) => set({ selectedProject: project, view: "projects" }),
+  commandOpen: false,
+  setCommandOpen: (commandOpen) => set({ commandOpen }),
   setQuery: (query) => set({ query }),
   toggleSource: (s) =>
     set((state) => ({

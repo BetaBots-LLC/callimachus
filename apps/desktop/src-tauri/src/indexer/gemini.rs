@@ -41,7 +41,7 @@ fn collect_chat_jsonl(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 /// Walk every project tmp dir, (re)indexing chat files whose mtime/size changed.
-pub fn scan(conn: &mut Connection) -> Result<IndexReport> {
+pub fn scan(conn: &mut Connection, tick: &mut dyn FnMut()) -> Result<IndexReport> {
     let mut report = IndexReport::default();
     let Some(root) = tmp_root() else {
         return Ok(report);
@@ -55,6 +55,7 @@ pub fn scan(conn: &mut Connection) -> Result<IndexReport> {
     collect_chat_jsonl(&root, &mut files);
 
     for path in files {
+        tick();
         match index_file(conn, sid, &root, &path) {
             Ok(Some(n)) => {
                 report.threads_indexed += 1;
@@ -330,7 +331,7 @@ mod tests {
     #[ignore]
     fn real_gemini_index() {
         let mut conn = crate::db::open(&temp_path("gem_real.db")).unwrap();
-        let report = scan(&mut conn).unwrap();
+        let report = scan(&mut conn, &mut || {}).unwrap();
         eprintln!("{report:?}");
     }
 }

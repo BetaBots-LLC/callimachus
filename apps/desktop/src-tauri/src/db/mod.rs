@@ -53,9 +53,11 @@ pub fn open(path: &Path) -> Result<Connection> {
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     // Wait (don't fail) for a write lock — the app, `cal`, and the MCP server open
-    // the same file from separate processes; a `cal star`/`cal tag` write shouldn't
-    // error just because the app is mid-write.
-    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    // the same file from separate processes, AND in-process the indexer + file watcher
+    // each hold their own write connection. Combined with BEGIN IMMEDIATE on every write
+    // txn (so the busy handler actually engages instead of an instant upgrade-conflict),
+    // a generous timeout lets concurrent writers queue rather than error "database locked".
+    conn.busy_timeout(std::time::Duration::from_secs(15))?;
     // Performance pragmas (defaults are tiny). cache_size is the biggest single win:
     // -65536 = 64 MiB page cache. mmap maps the file for read; temp_store keeps
     // sorts/CTEs in RAM; the WAL caps keep the -wal file from growing unbounded and

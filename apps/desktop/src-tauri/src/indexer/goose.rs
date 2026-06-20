@@ -31,15 +31,15 @@ struct Session {
     working_dir: Option<String>,
 }
 
-pub fn scan(conn: &mut Connection) -> Result<IndexReport> {
+pub fn scan(conn: &mut Connection, tick: &mut dyn FnMut()) -> Result<IndexReport> {
     let Some(db) = sessions_db_path() else {
         return Ok(IndexReport::default());
     };
-    scan_path(conn, &db)
+    scan_path(conn, &db, tick)
 }
 
 /// Index Goose sessions from a specific sessions.db. Skips if the file is unchanged.
-fn scan_path(conn: &mut Connection, db: &Path) -> Result<IndexReport> {
+fn scan_path(conn: &mut Connection, db: &Path, tick: &mut dyn FnMut()) -> Result<IndexReport> {
     let mut report = IndexReport::default();
     if !db.exists() {
         return Ok(report);
@@ -58,6 +58,7 @@ fn scan_path(conn: &mut Connection, db: &Path) -> Result<IndexReport> {
     )?;
 
     for s in sessions {
+        tick();
         let mut messages: Vec<ParsedMessage> = Vec::new();
         let mut first_user: Option<String> = None;
         let mut min_ts: Option<i64> = None;
@@ -245,7 +246,7 @@ mod tests {
         let dst = temp("goose_dst.db");
         let _ = std::fs::remove_file(&dst);
         let mut conn = crate::db::open(&dst).unwrap();
-        let report = scan_path(&mut conn, &src).unwrap();
+        let report = scan_path(&mut conn, &src, &mut || {}).unwrap();
         assert_eq!(report.threads_indexed, 1);
         assert_eq!(report.messages_indexed, 2);
 
@@ -266,6 +267,6 @@ mod tests {
     #[ignore]
     fn real_goose_index() {
         let mut conn = crate::db::open(&temp("goose_real.db")).unwrap();
-        eprintln!("{:?}", scan(&mut conn).unwrap());
+        eprintln!("{:?}", scan(&mut conn, &mut || {}).unwrap());
     }
 }

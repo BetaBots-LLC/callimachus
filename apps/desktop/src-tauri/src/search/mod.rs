@@ -623,7 +623,7 @@ pub fn set_thread_tags(
     tags: &[String],
     now: i64,
 ) -> Result<()> {
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     tx.execute("DELETE FROM thread_tags WHERE thread_id = ?1", [thread_id])?;
     {
         let mut ins = tx.prepare(

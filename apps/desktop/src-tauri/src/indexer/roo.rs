@@ -11,8 +11,8 @@ use std::path::PathBuf;
 pub const KIND: &str = "roo";
 pub const EXT_ID: &str = "rooveterinaryinc.roo-cline";
 
-pub fn scan(conn: &mut Connection) -> Result<IndexReport> {
-    cline::scan_ext(conn, KIND, EXT_ID)
+pub fn scan(conn: &mut Connection, tick: &mut dyn FnMut()) -> Result<IndexReport> {
+    cline::scan_ext(conn, KIND, EXT_ID, tick)
 }
 
 /// Roo's task roots (used by the watcher).
