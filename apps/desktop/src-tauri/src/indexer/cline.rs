@@ -56,7 +56,12 @@ pub fn scan(conn: &mut Connection, tick: &mut dyn FnMut()) -> Result<IndexReport
 
 /// Index a Cline-architecture agent's tasks under `ext_id` into source `kind`.
 /// Shared by Cline, Roo Code, and Kilo Code.
-pub fn scan_ext(conn: &mut Connection, kind: &str, ext_id: &str, tick: &mut dyn FnMut()) -> Result<IndexReport> {
+pub fn scan_ext(
+    conn: &mut Connection,
+    kind: &str,
+    ext_id: &str,
+    tick: &mut dyn FnMut(),
+) -> Result<IndexReport> {
     let mut report = IndexReport::default();
     let roots = task_roots_for(ext_id);
     if roots.is_empty() {
@@ -76,7 +81,7 @@ pub fn scan_ext(conn: &mut Connection, kind: &str, ext_id: &str, tick: &mut dyn 
             if !dir.is_dir() {
                 continue;
             }
-            match index_task(conn, sid, &editor, &dir) {
+            match index_task(conn, sid, kind, &editor, &dir) {
                 Ok(Some(n)) => {
                     report.threads_indexed += 1;
                     report.messages_indexed += n;
@@ -100,7 +105,13 @@ fn editor_tag(tasks_dir: &Path) -> String {
         .to_string()
 }
 
-fn index_task(conn: &mut Connection, sid: i64, editor: &str, dir: &Path) -> Result<Option<usize>> {
+fn index_task(
+    conn: &mut Connection,
+    sid: i64,
+    kind: &str,
+    editor: &str,
+    dir: &Path,
+) -> Result<Option<usize>> {
     let history = dir.join("api_conversation_history.json");
     if !history.is_file() {
         return Ok(None);
@@ -138,7 +149,7 @@ fn index_task(conn: &mut Connection, sid: i64, editor: &str, dir: &Path) -> Resu
     } else {
         0
     };
-    set_file_state(conn, &path_str, KIND, mtime, size)?;
+    set_file_state(conn, &path_str, kind, mtime, size)?;
     Ok(Some(n))
 }
 

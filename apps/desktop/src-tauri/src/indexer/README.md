@@ -56,7 +56,7 @@ Tests: a parse test over a synthetic sample, a search round-trip, and an
 Re-upserting an unchanged thread churns message ids and forces re-embedding. Avoid:
 
 - **One file per thread** (JSONL) — skip on `(mtime, size)` via `file_state` / `set_file_state` (see `claude.rs`, `gemini.rs`).
-- **One DB for all threads** (SQLite) — skip the whole pass with `file_unchanged` on the DB file (see `cursor.rs`, `goose.rs`).
+- **One DB for all threads** (SQLite) — skip the whole pass with `file_change_state` (read-only) on the DB file, then `set_file_state` only after the upserts succeed (see `cursor.rs`, `goose.rs`).
 - **Many files per thread** (OpenCode) — fingerprint the message dir as `(max mtime, file count)` and store it in `file_state` keyed by the session file.
 
 ## Tolerant parsing

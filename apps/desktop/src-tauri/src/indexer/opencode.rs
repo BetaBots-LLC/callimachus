@@ -149,9 +149,9 @@ fn index_session(conn: &mut Connection, sid: i64, root: &Path, sf: &Path) -> Res
         });
     }
 
-    set_file_state(conn, &key, KIND, fp_mtime, fp_count)?;
-
     if messages.is_empty() {
+        // Empty session has no upsert that could fail — safe to record now.
+        set_file_state(conn, &key, KIND, fp_mtime, fp_count)?;
         return Ok(Some(0));
     }
 
@@ -182,7 +182,12 @@ fn index_session(conn: &mut Connection, sid: i64, root: &Path, sf: &Path) -> Res
         is_subagent: false,
         messages,
     };
-    Ok(Some(upsert_thread(conn, sid, &thread)?))
+    let n = upsert_thread(conn, sid, &thread)?;
+    // Record the session fingerprint ONLY after the upsert succeeds, so a failed upsert
+    // (e.g. a transient write-lock) leaves the fingerprint stale and the next pass retries
+    // instead of silently skipping this session forever.
+    set_file_state(conn, &key, KIND, fp_mtime, fp_count)?;
+    Ok(Some(n))
 }
 
 /// Concatenate the text of all `type:"text"` parts of a message, ordered by file.
