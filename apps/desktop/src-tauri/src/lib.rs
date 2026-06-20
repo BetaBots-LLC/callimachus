@@ -404,6 +404,31 @@ fn is_db_locked(e: &anyhow::Error) -> bool {
     s.contains("database is locked") || s.contains("database is busy")
 }
 
+/// Run a short DB write, retrying briefly on transient "database is locked" (another
+/// process — the MCP server, a second app instance — momentarily holds the write
+/// lock) instead of failing the user's click. The mutex is released between tries.
+fn write_retry<T>(
+    db: &db::Db,
+    mut op: impl FnMut(&rusqlite::Connection) -> anyhow::Result<T>,
+) -> AppResult<T> {
+    let mut last: Option<anyhow::Error> = None;
+    for attempt in 0..8 {
+        let res = {
+            let conn = lock(db)?;
+            op(&conn)
+        };
+        match res {
+            Ok(v) => return Ok(v),
+            Err(e) if is_db_locked(&e) => {
+                last = Some(e);
+                std::thread::sleep(std::time::Duration::from_millis(120 * (attempt + 1)));
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err(last.unwrap_or_else(|| anyhow::anyhow!("database stayed locked")).into())
+}
+
 /// Kick off (or no-op if already running) a background job that embeds all pending
 /// messages batch-by-batch, releasing the DB lock between batches.
 #[tauri::command]
@@ -701,18 +726,14 @@ async fn distill_thread(
 /// Pin or unpin a distilled fact (pinned ranks first + survives re-distill).
 #[tauri::command]
 fn set_fact_pinned(db: tauri::State<'_, db::Db>, fact_id: i64, pinned: bool) -> AppResult<()> {
-    let conn = lock(&db)?;
-    knowledge::set_fact_pinned(&conn, fact_id, pinned)?;
-    Ok(())
+    write_retry(&db, |conn| knowledge::set_fact_pinned(conn, fact_id, pinned))
 }
 
 /// Hide (soft-delete) or restore a fact. Hidden facts are kept as a tombstone so
 /// re-distillation won't bring them back.
 #[tauri::command]
 fn hide_fact(db: tauri::State<'_, db::Db>, fact_id: i64, hidden: bool) -> AppResult<()> {
-    let conn = lock(&db)?;
-    knowledge::set_fact_hidden(&conn, fact_id, hidden)?;
-    Ok(())
+    write_retry(&db, |conn| knowledge::set_fact_hidden(conn, fact_id, hidden))
 }
 
 /// Edit a fact's text. Re-embeds it so cross-thread recall matches the new wording.
@@ -723,10 +744,7 @@ fn edit_fact(
     fact_id: i64,
     text: String,
 ) -> AppResult<()> {
-    {
-        let conn = lock(&db)?;
-        knowledge::edit_fact(&conn, fact_id, &text)?;
-    }
+    write_retry(&db, |conn| knowledge::edit_fact(conn, fact_id, &text))?;
     if let Err(e) = embed::embed_pending_facts(&db, &embedder) {
         eprintln!("[knowledge] re-embed edited fact: {e}");
     }

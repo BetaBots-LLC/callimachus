@@ -1,7 +1,7 @@
 import { type ReactNode, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Pencil, Pin, Trash2 } from "lucide-react";
-import { api, type MemoryFact } from "../lib/api";
+import { api, type MemoryFact, type ProjectMemory } from "../lib/api";
 import { useUi } from "../store/ui";
 import { shortPath } from "../lib/format";
 import { Badge } from "@/components/ui/badge";
@@ -14,6 +14,8 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { Item, ItemActions, ItemContent, ItemDescription, ItemTitle } from "@/components/ui/item";
+import { cn } from "@/lib/utils";
 import { Loading } from "./Loading";
 import { Markdown } from "./Markdown";
 
@@ -75,31 +77,78 @@ export function ProjectMemoryView() {
   });
   const conflicts = useMutation({ mutationFn: () => api.detectConflicts(project as string) });
 
-  // Curation actions (pin / hide / edit a fact) — all refresh the project's memory.
-  const refreshMem = () => qc.invalidateQueries({ queryKey: ["project_memory", project] });
+  // Curation actions (pin / hide / edit). Each updates the cached memory optimistically
+  // so the UI reacts instantly, rolls back + surfaces the error if the write fails, and
+  // resyncs on settle. (Writes go through the app's single writer; a failure here means
+  // a real backend error, which we now show instead of silently freezing.)
+  const memKey = ["project_memory", project] as const;
+  const refreshMem = () => qc.invalidateQueries({ queryKey: memKey });
+  const [curationError, setCurationError] = useState<string | null>(null);
+
+  function optimistic<V>(mapFor: (v: V) => (facts: MemoryFact[]) => MemoryFact[]) {
+    return {
+      onMutate: async (v: V): Promise<{ prev?: ProjectMemory }> => {
+        setCurationError(null);
+        await qc.cancelQueries({ queryKey: memKey });
+        const prev = qc.getQueryData<ProjectMemory>(memKey);
+        if (prev) {
+          const map = mapFor(v);
+          qc.setQueryData<ProjectMemory>(memKey, {
+            ...prev,
+            decisions: map(prev.decisions),
+            gotchas: map(prev.gotchas),
+            openTodos: map(prev.openTodos),
+          });
+        }
+        return { prev };
+      },
+      onError: (e: unknown, _v: V, ctx: { prev?: ProjectMemory } | undefined) => {
+        if (ctx?.prev) qc.setQueryData(memKey, ctx.prev);
+        setCurationError(`Couldn't save: ${e}`);
+      },
+      onSettled: () => refreshMem(),
+    };
+  }
+
   const pin = useMutation({
     mutationFn: (v: { id: number; pinned: boolean }) => api.setFactPinned(v.id, v.pinned),
-    onSuccess: refreshMem,
+    ...optimistic(
+      (v: { id: number; pinned: boolean }) => (fs) =>
+        fs.map((f) => (f.id === v.id ? { ...f, pinned: v.pinned } : f)),
+    ),
   });
   const hideFact = useMutation({
     mutationFn: (id: number) => api.hideFact(id, true),
-    onSuccess: refreshMem,
+    ...optimistic((id: number) => (fs) => fs.filter((f) => f.id !== id)),
   });
   const editFact = useMutation({
     mutationFn: (v: { id: number; text: string }) => api.editFact(v.id, v.text),
-    onSuccess: refreshMem,
+    ...optimistic(
+      (v: { id: number; text: string }) => (fs) =>
+        fs.map((f) => (f.id === v.id ? { ...f, text: v.text } : f)),
+    ),
   });
+  // Locally remember hidden facts so the conflicts panel (a mutation result, not a
+  // query) updates immediately — hiding a decision resolves any conflict it's in.
+  const [hiddenIds, setHiddenIds] = useState<Set<number>>(() => new Set());
   const factActions: FactActions = {
     onOpen: (threadId) => {
       selectThread(threadId);
       setView("search");
     },
     onPin: (id, pinned) => pin.mutate({ id, pinned }),
-    onHide: (id) => hideFact.mutate(id),
+    onHide: (id) => {
+      setHiddenIds((prev) => new Set(prev).add(id));
+      hideFact.mutate(id);
+    },
     onEdit: (id, text) => editFact.mutate({ id, text }),
   };
 
   const mem = memory.data;
+  // A conflict is resolved once either of its two decisions is hidden.
+  const visibleConflicts = (conflicts.data ?? []).filter(
+    (c) => !hiddenIds.has(c.aId) && !hiddenIds.has(c.bId),
+  );
   const isDistilling = !!distilling.data;
   const pct =
     progress.data && progress.data.total > 0
@@ -188,6 +237,7 @@ export function ProjectMemoryView() {
         {writeFile.data && (
           <p className="truncate text-xs text-muted-foreground">Wrote {writeFile.data}</p>
         )}
+        {curationError && <p className="text-xs text-destructive">{curationError}</p>}
       </div>
 
       <div className="min-h-0 flex-1 overflow-y-auto">
@@ -203,12 +253,12 @@ export function ProjectMemoryView() {
               </div>
             )}
             {conflicts.data &&
-              (conflicts.data.length > 0 ? (
+              (visibleConflicts.length > 0 ? (
                 <div className="space-y-3 rounded-lg border border-amber-500/50 bg-amber-500/5 p-3">
                   <div className="text-[0.7rem] font-medium uppercase tracking-wide text-amber-600 dark:text-amber-400">
-                    Possible conflicts ({conflicts.data.length})
+                    Possible conflicts ({visibleConflicts.length})
                   </div>
-                  {conflicts.data.map((c) => (
+                  {visibleConflicts.map((c) => (
                     <div key={`${c.aId}-${c.bId}`} className="space-y-1.5 text-sm">
                       <p className="text-muted-foreground">{c.reason}</p>
                       {[
@@ -275,43 +325,51 @@ function Section({
 }) {
   if (!facts.length) return null;
   return (
-    <div>
-      <div className="mb-1.5 text-[0.7rem] font-medium uppercase tracking-wide text-muted-foreground">
-        {title} ({facts.length})
-      </div>
-      <ul className="space-y-1.5">
+    <section>
+      <h3 className="mb-2 flex items-baseline gap-2 px-1 text-[0.7rem] font-medium uppercase tracking-wider text-muted-foreground">
+        {title}
+        <span className="font-mono text-[0.65rem] tabular-nums text-muted-foreground/60">
+          {facts.length}
+        </span>
+      </h3>
+      <div className="flex flex-col gap-1.5">
         {facts.map((f) => (
           <FactRow key={f.id} fact={f} actions={actions} />
         ))}
-      </ul>
-    </div>
+      </div>
+    </section>
   );
 }
 
-/** One fact: click to open its thread; hover for pin / edit / delete; inline edit. */
+/** One fact: click to open its thread; hover reveals pin / edit / delete; inline edit. */
 function FactRow({ fact, actions }: { fact: MemoryFact; actions: FactActions }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(fact.text);
 
   if (editing) {
+    const save = () => {
+      const t = draft.trim();
+      if (t && t !== fact.text) actions.onEdit(fact.id, t);
+      setEditing(false);
+    };
     return (
-      <li className="flex items-start gap-1 rounded-md border p-2">
+      <Item variant="outline" className="items-stretch gap-2 ring-1 ring-ring/30">
         <textarea
           // biome-ignore lint/a11y/noAutofocus: focus the edit field the user just opened
           autoFocus
           value={draft}
           onChange={(e) => setDraft(e.currentTarget.value)}
-          className="min-h-16 flex-1 resize-y rounded bg-transparent text-sm outline-none"
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) save();
+            if (e.key === "Escape") {
+              setDraft(fact.text);
+              setEditing(false);
+            }
+          }}
+          className="min-h-16 flex-1 resize-y bg-transparent text-sm leading-relaxed outline-none placeholder:text-muted-foreground"
         />
         <div className="flex shrink-0 flex-col gap-1">
-          <Button
-            size="xs"
-            onClick={() => {
-              const t = draft.trim();
-              if (t && t !== fact.text) actions.onEdit(fact.id, t);
-              setEditing(false);
-            }}
-          >
+          <Button size="xs" onClick={save}>
             Save
           </Button>
           <Button
@@ -325,27 +383,45 @@ function FactRow({ fact, actions }: { fact: MemoryFact; actions: FactActions }) 
             Cancel
           </Button>
         </div>
-      </li>
+      </Item>
     );
   }
 
   return (
-    <li className="group flex items-start gap-1">
-      <button
-        type="button"
-        onClick={() => actions.onOpen(fact.threadId)}
-        className="flex-1 cursor-pointer rounded-md border px-3 py-2 text-left text-sm transition-colors hover:bg-muted/50"
-      >
-        {fact.pinned && <Pin className="mr-1 inline size-3 fill-current text-amber-500" />}
-        {fact.text}
-        {fact.title && <span className="ml-1 text-xs text-muted-foreground">· {fact.title}</span>}
-      </button>
-      <div className="flex shrink-0 flex-col gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
+    <Item
+      variant="outline"
+      role="button"
+      tabIndex={0}
+      onClick={() => actions.onOpen(fact.threadId)}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          actions.onOpen(fact.threadId);
+        }
+      }}
+      className={cn(
+        "cursor-pointer items-start transition-colors hover:bg-muted/40 focus-visible:bg-muted/40",
+        fact.pinned && "border-amber-500/25 bg-amber-500/4",
+      )}
+    >
+      <ItemContent>
+        <ItemTitle className="block w-full font-normal leading-relaxed line-clamp-none">
+          {fact.pinned && (
+            <Pin className="mr-1.5 inline size-3 -translate-y-px fill-amber-500 text-amber-500" />
+          )}
+          {fact.text}
+        </ItemTitle>
+        {fact.title && <ItemDescription className="line-clamp-1">{fact.title}</ItemDescription>}
+      </ItemContent>
+      {/* Reserved width + invisible→visible keeps the row from reflowing and the
+          actions from ever getting "stuck"; opacity gives a smooth fade-in.
+          Revealed on hover and on keyboard focus-within (a11y). */}
+      <ItemActions className="invisible self-start gap-0.5 opacity-0 transition-opacity duration-150 group-hover/item:visible group-hover/item:opacity-100 group-focus-within/item:visible group-focus-within/item:opacity-100">
         <IconBtn
           title={fact.pinned ? "Unpin" : "Pin"}
           onClick={() => actions.onPin(fact.id, !fact.pinned)}
         >
-          <Pin className={`size-3.5 ${fact.pinned ? "fill-current text-amber-500" : ""}`} />
+          <Pin className={cn("size-3.5", fact.pinned && "fill-amber-500 text-amber-500")} />
         </IconBtn>
         <IconBtn title="Edit" onClick={() => setEditing(true)}>
           <Pencil className="size-3.5" />
@@ -353,8 +429,8 @@ function FactRow({ fact, actions }: { fact: MemoryFact; actions: FactActions }) 
         <IconBtn title="Delete" onClick={() => actions.onHide(fact.id)}>
           <Trash2 className="size-3.5" />
         </IconBtn>
-      </div>
-    </li>
+      </ItemActions>
+    </Item>
   );
 }
 
@@ -371,8 +447,12 @@ function IconBtn({
     <button
       type="button"
       title={title}
-      onClick={onClick}
-      className="cursor-pointer rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
+      // The row (Item) is clickable; stop the action click from opening the thread.
+      onClick={(e) => {
+        e.stopPropagation();
+        onClick();
+      }}
+      className="grid size-7 place-items-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
     >
       {children}
     </button>
