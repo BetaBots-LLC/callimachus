@@ -213,11 +213,10 @@ fn vacuum_db(db: tauri::State<'_, db::Db>) -> AppResult<()> {
 /// the report) when finished; no-op if one is already running.
 #[tauri::command]
 fn index_all(app: AppHandle) -> AppResult<()> {
-    if app.state::<EmbedJob>().0.load(Ordering::Relaxed)
-        || app.state::<DistillJob>().0.load(Ordering::Relaxed)
-    {
-        return Ok(()); // a semantic build / distill is writing — don't fight for the lock
+    if app.state::<EmbedJob>().0.load(Ordering::Relaxed) {
+        return Ok(()); // a semantic build is writing — don't fight for the lock
     }
+    // Note: a running distill does NOT block reindex — the distill loop yields to us.
     if app.state::<IndexJob>().0.swap(true, Ordering::SeqCst) {
         return Ok(()); // already running
     }
@@ -239,6 +238,8 @@ fn index_all(app: AppHandle) -> AppResult<()> {
             indexer::IndexReport::default()
         });
         let _ = app.emit("index:done", report);
+        // Newly indexed threads may need distilling — drain them if auto-distill is on.
+        auto_distill_kick(&app);
     });
     Ok(())
 }
@@ -349,11 +350,10 @@ fn is_db_locked(e: &anyhow::Error) -> bool {
 /// messages batch-by-batch, releasing the DB lock between batches.
 #[tauri::command]
 fn build_embeddings(app: AppHandle) -> AppResult<()> {
-    if app.state::<IndexJob>().0.load(Ordering::Relaxed)
-        || app.state::<DistillJob>().0.load(Ordering::Relaxed)
-    {
-        return Ok(()); // a reindex / distill is writing — don't fight it for the write lock
+    if app.state::<IndexJob>().0.load(Ordering::Relaxed) {
+        return Ok(()); // a reindex is writing — don't fight it for the write lock
     }
+    // Note: a running distill does NOT block the embed build — the distill loop yields.
     let job = app.state::<EmbedJob>();
     if job.0.swap(true, Ordering::SeqCst) {
         return Ok(()); // already running
@@ -511,6 +511,20 @@ fn list_open_todos(
 fn knowledge_config(db: tauri::State<'_, db::Db>) -> AppResult<knowledge::KnowledgeConfig> {
     let conn = lock(&db)?;
     Ok(knowledge::get_config(&conn)?)
+}
+
+/// Toggle background auto-distillation. Turning it ON kicks an immediate drain.
+#[tauri::command]
+fn set_auto_distill(app: AppHandle, on: bool) -> AppResult<()> {
+    {
+        let db = app.state::<db::Db>();
+        let conn = lock(&db)?;
+        knowledge::set_auto_distill(&conn, on)?;
+    }
+    if on {
+        auto_distill_kick(&app);
+    }
+    Ok(())
 }
 
 /// Enable/disable distillation and pick the engine. Enabling is the user's consent.
@@ -701,22 +715,32 @@ fn cancel_distill(job: tauri::State<'_, DistillJob>) {
     job.0.store(false, Ordering::SeqCst);
 }
 
-/// Distill every not-yet-distilled thread in a project, in the BACKGROUND, so the whole
-/// project's memory fills in. Rate-limited + cancellable; mutually exclusive with reindex
-/// and the embedding build (all share one write lock). Emits distill:progress / distill:done.
+/// Threads per auto-distill round before re-checking the gates (so a reindex/embed can
+/// preempt promptly, and the first run on a big history doesn't commit to it all at once).
+const AUTO_DISTILL_BATCH: i64 = 25;
+
+/// Distill every not-yet-distilled thread in a project, in the BACKGROUND, so the project's
+/// memory fills in. Paced + cancellable; yields to a reindex / embed build if one starts.
+/// Emits distill:progress / distill:done.
 #[tauri::command]
 fn distill_project(app: AppHandle, project: String) -> AppResult<()> {
     if app.state::<IndexJob>().0.load(Ordering::Relaxed)
         || app.state::<EmbedJob>().0.load(Ordering::Relaxed)
     {
-        return Ok(()); // a reindex / embed build is writing — don't fight for the lock
+        return Ok(()); // a reindex / embed build is writing — start later
     }
     if app.state::<DistillJob>().0.swap(true, Ordering::SeqCst) {
         return Ok(()); // already running
     }
     tauri::async_runtime::spawn(async move {
-        if let Err(e) = run_project_distill(&app, &project).await {
-            eprintln!("[distill] {e}");
+        let ids = {
+            let db = app.state::<db::Db>();
+            db.0.lock().ok().and_then(|c| knowledge::project_pending_threads(&c, &project).ok())
+        };
+        if let Some(ids) = ids {
+            if let Err(e) = run_distill(&app, ids).await {
+                eprintln!("[distill] {e}");
+            }
         }
         app.state::<DistillJob>().0.store(false, Ordering::SeqCst);
         let _ = app.emit("distill:done", ());
@@ -724,21 +748,27 @@ fn distill_project(app: AppHandle, project: String) -> AppResult<()> {
     Ok(())
 }
 
-async fn run_project_distill(app: &AppHandle, project: &str) -> anyhow::Result<()> {
+/// Distill a worklist of thread ids with the resolved engine. Paced (so a cloud provider
+/// isn't hammered), cancellable (DistillJob cleared), and yields to a user-initiated
+/// reindex / embed build. Shared by the project distill and the background auto-distill.
+async fn run_distill(app: &AppHandle, ids: Vec<i64>) -> anyhow::Result<()> {
+    if ids.is_empty() {
+        return Ok(());
+    }
     let db = app.state::<db::Db>();
     let embedder = app.state::<embed::Embedder>();
-    // Engine + worklist under the lock, then release it for the LLM calls.
-    let (provider, model, key, ids) = {
+    let (provider, model, key) = {
         let conn = lock_anyhow(&db)?;
-        let (provider, model, key) = resolve_distill_engine(&conn)?;
-        let ids = knowledge::project_pending_threads(&conn, project)?;
-        (provider, model, key, ids)
+        resolve_distill_engine(&conn)?
     };
     let total = ids.len() as i64;
     let _ = app.emit("distill:progress", DistillProgressEvent { done: 0, total });
     for (i, tid) in ids.into_iter().enumerate() {
-        // cancel_distill clears the flag to stop us here.
-        if !app.state::<DistillJob>().0.load(Ordering::Relaxed) {
+        // Stop if canceled, or yield to a user-initiated reindex / embed build.
+        if !app.state::<DistillJob>().0.load(Ordering::Relaxed)
+            || app.state::<IndexJob>().0.load(Ordering::Relaxed)
+            || app.state::<EmbedJob>().0.load(Ordering::Relaxed)
+        {
             break;
         }
         let packed = {
@@ -768,6 +798,43 @@ async fn run_project_distill(app: &AppHandle, project: &str) -> anyhow::Result<(
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
     Ok(())
+}
+
+/// Kick a background auto-distill drain: distill pending threads corpus-wide so the
+/// knowledge surfaces (Ask / recall / Project Memory) self-populate. No-op unless
+/// distillation AND auto-distill are enabled and nothing else is running. Drains in
+/// batches, re-checking the gates each round, and yields to reindex / embed.
+fn auto_distill_kick(app: &AppHandle) {
+    if app.state::<IndexJob>().0.load(Ordering::Relaxed)
+        || app.state::<EmbedJob>().0.load(Ordering::Relaxed)
+    {
+        return;
+    }
+    let ids = {
+        let db = app.state::<db::Db>();
+        let Ok(conn) = db.0.lock() else { return };
+        let Ok(cfg) = knowledge::get_config(&conn) else { return };
+        if !cfg.enabled || !cfg.auto_distill {
+            return;
+        }
+        knowledge::pending_threads(&conn, AUTO_DISTILL_BATCH).unwrap_or_default()
+    };
+    if ids.is_empty() {
+        return;
+    }
+    if app.state::<DistillJob>().0.swap(true, Ordering::SeqCst) {
+        return; // a distill is already running
+    }
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Err(e) = run_distill(&app, ids).await {
+            eprintln!("[auto-distill] {e}");
+        }
+        app.state::<DistillJob>().0.store(false, Ordering::SeqCst);
+        let _ = app.emit("distill:done", ());
+        // More may remain (and nothing preempted us) — drain the next batch.
+        auto_distill_kick(&app);
+    });
 }
 
 /// Cross-thread semantic recall of distilled DECISIONS, matched to a query.
@@ -1286,6 +1353,8 @@ pub fn run() {
                     if let Err(e) = embed::embed_pending_facts(&db, &embedder) {
                         eprintln!("[knowledge] startup fact embed: {e}");
                     }
+                    // Then catch up on any auto-distillation owed (no-op unless enabled).
+                    auto_distill_kick(&app);
                 });
             }
             Ok(())
@@ -1327,6 +1396,7 @@ pub fn run() {
             list_open_todos,
             knowledge_config,
             set_knowledge_config,
+            set_auto_distill,
             thread_knowledge,
             distill_thread,
             recall_decisions,

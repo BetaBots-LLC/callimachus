@@ -88,19 +88,42 @@ export function SearchBar() {
     staleTime: Number.POSITIVE_INFINITY,
   });
 
-  // One progress bar, whichever long job is active (they're mutually exclusive).
+  // Background auto-distill: status flag + per-thread progress (distill:* events).
+  const distilling = useQuery({
+    queryKey: ["distill_status"],
+    queryFn: api.distillingStatus,
+    refetchInterval: (q) => (q.state.data ? 1500 : false),
+  });
+  const distillProgress = useQuery<{ done: number; total: number } | null>({
+    queryKey: ["distill_progress"],
+    queryFn: () =>
+      queryClient.getQueryData<{ done: number; total: number }>(["distill_progress"]) ?? null,
+    staleTime: Number.POSITIVE_INFINITY,
+  });
+
+  // One progress bar, whichever long job is active. Priority: index > embed > distill
+  // (distill is background and yields to the others).
   const ip = indexProgress.data;
-  const jobActive = embed.data?.running || indexing.data;
+  const dp = distillProgress.data;
+  const jobActive = embed.data?.running || indexing.data || distilling.data;
   const jobPct = embed.data?.running
     ? embedPct
-    : ip && ip.total > 0
-      ? Math.round((ip.done / ip.total) * 100)
-      : 0;
+    : indexing.data
+      ? ip && ip.total > 0
+        ? Math.round((ip.done / ip.total) * 100)
+        : 0
+      : dp && dp.total > 0
+        ? Math.round((dp.done / dp.total) * 100)
+        : 0;
   const jobLabel = embed.data?.running
     ? `Building semantic index · ${embed.data.done.toLocaleString()} / ${embed.data.total.toLocaleString()} messages`
-    : ip?.current
-      ? `Indexing ${SOURCE_LABELS[ip.current as SourceKind] ?? ip.current}…`
-      : "Indexing…";
+    : indexing.data
+      ? ip?.current
+        ? `Indexing ${SOURCE_LABELS[ip.current as SourceKind] ?? ip.current}…`
+        : "Indexing…"
+      : dp
+        ? `Distilling knowledge · ${dp.done} / ${dp.total} threads`
+        : "Distilling knowledge…";
 
   // How many "More" sources are active — surfaced on the dropdown so a hidden
   // filter is never silently in effect.
