@@ -68,6 +68,8 @@ function CliPage() {
               'cal remember decision "use sqlite-vec for the KNN index"',
               "# close out a leftover TODO",
               "cal done 137",
+              "# inject the repo's memory into AGENTS.md so any agent reads it",
+              "cal agents",
             ]}
           />
         </div>

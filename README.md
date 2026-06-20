@@ -26,7 +26,7 @@ Grab the latest signed build from **[Releases](../../releases/latest)** — macO
 - **Finds code-aware** — type `file:embed/mod.rs` in the search bar (or `cal files <path>`) to find every thread that touched a path; backed by a file-mention index built at index time.
 - **Distills knowledge** — free heuristic TODO extraction, plus opt-in LLM distillation of decisions, gotchas, and summaries, with cross-thread semantic recall of past decisions/gotchas. Optional **auto-distillation** drains new/changed threads in the background so memory self-populates. Needs local Ollama (keyless) or a cloud API key.
 - **Curates the facts** — pin, edit, or delete distilled facts so your edits survive re-distilling, plus an LLM **"Review conflicts"** pass that flags decisions that contradict each other.
-- **Remembers per project** — a **Projects** tab aggregates each repo's decisions, gotchas, and open TODOs into durable memory, with an LLM brief and a managed `.callimachus/memory.md`; that memory is prepended when you "Open in CLI" so the agent starts with what was already decided.
+- **Remembers per project** — a **Projects** tab aggregates each repo's decisions, gotchas, and open TODOs into durable memory (grouped by a canonical project key, so worktrees / symlinks / `~` don't split one repo), with an LLM brief and a managed `.callimachus/memory.md`. That memory is prepended when you "Open in CLI", and you can inject it into any agent automatically: **Update AGENTS.md** (or `cal agents`) writes a managed block into the repo's `AGENTS.md` / `CLAUDE.md`, and `cal hook` feeds it to a Claude Code SessionStart hook.
 - **Asks your history (RAG)** — a synthesized, cited answer over your own threads, with `[thread N]` citations back to the sources it used. Needs an LLM engine (Knowledge/distillation enabled).
 - **Organizes into collections** — star threads and attach free-form tags, then filter the list by starred or by tag.
 - **Chats** with an in-app agent (Anthropic / OpenAI / Gemini / OpenRouter / Ollama — your key, your choice) that can **search your own history** and **run shell commands with your approval**; streaming, cancellable, with live model lists. Chats are saved and become searchable too.
@@ -110,9 +110,11 @@ cal files embed/mod.rs                     # threads that touched a file path
 cal memory                                 # this repo's distilled memory (decisions/gotchas/TODOs)
 cal done 17                                # mark an open TODO done (id from `cal todos`)
 cal remember decision "use sqlite-vec for KNN"  # record a fact into the repo's memory
+cal agents                                 # write the repo's memory into AGENTS.md (any agent reads it)
+cal hook                                   # print the repo's memory (use as a Claude Code SessionStart hook)
 ```
 
-`star`, `tag`, `tags`, `todos`, `knowledge`, `distill`, `decisions`, `gotchas`, and `related` also exist — run `cal help` for all 19.
+`star`, `tag`, `tags`, `todos`, `knowledge`, `distill`, `decisions`, `gotchas`, and `related` also exist — run `cal help` for all 21.
 
 **VS Code / Cursor** — the extension adds a "Callimachus History" sidebar, a status-bar search button, and commands to search / insert / copy threads (it shells out to `cal`). Install from the **[VS Code Marketplace](https://marketplace.visualstudio.com/)** or **[Open VSX](https://open-vsx.org/)** (the registry **Cursor** and VSCodium use), or grab the `.vsix` from [Releases](../../releases). See [apps/vscode/README.md](apps/vscode/README.md).
 
