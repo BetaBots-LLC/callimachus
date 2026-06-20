@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Callimachus</title>
+    <style>
+      /* Standalone splash window (Tauri loads this instantly, before the main app's
+         bundle). Mirrors the app's neutral-dark theme; the one accent is the brand's
+         warm sunset (the icon + the loading sweep). No build step, no dependencies. */
+      :root {
+        --bg: #0a0a0a;
+        --fg: #fafafa;
+        --muted: #a1a1a1;
+        --border: rgba(255, 255, 255, 0.12);
+        --accent: #c16e2c;
+      }
+      * {
+        margin: 0;
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        height: 100%;
+      }
+      body {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 1.5rem;
+        background: var(--bg);
+        color: var(--fg);
+        font-family:
+          "Geist Variable", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+        user-select: none;
+        cursor: default;
+        overflow: hidden;
+      }
+      .logo {
+        width: 80px;
+        height: 80px;
+        border-radius: 1.15rem;
+        box-shadow: 0 6px 24px rgba(0, 0, 0, 0.45);
+        outline: 1px solid var(--border);
+        animation: rise 0.5s cubic-bezier(0.16, 1, 0.3, 1) both;
+      }
+      .wordmark {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 0.25rem;
+        animation: rise 0.5s cubic-bezier(0.16, 1, 0.3, 1) 0.07s both;
+      }
+      .wordmark h1 {
+        font-size: 1.5rem;
+        font-weight: 600;
+        letter-spacing: -0.02em;
+      }
+      .wordmark p {
+        font-size: 0.75rem;
+        color: var(--muted);
+      }
+      .track {
+        position: relative;
+        width: 11rem;
+        height: 1px;
+        overflow: hidden;
+        border-radius: 9999px;
+        background: var(--border);
+        animation: rise 0.5s cubic-bezier(0.16, 1, 0.3, 1) 0.14s both;
+      }
+      .track .bar {
+        position: absolute;
+        inset: 0;
+        width: 33%;
+        border-radius: 9999px;
+        background: var(--accent);
+        animation: sweep 1.15s ease-in-out infinite;
+      }
+      @keyframes rise {
+        from {
+          opacity: 0;
+          transform: translateY(6px);
+        }
+        to {
+          opacity: 1;
+          transform: none;
+        }
+      }
+      @keyframes sweep {
+        0% {
+          transform: translateX(-120%);
+        }
+        100% {
+          transform: translateX(320%);
+        }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .logo,
+        .wordmark,
+        .track {
+          animation: none;
+        }
+        .track .bar {
+          animation: none;
+          width: 100%;
+          opacity: 0.6;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <img class="logo" src="/icon.svg" alt="" />
+    <div class="wordmark">
+      <h1>Callimachus</h1>
+      <p>Cataloguing your coding history…</p>
+    </div>
+    <div class="track"><div class="bar"></div></div>
+  </body>
+</html>
