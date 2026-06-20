@@ -261,6 +261,14 @@ fn index_stats(pool: tauri::State<'_, db::ReadPool>) -> AppResult<search::Stats>
     Ok(search::stats(&conn)?)
 }
 
+/// Proactive Coach dashboard: a daily-activity heatmap + the last week's distilled
+/// decisions and gotchas.
+#[tauri::command]
+fn coach_overview(pool: tauri::State<'_, db::ReadPool>) -> AppResult<search::CoachOverview> {
+    let conn = read(&pool)?;
+    Ok(search::coach_overview(&conn, chrono::Utc::now().timestamp())?)
+}
+
 /// Oldest-first list of threads with their size, for the storage-cleanup UI.
 #[tauri::command]
 fn cleanup_candidates(
@@ -1823,6 +1831,7 @@ pub fn run() {
             list_open_todos,
             knowledge_config,
             set_complete,
+            coach_overview,
             set_knowledge_config,
             set_auto_distill,
             thread_knowledge,

@@ -37,5 +37,7 @@ pub static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
         M::up(include_str!("../../migrations/0015_fact_curation.sql")),
         // 0016 — canonical project key for stable per-project grouping.
         M::up(include_str!("../../migrations/0016_project_key.sql")),
+        // 0017 — index messages.ts for the Coach activity heatmap range scan.
+        M::up(include_str!("../../migrations/0017_messages_ts.sql")),
     ])
 });

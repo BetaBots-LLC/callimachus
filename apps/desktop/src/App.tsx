@@ -4,6 +4,7 @@ import { SearchBar } from "./components/SearchBar";
 import { ResultsList } from "./components/ResultsList";
 import { ThreadView } from "./components/ThreadView";
 import { ChatView } from "./components/ChatView";
+import { CoachView } from "./components/CoachView";
 import { KnowledgeView } from "./components/KnowledgeView";
 import { AskView } from "./components/AskView";
 import { ProjectMemoryView } from "./components/ProjectMemoryView";
@@ -42,6 +43,7 @@ function App() {
     (import.meta.env.VITE_ONBOARD === "1" || localStorage.getItem("cal:onboard") === "1");
   const tabs: { id: View; label: string }[] = [
     ...TABS.slice(0, 2),
+    { id: "coach", label: "Coach" },
     { id: "knowledge", label: "Knowledge" },
     { id: "ask", label: "Ask" },
     { id: "projects", label: "Projects" },
@@ -104,6 +106,7 @@ function App() {
             </>
           ))}
         {view === "chat" && <ChatView />}
+        {view === "coach" && <CoachView />}
         {view === "knowledge" && (
           <KnowledgeGate
             enabled={on}

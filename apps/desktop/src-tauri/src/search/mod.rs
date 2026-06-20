@@ -550,6 +550,91 @@ pub fn stats(conn: &Connection) -> Result<Stats> {
     })
 }
 
+/// One day's message activity, for the Coach coding heatmap.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DayActivity {
+    pub day: i64, // unix seconds at UTC midnight
+    pub messages: i64,
+}
+
+/// A distilled decision or gotcha surfaced in the Coach "this week" digest.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CoachFact {
+    pub id: i64,
+    pub thread_id: i64,
+    pub text: String,
+    pub title: Option<String>,
+    pub project: Option<String>,
+    pub created_at: i64,
+}
+
+/// Proactive dashboard data: a daily-activity heatmap plus the decisions and gotchas
+/// captured in the last week (so the memory layer surfaces insight, not just answers).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CoachOverview {
+    pub heatmap: Vec<DayActivity>,
+    pub decisions: Vec<CoachFact>,
+    pub gotchas: Vec<CoachFact>,
+    pub since: i64, // window start (unix s) for the decisions/gotchas digest
+}
+
+/// Build the Coach overview as of `now` (unix seconds): ~52 weeks of daily activity and
+/// the last 7 days of decisions / gotchas (LLM-distilled or agent-recorded).
+pub fn coach_overview(conn: &Connection, now: i64) -> Result<CoachOverview> {
+    let heatmap_since = now - 364 * 86_400;
+    let heatmap = {
+        // Human-facing activity only: skip subagent transcripts and tool/system rows so the
+        // grid reflects sessions you drove, not machine chatter (mirrors the app's lists).
+        let mut stmt = conn.prepare(
+            "SELECT (m.ts / 86400) * 86400 AS day, COUNT(*)
+             FROM messages m JOIN threads t ON t.id = m.thread_id
+             WHERE m.ts IS NOT NULL AND m.ts >= ?1
+               AND t.is_subagent = 0 AND m.role IN ('user', 'assistant')
+             GROUP BY day ORDER BY day",
+        )?;
+        let rows = stmt
+            .query_map([heatmap_since], |r| {
+                Ok(DayActivity { day: r.get(0)?, messages: r.get(1)? })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+
+    let since = now - 7 * 86_400;
+    let recent = |kind: &str| -> Result<Vec<CoachFact>> {
+        let mut stmt = conn.prepare(
+            "SELECT f.id, f.thread_id, f.text, t.title,
+                    COALESCE(t.project_key, t.project_path), f.created_at
+             FROM facts f JOIN threads t ON t.id = f.thread_id
+             WHERE f.kind = ?1 AND f.hidden = 0 AND f.created_at >= ?2
+             ORDER BY f.created_at DESC LIMIT 40",
+        )?;
+        let rows = stmt
+            .query_map(rusqlite::params![kind, since], |r| {
+                Ok(CoachFact {
+                    id: r.get(0)?,
+                    thread_id: r.get(1)?,
+                    text: r.get(2)?,
+                    title: r.get(3)?,
+                    project: r.get(4)?,
+                    created_at: r.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    };
+
+    Ok(CoachOverview {
+        heatmap,
+        decisions: recent("decision")?,
+        gotchas: recent("gotcha")?,
+        since,
+    })
+}
+
 /// Full detail + ordered messages for one thread.
 pub fn thread_detail(conn: &Connection, thread_id: i64) -> Result<Option<ThreadDetail>> {
     let head = conn.query_row(
