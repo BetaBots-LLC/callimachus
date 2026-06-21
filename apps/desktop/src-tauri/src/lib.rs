@@ -1756,6 +1756,27 @@ fn uninstall_recall_integration() -> AppResult<()> {
     Ok(())
 }
 
+/// MCP-registration status for the other detected agents (Codex / Cursor / Gemini).
+#[tauri::command]
+fn agent_integrations_status() -> AppResult<Vec<integration::AgentIntegration>> {
+    let exe = std::env::current_exe().map_err(anyhow::Error::from)?;
+    Ok(integration::agent_status(&exe))
+}
+
+/// Register the `callimachus` MCP server with every detected non-Claude agent.
+#[tauri::command]
+fn install_agent_integrations() -> AppResult<Vec<integration::AgentIntegration>> {
+    let exe = std::env::current_exe().map_err(anyhow::Error::from)?;
+    Ok(integration::install_agents(&exe)?)
+}
+
+/// Remove the `callimachus` MCP registration from the other agents.
+#[tauri::command]
+fn uninstall_agent_integrations() -> AppResult<()> {
+    integration::uninstall_agents()?;
+    Ok(())
+}
+
 pub fn run() {
     let mut builder = tauri::Builder::default().plugin(tauri_plugin_opener::init());
 
@@ -1850,6 +1871,9 @@ pub fn run() {
             recall_integration_status,
             install_recall_integration,
             uninstall_recall_integration,
+            agent_integrations_status,
+            install_agent_integrations,
+            uninstall_agent_integrations,
             set_star,
             set_thread_tags,
             list_tags,

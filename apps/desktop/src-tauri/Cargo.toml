@@ -37,6 +37,8 @@ tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Format-preserving TOML edit for Codex's ~/.codex/config.toml MCP registration.
+toml_edit = "0.22"
 # Canonical store: bundled SQLite (FTS5 is compiled into the bundled amalgamation).
 rusqlite = { version = "0.37", features = ["bundled", "functions"] }
 rusqlite_migration = "2"

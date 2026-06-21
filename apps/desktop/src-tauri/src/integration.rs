@@ -232,7 +232,9 @@ fn install_hook(app_exe: &Path) -> Result<()> {
         .entry("SessionStart")
         .or_insert_with(|| Value::Array(Vec::new()))
         .as_array_mut()
-        .ok_or_else(|| anyhow::anyhow!("hooks.SessionStart in {} is not an array", path.display()))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!("hooks.SessionStart in {} is not an array", path.display())
+        })?;
 
     remove_our_hooks(arr); // drop any prior Callimachus hook so re-install doesn't duplicate
     arr.push(json!({
@@ -317,12 +319,19 @@ fn write_skill() -> Result<()> {
     Ok(())
 }
 
-/// Merge a `callimachus` entry into `~/.claude.json` `mcpServers`, pointing Claude
-/// Code at this app run with `--mcp`. Preserves all other config; refuses to clobber
-/// an unparseable file.
+/// Register Claude Code's MCP server in `~/.claude.json`.
 fn register_mcp(app_exe: &Path) -> Result<()> {
-    let cfg = claude_config_path()?;
-    let mut root: Value = match std::fs::read_to_string(&cfg) {
+    register_mcp_json(&claude_config_path()?, app_exe)
+}
+
+/// Merge a `callimachus` entry into a JSON config's `mcpServers`, pointing the client at this
+/// app run with `--mcp`. Shared by Claude Code, Cursor, and Gemini (same schema, different
+/// files). Preserves all other config; refuses to clobber an unparseable file.
+fn register_mcp_json(cfg: &Path, app_exe: &Path) -> Result<()> {
+    if let Some(dir) = cfg.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
+    let mut root: Value = match std::fs::read_to_string(cfg) {
         Ok(text) if !text.trim().is_empty() => serde_json::from_str(&text)
             .with_context(|| format!("{} is not valid JSON; not modifying it", cfg.display()))?,
         _ => Value::Object(Map::new()),
@@ -346,8 +355,196 @@ fn register_mcp(app_exe: &Path) -> Result<()> {
         }),
     );
 
-    std::fs::write(&cfg, serde_json::to_string_pretty(&root)?)
+    std::fs::write(cfg, serde_json::to_string_pretty(&root)?)
         .with_context(|| format!("writing {}", cfg.display()))?;
+    Ok(())
+}
+
+/// Remove our `mcpServers.callimachus` entry from a JSON config (leaves the rest intact).
+fn remove_mcp_json(cfg: &Path) -> Result<()> {
+    if let Ok(text) = std::fs::read_to_string(cfg) {
+        if let Ok(mut v) = serde_json::from_str::<Value>(&text) {
+            if let Some(servers) = v.get_mut("mcpServers").and_then(Value::as_object_mut) {
+                servers.remove(MCP_NAME);
+            }
+            let _ = std::fs::write(cfg, serde_json::to_string_pretty(&v)?);
+        }
+    }
+    Ok(())
+}
+
+/// True if a JSON config registers our MCP server pointing at this exe.
+fn mcp_registered_json(cfg: &Path, app_exe: &Path) -> bool {
+    std::fs::read_to_string(cfg)
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .and_then(|v| {
+            v.get("mcpServers")
+                .and_then(|m| m.get(MCP_NAME))
+                .and_then(|s| s.get("command"))
+                .and_then(Value::as_str)
+                .map(|cmd| cmd == app_exe.to_string_lossy())
+        })
+        .unwrap_or(false)
+}
+
+/// Merge `[mcp_servers.callimachus]` into Codex's `~/.codex/config.toml` with format-
+/// preserving TOML edits (keeps the user's comments + ordering). Refuses unparseable TOML.
+fn register_mcp_toml(cfg: &Path, app_exe: &Path) -> Result<()> {
+    if let Some(dir) = cfg.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
+    let mut doc = match std::fs::read_to_string(cfg) {
+        Ok(text) if !text.trim().is_empty() => text
+            .parse::<toml_edit::DocumentMut>()
+            .with_context(|| format!("{} is not valid TOML; not modifying it", cfg.display()))?,
+        _ => toml_edit::DocumentMut::new(),
+    };
+    let servers = doc
+        .entry("mcp_servers")
+        .or_insert(toml_edit::Item::Table(toml_edit::Table::new()))
+        .as_table_mut()
+        .ok_or_else(|| anyhow::anyhow!("mcp_servers in {} is not a table", cfg.display()))?;
+    let mut entry = toml_edit::Table::new();
+    entry["command"] = toml_edit::value(app_exe.to_string_lossy().to_string());
+    let mut args = toml_edit::Array::new();
+    args.push("--mcp");
+    entry["args"] = toml_edit::value(args);
+    servers.insert(MCP_NAME, toml_edit::Item::Table(entry));
+    std::fs::write(cfg, doc.to_string()).with_context(|| format!("writing {}", cfg.display()))?;
+    Ok(())
+}
+
+/// Remove our `[mcp_servers.callimachus]` table from Codex's config (leaves the rest intact).
+fn remove_mcp_toml(cfg: &Path) -> Result<()> {
+    if let Ok(text) = std::fs::read_to_string(cfg) {
+        if let Ok(mut doc) = text.parse::<toml_edit::DocumentMut>() {
+            if let Some(servers) = doc.get_mut("mcp_servers").and_then(|i| i.as_table_mut()) {
+                servers.remove(MCP_NAME);
+            }
+            let _ = std::fs::write(cfg, doc.to_string());
+        }
+    }
+    Ok(())
+}
+
+/// True if Codex's config registers our MCP server pointing at this exe.
+fn mcp_registered_toml(cfg: &Path, app_exe: &Path) -> bool {
+    std::fs::read_to_string(cfg)
+        .ok()
+        .and_then(|s| s.parse::<toml_edit::DocumentMut>().ok())
+        .and_then(|doc| {
+            doc.get("mcp_servers")
+                .and_then(|i| i.get(MCP_NAME))
+                .and_then(|s| s.get("command"))
+                .and_then(|c| c.as_str())
+                .map(|cmd| cmd == app_exe.to_string_lossy())
+        })
+        .unwrap_or(false)
+}
+
+/// One non-Claude agent's MCP integration state.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentIntegration {
+    pub id: String,
+    pub label: String,
+    /// The agent's config dir exists (i.e. the user actually uses it).
+    pub present: bool,
+    /// Our MCP server is registered in its config, pointing at this app.
+    pub registered: bool,
+    pub config_path: String,
+}
+
+enum Fmt {
+    Json,
+    Toml,
+}
+struct AgentDef {
+    id: &'static str,
+    label: &'static str,
+    dir: &'static str,
+    config: &'static str,
+    fmt: Fmt,
+}
+
+/// The agents we can register the MCP server for, beyond Claude Code. Cursor + Gemini use the
+/// JSON `mcpServers` schema; Codex uses a TOML `[mcp_servers]` table.
+fn agent_defs() -> [AgentDef; 3] {
+    [
+        AgentDef {
+            id: "codex",
+            label: "Codex",
+            dir: ".codex",
+            config: ".codex/config.toml",
+            fmt: Fmt::Toml,
+        },
+        AgentDef {
+            id: "cursor",
+            label: "Cursor",
+            dir: ".cursor",
+            config: ".cursor/mcp.json",
+            fmt: Fmt::Json,
+        },
+        AgentDef {
+            id: "gemini",
+            label: "Gemini CLI",
+            dir: ".gemini",
+            config: ".gemini/settings.json",
+            fmt: Fmt::Json,
+        },
+    ]
+}
+
+/// Detected-agent MCP status (present = config dir exists; registered = our server is wired).
+pub fn agent_status(app_exe: &Path) -> Vec<AgentIntegration> {
+    let Ok(home) = home() else { return Vec::new() };
+    agent_defs()
+        .into_iter()
+        .map(|a| {
+            let cfg = home.join(a.config);
+            let registered = match a.fmt {
+                Fmt::Json => mcp_registered_json(&cfg, app_exe),
+                Fmt::Toml => mcp_registered_toml(&cfg, app_exe),
+            };
+            AgentIntegration {
+                id: a.id.to_string(),
+                label: a.label.to_string(),
+                present: home.join(a.dir).is_dir(),
+                registered,
+                config_path: cfg.display().to_string(),
+            }
+        })
+        .collect()
+}
+
+/// Register the MCP server for every DETECTED agent (config dir exists). Never creates a
+/// config for an agent the user doesn't use. Idempotent.
+pub fn install_agents(app_exe: &Path) -> Result<Vec<AgentIntegration>> {
+    let home = home()?;
+    for a in agent_defs() {
+        if !home.join(a.dir).is_dir() {
+            continue;
+        }
+        let cfg = home.join(a.config);
+        match a.fmt {
+            Fmt::Json => register_mcp_json(&cfg, app_exe)?,
+            Fmt::Toml => register_mcp_toml(&cfg, app_exe)?,
+        }
+    }
+    Ok(agent_status(app_exe))
+}
+
+/// Remove our MCP registration from every agent's config (leaves their other config intact).
+pub fn uninstall_agents() -> Result<()> {
+    let home = home()?;
+    for a in agent_defs() {
+        let cfg = home.join(a.config);
+        match a.fmt {
+            Fmt::Json => remove_mcp_json(&cfg)?,
+            Fmt::Toml => remove_mcp_toml(&cfg)?,
+        }
+    }
     Ok(())
 }
 
@@ -444,7 +641,10 @@ mod tests {
             .iter()
             .flat_map(|g| g["hooks"].as_array().unwrap())
             .any(|h| h["command"] == "my-own-hook");
-        assert!(user_hook_kept, "the user's own SessionStart hook is preserved");
+        assert!(
+            user_hook_kept,
+            "the user's own SessionStart hook is preserved"
+        );
         assert!(session_start_has_our_hook(&root));
 
         // Uninstall removes ours but keeps the user's.
@@ -457,5 +657,36 @@ mod tests {
             .iter()
             .flat_map(|g| g["hooks"].as_array().unwrap())
             .any(|h| h["command"] == "my-own-hook"));
+    }
+
+    #[test]
+    fn codex_toml_merge_preserves_others() {
+        // Mirror register_mcp_toml's merge against an in-memory Codex config.
+        let mut doc = "model = \"o3\"\n\n[mcp_servers.other]\ncommand = \"x\"\n"
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        let servers = doc
+            .entry("mcp_servers")
+            .or_insert(toml_edit::Item::Table(toml_edit::Table::new()))
+            .as_table_mut()
+            .unwrap();
+        let mut entry = toml_edit::Table::new();
+        entry["command"] = toml_edit::value("/app");
+        let mut args = toml_edit::Array::new();
+        args.push("--mcp");
+        entry["args"] = toml_edit::value(args);
+        servers.insert(MCP_NAME, toml_edit::Item::Table(entry));
+
+        let back = doc.to_string().parse::<toml_edit::DocumentMut>().unwrap();
+        assert_eq!(back["model"].as_str(), Some("o3")); // preserved
+        assert_eq!(back["mcp_servers"]["other"]["command"].as_str(), Some("x")); // preserved
+        assert_eq!(
+            back["mcp_servers"]["callimachus"]["command"].as_str(),
+            Some("/app")
+        ); // added
+        assert_eq!(
+            back["mcp_servers"]["callimachus"]["args"][0].as_str(),
+            Some("--mcp")
+        );
     }
 }

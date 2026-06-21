@@ -409,6 +409,10 @@ export const api = {
   recallIntegrationStatus: () => invoke<IntegrationStatus>("recall_integration_status"),
   installRecallIntegration: () => invoke<IntegrationStatus>("install_recall_integration"),
   uninstallRecallIntegration: () => invoke<void>("uninstall_recall_integration"),
+  // MCP registration for the other detected agents (Codex / Cursor / Gemini).
+  agentIntegrationsStatus: () => invoke<AgentIntegration[]>("agent_integrations_status"),
+  installAgentIntegrations: () => invoke<AgentIntegration[]>("install_agent_integrations"),
+  uninstallAgentIntegrations: () => invoke<void>("uninstall_agent_integrations"),
 };
 
 // State of the Claude Code integration (the `/recall` skill + `callimachus` MCP server).
@@ -419,6 +423,15 @@ export interface IntegrationStatus {
   hookInstalled: boolean;
   calInstalled: boolean;
   skillPath: string;
+  configPath: string;
+}
+
+// One non-Claude agent's MCP integration state.
+export interface AgentIntegration {
+  id: string;
+  label: string;
+  present: boolean; // the agent's config dir exists (the user uses it)
+  registered: boolean;
   configPath: string;
 }
 
