@@ -395,6 +395,7 @@ pub fn parse_distilled(raw: &str) -> Distilled {
 /// retries). The adapter is forced per `provider`; the API key (from the keychain)
 /// is injected through an auth resolver so it never leaves Rust. `on_token` fires
 /// for each text chunk; the full assistant text is returned.
+#[allow(clippy::too_many_arguments)] // provider/model/key/messages/tools/cancel/callbacks — all distinct inputs
 pub async fn chat_stream<F, E, Fut>(
     provider: &str,
     model: &str,

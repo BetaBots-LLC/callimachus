@@ -535,7 +535,7 @@ pub fn stats(conn: &Connection) -> Result<Stats> {
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     per_source.retain(|s| s.threads > 0);
-    per_source.sort_by(|a, b| b.messages.cmp(&a.messages));
+    per_source.sort_by_key(|s| std::cmp::Reverse(s.messages));
 
     let mut role_stmt =
         conn.prepare("SELECT role, COUNT(*) FROM messages GROUP BY role ORDER BY 2 DESC")?;

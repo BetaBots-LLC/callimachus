@@ -13,6 +13,9 @@ pub struct Db(pub Mutex<Connection>);
 
 /// Register the sqlite-vec (vec0) extension exactly once, for all connections
 /// opened afterwards. Must run before the first `Connection::open`.
+// The transmute is the documented sqlite-vec registration idiom (fn ptr -> the
+// extension entry-point type); the source/target types are unambiguous here.
+#[allow(clippy::missing_transmute_annotations)]
 fn register_vec() {
     static INIT: Once = Once::new();
     INIT.call_once(|| unsafe {
