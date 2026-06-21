@@ -77,21 +77,6 @@ pub struct ThreadDetail {
     pub messages: Vec<MessageRow>,
 }
 
-/// Escape a user query into a safe FTS5 MATCH string: each whitespace-separated
-/// token becomes a quoted term (implicit AND). Prevents syntax errors on stray
-/// operators/quotes while still doing sensible multi-term search.
-fn to_fts_query(raw: &str) -> Option<String> {
-    let terms: Vec<String> = raw
-        .split_whitespace()
-        .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
-        .collect();
-    if terms.is_empty() {
-        None
-    } else {
-        Some(terms.join(" "))
-    }
-}
-
 /// Append the starred + tags ("collections") WHERE clauses, assuming the threads
 /// table is aliased `t`. Shared by `search` and `recent_threads`.
 fn push_collection_filters(
@@ -120,11 +105,41 @@ fn push_collection_filters(
 
 /// Run a full-text search. Empty query returns nothing (use recent_threads instead).
 pub fn search(conn: &Connection, query: &str, filters: &SearchFilters) -> Result<Vec<SearchHit>> {
-    let Some(match_query) = to_fts_query(query) else {
+    // Each whitespace token becomes a quoted PREFIX term (`"tok"*`), so "embed" matches
+    // "embedder"/"embedding" and a natural-language query isn't gated on exact words.
+    let terms: Vec<String> = query
+        .split_whitespace()
+        .map(|t| format!("\"{}\"*", t.replace('"', "\"\"")))
+        .collect();
+    if terms.is_empty() {
         return Ok(Vec::new());
-    };
+    }
     let limit = filters.limit.unwrap_or(100).min(500) as i64;
 
+    // Strict pass: require ALL terms (precise). If it under-fills and there were several
+    // terms, back-fill with a looser OR pass appended AFTER the precise hits (deduped).
+    let mut hits = run_fts(conn, &terms.join(" "), filters, limit)?;
+    if (hits.len() as i64) < limit && terms.len() > 1 {
+        let seen: HashSet<i64> = hits.iter().map(|h| h.message_id).collect();
+        for h in run_fts(conn, &terms.join(" OR "), filters, limit)? {
+            if (hits.len() as i64) >= limit {
+                break;
+            }
+            if !seen.contains(&h.message_id) {
+                hits.push(h);
+            }
+        }
+    }
+    Ok(hits)
+}
+
+/// One FTS5 pass for an already-built MATCH string, with all the non-text filters applied.
+fn run_fts(
+    conn: &Connection,
+    match_query: &str,
+    filters: &SearchFilters,
+    limit: i64,
+) -> Result<Vec<SearchHit>> {
     // Use control-char sentinels (\u{1}/\u{2}) for match boundaries, not HTML tags:
     // snippet() does not escape the body, so the frontend HTML-escapes the text and
     // only then swaps the sentinels for <mark> — preventing injection from indexed
@@ -141,7 +156,7 @@ pub fn search(conn: &Connection, query: &str, filters: &SearchFilters) -> Result
     if !filters.include_subagents {
         sql.push_str(" AND t.is_subagent = 0");
     }
-    let mut args: Vec<Box<dyn ToSql>> = vec![Box::new(match_query)];
+    let mut args: Vec<Box<dyn ToSql>> = vec![Box::new(match_query.to_string())];
 
     if !filters.sources.is_empty() {
         let placeholders: Vec<String> = filters
@@ -157,7 +172,11 @@ pub fn search(conn: &Connection, query: &str, filters: &SearchFilters) -> Result
     }
     if let Some(project) = &filters.project {
         args.push(Box::new(format!("%{project}%")));
-        sql.push_str(&format!(" AND t.project_path LIKE ?{}", args.len()));
+        // Scope the same way facts/threads aggregate (COALESCE), matching the semantic arm.
+        sql.push_str(&format!(
+            " AND COALESCE(t.project_key, t.project_path) LIKE ?{}",
+            args.len()
+        ));
     }
     if let Some(after) = filters.after {
         args.push(Box::new(after));
@@ -221,6 +240,7 @@ pub fn hybrid_vec(
             v,
             filters.include_subagents,
             &filters.sources,
+            filters.project.as_deref(),
             limit.max(50),
         )?,
         None => Vec::new(),
@@ -299,7 +319,11 @@ pub fn recent_threads(conn: &Connection, filters: &SearchFilters) -> Result<Vec<
     }
     if let Some(project) = &filters.project {
         args.push(Box::new(format!("%{project}%")));
-        sql.push_str(&format!(" AND t.project_path LIKE ?{}", args.len()));
+        // Scope the same way facts/threads aggregate (COALESCE), matching the semantic arm.
+        sql.push_str(&format!(
+            " AND COALESCE(t.project_key, t.project_path) LIKE ?{}",
+            args.len()
+        ));
     }
     push_collection_filters(&mut sql, &mut args, filters);
     sql.push_str(" ORDER BY t.updated_at DESC LIMIT ?");
@@ -340,6 +364,7 @@ pub fn related(
         context,
         filters.include_subagents,
         &filters.sources,
+        filters.project.as_deref(),
         limit * 8,
     )?;
 

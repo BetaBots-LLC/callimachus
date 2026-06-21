@@ -180,13 +180,21 @@ pub fn upsert_thread(
     // UTF-8 byte size of all message text (String::len is byte length) — stored so the
     // cleanup list reads a column instead of SUM(LENGTH(text)) across every message.
     let bytes: i64 = thread.messages.iter().map(|m| m.text.len() as i64).sum();
+    // Count of DISTILLABLE messages (what the LLM actually sees); distill staleness keys off
+    // this, not total message_count, so appended tool/system rows don't re-trigger a distill.
+    let distillable: i64 = thread
+        .messages
+        .iter()
+        .filter(|m| m.role == "user" || m.role == "assistant")
+        .count() as i64;
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
     let project_key = thread.project_path.as_deref().and_then(canonical_project);
     tx.execute(
         "INSERT INTO threads (source_id, external_id, title, project_path, git_branch,
-            created_at, updated_at, message_count, last_indexed_at, is_subagent, bytes, project_key)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            created_at, updated_at, message_count, last_indexed_at, is_subagent, bytes, project_key,
+            distillable_count)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
          ON CONFLICT (source_id, external_id) DO UPDATE SET
             title = excluded.title,
             project_path = excluded.project_path,
@@ -197,7 +205,8 @@ pub fn upsert_thread(
             last_indexed_at = excluded.last_indexed_at,
             is_subagent = excluded.is_subagent,
             bytes = excluded.bytes,
-            project_key = excluded.project_key",
+            project_key = excluded.project_key,
+            distillable_count = excluded.distillable_count",
         params![
             source_id,
             thread.external_id,
@@ -211,6 +220,7 @@ pub fn upsert_thread(
             thread.is_subagent as i64,
             bytes,
             project_key,
+            distillable,
         ],
     )?;
 
@@ -407,7 +417,9 @@ pub fn upsert_thread(
         .optional()?
         .flatten();
     if let Some(pc) = prev_kcount {
-        if pc != thread.messages.len() as i64 || content_changed {
+        // Compare against the DISTILLABLE count (matches what store_distilled records), so
+        // appended tool/system rows alone don't invalidate distilled knowledge.
+        if pc != distillable || content_changed {
             tx.execute(
                 "UPDATE threads SET knowledge_extracted = 0, knowledge_error = NULL WHERE id = ?1",
                 [thread_id],
@@ -685,6 +697,87 @@ mod tests {
         assert_eq!(
             seq3, "DDDD",
             "interior same-length edit on a long thread is not missed"
+        );
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn distillable_count_excludes_tool_rows_and_gates_invalidation() {
+        let p = std::env::temp_dir().join(format!("calli_dc_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        let mut conn = crate::db::open(&p).unwrap();
+        let sid = source_id(&conn, "claude_code").unwrap();
+
+        let mk = |roles: &[(&str, &str)]| ParsedThread {
+            external_id: "t1".into(),
+            title: Some("t".into()),
+            messages: roles
+                .iter()
+                .enumerate()
+                .map(|(i, (role, text))| ParsedMessage {
+                    role: (*role).to_string(),
+                    text: (*text).to_string(),
+                    tool_name: None,
+                    ts: Some(i as i64),
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let base: &[(&str, &str)] = &[
+            ("user", "a"),
+            ("assistant", "b"),
+            ("user", "c"),
+            ("assistant", "d"),
+        ];
+        upsert_thread(&mut conn, sid, &mk(base)).unwrap();
+        let tid: i64 = conn
+            .query_row("SELECT id FROM threads WHERE external_id = 't1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let col = |c: &rusqlite::Connection, name: &str| -> i64 {
+            c.query_row(
+                &format!("SELECT {name} FROM threads WHERE id = ?1"),
+                [tid],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(col(&conn, "distillable_count"), 4);
+
+        // Simulate a completed distill (records distillable_count, not total).
+        conn.execute(
+            "UPDATE threads SET knowledge_extracted = 1, knowledge_msg_count = distillable_count WHERE id = ?1",
+            [tid],
+        )
+        .unwrap();
+
+        // Append a TOOL row: distillable count unchanged, distilled knowledge NOT invalidated.
+        let mut with_tool = base.to_vec();
+        with_tool.push(("tool", "ls output"));
+        upsert_thread(&mut conn, sid, &mk(&with_tool)).unwrap();
+        assert_eq!(
+            col(&conn, "distillable_count"),
+            4,
+            "tool rows aren't distillable"
+        );
+        assert_eq!(col(&conn, "message_count"), 5);
+        assert_eq!(
+            col(&conn, "knowledge_extracted"),
+            1,
+            "a tool-only append must NOT re-trigger distillation"
+        );
+
+        // Append a USER row: distillable +1, knowledge invalidated for re-distill.
+        let mut with_user = with_tool.clone();
+        with_user.push(("user", "e"));
+        upsert_thread(&mut conn, sid, &mk(&with_user)).unwrap();
+        assert_eq!(col(&conn, "distillable_count"), 5);
+        assert_eq!(
+            col(&conn, "knowledge_extracted"),
+            0,
+            "a new user/assistant message DOES re-trigger distillation"
         );
 
         let _ = std::fs::remove_file(&p);
