@@ -230,7 +230,6 @@ pub fn hybrid_vec(
     qv: Option<&[f32]>,
     filters: &SearchFilters,
 ) -> Result<Vec<SearchHit>> {
-    const RRF_K: f32 = 60.0;
     let limit = filters.limit.unwrap_or(100).min(500) as usize;
 
     let fts = search(conn, query, filters)?;
@@ -246,16 +245,8 @@ pub fn hybrid_vec(
         None => Vec::new(),
     };
 
-    let mut scores: HashMap<i64, f32> = HashMap::new();
-    for (rank, h) in fts.iter().enumerate() {
-        *scores.entry(h.message_id).or_default() += 1.0 / (RRF_K + rank as f32 + 1.0);
-    }
-    for (rank, (id, _)) in sem.iter().enumerate() {
-        *scores.entry(*id).or_default() += 1.0 / (RRF_K + rank as f32 + 1.0);
-    }
-
-    let mut ranked: Vec<(i64, f32)> = scores.into_iter().collect();
-    ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let fts_ids: Vec<i64> = fts.iter().map(|h| h.message_id).collect();
+    let mut ranked = fuse_rrf(&fts_ids, &sem);
     ranked.truncate(limit);
 
     let fts_by_id: HashMap<i64, &SearchHit> = fts.iter().map(|h| (h.message_id, h)).collect();
@@ -268,6 +259,37 @@ pub fn hybrid_vec(
         }
     }
     Ok(out)
+}
+
+/// Reciprocal-rank fusion of the keyword (FTS/BM25) and semantic (cosine) result lists,
+/// returning `(message_id, score)` sorted best-first. The keyword arm contributes the
+/// classic rank-only term `1/(K+rank)`. The semantic arm scales that term by
+/// `sem_weight(similarity)`, so a marginal near-floor match contributes less than a strong
+/// one at the same rank — without ever exceeding the keyword arm's weight (factor caps at
+/// 1.0), so the previously-tuned keyword/semantic balance can't blow out.
+fn fuse_rrf(fts_ids: &[i64], sem: &[(i64, f32)]) -> Vec<(i64, f32)> {
+    const RRF_K: f32 = 60.0;
+    let mut scores: HashMap<i64, f32> = HashMap::new();
+    for (rank, id) in fts_ids.iter().enumerate() {
+        *scores.entry(*id).or_default() += 1.0 / (RRF_K + rank as f32 + 1.0);
+    }
+    for (rank, (id, sim)) in sem.iter().enumerate() {
+        *scores.entry(*id).or_default() += sem_weight(*sim) / (RRF_K + rank as f32 + 1.0);
+    }
+    let mut ranked: Vec<(i64, f32)> = scores.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+    ranked
+}
+
+/// Map a cosine similarity in `[SEM_SIMILARITY_FLOOR, 1.0]` to an RRF weight in `[0.5, 1.0]`:
+/// a top match keeps full rank-weight, the weakest retained match keeps half. Monotonic and
+/// clamped, so it only ever demotes weak semantic matches — never inflates above the keyword
+/// arm. (The semantic list is already returned floored at `SEM_SIMILARITY_FLOOR`.)
+fn sem_weight(sim: f32) -> f32 {
+    const MIN_W: f32 = 0.5;
+    let floor = embed::SEM_SIMILARITY_FLOOR;
+    let norm = ((sim - floor) / (1.0 - floor)).clamp(0.0, 1.0);
+    MIN_W + (1.0 - MIN_W) * norm
 }
 
 /// Build a SearchHit for a message that matched only semantically (plain snippet).
@@ -793,6 +815,47 @@ mod tests {
             tool_name: None,
             ts: Some(ts),
         }
+    }
+
+    #[test]
+    fn sem_weight_full_at_top_half_at_floor_and_monotonic() {
+        let floor = crate::embed::SEM_SIMILARITY_FLOOR;
+        assert!(
+            (sem_weight(1.0) - 1.0).abs() < 1e-6,
+            "top similarity keeps full weight"
+        );
+        assert!(
+            (sem_weight(floor) - 0.5).abs() < 1e-6,
+            "floor similarity keeps half weight"
+        );
+        // Below the floor clamps (the arm is pre-floored, but be safe).
+        assert!((sem_weight(floor - 0.1) - 0.5).abs() < 1e-6);
+        // Strictly increasing across the retained range.
+        assert!(sem_weight(0.5) < sem_weight(0.7));
+        assert!(sem_weight(0.7) < sem_weight(0.95));
+    }
+
+    #[test]
+    fn fuse_rrf_lets_strong_similarity_outrank_weak_at_same_rank() {
+        // Two semantic-only hits: id 1 a weak match at rank 0, id 2 a strong match at rank 1.
+        // Pure rank-only RRF ranks id 1 first (1/61 > 1/62); similarity weighting flips it.
+        let ranked = fuse_rrf(&[], &[(1, 0.40), (2, 0.95)]);
+        assert_eq!(
+            ranked[0].0, 2,
+            "strong semantic match wins despite a worse rank"
+        );
+        assert_eq!(ranked[1].0, 1);
+    }
+
+    #[test]
+    fn fuse_rrf_keyword_arm_unchanged() {
+        // No semantic input: scores are exactly the classic 1/(K+rank+1), order = input order.
+        let ranked = fuse_rrf(&[10, 20, 30], &[]);
+        assert_eq!(
+            ranked.iter().map(|x| x.0).collect::<Vec<_>>(),
+            vec![10, 20, 30]
+        );
+        assert!((ranked[0].1 - 1.0 / 61.0).abs() < 1e-6);
     }
 
     #[test]

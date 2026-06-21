@@ -12,6 +12,11 @@ use std::sync::Mutex;
 /// bge-small-en-v1.5 output dimensionality (matches vec_chunks `float[384]`).
 pub const DIM: usize = 384;
 
+/// Cosine-similarity floor for the semantic arm: KNN always returns its k-nearest, so a
+/// query with no good match would otherwise inject noise. Anything below this is dropped.
+/// Shared so the hybrid fusion can weight by similarity over the same [floor, 1.0] range.
+pub(crate) const SEM_SIMILARITY_FLOOR: f32 = 0.35;
+
 /// bge retrieval works best with an instruction prefix on the QUERY only.
 const QUERY_PREFIX: &str = "Represent this sentence for searching relevant passages: ";
 
@@ -350,9 +355,8 @@ pub fn semantic_search_vec(
     }
     // Similarity floor: KNN always returns its k-nearest, so a query with no good semantic
     // match would otherwise inject irrelevant chunks that RRF then promotes. Drop anything
-    // below MIN_SIMILARITY (distance = 1 - cosine). Conservative so real matches survive.
-    const MIN_SIMILARITY: f64 = 0.35;
-    args.push(Box::new(1.0_f64 - MIN_SIMILARITY));
+    // below SEM_SIMILARITY_FLOOR (distance = 1 - cosine). Conservative so real matches survive.
+    args.push(Box::new(1.0_f64 - SEM_SIMILARITY_FLOOR as f64));
     let dist_ph = args.len();
     args.push(Box::new(k as i64));
     let limit_ph = args.len();
