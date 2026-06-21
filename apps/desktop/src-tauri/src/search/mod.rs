@@ -103,8 +103,32 @@ fn push_collection_filters(
     }
 }
 
-/// Run a full-text search. Empty query returns nothing (use recent_threads instead).
+/// Per-thread hit cap for result lists: at most this many message-hits from any one thread,
+/// so a single long thread can't fill the list and bury every other thread. Discovery is
+/// cross-thread; per-thread depth is via opening the thread.
+const MAX_HITS_PER_THREAD: usize = 3;
+/// How far past `limit` to fetch before capping, leaving room to back-fill the slots freed
+/// by dropping a dominant thread's overflow.
+const THREAD_CAP_OVERFETCH: usize = 4;
+
+/// Run a full-text search, capped to `MAX_HITS_PER_THREAD` per thread. Empty query returns
+/// nothing (use recent_threads instead).
 pub fn search(conn: &Connection, query: &str, filters: &SearchFilters) -> Result<Vec<SearchHit>> {
+    let limit = filters.limit.unwrap_or(100).min(500) as usize;
+    let fetch = (limit * THREAD_CAP_OVERFETCH).min(2000) as i64;
+    let hits = search_ranked(conn, query, filters, fetch)?;
+    Ok(cap_per_thread(hits, limit))
+}
+
+/// BM25-ranked FTS hits (strict-AND, then OR back-fill), fetching up to `fetch` rows with NO
+/// per-thread cap — `search` caps after, and the hybrid fusion needs the full per-thread
+/// signal before it merges with the semantic arm.
+fn search_ranked(
+    conn: &Connection,
+    query: &str,
+    filters: &SearchFilters,
+    fetch: i64,
+) -> Result<Vec<SearchHit>> {
     // Each whitespace token becomes a quoted PREFIX term (`"tok"*`), so "embed" matches
     // "embedder"/"embedding" and a natural-language query isn't gated on exact words.
     let terms: Vec<String> = query
@@ -114,15 +138,14 @@ pub fn search(conn: &Connection, query: &str, filters: &SearchFilters) -> Result
     if terms.is_empty() {
         return Ok(Vec::new());
     }
-    let limit = filters.limit.unwrap_or(100).min(500) as i64;
 
     // Strict pass: require ALL terms (precise). If it under-fills and there were several
     // terms, back-fill with a looser OR pass appended AFTER the precise hits (deduped).
-    let mut hits = run_fts(conn, &terms.join(" "), filters, limit)?;
-    if (hits.len() as i64) < limit && terms.len() > 1 {
+    let mut hits = run_fts(conn, &terms.join(" "), filters, fetch)?;
+    if (hits.len() as i64) < fetch && terms.len() > 1 {
         let seen: HashSet<i64> = hits.iter().map(|h| h.message_id).collect();
-        for h in run_fts(conn, &terms.join(" OR "), filters, limit)? {
-            if (hits.len() as i64) >= limit {
+        for h in run_fts(conn, &terms.join(" OR "), filters, fetch)? {
+            if (hits.len() as i64) >= fetch {
                 break;
             }
             if !seen.contains(&h.message_id) {
@@ -232,7 +255,9 @@ pub fn hybrid_vec(
 ) -> Result<Vec<SearchHit>> {
     let limit = filters.limit.unwrap_or(100).min(500) as usize;
 
-    let fts = search(conn, query, filters)?;
+    // Uncapped FTS arm (search_ranked, not search): fusion needs every per-thread hit before
+    // it merges with the semantic arm; the per-thread cap is applied once, on the fused output.
+    let fts = search_ranked(conn, query, filters, limit as i64)?;
     let sem = match qv {
         Some(v) => embed::semantic_search_vec(
             conn,
@@ -246,19 +271,20 @@ pub fn hybrid_vec(
     };
 
     let fts_ids: Vec<i64> = fts.iter().map(|h| h.message_id).collect();
-    let mut ranked = fuse_rrf(&fts_ids, &sem);
-    ranked.truncate(limit);
+    let ranked = fuse_rrf(&fts_ids, &sem);
 
+    // Materialize hits in fused order (FTS hits already in hand; semantic-only hits need one
+    // PK fetch each — both lists are limit-bounded, so this stays small), then cap per thread.
     let fts_by_id: HashMap<i64, &SearchHit> = fts.iter().map(|h| (h.message_id, h)).collect();
-    let mut out = Vec::with_capacity(ranked.len());
+    let mut ordered = Vec::with_capacity(ranked.len());
     for (id, _) in ranked {
         if let Some(h) = fts_by_id.get(&id) {
-            out.push((*h).clone());
+            ordered.push((*h).clone());
         } else if let Some(h) = hit_for_message(conn, id)? {
-            out.push(h);
+            ordered.push(h);
         }
     }
-    Ok(out)
+    Ok(cap_per_thread(ordered, limit))
 }
 
 /// Reciprocal-rank fusion of the keyword (FTS/BM25) and semantic (cosine) result lists,
@@ -279,6 +305,26 @@ fn fuse_rrf(fts_ids: &[i64], sem: &[(i64, f32)]) -> Vec<(i64, f32)> {
     let mut ranked: Vec<(i64, f32)> = scores.into_iter().collect();
     ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
     ranked
+}
+
+/// Limit how many hits any single thread contributes (preserving fused/ranked order), then
+/// trim to `limit`. One long thread can otherwise occupy every top slot and bury the rest;
+/// the dropped overflow lets other threads back-fill (callers over-fetch to leave room).
+fn cap_per_thread(ordered: Vec<SearchHit>, limit: usize) -> Vec<SearchHit> {
+    let mut per_thread: HashMap<i64, usize> = HashMap::new();
+    let mut out = Vec::with_capacity(limit.min(ordered.len()));
+    for h in ordered {
+        if out.len() >= limit {
+            break;
+        }
+        let count = per_thread.entry(h.thread_id).or_insert(0);
+        if *count >= MAX_HITS_PER_THREAD {
+            continue;
+        }
+        *count += 1;
+        out.push(h);
+    }
+    out
 }
 
 /// Map a cosine similarity in `[SEM_SIMILARITY_FLOOR, 1.0]` to an RRF weight in `[0.5, 1.0]`:
@@ -856,6 +902,91 @@ mod tests {
             vec![10, 20, 30]
         );
         assert!((ranked[0].1 - 1.0 / 61.0).abs() < 1e-6);
+    }
+
+    fn mk_hit(thread_id: i64, message_id: i64) -> SearchHit {
+        SearchHit {
+            thread_id,
+            message_id,
+            source: "claude_code".into(),
+            title: None,
+            project_path: None,
+            role: "user".into(),
+            snippet: String::new(),
+            ts: None,
+        }
+    }
+
+    #[test]
+    fn cap_per_thread_caps_dominant_thread_and_preserves_order() {
+        // thread 1 appears 5x, interleaved with threads 2 and 3.
+        let ordered = vec![
+            mk_hit(1, 100),
+            mk_hit(1, 101),
+            mk_hit(1, 102),
+            mk_hit(2, 200),
+            mk_hit(1, 103),
+            mk_hit(1, 104),
+            mk_hit(3, 300),
+        ];
+        let threads: Vec<i64> = cap_per_thread(ordered, 100)
+            .iter()
+            .map(|h| h.thread_id)
+            .collect();
+        // thread 1 capped at 3, original order kept, threads 2 and 3 retained.
+        assert_eq!(threads, vec![1, 1, 1, 2, 3]);
+    }
+
+    #[test]
+    fn cap_per_thread_respects_limit() {
+        let ordered: Vec<SearchHit> = (0..10).map(|i| mk_hit(i, i + 1000)).collect();
+        assert_eq!(cap_per_thread(ordered, 4).len(), 4);
+    }
+
+    #[test]
+    fn search_caps_hits_from_a_dominant_thread() {
+        let mut conn = temp_db();
+        let sid = source_id(&conn, "claude_code").unwrap();
+        // One thread with 6 messages all matching "alpha"; a second thread matches once.
+        let big = ParsedThread {
+            external_id: "big".into(),
+            title: Some("alpha thread".into()),
+            messages: (0..6)
+                .map(|i| msg("user", "alpha alpha keyword", 100 + i as i64))
+                .collect(),
+            ..Default::default()
+        };
+        let small = ParsedThread {
+            external_id: "small".into(),
+            title: Some("other thread".into()),
+            messages: vec![msg("user", "alpha here too", 50)],
+            ..Default::default()
+        };
+        upsert_thread(&mut conn, sid, &big).unwrap();
+        upsert_thread(&mut conn, sid, &small).unwrap();
+
+        let hits = search(
+            &conn,
+            "alpha",
+            &SearchFilters {
+                limit: Some(20),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // Without the cap the 6-message thread would take 6 of the top slots; capped to 3.
+        let big_id = hits
+            .iter()
+            .find(|h| h.title.as_deref() == Some("alpha thread"))
+            .map(|h| h.thread_id)
+            .unwrap();
+        let from_big = hits.iter().filter(|h| h.thread_id == big_id).count();
+        assert_eq!(from_big, 3, "dominant thread should be capped to 3");
+        // The other thread still surfaces (wasn't crowded out).
+        assert!(hits
+            .iter()
+            .any(|h| h.title.as_deref() == Some("other thread")));
     }
 
     #[test]
