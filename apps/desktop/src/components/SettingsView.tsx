@@ -64,6 +64,8 @@ export function SettingsView() {
 
       <RecallIntegrationCard />
 
+      <OtherAgentsCard />
+
       <Card>
         <CardHeader>
           <CardTitle>Sources</CardTitle>
@@ -199,8 +201,9 @@ function RecallIntegrationCard() {
   const uninstall = useMutation({ mutationFn: api.uninstallRecallIntegration, onSuccess: refresh });
 
   const s = status.data;
-  const connected = !!s && s.skillInstalled && s.mcpRegistered && !s.skillOutdated;
-  const partial = !!s && (s.skillInstalled || s.mcpRegistered) && !connected;
+  const connected =
+    !!s && s.skillInstalled && s.mcpRegistered && s.hookInstalled && !s.skillOutdated;
+  const partial = !!s && (s.skillInstalled || s.mcpRegistered || s.hookInstalled) && !connected;
 
   return (
     <Card>
@@ -215,8 +218,9 @@ function RecallIntegrationCard() {
         </CardTitle>
         <p className="text-sm text-muted-foreground">
           Let Claude Code (and other agents) search your history. Installs the <code>/recall</code>{" "}
-          skill, registers Callimachus as an MCP server, and adds the <code>cal</code> CLI (used by
-          the VS Code extension) — no terminal, no setup.
+          skill, registers Callimachus as an MCP server, adds a <strong>SessionStart hook</strong>{" "}
+          that auto-injects each repo's memory at the start of a session, and adds the{" "}
+          <code>cal</code> CLI (used by the VS Code extension) — no terminal, no setup.
         </p>
       </CardHeader>
       <CardContent className="space-y-3">
@@ -225,6 +229,7 @@ function RecallIntegrationCard() {
             {s?.skillInstalled ? (s.skillOutdated ? "⚠ skill outdated" : "✓ skill") : "○ skill"}
           </span>
           <span>{s?.mcpRegistered ? "✓ MCP server" : "○ MCP server"}</span>
+          <span>{s?.hookInstalled ? "✓ memory hook" : "○ memory hook"}</span>
           <span>{s?.calInstalled ? "✓ cal CLI" : "○ cal CLI"}</span>
         </div>
         <div className="flex items-center gap-2">
@@ -255,6 +260,84 @@ function RecallIntegrationCard() {
           </p>
         )}
         {install.isError && <p className="text-xs text-destructive">{String(install.error)}</p>}
+      </CardContent>
+    </Card>
+  );
+}
+
+/** Register the `callimachus` MCP server with the OTHER detected agents (Codex / Cursor /
+ *  Gemini), so they can search the history too. Only touches agents installed on this machine. */
+function OtherAgentsCard() {
+  const queryClient = useQueryClient();
+  const status = useQuery({
+    queryKey: ["agent_integrations"],
+    queryFn: api.agentIntegrationsStatus,
+  });
+  const refresh = () => queryClient.invalidateQueries({ queryKey: ["agent_integrations"] });
+  const install = useMutation({ mutationFn: api.installAgentIntegrations, onSuccess: refresh });
+  const uninstall = useMutation({ mutationFn: api.uninstallAgentIntegrations, onSuccess: refresh });
+
+  const present = (status.data ?? []).filter((a) => a.present);
+  const anyRegistered = present.some((a) => a.registered);
+  const allRegistered = present.length > 0 && present.every((a) => a.registered);
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2">
+          Other agents
+          {allRegistered && (
+            <span className="rounded-full bg-emerald-500/15 px-2 py-0.5 text-[0.6rem] font-medium uppercase tracking-wide text-emerald-600 dark:text-emerald-400">
+              connected
+            </span>
+          )}
+        </CardTitle>
+        <p className="text-sm text-muted-foreground">
+          Register the <code>callimachus</code> MCP server with your other agents so they can search
+          your history too. Only agents installed on this machine are touched.
+        </p>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        {present.length === 0 ? (
+          <p className="text-xs text-muted-foreground">
+            No other agents detected (Codex, Cursor, or Gemini CLI).
+          </p>
+        ) : (
+          <>
+            <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
+              {present.map((a) => (
+                <span key={a.id}>
+                  {a.registered ? "✓" : "○"} {a.label}
+                </span>
+              ))}
+            </div>
+            <div className="flex items-center gap-2">
+              <Button size="sm" onClick={() => install.mutate()} disabled={install.isPending}>
+                {install.isPending
+                  ? "Registering…"
+                  : allRegistered
+                    ? "Re-register"
+                    : "Register with detected agents"}
+              </Button>
+              {anyRegistered && (
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => uninstall.mutate()}
+                  disabled={uninstall.isPending}
+                >
+                  Remove
+                </Button>
+              )}
+            </div>
+            {install.isSuccess && (
+              <p className="text-xs text-muted-foreground">
+                Done. Restart the agent (or reload its MCP config) to pick up the server.
+              </p>
+            )}
+            {install.isError && <p className="text-xs text-destructive">{String(install.error)}</p>}
+          </>
+        )}
       </CardContent>
     </Card>
   );
