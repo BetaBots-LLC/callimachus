@@ -838,3 +838,45 @@ fn fmt_time(epoch: Option<i64>) -> String {
         None => "—".to_string(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn parse_pulls_flags_and_keeps_positionals() {
+        let o = parse(&argv(&["-s", "claude", "--json", "auth", "bug"])).unwrap();
+        assert_eq!(o.source.as_deref(), Some("claude"));
+        assert!(o.json);
+        assert_eq!(o.positional, vec!["auth", "bug"]);
+    }
+
+    #[test]
+    fn parse_repeats_tags_and_reads_limit() {
+        let o = parse(&argv(&["-t", "a", "--tag", "b", "-n", "5", "--starred"])).unwrap();
+        assert_eq!(o.tags, vec!["a", "b"]);
+        assert_eq!(o.limit, Some(5));
+        assert!(o.starred);
+    }
+
+    #[test]
+    fn parse_rejects_unknown_flag_and_non_numeric_limit() {
+        assert!(parse(&argv(&["--nope"])).is_err());
+        assert!(parse(&argv(&["-n", "abc"])).is_err());
+    }
+
+    #[test]
+    fn run_with_no_args_prints_usage_ok() {
+        // Empty argv is the help path — must not touch the DB or error.
+        run(&[]).unwrap();
+    }
+
+    #[test]
+    fn run_rejects_unknown_command() {
+        assert!(run(&argv(&["bogus-cmd"])).is_err());
+    }
+}

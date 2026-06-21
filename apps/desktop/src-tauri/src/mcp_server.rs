@@ -588,3 +588,82 @@ pub async fn serve(conn: Connection) -> anyhow::Result<()> {
     service.waiting().await?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::indexer::{source_id, upsert_thread, ParsedMessage, ParsedThread};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static N: AtomicU32 = AtomicU32::new(0);
+
+    fn msg(role: &str, text: &str, ts: i64) -> ParsedMessage {
+        ParsedMessage {
+            role: role.into(),
+            text: text.into(),
+            tool_name: None,
+            ts: Some(ts),
+        }
+    }
+
+    /// A migrated temp DB seeded with one thread, wrapped in the MCP server. Exercises
+    /// the real entry point: tool dispatch -> conn lock -> search/pack -> CallToolResult.
+    fn seeded_server() -> Callimachus {
+        let p = std::env::temp_dir().join(format!(
+            "calli_mcp_{}_{}.db",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        for ext in ["db", "db-wal", "db-shm"] {
+            let _ = std::fs::remove_file(p.with_extension(ext));
+        }
+        let mut conn = crate::db::open(&p).unwrap();
+        let sid = source_id(&conn, "claude_code").unwrap();
+        let t = ParsedThread {
+            external_id: "t1".into(),
+            title: Some("auth token refresh".into()),
+            messages: vec![
+                msg("user", "how do we refresh the auth token", 100),
+                msg("assistant", "rotate the refresh token on a 401", 150),
+            ],
+            ..Default::default()
+        };
+        upsert_thread(&mut conn, sid, &t).unwrap();
+        Callimachus::new(conn)
+    }
+
+    #[tokio::test]
+    async fn search_threads_tool_surfaces_seeded_thread() {
+        let srv = seeded_server();
+        let res = srv
+            .search_threads(Parameters(SearchArgs {
+                query: "auth".into(),
+                sources: vec![],
+                hybrid: false,
+                include_subagents: false,
+                limit: Some(5),
+            }))
+            .await
+            .expect("search tool should succeed");
+        let body = format!("{:?}", res.content);
+        assert!(
+            body.contains("auth token refresh"),
+            "search should return the seeded thread; got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_thread_tool_packs_transcript() {
+        let srv = seeded_server();
+        // Single thread in a fresh DB has id 1.
+        let res = srv
+            .get_thread(Parameters(GetThreadArgs { thread_id: 1 }))
+            .await
+            .expect("get_thread tool should succeed");
+        let body = format!("{:?}", res.content);
+        assert!(
+            body.contains("refresh"),
+            "packed transcript should contain message text; got: {body}"
+        );
+    }
+}

@@ -1377,6 +1377,7 @@ fn search_by_file(
 /// Stream a chat completion. Tokens are pushed over `on_token`; the full reply is
 /// returned and the conversation persisted as a searchable in_app thread.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // Tauri injects app/db/generation/channel; the rest are the chat params
 async fn send_chat(
     app: AppHandle,
     db: tauri::State<'_, db::Db>,
@@ -1837,7 +1838,7 @@ pub fn run() {
             }
             // The blocking init (open + migrate + backfill + read pool) is done — the
             // backend is ready. The splash stays up until the frontend also signals ready.
-            complete_setup(&app.handle(), "backend");
+            complete_setup(app.handle(), "backend");
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

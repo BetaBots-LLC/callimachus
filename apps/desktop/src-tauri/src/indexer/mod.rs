@@ -84,7 +84,7 @@ pub fn scan_all_with_progress(
         let r = scan(conn, &mut || {
             seen += 1;
             // Emit the first 50 per-thread (so movement is obviously live), then every 10.
-            if seen <= 50 || seen % 10 == 0 {
+            if seen <= 50 || seen.is_multiple_of(10) {
                 on_progress(seen, name);
             }
         })?;
@@ -538,15 +538,12 @@ pub fn set_file_state(
 /// very latest uncommitted rows, which is fine for indexing).
 pub fn open_external_readonly(path: &Path) -> Result<Connection> {
     let ro = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI;
-    match Connection::open_with_flags(path, ro) {
-        Ok(conn) => {
-            // A trivial query forces SQLite to actually touch the file now, so a lock
-            // surfaces here (and we can fall back) rather than mid-scan.
-            if conn.query_row("SELECT 1", [], |_| Ok(())).is_ok() {
-                return Ok(conn);
-            }
+    if let Ok(conn) = Connection::open_with_flags(path, ro) {
+        // A trivial query forces SQLite to actually touch the file now, so a lock
+        // surfaces here (and we can fall back) rather than mid-scan.
+        if conn.query_row("SELECT 1", [], |_| Ok(())).is_ok() {
+            return Ok(conn);
         }
-        Err(_) => {}
     }
     // Immutable fallback: file:<path>?immutable=1
     let uri = format!("file:{}?immutable=1", path.to_string_lossy());

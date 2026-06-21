@@ -6,6 +6,7 @@
 //!   1. full transcript            (if it fits)
 //!   2. drop tool calls / output   (keep just user+assistant)
 //!   3. head/tail elision          (keep the first/last N turns, mark the gap)
+//!
 //! LLM summarization of the elided middle is a future step; elision is the floor.
 
 use crate::search;

@@ -43,3 +43,45 @@ pub static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
         M::up(include_str!("../../migrations/0018_distillable_count.sql")),
     ])
 });
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static N: AtomicU32 = AtomicU32::new(0);
+
+    fn temp_path() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "calli_mig_{}_{}.db",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    /// A fresh install must apply every embedded migration cleanly and land on an
+    /// applied version. `db::open` registers the vec0 extension (migration 0004 needs
+    /// it) and runs `to_latest`, so a successful open *is* the real first-run path.
+    /// Then `validate()` re-applies all migrations on its own in-memory DB — which
+    /// turns a malformed or out-of-order migration into a CI failure, not a user's
+    /// broken first launch.
+    #[test]
+    fn fresh_db_migrates_then_validates() {
+        let p = temp_path();
+        for ext in ["db", "db-wal", "db-shm"] {
+            let _ = std::fs::remove_file(p.with_extension(ext));
+        }
+        let conn = crate::db::open(&p).expect("fresh DB should migrate cleanly");
+        assert!(
+            matches!(
+                MIGRATIONS.current_version(&conn).unwrap(),
+                rusqlite_migration::SchemaVersion::Inside(_)
+            ),
+            "a migrated DB should report an applied schema version"
+        );
+        // vec0 is now registered process-wide, so validate()'s in-memory apply works.
+        MIGRATIONS
+            .validate()
+            .expect("embedded migrations should validate");
+    }
+}
