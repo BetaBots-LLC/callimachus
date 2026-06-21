@@ -591,10 +591,25 @@ pub fn recall(
     ];
     if let Some(p) = project.filter(|p| !p.is_empty()) {
         args.push(Box::new(format!("%{p}%")));
-        sql.push_str(&format!(" AND t.project_path LIKE ?{}", args.len()));
+        // Match how facts are WRITTEN + aggregated (record_fact / project_memory both scope by
+        // COALESCE(project_key, project_path)); filtering project_path alone silently drops the
+        // canonical-key threads the backfill exists to fix.
+        sql.push_str(&format!(
+            " AND COALESCE(t.project_key, t.project_path) LIKE ?{}",
+            args.len()
+        ));
     }
+    // Similarity floor: a cosine KNN always returns its k-nearest, so a query with no real match
+    // still yields confident-but-wrong hits. Drop neighbors below MIN_SIMILARITY (distance =
+    // 1 - cosine, so similarity >= floor ⟺ distance <= 1 - floor) and return an explicit empty.
+    const MIN_SIMILARITY: f64 = 0.45;
+    args.push(Box::new(1.0_f64 - MIN_SIMILARITY));
+    let dist_ph = args.len();
     args.push(Box::new(k as i64));
-    sql.push_str(&format!(" GROUP BY f.id ORDER BY d LIMIT ?{}", args.len()));
+    let limit_ph = args.len();
+    sql.push_str(&format!(
+        " GROUP BY f.id HAVING d <= ?{dist_ph} ORDER BY d LIMIT ?{limit_ph}"
+    ));
 
     let arg_refs: Vec<&dyn rusqlite::ToSql> = args.iter().map(|b| b.as_ref()).collect();
     let mut stmt = conn.prepare(&sql)?;
@@ -664,7 +679,14 @@ pub fn find_prior_work(
         }
     }
 
-    let mut out: Vec<PriorWork> = by_thread.into_values().collect();
+    // The guard is high-stakes — an agent acts on "you solved this before", so a false positive
+    // is worse than an empty answer. Hold it to a stricter floor than general recall; recall()
+    // already dropped the clear noise, this keeps only genuinely-related prior sessions.
+    const GUARD_FLOOR: f32 = 0.55;
+    let mut out: Vec<PriorWork> = by_thread
+        .into_values()
+        .filter(|w| w.similarity >= GUARD_FLOOR)
+        .collect();
     out.sort_by(|a, b| {
         b.similarity
             .partial_cmp(&a.similarity)
@@ -1235,5 +1257,102 @@ mod tests {
         assert!(hits[0].similarity > 0.99);
         // Kind filter excludes non-matching kinds.
         assert!(recall(&conn, &v, "gotcha", None, 5).unwrap().is_empty());
+    }
+
+    #[test]
+    fn recall_floors_noise_and_scopes_by_project_key() {
+        use crate::embed::{vec_to_bytes, DIM};
+        use crate::indexer::{source_id, upsert_thread, ParsedMessage, ParsedThread};
+
+        let mut conn = temp_db();
+        let sid = source_id(&conn, "claude_code").unwrap();
+        let add = |conn: &mut rusqlite::Connection, ext: &str, text: &str, vec: &[f32]| -> i64 {
+            upsert_thread(
+                conn,
+                sid,
+                &ParsedThread {
+                    external_id: ext.into(),
+                    title: Some(ext.into()),
+                    messages: vec![ParsedMessage {
+                        role: "user".into(),
+                        text: "x".into(),
+                        tool_name: None,
+                        ts: Some(1),
+                    }],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let tid: i64 = conn
+                .query_row(
+                    "SELECT id FROM threads WHERE external_id = ?1",
+                    [ext],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            conn.execute(
+                "INSERT INTO facts (thread_id, kind, text, status, extractor, created_at)
+                 VALUES (?1, 'decision', ?2, 'open', 'llm', 1)",
+                rusqlite::params![tid, text],
+            )
+            .unwrap();
+            let fid = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO vec_facts (fact_id, embedding) VALUES (?1, ?2)",
+                rusqlite::params![fid, vec_to_bytes(vec)],
+            )
+            .unwrap();
+            tid
+        };
+
+        let mut near = vec![0.0_f32; DIM];
+        near[0] = 1.0; // cosine 1.0 with the query
+        let mut far = vec![0.0_f32; DIM];
+        far[1] = 1.0; // cosine 0.0 with the query → below the floor
+        let near_tid = add(&mut conn, "near", "use jwt for auth", &near);
+        add(&mut conn, "far", "unrelated thing", &far);
+        let qv = near.clone();
+
+        // Floor: the orthogonal fact is dropped, only the genuine match returns.
+        let hits = recall(&conn, &qv, "decision", None, 5).unwrap();
+        assert_eq!(hits.len(), 1, "similarity floor drops the orthogonal fact");
+        assert_eq!(hits[0].text, "use jwt for auth");
+
+        // Scope by COALESCE(project_key, project_path): set project_key with a NULL project_path
+        // (the old project_path-only filter would have missed this).
+        conn.execute(
+            "UPDATE threads SET project_key = 'myproj', project_path = NULL WHERE id = ?1",
+            [near_tid],
+        )
+        .unwrap();
+        assert_eq!(
+            recall(&conn, &qv, "decision", Some("myproj"), 5)
+                .unwrap()
+                .len(),
+            1,
+            "scoped recall matches on project_key"
+        );
+        assert!(
+            recall(&conn, &qv, "decision", Some("nope"), 5)
+                .unwrap()
+                .is_empty(),
+            "non-matching project is excluded"
+        );
+
+        // find_prior_work guard: a query unrelated to everything returns EMPTY, not a false
+        // positive; a related query still surfaces the prior session.
+        let mut unrelated = vec![0.0_f32; DIM];
+        unrelated[2] = 1.0;
+        assert!(
+            find_prior_work(&conn, &unrelated, None, 5)
+                .unwrap()
+                .is_empty(),
+            "guard returns empty when nothing is related"
+        );
+        assert_eq!(
+            find_prior_work(&conn, &qv, None, 5).unwrap().len(),
+            1,
+            "guard still surfaces a genuinely-related prior session"
+        );
     }
 }
