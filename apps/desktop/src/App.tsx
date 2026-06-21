@@ -12,6 +12,7 @@ import { ProjectMemoryView } from "./components/ProjectMemoryView";
 import { KnowledgeGate } from "./components/KnowledgeGate";
 import { Onboarding } from "./components/Onboarding";
 import { CommandPalette } from "./components/CommandPalette";
+import { UpdateBanner } from "./components/UpdateBanner";
 import { StatsView } from "./components/StatsView";
 import { SettingsView } from "./components/SettingsView";
 import { Button } from "@/components/ui/button";
@@ -178,6 +179,7 @@ function App() {
       </div>
 
       <CommandPalette />
+      <UpdateBanner />
     </div>
   );
 }
