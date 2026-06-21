@@ -1,5 +1,5 @@
 ---
-"callimachus": minor
+"callimachus": patch
 ---
 
 **Agent Session Snapshots — resumable cross-agent handoff, captured automatically.** Save a durable checkpoint of an indexed thread (its packed transcript plus a carry-forward block of the project's distilled decisions, gotchas, and open TODOs) and reload it to continue, across a context-window compaction or across tools (Claude Code -> Codex -> Cursor).
