@@ -14,6 +14,7 @@ pub mod integration;
 pub mod knowledge;
 pub mod mcp_server;
 pub mod search;
+pub mod snapshot;
 
 use error::AppResult;
 use search::{SearchFilters, SearchHit, ThreadDetail, ThreadSummary};

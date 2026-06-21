@@ -67,10 +67,18 @@ fn hook_command(app_exe: &Path) -> String {
     format!("\"{}\" hook", cal_exe(app_exe).display())
 }
 
-/// Recognize a hook command we installed: our format always ends with `" hook` (a quoted
-/// path followed by the `hook` subcommand), which a user's own hook is very unlikely to use.
+/// The PreCompact / SubagentStop hook command: `"<cal>" snapshot-hook`, which auto-snapshots
+/// the live session (before its context is compacted, or when a subagent finishes).
+fn snapshot_hook_command(app_exe: &Path) -> String {
+    format!("\"{}\" snapshot-hook", cal_exe(app_exe).display())
+}
+
+/// Recognize a hook command we installed: our commands always end with `" hook` or
+/// `" snapshot-hook` (a quoted path followed by the subcommand), which a user's own hook is
+/// very unlikely to use.
 fn is_our_hook(cmd: &str) -> bool {
-    cmd.trim().ends_with("\" hook")
+    let c = cmd.trim();
+    c.ends_with("\" hook") || c.ends_with("\" snapshot-hook")
 }
 
 /// True if `~/.claude/settings.json` already has a Callimachus SessionStart hook.
@@ -186,18 +194,20 @@ pub fn uninstall() -> Result<()> {
             std::fs::write(&cfg, serde_json::to_string_pretty(&v)?)?;
         }
     }
-    // Strip our SessionStart hook from settings.json (leave any other hooks alone).
+    // Strip our hooks from every event we install into (leave any other hooks alone).
     if let Ok(path) = settings_path() {
         if let Ok(text) = std::fs::read_to_string(&path) {
             if let Ok(mut v) = serde_json::from_str::<Value>(&text) {
-                if let Some(arr) = v
-                    .get_mut("hooks")
-                    .and_then(|h| h.get_mut("SessionStart"))
-                    .and_then(Value::as_array_mut)
-                {
-                    remove_our_hooks(arr);
-                    let _ = std::fs::write(&path, serde_json::to_string_pretty(&v)?);
+                for event in HOOK_EVENTS {
+                    if let Some(arr) = v
+                        .get_mut("hooks")
+                        .and_then(|h| h.get_mut(event))
+                        .and_then(Value::as_array_mut)
+                    {
+                        remove_our_hooks(arr);
+                    }
                 }
+                let _ = std::fs::write(&path, serde_json::to_string_pretty(&v)?);
             }
         }
     }
@@ -207,9 +217,14 @@ pub fn uninstall() -> Result<()> {
     Ok(())
 }
 
-/// Merge a Callimachus SessionStart hook into `~/.claude/settings.json`. Preserves all other
-/// settings and hooks; refuses to clobber an unparseable file; idempotent (re-install drops
-/// any prior Callimachus hook first, so it never duplicates).
+/// The Claude Code hook events we install into: SessionStart injects each repo's memory;
+/// PreCompact + SubagentStop auto-snapshot the live session so context survives a compaction
+/// and a finished subagent's work is captured.
+const HOOK_EVENTS: [&str; 3] = ["SessionStart", "PreCompact", "SubagentStop"];
+
+/// Merge our hooks into `~/.claude/settings.json`. Preserves all other settings and hooks;
+/// refuses to clobber an unparseable file; idempotent (re-install drops any prior Callimachus
+/// hook first, so it never duplicates).
 fn install_hook(app_exe: &Path) -> Result<()> {
     let path = settings_path()?;
     if let Some(dir) = path.parent() {
@@ -223,26 +238,38 @@ fn install_hook(app_exe: &Path) -> Result<()> {
     let obj = root
         .as_object_mut()
         .ok_or_else(|| anyhow::anyhow!("{} is not a JSON object", path.display()))?;
+
+    let memory = hook_command(app_exe);
+    let snapshot = snapshot_hook_command(app_exe);
+    for event in HOOK_EVENTS {
+        let cmd = if event == "SessionStart" {
+            &memory
+        } else {
+            &snapshot
+        };
+        upsert_hook(obj, event, cmd)?;
+    }
+
+    std::fs::write(&path, serde_json::to_string_pretty(&root)?)
+        .with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
+/// Merge one Callimachus hook command into `hooks.<event>` of a settings object, dropping any
+/// prior Callimachus hook in that event first (idempotent) while preserving the user's own.
+fn upsert_hook(obj: &mut Map<String, Value>, event: &str, command: &str) -> Result<()> {
     let hooks = obj
         .entry("hooks")
         .or_insert_with(|| Value::Object(Map::new()))
         .as_object_mut()
-        .ok_or_else(|| anyhow::anyhow!("hooks in {} is not an object", path.display()))?;
+        .ok_or_else(|| anyhow::anyhow!("hooks is not an object"))?;
     let arr = hooks
-        .entry("SessionStart")
+        .entry(event)
         .or_insert_with(|| Value::Array(Vec::new()))
         .as_array_mut()
-        .ok_or_else(|| {
-            anyhow::anyhow!("hooks.SessionStart in {} is not an array", path.display())
-        })?;
-
-    remove_our_hooks(arr); // drop any prior Callimachus hook so re-install doesn't duplicate
-    arr.push(json!({
-        "hooks": [ { "type": "command", "command": hook_command(app_exe) } ]
-    }));
-
-    std::fs::write(&path, serde_json::to_string_pretty(&root)?)
-        .with_context(|| format!("writing {}", path.display()))?;
+        .ok_or_else(|| anyhow::anyhow!("hooks.{event} is not an array"))?;
+    remove_our_hooks(arr);
+    arr.push(json!({ "hooks": [ { "type": "command", "command": command } ] }));
     Ok(())
 }
 
@@ -688,5 +715,52 @@ mod tests {
             back["mcp_servers"]["callimachus"]["args"][0].as_str(),
             Some("--mcp")
         );
+    }
+
+    #[test]
+    fn snapshot_hooks_install_across_events_idempotently() {
+        // is_our_hook recognizes both the memory hook and the snapshot hook, nothing else.
+        assert!(is_our_hook("\"/x/cal\" hook"));
+        assert!(is_our_hook("\"/x/cal\" snapshot-hook"));
+        assert!(!is_our_hook("\"/x/cal\" other"));
+        assert!(!is_our_hook("my-own-snapshot-hook"));
+
+        // Install all three events (mirrors install_hook), then re-install to prove no dup.
+        let mut root = json!({"model": "opus"});
+        let obj = root.as_object_mut().unwrap();
+        for _ in 0..2 {
+            upsert_hook(obj, "SessionStart", "\"/x/cal\" hook").unwrap();
+            upsert_hook(obj, "PreCompact", "\"/x/cal\" snapshot-hook").unwrap();
+            upsert_hook(obj, "SubagentStop", "\"/x/cal\" snapshot-hook").unwrap();
+        }
+
+        let ours_in = |root: &Value, event: &str| -> usize {
+            root["hooks"][event]
+                .as_array()
+                .map(|gs| {
+                    gs.iter()
+                        .flat_map(|g| g["hooks"].as_array().unwrap().iter())
+                        .filter(|h| is_our_hook(h["command"].as_str().unwrap()))
+                        .count()
+                })
+                .unwrap_or(0)
+        };
+        assert_eq!(root["model"], "opus"); // unrelated setting preserved
+        for event in HOOK_EVENTS {
+            assert_eq!(ours_in(&root, event), 1, "exactly one hook in {event}");
+        }
+        assert_eq!(
+            root["hooks"]["PreCompact"][0]["hooks"][0]["command"],
+            "\"/x/cal\" snapshot-hook"
+        );
+
+        // Uninstall strips ours from every event.
+        for event in HOOK_EVENTS {
+            let arr = root["hooks"][event].as_array_mut().unwrap();
+            remove_our_hooks(arr);
+        }
+        for event in HOOK_EVENTS {
+            assert_eq!(ours_in(&root, event), 0, "{event} cleared on uninstall");
+        }
     }
 }

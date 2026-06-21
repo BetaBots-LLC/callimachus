@@ -6,7 +6,7 @@
 
 use std::sync::Mutex;
 
-use crate::{context, embed, search};
+use crate::{context, embed, search, snapshot};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content, Implementation, ServerCapabilities, ServerInfo};
@@ -137,6 +137,26 @@ struct ProjectSearchArgs {
     limit: Option<u32>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SnapshotArgs {
+    /// The thread id (from a search/recent result) to checkpoint.
+    thread_id: i64,
+    /// Optional label for the snapshot; defaults to the thread title.
+    label: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ListSnapshotsArgs {
+    /// Substring-match the project path to scope results. Empty = all projects.
+    project: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct LoadSnapshotArgs {
+    /// The snapshot id (from list_snapshots or snapshot_session).
+    id: i64,
+}
+
 #[tool_router]
 impl Callimachus {
     fn new(conn: Connection) -> Self {
@@ -191,6 +211,59 @@ impl Callimachus {
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
             .ok_or_else(|| ErrorData::invalid_params("thread not found", None))?;
         Ok(CallToolResult::success(vec![Content::text(packed)]))
+    }
+
+    #[tool(
+        description = "Save a resumable SNAPSHOT of a thread: its packed transcript plus a carry-forward block of the project's distilled decisions/gotchas/open TODOs. Use this to checkpoint a session before context is compacted, or to hand work off to another agent or tool. Returns the snapshot id to load later. Pass a threadId from search_threads."
+    )]
+    async fn snapshot_session(
+        &self,
+        Parameters(args): Parameters<SnapshotArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let snap = snapshot::create(&conn, args.thread_id, args.label.as_deref())
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let json = serde_json::to_string_pretty(&snap)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(
+        description = "List saved session snapshots (newest first), optionally scoped to a project-path substring. Returns snapshot metadata with an id to load."
+    )]
+    async fn list_snapshots(
+        &self,
+        Parameters(args): Parameters<ListSnapshotsArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let snaps = snapshot::list(&conn, args.project.as_deref(), 40)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let json = serde_json::to_string_pretty(&snaps)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(
+        description = "Load a saved snapshot's full checkpoint (carry-forward project memory + packed transcript) as markdown, ready to drop into context to continue the session. Pass an id from list_snapshots."
+    )]
+    async fn load_snapshot(
+        &self,
+        Parameters(args): Parameters<LoadSnapshotArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let snap = snapshot::load(&conn, args.id)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
+            .ok_or_else(|| ErrorData::invalid_params("snapshot not found", None))?;
+        Ok(CallToolResult::success(vec![Content::text(snap.body)]))
     }
 
     #[tool(
@@ -664,6 +737,40 @@ mod tests {
         assert!(
             body.contains("refresh"),
             "packed transcript should contain message text; got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_tools_roundtrip() {
+        let srv = seeded_server();
+        // Checkpoint the seeded thread (id 1 in a fresh DB).
+        let created = srv
+            .snapshot_session(Parameters(SnapshotArgs {
+                thread_id: 1,
+                label: None,
+            }))
+            .await
+            .expect("snapshot_session should succeed");
+        assert!(
+            format!("{:?}", created.content).contains("auth token refresh"),
+            "snapshot label defaults to the thread title"
+        );
+
+        // It shows up in the list.
+        let listed = srv
+            .list_snapshots(Parameters(ListSnapshotsArgs { project: None }))
+            .await
+            .expect("list_snapshots should succeed");
+        assert!(format!("{:?}", listed.content).contains("auth token refresh"));
+
+        // Loading returns the checkpoint body (the packed transcript).
+        let loaded = srv
+            .load_snapshot(Parameters(LoadSnapshotArgs { id: 1 }))
+            .await
+            .expect("load_snapshot should succeed");
+        assert!(
+            format!("{:?}", loaded.content).contains("refresh"),
+            "loaded checkpoint should contain the transcript"
         );
     }
 }

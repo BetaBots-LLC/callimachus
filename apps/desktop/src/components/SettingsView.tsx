@@ -218,8 +218,9 @@ function RecallIntegrationCard() {
         </CardTitle>
         <p className="text-sm text-muted-foreground">
           Let Claude Code (and other agents) search your history. Installs the <code>/recall</code>{" "}
-          skill, registers Callimachus as an MCP server, adds a <strong>SessionStart hook</strong>{" "}
-          that auto-injects each repo's memory at the start of a session, and adds the{" "}
+          skill, registers Callimachus as an MCP server, adds hooks that{" "}
+          <strong>auto-inject each repo's memory</strong> at the start of a session and{" "}
+          <strong>auto-snapshot</strong> a session before its context is compacted, and adds the{" "}
           <code>cal</code> CLI (used by the VS Code extension) — no terminal, no setup.
         </p>
       </CardHeader>
