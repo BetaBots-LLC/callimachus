@@ -388,7 +388,7 @@ pub fn store_distilled(
     }
     tx.execute(
         "UPDATE threads SET knowledge_extracted = 1, knowledge_extracted_at = ?2,
-            knowledge_msg_count = message_count, knowledge_error = NULL WHERE id = ?1",
+            knowledge_msg_count = distillable_count, knowledge_error = NULL WHERE id = ?1",
         params![thread_id, now],
     )?;
     tx.commit()?;
@@ -486,7 +486,7 @@ pub fn needs_distill(conn: &Connection, thread_id: i64) -> Result<bool> {
     }
     let row: Option<(bool, Option<i64>, Option<String>, i64)> = conn
         .query_row(
-            "SELECT knowledge_extracted, knowledge_msg_count, knowledge_error, message_count
+            "SELECT knowledge_extracted, knowledge_msg_count, knowledge_error, distillable_count
              FROM threads WHERE id = ?1",
             [thread_id],
             |r| Ok((r.get::<_, i64>(0)? != 0, r.get(1)?, r.get(2)?, r.get(3)?)),
@@ -503,7 +503,7 @@ pub fn needs_distill(conn: &Connection, thread_id: i64) -> Result<bool> {
 pub fn get_thread_knowledge(conn: &Connection, thread_id: i64) -> Result<ThreadKnowledge> {
     let (extracted, kmsg, error, mcount): (bool, Option<i64>, Option<String>, i64) = conn
         .query_row(
-            "SELECT knowledge_extracted, knowledge_msg_count, knowledge_error, message_count
+            "SELECT knowledge_extracted, knowledge_msg_count, knowledge_error, distillable_count
          FROM threads WHERE id = ?1",
             [thread_id],
             |r| Ok((r.get::<_, i64>(0)? != 0, r.get(1)?, r.get(2)?, r.get(3)?)),
@@ -915,7 +915,7 @@ pub fn pending_threads(conn: &Connection, limit: i64) -> Result<Vec<i64>> {
     let mut stmt = conn.prepare(&format!(
         "SELECT id FROM threads
          WHERE {DISTILLABLE} AND knowledge_error IS NULL
-           AND (knowledge_extracted = 0 OR knowledge_msg_count != message_count)
+           AND (knowledge_extracted = 0 OR knowledge_msg_count != distillable_count)
          ORDER BY updated_at DESC
          LIMIT ?1"
     ))?;

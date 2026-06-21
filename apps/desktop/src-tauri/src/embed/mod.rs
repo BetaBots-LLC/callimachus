@@ -279,12 +279,13 @@ pub fn semantic_search(
     query: &str,
     include_subagents: bool,
     sources: &[String],
+    project: Option<&str>,
     k: usize,
 ) -> Result<Vec<(i64, f32)>> {
     let Some(qv) = embed_query(embedder, query)? else {
         return Ok(Vec::new());
     };
-    semantic_search_vec(conn, &qv, include_subagents, sources, k)
+    semantic_search_vec(conn, &qv, include_subagents, sources, project, k)
 }
 
 /// SQL-only semantic KNN given an already-embedded query vector. No model inference
@@ -294,16 +295,19 @@ pub fn semantic_search_vec(
     qv: &[f32],
     include_subagents: bool,
     sources: &[String],
+    project: Option<&str>,
     k: usize,
 ) -> Result<Vec<(i64, f32)>> {
-    // Over-fetch chunks so dedup + filtering still leaves k messages. vec0 applies
-    // the source/subagent filter AFTER the KNN, so a selective source filter can
-    // starve results — over-fetch far more candidates when one is active. sqlite-vec
-    // requires `k` as a literal (not a bound parameter), so inline our own integer.
-    let knn_k = if sources.is_empty() {
-        (k * 5).max(200)
-    } else {
+    let project = project.filter(|p| !p.is_empty());
+    // Over-fetch chunks so dedup + filtering still leaves k messages. vec0 applies the
+    // source/subagent/project filter AFTER the KNN, so a selective filter can starve
+    // results — over-fetch far more candidates when one is active. sqlite-vec requires `k`
+    // as a literal (not a bound parameter), so inline our own integer.
+    let selective = !sources.is_empty() || project.is_some();
+    let knn_k = if selective {
         (k * 20).max(800)
+    } else {
+        (k * 5).max(200)
     };
 
     // MATERIALIZED so SQLite doesn't inline the KNN into the outer query (vec0 only
@@ -335,11 +339,26 @@ pub fn semantic_search_vec(
             args.push(Box::new(s.clone()));
         }
     }
-    sql.push_str(&format!(
-        " GROUP BY knn.message_id ORDER BY d LIMIT ?{}",
-        args.len() + 1
-    ));
+    // Scope the semantic arm to the project too (was previously ignored, leaking cross-
+    // project hits into a project-scoped hybrid search). Match how facts/threads aggregate.
+    if let Some(p) = project {
+        args.push(Box::new(format!("%{p}%")));
+        sql.push_str(&format!(
+            " AND COALESCE(t.project_key, t.project_path) LIKE ?{}",
+            args.len()
+        ));
+    }
+    // Similarity floor: KNN always returns its k-nearest, so a query with no good semantic
+    // match would otherwise inject irrelevant chunks that RRF then promotes. Drop anything
+    // below MIN_SIMILARITY (distance = 1 - cosine). Conservative so real matches survive.
+    const MIN_SIMILARITY: f64 = 0.35;
+    args.push(Box::new(1.0_f64 - MIN_SIMILARITY));
+    let dist_ph = args.len();
     args.push(Box::new(k as i64));
+    let limit_ph = args.len();
+    sql.push_str(&format!(
+        " GROUP BY knn.message_id HAVING d <= ?{dist_ph} ORDER BY d LIMIT ?{limit_ph}"
+    ));
 
     let arg_refs: Vec<&dyn ToSql> = args.iter().map(|b| b.as_ref()).collect();
     let mut stmt = conn.prepare(&sql)?;
@@ -455,6 +474,7 @@ mod tests {
             "enter the shell environment",
             false,
             &[],
+            None,
             3,
         )
         .unwrap();

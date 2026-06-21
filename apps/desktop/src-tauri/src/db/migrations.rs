@@ -39,5 +39,7 @@ pub static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
         M::up(include_str!("../../migrations/0016_project_key.sql")),
         // 0017 — index messages.ts for the Coach activity heatmap range scan.
         M::up(include_str!("../../migrations/0017_messages_ts.sql")),
+        // 0018 — track distillable (user/assistant) message count for distill staleness.
+        M::up(include_str!("../../migrations/0018_distillable_count.sql")),
     ])
 });
