@@ -41,6 +41,8 @@ pub static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
         M::up(include_str!("../../migrations/0017_messages_ts.sql")),
         // 0018 — track distillable (user/assistant) message count for distill staleness.
         M::up(include_str!("../../migrations/0018_distillable_count.sql")),
+        // 0019 — agent session snapshots: resumable thread checkpoints for cross-agent handoff.
+        M::up(include_str!("../../migrations/0019_snapshots.sql")),
     ])
 });
 

@@ -7,7 +7,7 @@
 //! Set CALLIMACHUS_DB to point at a specific index.db; CALLIMACHUS_VAULT to a
 //! default Obsidian vault for `cal export`.
 
-use crate::{agent, context, db, embed, export, knowledge, search, secrets};
+use crate::{agent, context, db, embed, export, knowledge, search, secrets, snapshot};
 use rusqlite::Connection;
 
 /// Subcommands that identify a `cal` invocation when the app is launched directly.
@@ -36,6 +36,10 @@ pub const COMMANDS: &[&str] = &[
     "remember",
     "hook",
     "agents",
+    "snapshot",
+    "snapshots",
+    "resume",
+    "snapshot-hook",
 ];
 
 const USAGE: &str = "\
@@ -78,6 +82,14 @@ USAGE:
   cal agents [<project>] [-o FILE]
                                 write/refresh the memory block in AGENTS.md (or -o
                                 CLAUDE.md) so any agent reading it opens with the memory
+  cal snapshot <thread-id> [-l LABEL]
+                                save a resumable checkpoint of a thread (packed transcript +
+                                the project's carry-forward memory)
+  cal snapshots [<project>] [-n LIMIT] [--json]
+                                list saved snapshots (newest first)
+  cal resume <snapshot-id> [-a AGENT]
+                                relaunch an agent CLI seeded with a snapshot (cross-tool
+                                handoff; AGENT defaults to claude, e.g. -a codex)
   cal help
 
 OPTIONS:
@@ -87,6 +99,8 @@ OPTIONS:
   -p, --project PATH    substring-match the project path
       --starred         only starred threads (recent/related/search)
   -t, --tag TAG         only threads with this tag (repeatable)
+  -l, --label LABEL     name for a `snapshot`
+  -a, --agent AGENT     target agent CLI for `resume` (default claude)
   -y, --hybrid          fuse keyword + on-device semantic search
   -n, --limit N         max results (default 20; todos 50, files 40)
   -V, --vault DIR       Obsidian vault dir for `export` (else CALLIMACHUS_VAULT)
@@ -135,6 +149,10 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
         "remember" => cmd_remember(rest),
         "hook" => cmd_hook(rest),
         "agents" => cmd_agents(rest),
+        "snapshot" => cmd_snapshot(rest),
+        "snapshots" => cmd_snapshots(rest),
+        "resume" => cmd_resume(rest),
+        "snapshot-hook" => cmd_snapshot_hook(rest),
         "help" | "-h" | "--help" => {
             println!("{USAGE}");
             Ok(())
@@ -157,6 +175,8 @@ struct Opts {
     starred: bool,
     off: bool,
     tags: Vec<String>,
+    label: Option<String>,
+    agent: Option<String>,
     positional: Vec<String>,
 }
 
@@ -179,6 +199,8 @@ fn parse(args: &[String]) -> anyhow::Result<Opts> {
             "-y" | "--hybrid" => o.hybrid = true,
             "-S" | "--synthesize" => o.synthesize = true,
             "-t" | "--tag" => o.tags.push(next(&mut it, "--tag")?),
+            "-l" | "--label" => o.label = Some(next(&mut it, "--label")?),
+            "-a" | "--agent" => o.agent = Some(next(&mut it, "--agent")?),
             "--starred" => o.starred = true,
             "--off" => o.off = true,
             "--json" => o.json = true,
@@ -832,6 +854,146 @@ fn strip_marks(s: &str) -> String {
     s.replace(['\u{1}', '\u{2}'], "")
 }
 
+/// `cal snapshot <thread-id> [-l label]` — save a resumable checkpoint of a thread.
+fn cmd_snapshot(args: &[String]) -> anyhow::Result<()> {
+    let o = parse(args)?;
+    let id: i64 = o
+        .positional
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("usage: cal snapshot <thread-id> [-l LABEL]"))?
+        .parse()
+        .map_err(|_| anyhow::anyhow!("thread-id must be a number"))?;
+    let conn = open_db_write()?;
+    let snap = snapshot::create(&conn, id, o.label.as_deref())?;
+    if o.json {
+        println!("{}", serde_json::to_string_pretty(&snap)?);
+        return Ok(());
+    }
+    println!(
+        "Saved snapshot #{} \"{}\" (~{} tokens). Resume with: cal resume {}",
+        snap.id, snap.label, snap.token_estimate, snap.id
+    );
+    Ok(())
+}
+
+/// `cal snapshots [project] [-n N] [--json]` — list saved snapshots (newest first).
+fn cmd_snapshots(args: &[String]) -> anyhow::Result<()> {
+    let o = parse(args)?;
+    let project = if o.positional.is_empty() {
+        None
+    } else {
+        Some(o.positional.join(" "))
+    };
+    let conn = open_db()?;
+    let snaps = snapshot::list(&conn, project.as_deref(), o.limit.unwrap_or(40) as usize)?;
+    if o.json {
+        println!("{}", serde_json::to_string_pretty(&snaps)?);
+        return Ok(());
+    }
+    if snaps.is_empty() {
+        eprintln!("(no snapshots yet — create one with `cal snapshot <thread-id>`)");
+        return Ok(());
+    }
+    for s in &snaps {
+        println!(
+            "#{:<4} {}  [{}]  {}",
+            s.id,
+            fmt_time(Some(s.created_at)),
+            s.source_kind.as_deref().unwrap_or("?"),
+            s.label
+        );
+    }
+    Ok(())
+}
+
+/// `cal resume <snapshot-id> [-a agent]` — relaunch an agent CLI seeded with a snapshot.
+fn cmd_resume(args: &[String]) -> anyhow::Result<()> {
+    let o = parse(args)?;
+    let id: i64 = o
+        .positional
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("usage: cal resume <snapshot-id> [-a AGENT]"))?
+        .parse()
+        .map_err(|_| anyhow::anyhow!("snapshot-id must be a number"))?;
+    let conn = open_db()?;
+    let snap = snapshot::load(&conn, id)?
+        .ok_or_else(|| anyhow::anyhow!("no snapshot #{id} (see `cal snapshots`)"))?;
+    let agent = o.agent.as_deref().unwrap_or("claude");
+    let file = agent::cli_resume::launch_with_context(
+        agent,
+        &snap.body,
+        snap.meta.project_path.as_deref(),
+    )?;
+    println!(
+        "Launched {agent} with snapshot #{id} (\"{}\"). Context: {file}",
+        snap.meta.label
+    );
+    Ok(())
+}
+
+/// Internal hook target for Claude Code's PreCompact / SubagentStop events. Reads the hook's
+/// JSON from stdin, maps the live session's `transcript_path` to its indexed thread, and saves
+/// a snapshot so context survives the compaction / the finished subagent's work is captured.
+/// Best-effort and SILENT: a hook must never break the agent loop, so every failure (no index,
+/// session not indexed yet, bad payload) just exits 0 without output.
+fn cmd_snapshot_hook(_args: &[String]) -> anyhow::Result<()> {
+    use std::io::Read;
+    let mut input = String::new();
+    if std::io::stdin().read_to_string(&mut input).is_err() {
+        return Ok(());
+    }
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&input) else {
+        return Ok(());
+    };
+    let Some(transcript) = v.get("transcript_path").and_then(|x| x.as_str()) else {
+        return Ok(());
+    };
+    let event = v
+        .get("hook_event_name")
+        .and_then(|x| x.as_str())
+        .unwrap_or("hook");
+    let Some(external_id) = claude_external_id(transcript) else {
+        return Ok(());
+    };
+    // Only act when an index already exists — never create one from inside a hook.
+    if !db::default_index_path().exists() {
+        return Ok(());
+    }
+    let conn = open_db_write()?;
+    let thread_id: Option<i64> = conn
+        .query_row(
+            "SELECT t.id FROM threads t JOIN sources s ON s.id = t.source_id
+             WHERE s.kind = 'claude_code' AND t.external_id = ?1",
+            [&external_id],
+            |r| r.get(0),
+        )
+        .ok();
+    if let Some(tid) = thread_id {
+        // Ignore errors: a failed auto-snapshot must not surface to the agent.
+        let _ = snapshot::create_rolling_auto(&conn, tid, event);
+    }
+    Ok(())
+}
+
+/// Map a Claude Code hook's absolute `transcript_path` back to the indexed thread's
+/// `external_id` (the path relative to `~/.claude/projects`).
+fn claude_external_id(transcript_path: &str) -> Option<String> {
+    let home = std::env::var("HOME").ok()?;
+    external_id_under(
+        transcript_path,
+        &std::path::Path::new(&home).join(".claude/projects"),
+    )
+}
+
+/// The path of `transcript_path` relative to `base`, as a string (the indexed `external_id`).
+fn external_id_under(transcript_path: &str, base: &std::path::Path) -> Option<String> {
+    std::path::Path::new(transcript_path)
+        .strip_prefix(base)
+        .ok()?
+        .to_str()
+        .map(str::to_string)
+}
+
 fn fmt_time(epoch: Option<i64>) -> String {
     match epoch.and_then(|e| chrono::DateTime::from_timestamp(e, 0)) {
         Some(dt) => dt.format("%Y-%m-%d").to_string(),
@@ -878,5 +1040,26 @@ mod tests {
     #[test]
     fn run_rejects_unknown_command() {
         assert!(run(&argv(&["bogus-cmd"])).is_err());
+    }
+
+    #[test]
+    fn external_id_maps_transcript_path_to_indexed_id() {
+        let base = std::path::Path::new("/home/me/.claude/projects");
+        // Top-level session.
+        assert_eq!(
+            external_id_under("/home/me/.claude/projects/-proj/abc-123.jsonl", base).as_deref(),
+            Some("-proj/abc-123.jsonl")
+        );
+        // Subagent transcript keeps its full relative path (matches the indexed subagent id).
+        assert_eq!(
+            external_id_under(
+                "/home/me/.claude/projects/-proj/sess/subagents/agent-x.jsonl",
+                base
+            )
+            .as_deref(),
+            Some("-proj/sess/subagents/agent-x.jsonl")
+        );
+        // A path outside the projects dir maps to nothing (we don't snapshot it).
+        assert!(external_id_under("/tmp/elsewhere/x.jsonl", base).is_none());
     }
 }
