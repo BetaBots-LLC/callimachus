@@ -199,8 +199,9 @@ function RecallIntegrationCard() {
   const uninstall = useMutation({ mutationFn: api.uninstallRecallIntegration, onSuccess: refresh });
 
   const s = status.data;
-  const connected = !!s && s.skillInstalled && s.mcpRegistered && !s.skillOutdated;
-  const partial = !!s && (s.skillInstalled || s.mcpRegistered) && !connected;
+  const connected =
+    !!s && s.skillInstalled && s.mcpRegistered && s.hookInstalled && !s.skillOutdated;
+  const partial = !!s && (s.skillInstalled || s.mcpRegistered || s.hookInstalled) && !connected;
 
   return (
     <Card>
@@ -215,8 +216,9 @@ function RecallIntegrationCard() {
         </CardTitle>
         <p className="text-sm text-muted-foreground">
           Let Claude Code (and other agents) search your history. Installs the <code>/recall</code>{" "}
-          skill, registers Callimachus as an MCP server, and adds the <code>cal</code> CLI (used by
-          the VS Code extension) — no terminal, no setup.
+          skill, registers Callimachus as an MCP server, adds a <strong>SessionStart hook</strong>{" "}
+          that auto-injects each repo's memory at the start of a session, and adds the{" "}
+          <code>cal</code> CLI (used by the VS Code extension) — no terminal, no setup.
         </p>
       </CardHeader>
       <CardContent className="space-y-3">
@@ -225,6 +227,7 @@ function RecallIntegrationCard() {
             {s?.skillInstalled ? (s.skillOutdated ? "⚠ skill outdated" : "✓ skill") : "○ skill"}
           </span>
           <span>{s?.mcpRegistered ? "✓ MCP server" : "○ MCP server"}</span>
+          <span>{s?.hookInstalled ? "✓ memory hook" : "○ memory hook"}</span>
           <span>{s?.calInstalled ? "✓ cal CLI" : "○ cal CLI"}</span>
         </div>
         <div className="flex items-center gap-2">

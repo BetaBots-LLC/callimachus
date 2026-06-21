@@ -416,6 +416,7 @@ export interface IntegrationStatus {
   skillInstalled: boolean;
   skillOutdated: boolean;
   mcpRegistered: boolean;
+  hookInstalled: boolean;
   calInstalled: boolean;
   skillPath: string;
   configPath: string;

@@ -39,6 +39,63 @@ fn cal_link_path() -> Result<PathBuf> {
     Ok(home()?.join(".local/bin/cal"))
 }
 
+/// `~/.claude/settings.json` — Claude Code's user settings (holds `hooks`).
+fn settings_path() -> Result<PathBuf> {
+    Ok(home()?.join(".claude/settings.json"))
+}
+
+/// The absolute `cal` entrypoint used in the SessionStart hook command. On Unix this is the
+/// `~/.local/bin/cal` symlink we install; on Windows the `cal.exe` placed next to the app.
+fn cal_exe(app_exe: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        return app_exe
+            .parent()
+            .map(|d| d.join("cal.exe"))
+            .unwrap_or_else(|| PathBuf::from("cal.exe"));
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = app_exe;
+        cal_link_path().unwrap_or_else(|_| PathBuf::from("cal"))
+    }
+}
+
+/// The SessionStart hook command: `"<cal>" hook`, which prints the current repo's memory
+/// (Callimachus injects it into the session). Quoted so a spaced path is shell-safe.
+fn hook_command(app_exe: &Path) -> String {
+    format!("\"{}\" hook", cal_exe(app_exe).display())
+}
+
+/// Recognize a hook command we installed: our format always ends with `" hook` (a quoted
+/// path followed by the `hook` subcommand), which a user's own hook is very unlikely to use.
+fn is_our_hook(cmd: &str) -> bool {
+    cmd.trim().ends_with("\" hook")
+}
+
+/// True if `~/.claude/settings.json` already has a Callimachus SessionStart hook.
+fn session_start_has_our_hook(v: &Value) -> bool {
+    v.get("hooks")
+        .and_then(|h| h.get("SessionStart"))
+        .and_then(Value::as_array)
+        .map(|groups| {
+            groups.iter().any(|g| {
+                g.get("hooks")
+                    .and_then(Value::as_array)
+                    .map(|hs| {
+                        hs.iter().any(|h| {
+                            h.get("command")
+                                .and_then(Value::as_str)
+                                .map(is_our_hook)
+                                .unwrap_or(false)
+                        })
+                    })
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IntegrationStatus {
@@ -48,6 +105,8 @@ pub struct IntegrationStatus {
     pub skill_outdated: bool,
     /// An MCP server named `callimachus` is registered and points at this app.
     pub mcp_registered: bool,
+    /// A Callimachus SessionStart hook is installed (auto-injects project memory).
+    pub hook_installed: bool,
     /// `~/.local/bin/cal` exists (powers the `cal` CLI + the VS Code extension).
     pub cal_installed: bool,
     pub skill_path: String,
@@ -81,10 +140,18 @@ pub fn status(app_exe: &Path) -> IntegrationStatus {
 
     let cal_installed = cal_link_path().map(|p| p.exists()).unwrap_or(false);
 
+    let hook_installed = settings_path()
+        .ok()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .map(|v| session_start_has_our_hook(&v))
+        .unwrap_or(false);
+
     IntegrationStatus {
         skill_installed,
         skill_outdated,
         mcp_registered,
+        hook_installed,
         cal_installed,
         skill_path: skill.map(|p| p.display().to_string()).unwrap_or_default(),
         config_path: claude_config_path()
@@ -93,15 +160,19 @@ pub fn status(app_exe: &Path) -> IntegrationStatus {
     }
 }
 
-/// Install (or refresh) the skill, MCP registration, and `cal` CLI symlink. Idempotent.
+/// Install (or refresh) the skill, MCP registration, `cal` CLI symlink, and the SessionStart
+/// hook (which auto-injects each repo's memory at the start of a Claude Code session).
+/// Idempotent. `cal` is installed before the hook so the hook command resolves.
 pub fn install(app_exe: &Path) -> Result<IntegrationStatus> {
     write_skill()?;
     register_mcp(app_exe)?;
     install_cal(app_exe)?;
+    install_hook(app_exe)?;
     Ok(status(app_exe))
 }
 
-/// Remove the skill file and the MCP registration. Leaves the rest of the config intact.
+/// Remove the skill file, the MCP registration, the SessionStart hook, and the `cal` symlink.
+/// Leaves the rest of each config intact.
 pub fn uninstall() -> Result<()> {
     if let Ok(p) = skill_path() {
         let _ = std::fs::remove_file(&p);
@@ -115,10 +186,84 @@ pub fn uninstall() -> Result<()> {
             std::fs::write(&cfg, serde_json::to_string_pretty(&v)?)?;
         }
     }
+    // Strip our SessionStart hook from settings.json (leave any other hooks alone).
+    if let Ok(path) = settings_path() {
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            if let Ok(mut v) = serde_json::from_str::<Value>(&text) {
+                if let Some(arr) = v
+                    .get_mut("hooks")
+                    .and_then(|h| h.get_mut("SessionStart"))
+                    .and_then(Value::as_array_mut)
+                {
+                    remove_our_hooks(arr);
+                    let _ = std::fs::write(&path, serde_json::to_string_pretty(&v)?);
+                }
+            }
+        }
+    }
     if let Ok(link) = cal_link_path() {
         let _ = std::fs::remove_file(&link);
     }
     Ok(())
+}
+
+/// Merge a Callimachus SessionStart hook into `~/.claude/settings.json`. Preserves all other
+/// settings and hooks; refuses to clobber an unparseable file; idempotent (re-install drops
+/// any prior Callimachus hook first, so it never duplicates).
+fn install_hook(app_exe: &Path) -> Result<()> {
+    let path = settings_path()?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
+    let mut root: Value = match std::fs::read_to_string(&path) {
+        Ok(text) if !text.trim().is_empty() => serde_json::from_str(&text)
+            .with_context(|| format!("{} is not valid JSON; not modifying it", path.display()))?,
+        _ => Value::Object(Map::new()),
+    };
+    let obj = root
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("{} is not a JSON object", path.display()))?;
+    let hooks = obj
+        .entry("hooks")
+        .or_insert_with(|| Value::Object(Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("hooks in {} is not an object", path.display()))?;
+    let arr = hooks
+        .entry("SessionStart")
+        .or_insert_with(|| Value::Array(Vec::new()))
+        .as_array_mut()
+        .ok_or_else(|| anyhow::anyhow!("hooks.SessionStart in {} is not an array", path.display()))?;
+
+    remove_our_hooks(arr); // drop any prior Callimachus hook so re-install doesn't duplicate
+    arr.push(json!({
+        "hooks": [ { "type": "command", "command": hook_command(app_exe) } ]
+    }));
+
+    std::fs::write(&path, serde_json::to_string_pretty(&root)?)
+        .with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
+/// Remove Callimachus hooks from a SessionStart array (and any group we leave empty),
+/// leaving the user's own hooks untouched.
+fn remove_our_hooks(arr: &mut Vec<Value>) {
+    for group in arr.iter_mut() {
+        if let Some(hs) = group.get_mut("hooks").and_then(Value::as_array_mut) {
+            hs.retain(|h| {
+                !h.get("command")
+                    .and_then(Value::as_str)
+                    .map(is_our_hook)
+                    .unwrap_or(false)
+            });
+        }
+    }
+    arr.retain(|group| {
+        group
+            .get("hooks")
+            .and_then(Value::as_array)
+            .map(|h| !h.is_empty())
+            .unwrap_or(true)
+    });
 }
 
 /// Symlink `~/.local/bin/cal` → this app (which runs in `cal` mode when invoked by
@@ -250,5 +395,67 @@ mod tests {
         assert_eq!(back["mcpServers"]["other"]["command"], "x"); // preserved
         assert_eq!(back["mcpServers"]["callimachus"]["command"], "/app"); // added
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn hook_merge_is_idempotent_and_preserves_others() {
+        // Hand-run the SessionStart merge (mirrors install_hook) against an in-memory config
+        // so the test never touches the real HOME / settings.json.
+        let mut root: Value = serde_json::from_str(
+            r#"{"model":"opus",
+                "hooks":{
+                  "PreToolUse":[{"hooks":[{"type":"command","command":"echo hi"}]}],
+                  "SessionStart":[{"hooks":[{"type":"command","command":"my-own-hook"}]}]
+                }}"#,
+        )
+        .unwrap();
+        let cmd = "\"/Users/x/.local/bin/cal\" hook".to_string();
+        let merge = |root: &mut Value, cmd: &str| {
+            let arr = root
+                .as_object_mut()
+                .unwrap()
+                .entry("hooks")
+                .or_insert_with(|| json!({}))
+                .as_object_mut()
+                .unwrap()
+                .entry("SessionStart")
+                .or_insert_with(|| json!([]))
+                .as_array_mut()
+                .unwrap();
+            remove_our_hooks(arr);
+            arr.push(json!({"hooks":[{"type":"command","command":cmd}]}));
+        };
+        merge(&mut root, &cmd);
+        merge(&mut root, &cmd); // installing twice must NOT duplicate
+
+        assert_eq!(root["model"], "opus"); // unrelated setting preserved
+        assert_eq!(
+            root["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+            "echo hi"
+        ); // other event preserved
+        let ss = root["hooks"]["SessionStart"].as_array().unwrap();
+        let ours = ss
+            .iter()
+            .flat_map(|g| g["hooks"].as_array().unwrap())
+            .filter(|h| is_our_hook(h["command"].as_str().unwrap()))
+            .count();
+        assert_eq!(ours, 1, "exactly one Callimachus hook after two installs");
+        let user_hook_kept = ss
+            .iter()
+            .flat_map(|g| g["hooks"].as_array().unwrap())
+            .any(|h| h["command"] == "my-own-hook");
+        assert!(user_hook_kept, "the user's own SessionStart hook is preserved");
+        assert!(session_start_has_our_hook(&root));
+
+        // Uninstall removes ours but keeps the user's.
+        let arr = root["hooks"]["SessionStart"].as_array_mut().unwrap();
+        remove_our_hooks(arr);
+        assert!(!session_start_has_our_hook(&root));
+        assert!(root["hooks"]["SessionStart"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|g| g["hooks"].as_array().unwrap())
+            .any(|h| h["command"] == "my-own-hook"));
     }
 }
