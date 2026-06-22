@@ -108,6 +108,16 @@ struct RememberArgs {
     text: String,
     /// Project-path substring to attach it to; omit to use the repo the server runs in.
     project: Option<String>,
+    /// For a decision, WHY it was made (the rationale). Surfaced by check_decision later.
+    rationale: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct CheckDecisionArgs {
+    /// The change/decision you are about to make. Returns settled decisions on the same topic.
+    proposal: String,
+    /// Substring-match the project path to scope results. Empty = all projects.
+    project: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -434,6 +444,31 @@ impl Callimachus {
     }
 
     #[tool(
+        description = "CONTRADICTION GUARD: before you make a technical decision or change, pass it as `proposal` to see SETTLED decisions on the same topic (each with its rationale), so you don't silently undo or re-litigate a past choice. Returns the closest prior decisions, best match first; an empty list means none conflict. Searches ALL projects unless `project` is given. Call this BEFORE acting on a non-trivial decision; if it returns something that contradicts your plan, reconcile with the user rather than overriding it. Requires distilled or recorded decisions."
+    )]
+    async fn check_decision(
+        &self,
+        Parameters(args): Parameters<CheckDecisionArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let qv = embed::embed_query(&self.embedder, &args.proposal)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let Some(qv) = qv else {
+            return Ok(CallToolResult::success(vec![Content::text(
+                "[]".to_string(),
+            )]));
+        };
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let hits = crate::knowledge::check_contradiction(&conn, &qv, args.project.as_deref(), 8)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let json = serde_json::to_string_pretty(&hits)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(
         description = "Get a project's durable MEMORY: the decisions, gotchas, and open TODOs distilled across ALL past AI-coding sessions on it, with coverage counts. Omit `project` to use the repo the server runs in. Call this at the START of work on a project to recall what was already decided and what to watch out for. Decisions/gotchas need the user to have distilled threads; TODOs are always available."
     )]
     async fn project_memory(
@@ -542,7 +577,7 @@ impl Callimachus {
     }
 
     #[tool(
-        description = "Record a DECISION you/the user just made for a project, so it persists in the project's memory and future cross-thread recall. Omit `project` to use the repo the server runs in. Use when you settle a technical choice worth remembering."
+        description = "Record a DECISION you/the user just made for a project, so it persists in the project's memory and future cross-thread recall (and the check_decision guard). Pass the WHY as `rationale` when you have it. Omit `project` to use the repo the server runs in. Use when you settle a technical choice worth remembering."
     )]
     async fn record_decision(
         &self,
@@ -580,7 +615,12 @@ impl Callimachus {
             .conn
             .lock()
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-        crate::knowledge::record_fact(&conn, &project, kind, &text, now)
+        let rationale = args
+            .rationale
+            .as_deref()
+            .map(str::trim)
+            .filter(|r| !r.is_empty());
+        crate::knowledge::record_fact(&conn, &project, kind, &text, rationale, now)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         crate::embed::embed_pending_facts_conn(&mut conn, &self.embedder)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
