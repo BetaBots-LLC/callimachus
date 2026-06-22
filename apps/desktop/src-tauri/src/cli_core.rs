@@ -40,6 +40,7 @@ pub const COMMANDS: &[&str] = &[
     "snapshots",
     "resume",
     "snapshot-hook",
+    "check",
 ];
 
 const USAGE: &str = "\
@@ -74,9 +75,12 @@ USAGE:
                                 a project's distilled memory (decisions / gotchas /
                                 open TODOs); defaults to the current repo
   cal done <todo-id>            mark an open TODO done (id from `cal todos`)
-  cal remember <decision|gotcha> <text…>
+  cal remember <decision|gotcha> <text…> [--because WHY]
                                 record a fact for the current repo (-p PROJECT to
                                 override), pinned into its project memory
+  cal check <proposal…> [-p PROJECT] [--json]
+                                contradiction guard: settled decisions on this topic
+                                (surfaces 'you already decided X because Y')
   cal hook [<project>]          print the current repo's memory for injection (use as a
                                 Claude Code SessionStart hook command)
   cal agents [<project>] [-o FILE]
@@ -101,6 +105,7 @@ OPTIONS:
   -t, --tag TAG         only threads with this tag (repeatable)
   -l, --label LABEL     name for a `snapshot`
   -a, --agent AGENT     target agent CLI for `resume` (default claude)
+      --because WHY      rationale for a `remember decision`
   -y, --hybrid          fuse keyword + on-device semantic search
   -n, --limit N         max results (default 20; todos 50, files 40)
   -V, --vault DIR       Obsidian vault dir for `export` (else CALLIMACHUS_VAULT)
@@ -153,6 +158,7 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
         "snapshots" => cmd_snapshots(rest),
         "resume" => cmd_resume(rest),
         "snapshot-hook" => cmd_snapshot_hook(rest),
+        "check" => cmd_check(rest),
         "help" | "-h" | "--help" => {
             println!("{USAGE}");
             Ok(())
@@ -177,6 +183,7 @@ struct Opts {
     tags: Vec<String>,
     label: Option<String>,
     agent: Option<String>,
+    because: Option<String>,
     positional: Vec<String>,
 }
 
@@ -201,6 +208,7 @@ fn parse(args: &[String]) -> anyhow::Result<Opts> {
             "-t" | "--tag" => o.tags.push(next(&mut it, "--tag")?),
             "-l" | "--label" => o.label = Some(next(&mut it, "--label")?),
             "-a" | "--agent" => o.agent = Some(next(&mut it, "--agent")?),
+            "--because" => o.because = Some(next(&mut it, "--because")?),
             "--starred" => o.starred = true,
             "--off" => o.off = true,
             "--json" => o.json = true,
@@ -602,11 +610,55 @@ fn cmd_remember(args: &[String]) -> anyhow::Result<()> {
     let project = crate::indexer::canonical_project(&raw).unwrap_or(raw);
     let mut conn = open_db_write()?;
     let now = chrono::Utc::now().timestamp();
-    knowledge::record_fact(&conn, &project, &kind, &text, now)?;
+    let rationale = o
+        .because
+        .as_deref()
+        .map(str::trim)
+        .filter(|r| !r.is_empty());
+    knowledge::record_fact(&conn, &project, &kind, &text, rationale, now)?;
     // Embed so it is immediately recallable.
     let embedder = embed::Embedder::default();
     embed::embed_pending_facts_conn(&mut conn, &embedder)?;
     eprintln!("remembered {kind} for {project}");
+    Ok(())
+}
+
+/// `cal check <proposal…> [-p PROJECT]` — the contradiction guard: show settled decisions on
+/// the same topic before you re-litigate one.
+fn cmd_check(args: &[String]) -> anyhow::Result<()> {
+    let o = parse(args)?;
+    if o.positional.is_empty() {
+        anyhow::bail!("usage: cal check <proposal…> [-p PROJECT]");
+    }
+    let proposal = o.positional.join(" ");
+    let embedder = embed::Embedder::default();
+    let Some(qv) = embed::embed_query(&embedder, &proposal)? else {
+        return Ok(());
+    };
+    let conn = open_db()?;
+    let hits = knowledge::check_contradiction(&conn, &qv, o.project.as_deref(), 8)?;
+    if o.json {
+        println!("{}", serde_json::to_string_pretty(&hits)?);
+        return Ok(());
+    }
+    if hits.is_empty() {
+        println!("No settled decisions conflict with that.");
+        return Ok(());
+    }
+    println!("Prior decisions on this topic (reconcile before overriding):");
+    for h in &hits {
+        println!(
+            "\n  • {}  ({:.0}% match)",
+            h.text.trim(),
+            h.similarity * 100.0
+        );
+        if let Some(why) = h.rationale.as_deref().filter(|w| !w.is_empty()) {
+            println!("    because: {}", why.trim());
+        }
+        if let Some(title) = h.title.as_deref() {
+            println!("    from: {title}");
+        }
+    }
     Ok(())
 }
 

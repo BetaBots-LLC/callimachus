@@ -820,8 +820,15 @@ fn remember(
     text: String,
 ) -> AppResult<()> {
     write_retry(&db, |conn| {
-        knowledge::record_fact(conn, &project, &kind, &text, chrono::Utc::now().timestamp())
-            .map(|_| ())
+        knowledge::record_fact(
+            conn,
+            &project,
+            &kind,
+            &text,
+            None,
+            chrono::Utc::now().timestamp(),
+        )
+        .map(|_| ())
     })?;
     if let Err(e) = embed::embed_pending_facts(&db, &embedder) {
         eprintln!("[remember] embed: {e}");

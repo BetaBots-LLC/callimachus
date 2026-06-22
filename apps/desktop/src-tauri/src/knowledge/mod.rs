@@ -557,6 +557,8 @@ pub struct RecallHit {
     pub title: Option<String>,
     #[serde(rename = "projectPath")]
     pub project_path: Option<String>,
+    /// ADR rationale ("why"), when the decision has one. NULL for gotchas/todos.
+    pub rationale: Option<String>,
     pub similarity: f32,
 }
 
@@ -577,7 +579,7 @@ pub fn recall(
             SELECT fact_id, distance FROM vec_facts
             WHERE embedding MATCH ?1 AND k = {knn_k} ORDER BY distance
          )
-         SELECT f.id, f.thread_id, f.kind, f.text, s.kind, t.title, t.project_path,
+         SELECT f.id, f.thread_id, f.kind, f.text, f.rationale, s.kind, t.title, t.project_path,
                 MIN(knn.distance) AS d
          FROM knn
          JOIN facts f ON f.id = knn.fact_id
@@ -614,15 +616,16 @@ pub fn recall(
     let arg_refs: Vec<&dyn rusqlite::ToSql> = args.iter().map(|b| b.as_ref()).collect();
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(arg_refs.as_slice(), |r| {
-        let dist: f64 = r.get(7)?;
+        let dist: f64 = r.get(8)?;
         Ok(RecallHit {
             id: r.get(0)?,
             thread_id: r.get(1)?,
             kind: r.get(2)?,
             text: r.get(3)?,
-            source: r.get(4)?,
-            title: r.get(5)?,
-            project_path: r.get(6)?,
+            rationale: r.get(4)?,
+            source: r.get(5)?,
+            title: r.get(6)?,
+            project_path: r.get(7)?,
             similarity: (1.0 - dist) as f32,
         })
     })?;
@@ -694,6 +697,26 @@ pub fn find_prior_work(
     });
     out.truncate(k);
     Ok(out)
+}
+
+/// The active contradiction guard: prior DECISIONS semantically close to `qv` (an embedded
+/// proposal an agent is about to act on), held to a stricter floor than general recall — a
+/// false "you already decided X" is worse than silence. Surface these before the agent
+/// re-litigates a settled choice. Returns decision facts (each with its rationale, when
+/// recorded) best-match first. `project` optionally scopes to one repo.
+pub fn check_contradiction(
+    conn: &Connection,
+    qv: &[f32],
+    project: Option<&str>,
+    k: usize,
+) -> Result<Vec<RecallHit>> {
+    // Same high-stakes floor as find_prior_work: recall() already dropped the clear noise; this
+    // keeps only decisions genuinely on the proposal's topic.
+    const GUARD_FLOOR: f32 = 0.55;
+    let mut hits = recall(conn, qv, "decision", project, (k * 3).max(15))?;
+    hits.retain(|h| h.similarity >= GUARD_FLOOR);
+    hits.truncate(k);
+    Ok(hits)
 }
 
 // ---------------------------------------------------------------------------
@@ -866,6 +889,7 @@ pub fn record_fact(
     project: &str,
     kind: &str,
     text: &str,
+    rationale: Option<&str>,
     now: i64,
 ) -> Result<i64> {
     if !matches!(kind, "decision" | "gotcha") {
@@ -888,9 +912,9 @@ pub fn record_fact(
         |r| r.get(0),
     )?;
     conn.execute(
-        "INSERT INTO facts (thread_id, kind, text, status, extractor, pinned, created_at)
-         VALUES (?1, ?2, ?3, 'open', 'agent', 1, ?4)",
-        params![tid, kind, text.trim(), now],
+        "INSERT INTO facts (thread_id, kind, text, rationale, status, extractor, pinned, created_at)
+         VALUES (?1, ?2, ?3, ?4, 'open', 'agent', 1, ?5)",
+        params![tid, kind, text.trim(), rationale.map(str::trim), now],
     )?;
     Ok(conn.last_insert_rowid())
 }
@@ -1133,8 +1157,22 @@ mod tests {
     #[test]
     fn recorded_fact_surfaces_in_project_memory() {
         let conn = temp_db();
-        let fid = record_fact(&conn, "/proj/r", "decision", "use the read pool", 100).unwrap();
+        let fid = record_fact(
+            &conn,
+            "/proj/r",
+            "decision",
+            "use the read pool",
+            Some("avoids writer contention"),
+            100,
+        )
+        .unwrap();
         assert!(fid > 0);
+        let stored: Option<String> = conn
+            .query_row("SELECT rationale FROM facts WHERE id = ?1", [fid], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(stored.as_deref(), Some("avoids writer contention"));
         let mem = get_project_memory(&conn, "/proj/r", 60).unwrap();
         assert!(
             mem.decisions
@@ -1143,7 +1181,7 @@ mod tests {
             "recorded decision is pinned + shown in project memory"
         );
         // A second record reuses the one synthetic notes thread for the project.
-        record_fact(&conn, "/proj/r", "gotcha", "watch the WAL", 101).unwrap();
+        record_fact(&conn, "/proj/r", "gotcha", "watch the WAL", None, 101).unwrap();
         let n: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM threads WHERE external_id LIKE 'callimachus-notes:%'",
@@ -1153,7 +1191,7 @@ mod tests {
             .unwrap();
         assert_eq!(n, 1, "one notes thread per project");
         // Invalid kind is rejected.
-        assert!(record_fact(&conn, "/proj/r", "note", "x", 102).is_err());
+        assert!(record_fact(&conn, "/proj/r", "note", "x", None, 102).is_err());
     }
 
     #[test]
@@ -1257,6 +1295,76 @@ mod tests {
         assert!(hits[0].similarity > 0.99);
         // Kind filter excludes non-matching kinds.
         assert!(recall(&conn, &v, "gotcha", None, 5).unwrap().is_empty());
+    }
+
+    #[test]
+    fn check_contradiction_surfaces_near_decision_and_floors_far() {
+        use crate::embed::{vec_to_bytes, DIM};
+        use crate::indexer::{source_id, upsert_thread, ParsedMessage, ParsedThread};
+
+        let mut conn = temp_db();
+        let sid = source_id(&conn, "claude_code").unwrap();
+        let add =
+            |conn: &mut Connection, ext: &str, text: &str, rationale: Option<&str>, vec: &[f32]| {
+                upsert_thread(
+                    conn,
+                    sid,
+                    &ParsedThread {
+                        external_id: ext.into(),
+                        title: Some(ext.into()),
+                        messages: vec![ParsedMessage {
+                            role: "user".into(),
+                            text: "x".into(),
+                            tool_name: None,
+                            ts: Some(1),
+                        }],
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                let tid: i64 = conn
+                    .query_row(
+                        "SELECT id FROM threads WHERE external_id = ?1",
+                        [ext],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                conn.execute(
+                "INSERT INTO facts (thread_id, kind, text, rationale, status, extractor, created_at)
+                 VALUES (?1, 'decision', ?2, ?3, 'open', 'llm', 1)",
+                rusqlite::params![tid, text, rationale],
+            )
+            .unwrap();
+                let fid = conn.last_insert_rowid();
+                conn.execute(
+                    "INSERT INTO vec_facts (fact_id, embedding) VALUES (?1, ?2)",
+                    rusqlite::params![fid, vec_to_bytes(vec)],
+                )
+                .unwrap();
+            };
+
+        let mut near = vec![0.0_f32; DIM];
+        near[0] = 1.0; // cosine 1.0 with the query
+        let mut far = vec![0.0_f32; DIM];
+        far[1] = 1.0; // cosine 0.0 → below the guard floor
+        add(
+            &mut conn,
+            "near",
+            "store auth tokens in the OS keychain",
+            Some("never on disk"),
+            &near,
+        );
+        add(&mut conn, "far", "use tabs not spaces", None, &far);
+
+        let hits = check_contradiction(&conn, &near, None, 8).unwrap();
+        assert_eq!(hits.len(), 1, "only the on-topic decision passes the floor");
+        assert_eq!(hits[0].text, "store auth tokens in the OS keychain");
+        assert_eq!(
+            hits[0].rationale.as_deref(),
+            Some("never on disk"),
+            "the guard surfaces the decision's rationale"
+        );
+        assert!(hits[0].similarity >= 0.55);
     }
 
     #[test]
