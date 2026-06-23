@@ -282,10 +282,21 @@ export interface CommitLink {
   overlap: number;
 }
 
+export interface IssueCluster {
+  example: string;
+  count: number;
+  threads: number;
+  firstSeen: number;
+  lastSeen: number;
+}
+
 export const api = {
   dbStats: () => invoke<DbStats>("db_stats"),
   indexStats: () => invoke<Stats>("index_stats"),
   coachOverview: () => invoke<CoachOverview>("coach_overview"),
+  // Recurring errors mined across all sessions (last 180 days, most frequent first).
+  recurringIssues: (project?: string) =>
+    invoke<IssueCluster[]>("recurring_issues", { project: project ?? null }),
   findPriorWork: (query: string, opts?: { project?: string; limit?: number }) =>
     invoke<PriorWork[]>("find_prior_work", {
       query,

@@ -7,7 +7,9 @@
 //! Set CALLIMACHUS_DB to point at a specific index.db; CALLIMACHUS_VAULT to a
 //! default Obsidian vault for `cal export`.
 
-use crate::{agent, context, db, embed, export, gitlink, knowledge, search, secrets, snapshot};
+use crate::{
+    agent, context, db, embed, export, gitlink, issues, knowledge, search, secrets, snapshot,
+};
 use rusqlite::Connection;
 
 /// Subcommands that identify a `cal` invocation when the app is launched directly.
@@ -42,6 +44,7 @@ pub const COMMANDS: &[&str] = &[
     "snapshot-hook",
     "check",
     "commits",
+    "issues",
 ];
 
 const USAGE: &str = "\
@@ -85,6 +88,9 @@ USAGE:
   cal commits [<repo>] [-n LIMIT] [--json]
                                 infer + show which commits your threads produced
                                 (run inside a git repo, or pass its path)
+  cal issues [<project>] [-n LIMIT] [--json]
+                                recurring errors you keep hitting across sessions
+                                (last 180 days, most frequent first)
   cal hook [<project>]          print the current repo's memory for injection (use as a
                                 Claude Code SessionStart hook command)
   cal agents [<project>] [-o FILE]
@@ -164,6 +170,7 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
         "snapshot-hook" => cmd_snapshot_hook(rest),
         "check" => cmd_check(rest),
         "commits" => cmd_commits(rest),
+        "issues" => cmd_issues(rest),
         "help" | "-h" | "--help" => {
             println!("{USAGE}");
             Ok(())
@@ -1092,6 +1099,48 @@ fn external_id_under(transcript_path: &str, base: &std::path::Path) -> Option<St
         .ok()?
         .to_str()
         .map(str::to_string)
+}
+
+/// `cal issues [project] [-n N] [--json]` — recurring errors across sessions (last 180 days).
+fn cmd_issues(args: &[String]) -> anyhow::Result<()> {
+    let o = parse(args)?;
+    let project = if o.positional.is_empty() {
+        None
+    } else {
+        Some(o.positional.join(" "))
+    };
+    let conn = open_db()?;
+    let since = chrono::Utc::now().timestamp() - 180 * 86_400;
+    let found = issues::recurring_issues(
+        &conn,
+        project.as_deref(),
+        since,
+        o.limit.unwrap_or(20) as usize,
+    )?;
+    if o.json {
+        println!("{}", serde_json::to_string_pretty(&found)?);
+        return Ok(());
+    }
+    if found.is_empty() {
+        eprintln!("(no recurring errors found in the last 180 days)");
+        return Ok(());
+    }
+    println!("Recurring errors (last 180 days, most frequent first):");
+    for i in &found {
+        let threads = if i.threads == 1 {
+            "1 thread".to_string()
+        } else {
+            format!("{} threads", i.threads)
+        };
+        println!(
+            "\n  {}×  across {}  (last seen {})",
+            i.count,
+            threads,
+            fmt_time(Some(i.last_seen))
+        );
+        println!("    {}", i.example.trim());
+    }
+    Ok(())
 }
 
 fn fmt_time(epoch: Option<i64>) -> String {

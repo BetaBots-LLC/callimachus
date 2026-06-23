@@ -146,6 +146,41 @@ function PriorWorkSearch({ onOpen }: { onOpen: (threadId: number) => void }) {
   );
 }
 
+/** Errors you keep hitting across sessions, grouped + counted from the whole index. */
+function RecurringIssues({ todayMid }: { todayMid: number }) {
+  const { data } = useQuery({
+    queryKey: ["recurring_issues"],
+    queryFn: () => api.recurringIssues(),
+  });
+  const issues = data ?? [];
+  if (issues.length === 0) return null;
+  return (
+    <section className="mb-8">
+      <h2 className="mb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+        Recurring errors · last 180 days
+      </h2>
+      <ul className="space-y-1.5">
+        {issues.slice(0, 8).map((i) => (
+          <li key={i.example} className="rounded-lg border px-3 py-2">
+            <div className="flex items-baseline gap-2">
+              <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 font-mono text-[0.7rem] tabular-nums text-foreground">
+                {i.count}×
+              </span>
+              <code className="truncate text-xs text-foreground" title={i.example}>
+                {i.example}
+              </code>
+            </div>
+            <div className="mt-1 text-[0.7rem] text-muted-foreground">
+              across {i.threads} thread{i.threads === 1 ? "" : "s"} · last seen{" "}
+              {relativeDay(i.lastSeen, todayMid)}
+            </div>
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
+}
+
 export function CoachView() {
   const selectThread = useUi((s) => s.selectThread);
   const setView = useUi((s) => s.setView);
@@ -240,6 +275,8 @@ export function CoachView() {
           <span>more</span>
         </div>
       </section>
+
+      <RecurringIssues todayMid={todayMid} />
 
       {/* This week's captured knowledge */}
       <section>
