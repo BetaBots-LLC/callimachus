@@ -11,9 +11,12 @@ concurrency:
 
 jobs:
   check:
-    # Lint/typecheck/test on macOS. Cross-platform compilation (Windows + Linux)
-    # is exercised by the release matrix in build.yml on every tag.
-    runs-on: macos-latest
+    # Lint/typecheck/test on macOS (Apple Silicon). Cross-platform compilation
+    # (Windows + Linux) is exercised by the release matrix in build.yml on every tag.
+    # Pinned to macos-14 (Xcode 15.4): the macos-latest image (Xcode 16.4) is missing
+    # libclang_rt.osx.a at the path rustc links against, so the test binary fails to link
+    # ("ld: library 'clang_rt.osx' not found"). Revisit when the macos-latest image is fixed.
+    runs-on: macos-14
     steps:
       - uses: actions/checkout@v5
 
