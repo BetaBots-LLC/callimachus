@@ -12,7 +12,10 @@ concurrency:
 jobs:
   check:
     # Lint/typecheck/test on macOS (Apple Silicon, per Tauri's recommended pipeline).
-    # Cross-platform compilation is exercised by the release matrix in build.yml on every tag.
+    # Stays on macos-latest because our HTTP stack is native-tls, NOT rustls (see Cargo.toml).
+    # rustls drags in aws-lc-sys, which needs libclang_rt.osx.a — absent in recent macos-latest
+    # Xcodes — and that's what used to break linking ("ld: library 'clang_rt.osx' not found").
+    # KEEP the TLS stack native (no rustls/aws-lc-sys) or this breaks on macos-latest again.
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v5
@@ -31,11 +34,6 @@ jobs:
       - uses: swatinem/rust-cache@v2
         with:
           workspaces: ./apps/desktop/src-tauri -> target
-          # Bump when the runner's toolchain changes: a cached build-script search path to the
-          # clang resource dir (e.g. .../clang/17/lib/darwin) goes stale after a macOS image
-          # update and breaks linking ("ld: library 'clang_rt.osx' not found"). This forces a
-          # clean rebuild against the current Xcode.
-          prefix-key: "v1-clangrt"
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
