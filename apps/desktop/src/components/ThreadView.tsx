@@ -15,7 +15,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { cn } from "@/lib/utils";
-import { ExternalLink, MoreHorizontal, Star } from "lucide-react";
+import { ExternalLink, GitCommitHorizontal, MoreHorizontal, Star } from "lucide-react";
 import { TagsEditor } from "./TagsEditor";
 import { KnowledgeButton } from "./KnowledgeSection";
 import { Loading } from "./Loading";
@@ -197,7 +197,68 @@ export function ThreadView() {
           </div>
         )}
       </header>
+      <CommitsSection threadId={data.id} />
       <MessageList key={data.id} messages={data.messages} />
+    </div>
+  );
+}
+
+/** The git commits this thread likely produced (inferred file-overlap links). Reads stored
+ *  links; "Find/Rescan" recomputes by reading the project's `git log`. */
+function CommitsSection({ threadId }: { threadId: number }) {
+  const queryClient = useQueryClient();
+  const { data: commits } = useQuery({
+    queryKey: ["thread_commits", threadId],
+    queryFn: () => api.threadCommits(threadId),
+  });
+  const link = useMutation({
+    mutationFn: () => api.linkThreadCommits(threadId),
+    onSuccess: (rows) => queryClient.setQueryData(["thread_commits", threadId], rows),
+  });
+
+  if (!commits || commits.length === 0) {
+    return (
+      <div className="flex items-center gap-2 border-b px-5 py-2 text-xs text-muted-foreground">
+        <GitCommitHorizontal className="size-3.5 shrink-0" />
+        <span>No linked commits.</span>
+        <button
+          type="button"
+          className="text-foreground underline-offset-2 hover:underline disabled:opacity-50"
+          onClick={() => link.mutate()}
+          disabled={link.isPending}
+        >
+          {link.isPending ? "Scanning git…" : "Find produced commits"}
+        </button>
+        {link.isError && <span className="text-destructive">git scan failed</span>}
+      </div>
+    );
+  }
+
+  return (
+    <div className="border-b px-5 py-2">
+      <div className="mb-1 flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
+        <GitCommitHorizontal className="size-3.5" />
+        Produced commits
+        <button
+          type="button"
+          className="ml-auto font-normal underline-offset-2 hover:underline disabled:opacity-50"
+          onClick={() => link.mutate()}
+          disabled={link.isPending}
+        >
+          {link.isPending ? "…" : "Rescan"}
+        </button>
+      </div>
+      <ul className="space-y-0.5">
+        {commits.map((c) => (
+          <li key={c.sha} className="flex items-baseline gap-2 text-xs">
+            <code className="shrink-0 text-muted-foreground">{c.shortSha}</code>
+            <span className="truncate">{c.subject ?? "(no subject)"}</span>
+            <span className="ml-auto shrink-0 text-[0.65rem] text-muted-foreground">
+              {c.overlap} file{c.overlap === 1 ? "" : "s"}
+            </span>
+          </li>
+        ))}
+      </ul>
     </div>
   );
 }

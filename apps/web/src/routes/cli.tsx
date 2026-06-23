@@ -10,7 +10,7 @@ export const Route = createFileRoute("/cli")({
     meta: seo({
       title: "cal — the Callimachus CLI",
       description:
-        "Search your AI coding history from the terminal. cal search, recent, cat, ask, files, memory, remember, stats, and export — pipe-friendly, reading the same local index as the desktop app.",
+        "Search your AI coding history from the terminal. cal search, recent, cat, ask, files, commits, memory, remember, check, snapshot, resume, stats, and export — pipe-friendly, reading the same local index as the desktop app.",
       path: "/cli",
     }),
     links: [{ rel: "canonical", href: `${SITE_URL}/cli` }],
@@ -62,10 +62,16 @@ function CliPage() {
               'cal ask "how did we handle the write-lock contention?"',
               "# every thread that touched a file path",
               "cal files embed/mod.rs",
+              "# the thread→commit timeline — which commits each conversation produced",
+              "cal commits",
               "# a project's durable memory (decisions / gotchas / open TODOs)",
               "cal memory",
-              "# record a decision into the current repo's memory",
-              'cal remember decision "use sqlite-vec for the KNN index"',
+              "# record a decision, with the reasoning behind it",
+              'cal remember decision "use sqlite-vec for the KNN index" --because "fewest deps, ships in-process"',
+              "# surface settled decisions before re-litigating one",
+              'cal check "switch the KNN index to faiss"',
+              "# checkpoint a thread, then resume it in another agent later",
+              "cal snapshot 42 -l pre-refactor",
               "# close out a leftover TODO",
               "cal done 137",
               "# inject the repo's memory into AGENTS.md so any agent reads it",
@@ -87,6 +93,14 @@ function CliPage() {
           <code className="font-mono">cal related</code> to find threads near some text.
         </p>
         <p className="mt-4 max-w-[60ch] leading-relaxed text-muted-foreground">
+          <code className="font-mono">cal commits</code> infers, entirely on-device, which git
+          commits a thread produced — overlapping the files a thread discussed with{" "}
+          <code className="font-mono">git log</code>'s changed files inside the thread's time
+          window, where the shared-file count is the confidence. Run it inside a git repo or pass a
+          path; it prints the thread→commit timeline, one row per commit with its linked-thread
+          count.
+        </p>
+        <p className="mt-4 max-w-[60ch] leading-relaxed text-muted-foreground">
           Curate as you go with <code className="font-mono">cal star</code>,{" "}
           <code className="font-mono">cal tag</code>, and{" "}
           <code className="font-mono">cal tags</code>; surface leftover work with{" "}
@@ -101,8 +115,22 @@ function CliPage() {
           Each project keeps a durable memory: <code className="font-mono">cal memory</code> prints
           its aggregated decisions, gotchas, and open TODOs (defaults to the current repo). And it
           writes back too — <code className="font-mono">cal remember decision|gotcha</code> pins a
-          new fact into that memory, and <code className="font-mono">cal done</code> closes a
-          leftover TODO. These only ever touch Callimachus's own index and memory, never your files.
+          new fact into that memory (add <code className="font-mono">--because "&lt;why&gt;"</code>{" "}
+          to a decision to keep its rationale), and <code className="font-mono">cal done</code>{" "}
+          closes a leftover TODO. These only ever touch Callimachus's own index and memory, never
+          your files.
+        </p>
+        <p className="mt-4 max-w-[60ch] leading-relaxed text-muted-foreground">
+          A contradiction guard keeps agents honest:{" "}
+          <code className="font-mono">cal check "&lt;proposal&gt;"</code> surfaces the settled
+          decisions on a topic before one gets re-litigated. And for handoff across a context-window
+          compaction or between tools,{" "}
+          <code className="font-mono">cal snapshot &lt;thread-id&gt;</code> (optionally{" "}
+          <code className="font-mono">-l LABEL</code>) saves a durable, resumable checkpoint — a
+          packed transcript plus carry-forward project memory;{" "}
+          <code className="font-mono">cal snapshots</code> lists them and{" "}
+          <code className="font-mono">cal resume &lt;id&gt;</code> (optionally{" "}
+          <code className="font-mono">-a AGENT</code>) picks one back up.
         </p>
       </div>
     </ProductLayout>

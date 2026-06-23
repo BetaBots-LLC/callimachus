@@ -2,9 +2,12 @@ import { Link, createFileRoute } from "@tanstack/react-router";
 import {
   ArrowRight,
   Blocks,
+  GitCommitVertical,
+  History,
   Lightbulb,
   MessageCircleQuestion,
   RefreshCw,
+  Scale,
   Search,
   Share2,
   ShieldCheck,
@@ -185,6 +188,39 @@ function Home() {
               Ask a question and get a synthesized, cited answer drawn from your own sessions, with
               [thread N] citations back to the sources it used. Retrieval-augmented over the local
               index; needs an LLM engine enabled.
+            </FeaturePanel>
+            <FeaturePanel
+              icon={GitCommitVertical}
+              label="Git linkage"
+              title="See which commits a conversation produced"
+              className="lg:col-span-7"
+            >
+              Callimachus infers — entirely on-device — which commits a thread shipped, by
+              overlapping the files it discussed with <code className="font-mono">git log</code>{" "}
+              inside the thread's time window. Walk the thread-to-commit timeline from the app or{" "}
+              <code className="font-mono">cal commits</code>, and ask “which commit came out of this
+              conversation?” straight from an agent.
+            </FeaturePanel>
+            <FeaturePanel
+              icon={History}
+              label="Session snapshots"
+              title="Resumable cross-tool handoff"
+              className="lg:col-span-5"
+            >
+              Durable checkpoints of a thread — packed transcript plus carry-forward project memory
+              — so work survives a context-window compaction or a jump to another tool.
+              Auto-captured via Claude Code hooks, or snapshot and resume by hand.
+            </FeaturePanel>
+            <FeaturePanel
+              icon={Scale}
+              label="Decision guard"
+              title="Catch contradictions before they ship"
+              className="lg:col-span-12"
+            >
+              Record a decision with the rationale behind it, then let the guard surface settled
+              calls on a topic before an agent quietly re-litigates one. Check a proposal against
+              your own history — from <code className="font-mono">cal check</code> or the MCP — so
+              the past gets a vote before the code does.
             </FeaturePanel>
           </div>
         </Container>
