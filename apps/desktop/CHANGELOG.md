@@ -1,5 +1,38 @@
 # callimachus
 
+## 0.6.2
+
+### Patch Changes
+
+- e5c2a5e: **Agent Session Snapshots — resumable cross-agent handoff, captured automatically.** Save a durable checkpoint of an indexed thread (its packed transcript plus a carry-forward block of the project's distilled decisions, gotchas, and open TODOs) and reload it to continue, across a context-window compaction or across tools (Claude Code -> Codex -> Cursor).
+
+  - **Automatic capture (zero-effort):** installing the Claude Code integration now also registers `PreCompact` and `SubagentStop` hooks, so the live session is snapshotted right before its context is compacted and when a subagent finishes — no tool call required. Capture is best-effort and silent (it never breaks the agent loop), and keeps one rolling auto-snapshot per thread so it can't flood the list.
+  - **`cal` commands:** `cal snapshot <thread-id> [-l LABEL]`, `cal snapshots [project]`, `cal resume <id> [-a AGENT]` (relaunches any agent CLI seeded with the checkpoint).
+  - **MCP tools:** `snapshot_session`, `list_snapshots`, `load_snapshot` — so an agent can checkpoint and the next agent picks up exactly where it left off.
+
+  Backed by a new `snapshots` table (migration 0019). Uninstalling the integration cleanly removes all three hooks.
+
+- f549122: **Codebase hardening (internal).** CI now gates Rust quality, not just tests: `cargo fmt --check` and `cargo clippy --lib --bins --tests -- -D warnings` run on every PR alongside the existing typecheck/build/test, so lint regressions and formatting drift can't land. Cleared the 8 pre-existing clippy warnings to make the gate green. Added the first tests over previously-untested entry points: the embedded migrations validate + apply cleanly on a fresh DB (catches a malformed/out-of-order migration in CI instead of on a user's first launch), the `cal` flag parser, and the MCP `search_threads` / `get_thread` tools end-to-end. No user-facing behavior change.
+- 29371b6: **ADR-style decisions + a contradiction guard.** Decisions can now carry a rationale (the "why"), and there's an active guard that surfaces settled decisions on a topic _before_ an agent re-litigates one. Call `check_decision` (MCP) or `cal check "<proposal>"` with what you're about to do; it returns the closest prior decisions, each with its rationale and a match score, held to a strict similarity floor so a false "you already decided X" stays rare. Record the why with `record_decision`'s new `rationale` field or `cal remember decision "<text>" --because "<why>"`. Turns the existing passive, post-hoc conflict review into a guardrail an agent (or you) can hit at decision time. Backed by a `rationale` column on facts (migration 0020).
+- cfadfb7: **Git linkage: see which commits a conversation produced.** Callimachus now infers, entirely on-device, which git commits each thread led to, by overlapping the files a thread discussed (`file_mentions`) with `git log`'s changed files inside the thread's time window (shared-file count = a confidence cue). Surfaces:
+
+  - **Desktop:** a "Produced commits" section on each thread, with a "Find produced commits" button that scans the project's `git log`.
+  - **`cal commits`** (run in a repo, or `cal commits <path>`): the thread-to-commit timeline, one row per commit with its linked-thread count.
+  - **MCP `linked_commits`**: an agent asks "which commit came out of this conversation?".
+
+  Only top-level threads are linked (subagent transcripts are skipped, since their work is attributed to the parent session), and the timeline is grouped one row per commit so a big commit doesn't flood it. No git library is bundled (it shells out to `git`), and nothing leaves the machine. Backed by a new `thread_commits` table (migration 0021).
+
+- 5b5db0e: **Switch HTTP from rustls to native TLS (OS trust store).** `reqwest`, `genai`, and the Tauri updater now use the platform's native TLS (Security.framework on macOS, SChannel on Windows, OpenSSL on Linux) instead of rustls. This drops `aws-lc-sys`/`aws-lc-rs` from the build entirely — a C library whose link step requires `libclang_rt.osx.a`, which recent GitHub `macos-latest` Xcode images don't ship, breaking CI/release linking. Using native TLS keeps the build on `macos-latest` (matching Tauri's recommended pipeline) and uses the OS certificate store. No user-facing behavior change.
+- 0917128: **Search results are now diversified across threads.** A single long thread with many matching messages could previously fill the entire result list and bury every other thread. Both keyword and hybrid search now cap how many message-hits any one thread contributes (3), so other threads surface. The keyword path over-fetches before capping so the freed slots back-fill with other threads rather than shrinking the list; the hybrid path applies the cap once on the fused output, leaving the pre-fusion per-thread signal intact. Per-thread depth is still one click away via opening the thread. Factored into a tested `cap_per_thread` helper.
+- 5066f75: **Recurring issues tracker: surface errors you keep hitting.** Callimachus now mines your whole indexed history for the same error recurring across sessions and tools, so chronic problems and blind spots become visible. A two-stage scan (an FTS pre-filter for error-ish messages, then a precise per-line extractor) pulls real error signatures, and a normalizer collapses the variable parts (paths, line:col, quoted identifiers, hashes) so the same error groups across runs even with different specifics. Surfaces:
+
+  - **Coach dashboard:** a "Recurring errors" card (count, threads spanned, last seen).
+  - **`cal issues [project]`:** the recurring-error list for the last 180 days, most frequent first (`--json` supported).
+
+  Entirely on-device; only top-level sessions are scanned (subagents skipped), and it's the kind of cross-tool pattern only a unified local index can compute.
+
+- c434695: **Hybrid search now weights fusion by semantic similarity, not just rank.** Reciprocal Rank Fusion previously gave every semantic match the same `1/(K+rank)` weight, so a marginal 0.4-cosine match counted as much as a strong 0.9 one at the same position. The semantic arm's RRF contribution is now scaled by a similarity factor over the `[0.35, 1.0]` retained range (`0.5×` at the floor, full weight at the top), so strong matches outrank marginal ones. The keyword (BM25) arm is untouched and the factor never exceeds 1.0, so the tuned keyword/semantic balance can't blow out, it only ever demotes weak semantic hits. Fusion is factored into testable `fuse_rrf` / `sem_weight` helpers with unit tests locking the behavior.
+
 ## 0.6.1
 
 ### Patch Changes

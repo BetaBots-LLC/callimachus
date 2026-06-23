@@ -1,6 +1,6 @@
 [package]
 name = "callimachus"
-version = "0.6.1"
+version = "0.6.2"
 description = "Local index & search for AI agent threads"
 authors = ["Ari Shaller"]
 license = "AGPL-3.0-or-later"
