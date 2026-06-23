@@ -7,7 +7,7 @@
 //! Set CALLIMACHUS_DB to point at a specific index.db; CALLIMACHUS_VAULT to a
 //! default Obsidian vault for `cal export`.
 
-use crate::{agent, context, db, embed, export, knowledge, search, secrets, snapshot};
+use crate::{agent, context, db, embed, export, gitlink, knowledge, search, secrets, snapshot};
 use rusqlite::Connection;
 
 /// Subcommands that identify a `cal` invocation when the app is launched directly.
@@ -41,6 +41,7 @@ pub const COMMANDS: &[&str] = &[
     "resume",
     "snapshot-hook",
     "check",
+    "commits",
 ];
 
 const USAGE: &str = "\
@@ -81,6 +82,9 @@ USAGE:
   cal check <proposal…> [-p PROJECT] [--json]
                                 contradiction guard: settled decisions on this topic
                                 (surfaces 'you already decided X because Y')
+  cal commits [<repo>] [-n LIMIT] [--json]
+                                infer + show which commits your threads produced
+                                (run inside a git repo, or pass its path)
   cal hook [<project>]          print the current repo's memory for injection (use as a
                                 Claude Code SessionStart hook command)
   cal agents [<project>] [-o FILE]
@@ -159,6 +163,7 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
         "resume" => cmd_resume(rest),
         "snapshot-hook" => cmd_snapshot_hook(rest),
         "check" => cmd_check(rest),
+        "commits" => cmd_commits(rest),
         "help" | "-h" | "--help" => {
             println!("{USAGE}");
             Ok(())
@@ -657,6 +662,46 @@ fn cmd_check(args: &[String]) -> anyhow::Result<()> {
         }
         if let Some(title) = h.title.as_deref() {
             println!("    from: {title}");
+        }
+    }
+    Ok(())
+}
+
+/// `cal commits [repo] [-n N] [--json]` — infer which commits a project's threads produced and
+/// show the timeline. Run inside a git repo, or pass its path.
+fn cmd_commits(args: &[String]) -> anyhow::Result<()> {
+    let o = parse(args)?;
+    let repo = if o.positional.is_empty() {
+        cwd_project_root()
+    } else {
+        o.positional.join(" ")
+    };
+    let key = crate::indexer::canonical_project(&repo).unwrap_or_else(|| repo.clone());
+    let conn = open_db_write()?;
+    let n = gitlink::link_project(&conn, &repo)?;
+    let rows = gitlink::commit_timeline(&conn, &key, o.limit.unwrap_or(40) as usize)?;
+    if o.json {
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+        return Ok(());
+    }
+    if rows.is_empty() {
+        eprintln!(
+            "(no thread↔commit links for {key} — need indexed threads with file mentions in this git repo)"
+        );
+        return Ok(());
+    }
+    eprintln!("Linked {n} commit(s) for {key}:");
+    for r in &rows {
+        println!(
+            "{}  {}  [{} file{}]  {}",
+            fmt_time(Some(r.committed_at)),
+            r.short_sha,
+            r.overlap,
+            if r.overlap == 1 { "" } else { "s" },
+            r.subject.as_deref().unwrap_or("")
+        );
+        if let Some(t) = r.thread_title.as_deref() {
+            println!("    from thread #{}: {t}", r.thread_id);
         }
     }
     Ok(())

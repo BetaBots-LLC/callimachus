@@ -75,7 +75,9 @@ jobs:
       - uses: swatinem/rust-cache@v2
         with:
           workspaces: ./apps/desktop/src-tauri -> target
-          key: ${{ matrix.platform }}
+          # `v1` busts stale caches whose build scripts baked a now-missing clang resource path
+          # (see ci.yml). Bump on the next toolchain/image drift.
+          key: v1-${{ matrix.platform }}
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile

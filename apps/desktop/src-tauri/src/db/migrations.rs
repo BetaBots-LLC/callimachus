@@ -45,6 +45,8 @@ pub static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
         M::up(include_str!("../../migrations/0019_snapshots.sql")),
         // 0020 — ADR-style decision rationale ("why") for the contradiction guard.
         M::up(include_str!("../../migrations/0020_decision_rationale.sql")),
+        // 0021 — git linkage: commits a thread produced (file-overlap within its time window).
+        M::up(include_str!("../../migrations/0021_thread_commits.sql")),
     ])
 });
 

@@ -10,6 +10,7 @@ pub mod context;
 pub mod db;
 pub mod embed;
 pub mod export;
+pub mod gitlink;
 pub mod integration;
 pub mod knowledge;
 pub mod mcp_server;
