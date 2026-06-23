@@ -55,7 +55,7 @@ pub struct CommitLink {
     pub overlap: i64,
 }
 
-/// One commit in a project's timeline, with the thread it was inferred from.
+/// One commit in a project's timeline, grouped across the threads it was inferred from.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TimelineRow {
@@ -63,9 +63,10 @@ pub struct TimelineRow {
     pub short_sha: String,
     pub subject: Option<String>,
     pub committed_at: i64,
-    pub overlap: i64,
-    pub thread_id: i64,
-    pub thread_title: Option<String>,
+    /// Strongest file-overlap among the linked threads (confidence proxy).
+    pub best_overlap: i64,
+    /// How many threads link to this commit.
+    pub thread_count: i64,
 }
 
 /// Parse `git log --name-only --pretty=format:%x1eCOMMIT%x1f%H%x1f%ct%x1f%s` output. Each record
@@ -204,10 +205,13 @@ fn run_git_log(repo: &str, since: i64) -> Result<String> {
 
 /// Load every thread's time window + mentions for a canonical project key.
 fn thread_windows(conn: &Connection, project_key: &str) -> Result<Vec<ThreadWindow>> {
+    // Only top-level threads: a subagent transcript's work is attributed to its parent session,
+    // and subagent prompts (e.g. orchestration scouts) mention many files, which over-links.
     let mut stmt = conn.prepare(
         "SELECT t.id, MIN(m.ts), MAX(m.ts)
          FROM threads t JOIN messages m ON m.thread_id = t.id
          WHERE COALESCE(t.project_key, t.project_path) = ?1 AND m.ts IS NOT NULL
+           AND t.is_subagent = 0
          GROUP BY t.id",
     )?;
     let rows: Vec<(i64, i64, i64)> = stmt
@@ -248,13 +252,14 @@ pub fn link_project(conn: &Connection, repo_path: &str) -> Result<usize> {
     let links = correlate(&windows, &commits);
 
     let now = chrono::Utc::now().timestamp();
-    // Replace links for the threads we just reconsidered (so a re-run doesn't stack duplicates).
-    for w in &windows {
-        conn.execute(
-            "DELETE FROM thread_commits WHERE thread_id = ?1",
-            [w.thread_id],
-        )?;
-    }
+    // Clear ALL of the project's links first (including any stale ones from threads we no longer
+    // consider, e.g. subagents), then reinsert the fresh set — so a re-run never stacks or strands.
+    conn.execute(
+        "DELETE FROM thread_commits WHERE thread_id IN (
+            SELECT id FROM threads WHERE COALESCE(project_key, project_path) = ?1
+         )",
+        [&key],
+    )?;
     let mut ins = conn.prepare(
         "INSERT OR REPLACE INTO thread_commits
             (thread_id, sha, short_sha, subject, committed_at, overlap, created_at)
@@ -300,9 +305,11 @@ pub fn commit_timeline(
     limit: usize,
 ) -> Result<Vec<TimelineRow>> {
     let mut stmt = conn.prepare(
-        "SELECT tc.sha, tc.short_sha, tc.subject, tc.committed_at, tc.overlap, t.id, t.title
+        "SELECT tc.sha, tc.short_sha, tc.subject, tc.committed_at,
+                MAX(tc.overlap) AS best_overlap, COUNT(*) AS thread_count
          FROM thread_commits tc JOIN threads t ON t.id = tc.thread_id
          WHERE COALESCE(t.project_key, t.project_path) = ?1
+         GROUP BY tc.sha
          ORDER BY tc.committed_at DESC, tc.sha
          LIMIT ?2",
     )?;
@@ -312,9 +319,8 @@ pub fn commit_timeline(
             short_sha: r.get(1)?,
             subject: r.get(2)?,
             committed_at: r.get(3)?,
-            overlap: r.get(4)?,
-            thread_id: r.get(5)?,
-            thread_title: r.get(6)?,
+            best_overlap: r.get(4)?,
+            thread_count: r.get(5)?,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -506,8 +512,8 @@ mod tests {
         assert!(links[0].overlap >= 1);
 
         let tl = commit_timeline(&conn, &key, 10).unwrap();
-        assert_eq!(tl.len(), 1);
-        assert_eq!(tl[0].thread_id, tid);
+        assert_eq!(tl.len(), 1, "one commit in the timeline");
+        assert_eq!(tl[0].thread_count, 1);
         assert_eq!(tl[0].subject.as_deref(), Some("wire auth"));
 
         let _ = std::fs::remove_dir_all(&dir);

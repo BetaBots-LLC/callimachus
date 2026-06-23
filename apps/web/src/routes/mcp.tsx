@@ -29,12 +29,29 @@ const TOOLS: { name: string; note: string; write?: boolean }[] = [
   { name: "get_thread_knowledge", note: "Distilled summary, decisions, gotchas for a thread" },
   { name: "recall_decisions", note: "Semantically recall past decisions and why" },
   { name: "recall_gotchas", note: "Semantically recall known pitfalls to avoid" },
+  {
+    name: "find_prior_work",
+    note: "Prior sessions similar to a task — the 'have I done this?' guard",
+  },
   { name: "project_memory", note: "A project's durable memory: decisions, gotchas, open TODOs" },
   { name: "ask_history", note: "A synthesized, cited answer over your own history (RAG)" },
   { name: "threads_for_file", note: "Which past sessions touched a file path" },
+  { name: "check_decision", note: "Surface settled decisions before re-litigating a proposal" },
+  { name: "linked_commits", note: "The git commits a thread likely produced" },
+  { name: "list_snapshots", note: "Resumable session snapshots for a project" },
+  { name: "load_snapshot", note: "Load a snapshot's packed transcript + carry-forward memory" },
   { name: "complete_todo", note: "Mark an open TODO done — persists across re-index", write: true },
-  { name: "record_decision", note: "Persist a decision into a project's memory", write: true },
+  {
+    name: "record_decision",
+    note: "Persist a decision (with optional rationale) into memory",
+    write: true,
+  },
   { name: "record_gotcha", note: "Persist a gotcha into a project's memory", write: true },
+  {
+    name: "snapshot_session",
+    note: "Checkpoint a thread for handoff across compaction or tools",
+    write: true,
+  },
 ];
 
 function McpPage() {
@@ -43,7 +60,7 @@ function McpPage() {
       no="04"
       kicker="MCP server"
       title="Give every agent a memory."
-      description="callimachus-mcp exposes your local history to any MCP client through fifteen tools — and now reads and writes the memory layer. Instead of re-explaining context, your agent can look it up: searching past sessions, recalling settled decisions and known gotchas, asking your history a cited question, and pulling the exact thread it needs. It can also write back — closing TODOs and recording new decisions and gotchas — but only ever touches Callimachus's own index and memory, never your files."
+      description="callimachus-mcp exposes your local history to any MCP client through twenty-one tools — and now reads and writes the memory layer. Instead of re-explaining context, your agent can look it up: searching past sessions, recalling settled decisions and known gotchas, asking your history a cited question, linking threads to the git commits they produced, and pulling the exact thread it needs. It can also write back — closing TODOs, recording new decisions and gotchas, and snapshotting a session for handoff across a context-window compaction or another tool — but only ever touches Callimachus's own index and memory, never your files."
     >
       <div className="grid gap-10 lg:grid-cols-2">
         <div className="flex flex-col gap-4">
@@ -93,11 +110,12 @@ function McpPage() {
             ))}
           </ul>
           <p className="text-sm leading-relaxed text-muted-foreground">
-            Twelve read tools and three <span className="font-mono text-amber-500">write</span>{" "}
+            Seventeen read tools and four <span className="font-mono text-amber-500">write</span>{" "}
             tools (<code className="font-mono">complete_todo</code>,{" "}
             <code className="font-mono">record_decision</code>,{" "}
-            <code className="font-mono">record_gotcha</code>) that update Callimachus's own memory —
-            never your project files.
+            <code className="font-mono">record_gotcha</code>,{" "}
+            <code className="font-mono">snapshot_session</code>) that update Callimachus's own
+            memory — never your project files.
           </p>
         </div>
       </div>

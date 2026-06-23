@@ -274,6 +274,38 @@ fn coach_overview(pool: tauri::State<'_, db::ReadPool>) -> AppResult<search::Coa
     )?)
 }
 
+/// The git commits a thread likely produced (inferred file-overlap links). Read-only.
+#[tauri::command]
+fn thread_commits(
+    pool: tauri::State<'_, db::ReadPool>,
+    thread_id: i64,
+) -> AppResult<Vec<gitlink::CommitLink>> {
+    let conn = read(&pool)?;
+    Ok(gitlink::linked_commits(&conn, thread_id)?)
+}
+
+/// (Re)compute git linkage for a thread's project by reading its `git log`, then return the
+/// thread's commits. Writes (shells out to git + stores links), so it takes the writer lock.
+#[tauri::command]
+fn link_thread_commits(
+    db: tauri::State<'_, db::Db>,
+    thread_id: i64,
+) -> AppResult<Vec<gitlink::CommitLink>> {
+    let conn = lock(&db)?;
+    let repo: Option<String> = conn
+        .query_row(
+            "SELECT project_path FROM threads WHERE id = ?1",
+            [thread_id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten();
+    if let Some(repo) = repo.filter(|p| !p.is_empty()) {
+        gitlink::link_project(&conn, &repo)?;
+    }
+    Ok(gitlink::linked_commits(&conn, thread_id)?)
+}
+
 /// Oldest-first list of threads with their size, for the storage-cleanup UI.
 #[tauri::command]
 fn cleanup_candidates(
@@ -1894,6 +1926,8 @@ pub fn run() {
             set_knowledge_config,
             set_auto_distill,
             thread_knowledge,
+            thread_commits,
+            link_thread_commits,
             distill_thread,
             recall_decisions,
             recall_gotchas,

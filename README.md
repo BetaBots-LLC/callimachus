@@ -31,7 +31,10 @@ Grab the latest signed build from **[Releases](../../releases/latest)** — macO
 - **Organizes into collections** — star threads and attach free-form tags, then filter the list by starred or by tag.
 - **Chats** with an in-app agent (Anthropic / OpenAI / Gemini / OpenRouter / Ollama — your key, your choice) that can **search your own history** and **run shell commands with your approval**; streaming, cancellable, with live model lists. Chats are saved and become searchable too.
 - **Carries context across tools** — open any thread in any agent CLI ("Open in Claude / Codex / Gemini …", seeded with the packed transcript), resume a Claude Code / Codex thread in its native CLI, copy context, or export a thread to Obsidian (optionally AI-summarized with decisions / gotchas / TODOs).
-- **Surfaces to your agents** — a bundled MCP server (`callimachus-mcp`) exposes the index as tools any agent can call mid-session, and it's two-way: agents can write back into Callimachus's own memory (close TODOs, record decisions/gotchas) without ever touching your files. The `/recall` skill teaches them when to use it.
+- **Links threads to commits** — infers **on-device** which git commits a thread produced, by overlapping the files a thread discussed with `git log`'s changed files inside the thread's time window (shared-file count = confidence). See it as a thread→commit timeline (`cal commits`), per-thread in the desktop UI ("Produced commits"), or via the `linked_commits` MCP tool.
+- **Snapshots agent sessions** — durable, resumable checkpoints of a thread (packed transcript + carry-forward project memory) for handoff across a context-window compaction or across tools; auto-captured via Claude Code PreCompact / SubagentStop hooks. Take, list, and resume them (`cal snapshot` / `cal snapshots` / `cal resume`, or the `snapshot_session` / `list_snapshots` / `load_snapshot` MCP tools).
+- **Guards decisions** — decisions can carry a **rationale** ("why"), and an active guard surfaces settled decisions on a topic before an agent re-litigates one (`cal check "<proposal>"` / the `check_decision` MCP tool).
+- **Surfaces to your agents** — a bundled MCP server (`callimachus-mcp`) exposes the index as tools any agent can call mid-session, and it's two-way: agents can write back into Callimachus's own memory (close TODOs, record decisions/gotchas, snapshot a session) without ever touching your files. The `/recall` skill teaches them when to use it.
 - **Stays current** via a background file watcher; **stays private** — API keys live in the OS keychain, nothing is sent anywhere except the LLM provider you pick.
 
 ## Stack
@@ -95,7 +98,7 @@ claude mcp add callimachus -- callimachus-mcp        # or any MCP client
 
 Building from a checkout instead? `cargo install --path apps/desktop/src-tauri --bin callimachus-mcp`.
 
-Tools (16) — now read **and** write. Reads: `search_threads`, `search_current_project` (auto-scoped to the repo it runs in), `recent_threads`, `get_thread`, `list_tags`, `list_open_todos`, `get_thread_knowledge`, `recall_decisions`, `recall_gotchas`, `find_prior_work` (the "have I done this before?" guard — prior sessions similar to a task), `project_memory` (a project's aggregated decisions / gotchas / open TODOs), `ask_history` (a cited RAG answer over your history), and `threads_for_file` (which sessions touched a path). Writes (into Callimachus's own memory, never your code): `complete_todo` (close an open TODO), `record_decision`, and `record_gotcha` (persist a fact into a project's memory). The bundled `/recall` skill ([.claude/skills/recall](.claude/skills/recall/SKILL.md)) tells agents when to reach for them.
+Tools (21) — now read **and** write. Reads (17): `search_threads`, `search_current_project` (auto-scoped to the repo it runs in), `recent_threads`, `get_thread`, `list_tags`, `list_open_todos`, `get_thread_knowledge`, `recall_decisions`, `recall_gotchas`, `find_prior_work` (the "have I done this before?" guard — prior sessions similar to a task), `project_memory` (a project's aggregated decisions / gotchas / open TODOs), `ask_history` (a cited RAG answer over your history), `threads_for_file` (which sessions touched a path), `check_decision` (surface settled decisions before re-litigating a proposal), `linked_commits` (the commits a thread likely produced), `list_snapshots` (a project's session snapshots), and `load_snapshot` (restore a saved checkpoint). Writes (4, into Callimachus's own memory, never your code): `complete_todo` (close an open TODO), `record_decision` (optionally with a `rationale`), `record_gotcha` (persist a fact into a project's memory), and `snapshot_session` (checkpoint a thread for handoff). The bundled `/recall` skill ([.claude/skills/recall](.claude/skills/recall/SKILL.md)) tells agents when to reach for them.
 
 **CLI** — `cal`, pipe-friendly. Ships with the desktop app (on your PATH); or build from a checkout with `cargo install --path apps/desktop/src-tauri --bin cal`.
 
@@ -109,7 +112,12 @@ cal ask "how did we set up releases?"      # cited RAG answer over your history
 cal files embed/mod.rs                     # threads that touched a file path
 cal memory                                 # this repo's distilled memory (decisions/gotchas/TODOs)
 cal done 17                                # mark an open TODO done (id from `cal todos`)
-cal remember decision "use sqlite-vec for KNN"  # record a fact into the repo's memory
+cal remember decision "use sqlite-vec for KNN" --because "no cloud, KNN in SQL"  # record a fact (+ rationale) into the repo's memory
+cal check "switch to pgvector"             # surface settled decisions before re-litigating one
+cal commits                                # infer the thread→commit timeline for this repo (--json; or pass a path)
+cal snapshot 42 -l "pre-refactor"          # checkpoint a thread for handoff (transcript + project memory)
+cal snapshots                              # list saved session snapshots (optionally for a project)
+cal resume 7 -a claude                     # resume a snapshot in an agent CLI
 cal agents                                 # write the repo's memory into AGENTS.md (any agent reads it)
 cal hook                                   # print the repo's memory (use as a Claude Code SessionStart hook)
 ```

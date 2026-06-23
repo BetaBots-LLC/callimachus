@@ -690,19 +690,22 @@ fn cmd_commits(args: &[String]) -> anyhow::Result<()> {
         );
         return Ok(());
     }
-    eprintln!("Linked {n} commit(s) for {key}:");
+    eprintln!("{n} thread↔commit link(s) for {key}; recent commits:");
     for r in &rows {
+        let threads = if r.thread_count == 1 {
+            "1 thread".to_string()
+        } else {
+            format!("{} threads", r.thread_count)
+        };
         println!(
-            "{}  {}  [{} file{}]  {}",
+            "{}  {}  [{}, {} file{}]  {}",
             fmt_time(Some(r.committed_at)),
             r.short_sha,
-            r.overlap,
-            if r.overlap == 1 { "" } else { "s" },
+            threads,
+            r.best_overlap,
+            if r.best_overlap == 1 { "" } else { "s" },
             r.subject.as_deref().unwrap_or("")
         );
-        if let Some(t) = r.thread_title.as_deref() {
-            println!("    from thread #{}: {t}", r.thread_id);
-        }
     }
     Ok(())
 }

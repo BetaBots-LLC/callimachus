@@ -274,6 +274,14 @@ export interface CleanupRow {
   updatedAt: number | null;
 }
 
+export interface CommitLink {
+  sha: string;
+  shortSha: string;
+  subject: string | null;
+  committedAt: number;
+  overlap: number;
+}
+
 export const api = {
   dbStats: () => invoke<DbStats>("db_stats"),
   indexStats: () => invoke<Stats>("index_stats"),
@@ -284,6 +292,11 @@ export const api = {
       project: opts?.project ?? null,
       limit: opts?.limit ?? null,
     }),
+  // Git linkage: the commits a thread likely produced. linkThreadCommits recomputes (reads
+  // the project's `git log`) then returns them; threadCommits just reads stored links.
+  threadCommits: (threadId: number) => invoke<CommitLink[]>("thread_commits", { threadId }),
+  linkThreadCommits: (threadId: number) =>
+    invoke<CommitLink[]>("link_thread_commits", { threadId }),
   // Oldest-first threads with size, for cleanup. before = epoch secs upper bound.
   cleanupCandidates: (opts?: { before?: number; sources?: string[]; limit?: number }) =>
     invoke<CleanupRow[]>("cleanup_candidates", {
