@@ -11,12 +11,9 @@ concurrency:
 
 jobs:
   check:
-    # Lint/typecheck/test on macOS (Apple Silicon). Cross-platform compilation
-    # (Windows + Linux) is exercised by the release matrix in build.yml on every tag.
-    # Pinned to macos-14 (Xcode 15.4): the macos-latest image (Xcode 16.4) is missing
-    # libclang_rt.osx.a at the path rustc links against, so the test binary fails to link
-    # ("ld: library 'clang_rt.osx' not found"). Revisit when the macos-latest image is fixed.
-    runs-on: macos-14
+    # Lint/typecheck/test on macOS (Apple Silicon, per Tauri's recommended pipeline).
+    # Cross-platform compilation is exercised by the release matrix in build.yml on every tag.
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v5
 
@@ -34,6 +31,11 @@ jobs:
       - uses: swatinem/rust-cache@v2
         with:
           workspaces: ./apps/desktop/src-tauri -> target
+          # Bump when the runner's toolchain changes: a cached build-script search path to the
+          # clang resource dir (e.g. .../clang/17/lib/darwin) goes stale after a macOS image
+          # update and breaks linking ("ld: library 'clang_rt.osx' not found"). This forces a
+          # clean rebuild against the current Xcode.
+          prefix-key: "v1-clangrt"
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
