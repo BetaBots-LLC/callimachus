@@ -12,6 +12,7 @@ pub mod embed;
 pub mod export;
 pub mod gitlink;
 pub mod integration;
+pub mod issues;
 pub mod knowledge;
 pub mod mcp_server;
 pub mod search;
@@ -271,6 +272,22 @@ fn coach_overview(pool: tauri::State<'_, db::ReadPool>) -> AppResult<search::Coa
     Ok(search::coach_overview(
         &conn,
         chrono::Utc::now().timestamp(),
+    )?)
+}
+
+/// Recurring errors mined across all sessions in the last 180 days (most frequent first).
+#[tauri::command]
+fn recurring_issues(
+    pool: tauri::State<'_, db::ReadPool>,
+    project: Option<String>,
+) -> AppResult<Vec<issues::IssueCluster>> {
+    let conn = read(&pool)?;
+    let since = chrono::Utc::now().timestamp() - 180 * 86_400;
+    Ok(issues::recurring_issues(
+        &conn,
+        project.as_deref(),
+        since,
+        30,
     )?)
 }
 
@@ -1928,6 +1945,7 @@ pub fn run() {
             thread_knowledge,
             thread_commits,
             link_thread_commits,
+            recurring_issues,
             distill_thread,
             recall_decisions,
             recall_gotchas,
