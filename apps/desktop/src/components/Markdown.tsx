@@ -39,8 +39,12 @@ function mdToHtml(src: string): string {
   return html;
 }
 
+// NOTE: prose's default `pre` is dark-bg + light-text. We override the bg to `bg-muted` (light
+// in light mode), so we MUST also pin the code text to `--foreground` — otherwise the default
+// light pre-text renders light-on-light and washes out in light mode. `text-foreground` is
+// theme-aware, so it reads in both; hljs tokens still color specific spans on top.
 const PROSE =
-  "prose prose-sm dark:prose-invert max-w-none break-words prose-p:my-2 prose-pre:my-3 prose-pre:overflow-x-auto prose-pre:rounded-md prose-pre:bg-muted prose-pre:p-3 prose-code:rounded prose-code:bg-muted prose-code:px-1 prose-code:py-0.5 prose-code:before:content-none prose-code:after:content-none prose-pre:prose-code:bg-transparent prose-pre:prose-code:p-0";
+  "prose prose-sm dark:prose-invert max-w-none break-words prose-p:my-2 prose-pre:my-3 prose-pre:overflow-x-auto prose-pre:rounded-md prose-pre:bg-muted prose-pre:text-foreground prose-pre:p-3 prose-code:rounded prose-code:bg-muted prose-code:px-1 prose-code:py-0.5 prose-code:before:content-none prose-code:after:content-none prose-pre:prose-code:bg-transparent prose-pre:prose-code:p-0";
 
 // Above this, parsing markdown synchronously can jank the main thread (e.g. a
 // pasted/packed-context message). Render those as plain, collapsed text instead.
@@ -153,6 +157,7 @@ export const StreamingMarkdown = memo(function StreamingMarkdown({
   return (
     <div className={PROSE}>
       {blocks.map((b, i) => (
+        // biome-ignore lint/suspicious/noArrayIndexKey: streaming blocks only append, so the index is a stable identity
         <Block key={i} src={b} />
       ))}
     </div>

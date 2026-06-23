@@ -33,7 +33,9 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
-tauri-plugin-updater = "2"
+# native-tls (OS TLS), NOT rustls: rustls pulls aws-lc-sys/ring, which need libclang_rt.osx.a
+# at link time — absent in recent macos-latest Xcodes. native-tls keeps CI on macos-latest.
+tauri-plugin-updater = { version = "2", default-features = false, features = ["native-tls", "zip"] }
 tauri-plugin-process = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -50,13 +52,15 @@ notify-debouncer-full = "0.7.0"
 fastembed = "5.17.2"
 tokio = { version = "1.52.3", features = ["rt", "macros", "rt-multi-thread", "io-std", "process"] }
 futures-util = "0.3.32"
-reqwest = { version = "0.13.4", features = ["json", "stream"] }
+# default-features off: reqwest's `default-tls` is rustls (-> aws-lc-sys/ring -> clang_rt.osx,
+# which breaks linking on recent macos-latest Xcodes). Use native-tls + the rest of the defaults.
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "stream", "native-tls", "charset", "http2", "system-proxy"] }
 # Cross-platform OS credential store: macOS Keychain, Windows Credential Manager,
 # Linux Secret Service (pure-Rust zbus + crypto — no system libsecret needed).
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
 sqlite-vec = "0.1.9"
 zerocopy = "0.8.52"
-genai = "0.6.5"
+genai = { version = "0.6.5", default-features = false, features = ["native-tls"] }
 rmcp = { version = "1.7.0", features = ["server", "transport-io", "macros"] }
 schemars = "1"
 tokio-util = "0.7.18"
