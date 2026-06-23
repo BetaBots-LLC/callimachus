@@ -167,6 +167,12 @@ struct LoadSnapshotArgs {
     id: i64,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+struct LinkedCommitsArgs {
+    /// The thread id (from a search/recent result) to find produced commits for.
+    thread_id: i64,
+}
+
 #[tool_router]
 impl Callimachus {
     fn new(conn: Connection) -> Self {
@@ -274,6 +280,24 @@ impl Callimachus {
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
             .ok_or_else(|| ErrorData::invalid_params("snapshot not found", None))?;
         Ok(CallToolResult::success(vec![Content::text(snap.body)]))
+    }
+
+    #[tool(
+        description = "List the git commits a thread likely PRODUCED — inferred on-device by overlapping the thread's discussed files with `git log` in the same time window. Answers 'which commit came out of this conversation?'. Each result has a short SHA, subject, and an overlap count (more shared files = higher confidence). Empty if none are inferred yet (the user runs `cal commits` in the repo to compute them). Pass a threadId from search_threads."
+    )]
+    async fn linked_commits(
+        &self,
+        Parameters(args): Parameters<LinkedCommitsArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let links = crate::gitlink::linked_commits(&conn, args.thread_id)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let json = serde_json::to_string_pretty(&links)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
     #[tool(
