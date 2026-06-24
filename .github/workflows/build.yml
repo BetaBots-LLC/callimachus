@@ -31,9 +31,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: macos-latest      # Apple Silicon (native arm64). On latest because our HTTP
-            # is native-tls (Cargo.toml), so aws-lc-sys — which needs clang_rt.osx, missing on
-            # recent macos-latest Xcodes — is out of the dep tree. Keep TLS native or this breaks.
+          - platform: macos-latest      # Apple Silicon (native arm64)
             args: "--target aarch64-apple-darwin"
             rust_target: aarch64-apple-darwin
           - platform: ubuntu-24.04      # Linux x64 (glibc 2.39 for the ONNX prebuilt)
@@ -73,6 +71,20 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.rust_target }}
+
+      # macOS: rustc links `-lclang_rt.osx` but searches a clang-version subdir the runner's
+      # Xcode lacks; the lib is present under a different clang/<ver> dir. Add it to the search
+      # path so the link resolves on macos-latest (see ci.yml for the full note).
+      - name: Locate compiler-rt for the linker (macOS)
+        if: startsWith(matrix.platform, 'macos')
+        run: |
+          LIB=$(find "$(xcode-select -p)" -name 'libclang_rt.osx.a' 2>/dev/null | head -1)
+          if [ -n "$LIB" ]; then
+            echo "RUSTFLAGS=${RUSTFLAGS:-} -L $(dirname "$LIB")" >> "$GITHUB_ENV"
+            echo "compiler-rt: $LIB"
+          else
+            echo "::warning::libclang_rt.osx.a not found under $(xcode-select -p)"
+          fi
 
       - uses: swatinem/rust-cache@v2
         with:
