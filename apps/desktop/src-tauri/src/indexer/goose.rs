@@ -124,6 +124,7 @@ fn scan_path(conn: &mut Connection, db: &Path, tick: &mut dyn FnMut()) -> Result
             created_at: min_ts,
             updated_at: max_ts.or(min_ts),
             is_subagent: false,
+            usage: Vec::new(),
             messages,
         };
         let n = upsert_thread(conn, sid, &thread)?;

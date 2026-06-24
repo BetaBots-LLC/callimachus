@@ -145,6 +145,7 @@ pub fn parse_file(path: &Path, fallback_id: &str, mtime: i64) -> Result<Option<P
         created_at: ts,
         updated_at: ts,
         is_subagent: false,
+        usage: Vec::new(),
         messages,
     }))
 }

@@ -7,6 +7,7 @@ pub mod secrets;
 pub mod cleanup;
 pub mod cli_core;
 pub mod context;
+pub mod cost;
 pub mod db;
 pub mod embed;
 pub mod export;
@@ -289,6 +290,13 @@ fn recurring_issues(
         since,
         30,
     )?)
+}
+
+/// Estimated $ spend by model + the priciest threads (all-time), from captured token usage.
+#[tauri::command]
+fn spend(pool: tauri::State<'_, db::ReadPool>, project: Option<String>) -> AppResult<cost::Spend> {
+    let conn = read(&pool)?;
+    Ok(cost::spend(&conn, 0, project.as_deref(), 8)?)
 }
 
 /// The git commits a thread likely produced (inferred file-overlap links). Read-only.
@@ -1946,6 +1954,7 @@ pub fn run() {
             thread_commits,
             link_thread_commits,
             recurring_issues,
+            spend,
             distill_thread,
             recall_decisions,
             recall_gotchas,

@@ -180,6 +180,7 @@ fn index_session(conn: &mut Connection, sid: i64, root: &Path, sf: &Path) -> Res
         created_at,
         updated_at: max_ts.or(created_at),
         is_subagent: false,
+        usage: Vec::new(),
         messages,
     };
     let n = upsert_thread(conn, sid, &thread)?;

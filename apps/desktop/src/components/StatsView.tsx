@@ -61,6 +61,8 @@ export function StatsView() {
         </CardContent>
       </Card>
 
+      <SpendCard />
+
       <div className="grid gap-6 md:grid-cols-2">
         <Card>
           <CardHeader>
@@ -99,6 +101,78 @@ export function StatsView() {
         </Card>
       </div>
     </div>
+  );
+}
+
+/** Estimated AI spend by model + the priciest threads, from captured token usage. */
+function SpendCard() {
+  const { data } = useQuery({ queryKey: ["spend"], queryFn: () => api.spend() });
+  if (!data) return null;
+  const usd = (n: number) => `$${n.toFixed(2)}`;
+
+  if (data.trackedCalls === 0 && data.untrackedCalls === 0) {
+    return (
+      <Card>
+        <CardHeader>
+          <CardTitle>Spend</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <p className="text-sm text-muted-foreground">
+            No token usage captured yet. Hit{" "}
+            <span className="font-medium text-foreground">Reindex</span> to read it from your source
+            files — then this shows your estimated AI spend by model and your priciest threads.
+          </p>
+        </CardContent>
+      </Card>
+    );
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex items-baseline justify-between">
+          <span>Spend (estimate)</span>
+          <span className="text-2xl font-semibold tabular-nums">{usd(data.totalCost)}</span>
+        </CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <div className="space-y-1.5">
+          {data.byModel
+            .filter((m) => m.priced)
+            .map((m) => (
+              <div key={m.model} className="flex items-baseline justify-between gap-2 text-sm">
+                <span className="truncate">{m.model}</span>
+                <span className="shrink-0 tabular-nums text-muted-foreground">
+                  {usd(m.cost)} · {m.calls.toLocaleString()} calls
+                </span>
+              </div>
+            ))}
+        </div>
+        {data.topThreads.length > 0 && (
+          <div>
+            <div className="mb-1 text-xs uppercase tracking-wide text-muted-foreground">
+              Most expensive threads
+            </div>
+            <div className="space-y-1">
+              {data.topThreads.slice(0, 5).map((t) => (
+                <div key={t.threadId} className="flex items-baseline justify-between gap-2 text-sm">
+                  <span className="truncate" title={t.title ?? undefined}>
+                    {t.title || `Thread #${t.threadId}`}
+                  </span>
+                  <span className="shrink-0 tabular-nums text-muted-foreground">{usd(t.cost)}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+        <p className="text-[0.7rem] text-muted-foreground">
+          Estimate from list prices, not a billing record.
+          {data.untrackedCalls > 0
+            ? ` ${data.untrackedCalls.toLocaleString()} calls on unpriced models not counted.`
+            : ""}
+        </p>
+      </CardContent>
+    </Card>
   );
 }
 

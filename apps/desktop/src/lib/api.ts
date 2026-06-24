@@ -290,6 +290,29 @@ export interface IssueCluster {
   lastSeen: number;
 }
 
+export interface ModelSpend {
+  model: string;
+  cost: number;
+  input: number;
+  output: number;
+  cacheRead: number;
+  calls: number;
+  priced: boolean;
+}
+export interface ThreadCost {
+  threadId: number;
+  title: string | null;
+  project: string | null;
+  cost: number;
+}
+export interface Spend {
+  totalCost: number;
+  trackedCalls: number;
+  untrackedCalls: number;
+  byModel: ModelSpend[];
+  topThreads: ThreadCost[];
+}
+
 export const api = {
   dbStats: () => invoke<DbStats>("db_stats"),
   indexStats: () => invoke<Stats>("index_stats"),
@@ -297,6 +320,8 @@ export const api = {
   // Recurring errors mined across all sessions (last 180 days, most frequent first).
   recurringIssues: (project?: string) =>
     invoke<IssueCluster[]>("recurring_issues", { project: project ?? null }),
+  // Estimated $ spend by model + priciest threads (needs a reindex to capture token usage).
+  spend: (project?: string) => invoke<Spend>("spend", { project: project ?? null }),
   findPriorWork: (query: string, opts?: { project?: string; limit?: number }) =>
     invoke<PriorWork[]>("find_prior_work", {
       query,

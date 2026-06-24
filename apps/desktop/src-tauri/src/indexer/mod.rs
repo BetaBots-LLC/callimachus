@@ -31,6 +31,19 @@ pub struct ParsedThread {
     pub updated_at: Option<i64>,
     pub is_subagent: bool,
     pub messages: Vec<ParsedMessage>,
+    /// Token usage per assistant turn, keyed by the turn's first-message INDEX in `messages`.
+    /// Populated by sources that report it (Claude Code); powers the cost/spend layer.
+    pub usage: Vec<(usize, MsgUsage)>,
+}
+
+/// Token usage + model for one assistant API turn (from the source's `usage` block).
+#[derive(Debug, Clone, Default)]
+pub struct MsgUsage {
+    pub model: String,
+    pub input: i64,
+    pub output: i64,
+    pub cache_write: i64,
+    pub cache_read: i64,
 }
 
 /// One message within a thread.
@@ -281,18 +294,28 @@ pub fn upsert_thread(
     let mut inserted: Vec<(i64, &str, &str)> =
         Vec::with_capacity(thread.messages.len().saturating_sub(start_seq));
     {
+        let usage_by_idx: std::collections::HashMap<usize, &MsgUsage> =
+            thread.usage.iter().map(|(i, u)| (*i, u)).collect();
         let mut stmt = tx.prepare(
-            "INSERT INTO messages (thread_id, seq, role, text, tool_name, ts)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO messages
+                (thread_id, seq, role, text, tool_name, ts,
+                 model, input_tokens, output_tokens, cache_write_tokens, cache_read_tokens)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         )?;
         for (seq, m) in thread.messages.iter().enumerate().skip(start_seq) {
+            let u = usage_by_idx.get(&seq);
             stmt.execute(params![
                 thread_id,
                 seq as i64,
                 m.role,
                 m.text,
                 m.tool_name,
-                m.ts
+                m.ts,
+                u.map(|u| u.model.as_str()),
+                u.map(|u| u.input),
+                u.map(|u| u.output),
+                u.map(|u| u.cache_write),
+                u.map(|u| u.cache_read),
             ])?;
             inserted.push((tx.last_insert_rowid(), m.role.as_str(), m.text.as_str()));
         }
@@ -589,6 +612,7 @@ mod tests {
             created_at: None,
             updated_at: None,
             is_subagent: false,
+            usage: Vec::new(),
             messages: texts
                 .iter()
                 .enumerate()
