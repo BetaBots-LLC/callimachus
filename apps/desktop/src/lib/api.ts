@@ -458,6 +458,9 @@ export const api = {
   recallIntegrationStatus: () => invoke<IntegrationStatus>("recall_integration_status"),
   installRecallIntegration: () => invoke<IntegrationStatus>("install_recall_integration"),
   uninstallRecallIntegration: () => invoke<void>("uninstall_recall_integration"),
+  // Opt-in proactive recall: inject prior work into Claude before each prompt (reads every prompt).
+  setProactiveRecall: (enabled: boolean) =>
+    invoke<IntegrationStatus>("set_proactive_recall", { enabled }),
   // MCP registration for the other detected agents (Codex / Cursor / Gemini).
   agentIntegrationsStatus: () => invoke<AgentIntegration[]>("agent_integrations_status"),
   installAgentIntegrations: () => invoke<AgentIntegration[]>("install_agent_integrations"),
@@ -470,6 +473,7 @@ export interface IntegrationStatus {
   skillOutdated: boolean;
   mcpRegistered: boolean;
   hookInstalled: boolean;
+  proactiveRecallInstalled: boolean;
   calInstalled: boolean;
   skillPath: string;
   configPath: string;

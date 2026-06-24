@@ -1823,6 +1823,14 @@ fn uninstall_recall_integration() -> AppResult<()> {
     Ok(())
 }
 
+/// Toggle the opt-in proactive-recall hook (injects prior work into Claude before each prompt).
+/// Separate from the base integration because it reads every prompt. Returns refreshed status.
+#[tauri::command]
+fn set_proactive_recall(enabled: bool) -> AppResult<integration::IntegrationStatus> {
+    let exe = std::env::current_exe().map_err(anyhow::Error::from)?;
+    Ok(integration::set_proactive_recall(&exe, enabled)?)
+}
+
 /// MCP-registration status for the other detected agents (Codex / Cursor / Gemini).
 #[tauri::command]
 fn agent_integrations_status() -> AppResult<Vec<integration::AgentIntegration>> {
@@ -1938,6 +1946,7 @@ pub fn run() {
             recall_integration_status,
             install_recall_integration,
             uninstall_recall_integration,
+            set_proactive_recall,
             agent_integrations_status,
             install_agent_integrations,
             uninstall_agent_integrations,
