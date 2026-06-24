@@ -8,7 +8,7 @@
 //! default Obsidian vault for `cal export`.
 
 use crate::{
-    agent, context, db, embed, export, gitlink, issues, knowledge, search, secrets, snapshot,
+    agent, context, cost, db, embed, export, gitlink, issues, knowledge, search, secrets, snapshot,
 };
 use rusqlite::Connection;
 
@@ -45,6 +45,7 @@ pub const COMMANDS: &[&str] = &[
     "check",
     "commits",
     "issues",
+    "cost",
 ];
 
 const USAGE: &str = "\
@@ -91,6 +92,9 @@ USAGE:
   cal issues [<project>] [-n LIMIT] [--json]
                                 recurring errors you keep hitting across sessions
                                 (last 180 days, most frequent first)
+  cal cost [<project>] [-n LIMIT] [--json]
+                                estimated $ spend by model + priciest threads
+                                (needs a Reindex to capture token usage)
   cal hook [<project>]          print the current repo's memory for injection (use as a
                                 Claude Code SessionStart hook command)
   cal agents [<project>] [-o FILE]
@@ -171,6 +175,7 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
         "check" => cmd_check(rest),
         "commits" => cmd_commits(rest),
         "issues" => cmd_issues(rest),
+        "cost" => cmd_cost(rest),
         "help" | "-h" | "--help" => {
             println!("{USAGE}");
             Ok(())
@@ -1140,6 +1145,58 @@ fn cmd_issues(args: &[String]) -> anyhow::Result<()> {
         );
         println!("    {}", i.example.trim());
     }
+    Ok(())
+}
+
+/// `cal cost [project] [-n N] [--json]` — estimated $ spend by model + the priciest threads.
+fn cmd_cost(args: &[String]) -> anyhow::Result<()> {
+    let o = parse(args)?;
+    let project = if o.positional.is_empty() {
+        None
+    } else {
+        Some(o.positional.join(" "))
+    };
+    let conn = open_db()?;
+    // All-time by default (cost is a lifetime figure); `since = 0`.
+    let s = cost::spend(&conn, 0, project.as_deref(), o.limit.unwrap_or(8) as usize)?;
+    if o.json {
+        println!("{}", serde_json::to_string_pretty(&s)?);
+        return Ok(());
+    }
+    if s.tracked_calls == 0 && s.untracked_calls == 0 {
+        eprintln!(
+            "(no token usage captured yet — run Reindex in the app, then retry. The source files\n carry it; data indexed before this feature doesn't.)"
+        );
+        return Ok(());
+    }
+    println!(
+        "Estimated spend: ${:.2}  ({} tracked LLM calls)",
+        s.total_cost, s.tracked_calls
+    );
+    if s.untracked_calls > 0 {
+        println!(
+            "  (+{} calls on models with no price on file — not counted)",
+            s.untracked_calls
+        );
+    }
+    println!("\nBy model:");
+    for m in &s.by_model {
+        if m.priced {
+            println!("  ${:>9.2}   {}  ({} calls)", m.cost, m.model, m.calls);
+        } else {
+            println!("  {:>10}   {}  ({} calls, no price)", "—", m.model, m.calls);
+        }
+    }
+    println!("\nMost expensive threads:");
+    for t in &s.top_threads {
+        println!(
+            "  ${:>9.2}   #{}  {}",
+            t.cost,
+            t.thread_id,
+            t.title.as_deref().unwrap_or("")
+        );
+    }
+    println!("\n(estimate from list prices; not a billing record)");
     Ok(())
 }
 

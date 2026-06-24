@@ -5,7 +5,9 @@
 //! (unique even when subagents reuse a session id). We extract user/assistant
 //! text, tool calls, and tool results; `thinking` blocks are skipped.
 
-use super::{set_file_state, source_id, upsert_thread, IndexReport, ParsedMessage, ParsedThread};
+use super::{
+    set_file_state, source_id, upsert_thread, IndexReport, MsgUsage, ParsedMessage, ParsedThread,
+};
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use serde_json::Value;
@@ -183,9 +185,16 @@ fn ingest_line(thread: &mut ParsedThread, obj: &Value, first_user_text: &mut Opt
             }
         }
         Some(role @ ("user" | "assistant")) => {
-            let content = obj.get("message").and_then(|m| m.get("content"));
+            let message = obj.get("message");
+            let content = message.and_then(|m| m.get("content"));
             let before = thread.messages.len();
             extract_messages(thread, role, content, ts);
+            // Attach the assistant turn's token usage to its first message (cost is per-turn).
+            if role == "assistant" && before < thread.messages.len() {
+                if let Some(u) = message.and_then(parse_usage) {
+                    thread.usage.push((before, u));
+                }
+            }
             if role == "user" && first_user_text.is_none() {
                 if let Some(m) = thread.messages.get(before) {
                     if m.role == "user" {
@@ -196,6 +205,21 @@ fn ingest_line(thread: &mut ParsedThread, obj: &Value, first_user_text: &mut Opt
         }
         _ => {}
     }
+}
+
+/// Extract model + token usage from a Claude `message` object (assistant turns carry a `usage`
+/// block: input/output/cache-creation/cache-read token counts and the model id).
+fn parse_usage(message: &Value) -> Option<MsgUsage> {
+    let model = message.get("model").and_then(Value::as_str)?.to_string();
+    let u = message.get("usage")?;
+    let n = |k: &str| u.get(k).and_then(Value::as_i64).unwrap_or(0);
+    Some(MsgUsage {
+        model,
+        input: n("input_tokens"),
+        output: n("output_tokens"),
+        cache_write: n("cache_creation_input_tokens"),
+        cache_read: n("cache_read_input_tokens"),
+    })
 }
 
 /// Turn a message's `content` (string or array of blocks) into ParsedMessages.
@@ -275,6 +299,24 @@ fn parse_ts(s: &str) -> Option<i64> {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn parse_usage_reads_model_and_tokens() {
+        // The real shape of a Claude Code assistant `message` object.
+        let msg: Value = serde_json::from_str(
+            r#"{"model":"claude-opus-4-8","usage":{"input_tokens":17276,"output_tokens":797,
+                "cache_creation_input_tokens":3139,"cache_read_input_tokens":15853}}"#,
+        )
+        .unwrap();
+        let u = parse_usage(&msg).expect("usage parsed");
+        assert_eq!(u.model, "claude-opus-4-8");
+        assert_eq!(u.input, 17276);
+        assert_eq!(u.output, 797);
+        assert_eq!(u.cache_write, 3139);
+        assert_eq!(u.cache_read, 15853);
+        // A message with no usage block (e.g. a user turn) yields None.
+        assert!(parse_usage(&serde_json::json!({"role": "user"})).is_none());
+    }
 
     fn temp_path(name: &str) -> PathBuf {
         use std::sync::atomic::{AtomicU64, Ordering};

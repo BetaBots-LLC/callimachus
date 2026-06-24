@@ -576,6 +576,7 @@ pub fn persist_chat(
         created_at: Some(now),
         updated_at: Some(now),
         is_subagent: false,
+        usage: Vec::new(),
         messages: parsed,
     };
     indexer::upsert_thread(conn, sid, &thread)?;

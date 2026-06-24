@@ -196,6 +196,7 @@ pub fn parse_history(
         created_at,
         updated_at,
         is_subagent: false,
+        usage: Vec::new(),
         messages,
     }))
 }

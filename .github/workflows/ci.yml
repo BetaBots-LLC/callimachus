@@ -12,10 +12,7 @@ concurrency:
 jobs:
   check:
     # Lint/typecheck/test on macOS (Apple Silicon, per Tauri's recommended pipeline).
-    # Stays on macos-latest because our HTTP stack is native-tls, NOT rustls (see Cargo.toml).
-    # rustls drags in aws-lc-sys, which needs libclang_rt.osx.a — absent in recent macos-latest
-    # Xcodes — and that's what used to break linking ("ld: library 'clang_rt.osx' not found").
-    # KEEP the TLS stack native (no rustls/aws-lc-sys) or this breaks on macos-latest again.
+    # Cross-platform compilation is exercised by the release matrix in build.yml on every tag.
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v5
@@ -30,6 +27,20 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+
+      # rustc links `-lclang_rt.osx` but searches a clang-version subdir the current macos-latest
+      # Xcode doesn't have, so the link fails ("ld: library 'clang_rt.osx' not found"). The lib
+      # IS on the runner, just under a different clang/<ver> dir — find it and add it to the
+      # linker search path. (Not a dependency issue; it's where the active Xcode put compiler-rt.)
+      - name: Locate compiler-rt for the linker
+        run: |
+          LIB=$(find "$(xcode-select -p)" -name 'libclang_rt.osx.a' 2>/dev/null | head -1)
+          if [ -n "$LIB" ]; then
+            echo "RUSTFLAGS=${RUSTFLAGS:-} -L $(dirname "$LIB")" >> "$GITHUB_ENV"
+            echo "compiler-rt: $LIB"
+          else
+            echo "::warning::libclang_rt.osx.a not found under $(xcode-select -p)"
+          fi
 
       - uses: swatinem/rust-cache@v2
         with:

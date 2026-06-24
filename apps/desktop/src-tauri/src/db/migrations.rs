@@ -47,6 +47,8 @@ pub static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
         M::up(include_str!("../../migrations/0020_decision_rationale.sql")),
         // 0021 — git linkage: commits a thread produced (file-overlap within its time window).
         M::up(include_str!("../../migrations/0021_thread_commits.sql")),
+        // 0022 — per-message token usage + model, for the cost/spend layer.
+        M::up(include_str!("../../migrations/0022_message_usage.sql")),
     ])
 });
 

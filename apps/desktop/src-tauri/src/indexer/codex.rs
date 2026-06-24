@@ -116,6 +116,7 @@ fn index_rollout(conn: &mut Connection, sid: i64, meta: &ThreadMeta) -> Result<O
         created_at: meta.created_at,
         updated_at: meta.updated_at,
         is_subagent: false,
+        usage: Vec::new(),
         messages,
     };
     let n = upsert_thread(conn, sid, &thread)?;
