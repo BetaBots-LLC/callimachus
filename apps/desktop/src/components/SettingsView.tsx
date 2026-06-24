@@ -199,6 +199,7 @@ function RecallIntegrationCard() {
   const refresh = () => queryClient.invalidateQueries({ queryKey: ["recall_integration"] });
   const install = useMutation({ mutationFn: api.installRecallIntegration, onSuccess: refresh });
   const uninstall = useMutation({ mutationFn: api.uninstallRecallIntegration, onSuccess: refresh });
+  const setRecall = useMutation({ mutationFn: api.setProactiveRecall, onSuccess: refresh });
 
   const s = status.data;
   const connected =
@@ -261,6 +262,25 @@ function RecallIntegrationCard() {
           </p>
         )}
         {install.isError && <p className="text-xs text-destructive">{String(install.error)}</p>}
+        {connected && (
+          <div className="flex items-center justify-between gap-3 border-t border-border/60 pt-3">
+            <div className="space-y-0.5">
+              <div className="text-sm font-medium">Proactive recall</div>
+              <p className="text-xs text-muted-foreground">
+                Before each prompt, silently tell Claude when you've solved it in a past session.
+                Reads every prompt (a brief on-device lookup); off by default.
+              </p>
+            </div>
+            <Switch
+              checked={!!s?.proactiveRecallInstalled}
+              disabled={setRecall.isPending}
+              onCheckedChange={(v) => setRecall.mutate(v)}
+            />
+          </div>
+        )}
+        {setRecall.isError && (
+          <p className="text-xs text-destructive">{String(setRecall.error)}</p>
+        )}
       </CardContent>
     </Card>
   );

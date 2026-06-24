@@ -73,18 +73,24 @@ fn snapshot_hook_command(app_exe: &Path) -> String {
     format!("\"{}\" snapshot-hook", cal_exe(app_exe).display())
 }
 
-/// Recognize a hook command we installed: our commands always end with `" hook` or
-/// `" snapshot-hook` (a quoted path followed by the subcommand), which a user's own hook is
-/// very unlikely to use.
-fn is_our_hook(cmd: &str) -> bool {
-    let c = cmd.trim();
-    c.ends_with("\" hook") || c.ends_with("\" snapshot-hook")
+/// The UserPromptSubmit hook command: `"<cal>" recall-now`, which silently injects a
+/// "you may have solved this before" note when the prompt strongly matches prior work.
+fn recall_hook_command(app_exe: &Path) -> String {
+    format!("\"{}\" recall-now", cal_exe(app_exe).display())
 }
 
-/// True if `~/.claude/settings.json` already has a Callimachus SessionStart hook.
-fn session_start_has_our_hook(v: &Value) -> bool {
+/// Recognize a hook command we installed: our commands always end with `" hook`,
+/// `" snapshot-hook`, or `" recall-now` (a quoted path + the subcommand), which a user's own
+/// hook is very unlikely to use.
+fn is_our_hook(cmd: &str) -> bool {
+    let c = cmd.trim();
+    c.ends_with("\" hook") || c.ends_with("\" snapshot-hook") || c.ends_with("\" recall-now")
+}
+
+/// True if `~/.claude/settings.json` already has a Callimachus hook on `event`.
+fn event_has_our_hook(v: &Value, event: &str) -> bool {
     v.get("hooks")
-        .and_then(|h| h.get("SessionStart"))
+        .and_then(|h| h.get(event))
         .and_then(Value::as_array)
         .map(|groups| {
             groups.iter().any(|g| {
@@ -104,6 +110,11 @@ fn session_start_has_our_hook(v: &Value) -> bool {
         .unwrap_or(false)
 }
 
+/// True if `~/.claude/settings.json` already has a Callimachus SessionStart hook.
+fn session_start_has_our_hook(v: &Value) -> bool {
+    event_has_our_hook(v, "SessionStart")
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IntegrationStatus {
@@ -115,6 +126,9 @@ pub struct IntegrationStatus {
     pub mcp_registered: bool,
     /// A Callimachus SessionStart hook is installed (auto-injects project memory).
     pub hook_installed: bool,
+    /// The opt-in UserPromptSubmit "proactive recall" hook is installed (injects prior work
+    /// before each prompt). Separate from `hook_installed` because it reads every prompt.
+    pub proactive_recall_installed: bool,
     /// `~/.local/bin/cal` exists (powers the `cal` CLI + the VS Code extension).
     pub cal_installed: bool,
     pub skill_path: String,
@@ -148,11 +162,17 @@ pub fn status(app_exe: &Path) -> IntegrationStatus {
 
     let cal_installed = cal_link_path().map(|p| p.exists()).unwrap_or(false);
 
-    let hook_installed = settings_path()
+    let settings = settings_path()
         .ok()
         .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-        .map(|v| session_start_has_our_hook(&v))
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok());
+    let hook_installed = settings
+        .as_ref()
+        .map(session_start_has_our_hook)
+        .unwrap_or(false);
+    let proactive_recall_installed = settings
+        .as_ref()
+        .map(|v| event_has_our_hook(v, "UserPromptSubmit"))
         .unwrap_or(false);
 
     IntegrationStatus {
@@ -160,6 +180,7 @@ pub fn status(app_exe: &Path) -> IntegrationStatus {
         skill_outdated,
         mcp_registered,
         hook_installed,
+        proactive_recall_installed,
         cal_installed,
         skill_path: skill.map(|p| p.display().to_string()).unwrap_or_default(),
         config_path: claude_config_path()
@@ -176,6 +197,40 @@ pub fn install(app_exe: &Path) -> Result<IntegrationStatus> {
     register_mcp(app_exe)?;
     install_cal(app_exe)?;
     install_hook(app_exe)?;
+    Ok(status(app_exe))
+}
+
+/// Toggle the opt-in proactive-recall hook (UserPromptSubmit -> `cal recall-now`) on its own,
+/// independent of the base integration. It reads every prompt, so it stays off until the user
+/// asks for it. Enabling ensures `cal` exists first (so the hook command resolves); disabling
+/// strips only our UserPromptSubmit hook and leaves any other hooks untouched. Idempotent.
+pub fn set_proactive_recall(app_exe: &Path, enabled: bool) -> Result<IntegrationStatus> {
+    let path = settings_path()?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
+    let mut root: Value = match std::fs::read_to_string(&path) {
+        Ok(text) if !text.trim().is_empty() => serde_json::from_str(&text)
+            .with_context(|| format!("{} is not valid JSON; not modifying it", path.display()))?,
+        _ => Value::Object(Map::new()),
+    };
+    let obj = root
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("{} is not a JSON object", path.display()))?;
+
+    if enabled {
+        install_cal(app_exe)?; // the hook command points at `cal`; make sure it's there
+        upsert_hook(obj, "UserPromptSubmit", &recall_hook_command(app_exe))?;
+    } else if let Some(arr) = obj
+        .get_mut("hooks")
+        .and_then(|h| h.get_mut("UserPromptSubmit"))
+        .and_then(Value::as_array_mut)
+    {
+        remove_our_hooks(arr);
+    }
+
+    std::fs::write(&path, serde_json::to_string_pretty(&root)?)
+        .with_context(|| format!("writing {}", path.display()))?;
     Ok(status(app_exe))
 }
 
@@ -220,7 +275,12 @@ pub fn uninstall() -> Result<()> {
 /// The Claude Code hook events we install into: SessionStart injects each repo's memory;
 /// PreCompact + SubagentStop auto-snapshot the live session so context survives a compaction
 /// and a finished subagent's work is captured.
-const HOOK_EVENTS: [&str; 3] = ["SessionStart", "PreCompact", "SubagentStop"];
+const HOOK_EVENTS: [&str; 4] = [
+    "SessionStart",
+    "PreCompact",
+    "SubagentStop",
+    "UserPromptSubmit",
+];
 
 /// Merge our hooks into `~/.claude/settings.json`. Preserves all other settings and hooks;
 /// refuses to clobber an unparseable file; idempotent (re-install drops any prior Callimachus
@@ -239,16 +299,12 @@ fn install_hook(app_exe: &Path) -> Result<()> {
         .as_object_mut()
         .ok_or_else(|| anyhow::anyhow!("{} is not a JSON object", path.display()))?;
 
-    let memory = hook_command(app_exe);
     let snapshot = snapshot_hook_command(app_exe);
-    for event in HOOK_EVENTS {
-        let cmd = if event == "SessionStart" {
-            &memory
-        } else {
-            &snapshot
-        };
-        upsert_hook(obj, event, cmd)?;
-    }
+    upsert_hook(obj, "SessionStart", &hook_command(app_exe))?; // inject project memory
+    upsert_hook(obj, "PreCompact", &snapshot)?; // auto-snapshot before compaction
+    upsert_hook(obj, "SubagentStop", &snapshot)?; // auto-snapshot a finished subagent
+                                                  // NOTE: the UserPromptSubmit "proactive recall" hook is deliberately NOT installed here. It
+                                                  // reads every prompt, so it's a separate opt-in toggle (set_proactive_recall), off by default.
 
     std::fs::write(&path, serde_json::to_string_pretty(&root)?)
         .with_context(|| format!("writing {}", path.display()))?;
@@ -719,19 +775,21 @@ mod tests {
 
     #[test]
     fn snapshot_hooks_install_across_events_idempotently() {
-        // is_our_hook recognizes both the memory hook and the snapshot hook, nothing else.
+        // is_our_hook recognizes the memory, snapshot, and recall hooks, nothing else.
         assert!(is_our_hook("\"/x/cal\" hook"));
         assert!(is_our_hook("\"/x/cal\" snapshot-hook"));
+        assert!(is_our_hook("\"/x/cal\" recall-now"));
         assert!(!is_our_hook("\"/x/cal\" other"));
         assert!(!is_our_hook("my-own-snapshot-hook"));
 
-        // Install all three events (mirrors install_hook), then re-install to prove no dup.
+        // Install every event (mirrors install_hook), then re-install to prove no dup.
         let mut root = json!({"model": "opus"});
         let obj = root.as_object_mut().unwrap();
         for _ in 0..2 {
             upsert_hook(obj, "SessionStart", "\"/x/cal\" hook").unwrap();
             upsert_hook(obj, "PreCompact", "\"/x/cal\" snapshot-hook").unwrap();
             upsert_hook(obj, "SubagentStop", "\"/x/cal\" snapshot-hook").unwrap();
+            upsert_hook(obj, "UserPromptSubmit", "\"/x/cal\" recall-now").unwrap();
         }
 
         let ours_in = |root: &Value, event: &str| -> usize {

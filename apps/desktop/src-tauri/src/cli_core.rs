@@ -46,6 +46,7 @@ pub const COMMANDS: &[&str] = &[
     "commits",
     "issues",
     "cost",
+    "recall-now",
 ];
 
 const USAGE: &str = "\
@@ -176,6 +177,7 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
         "commits" => cmd_commits(rest),
         "issues" => cmd_issues(rest),
         "cost" => cmd_cost(rest),
+        "recall-now" => cmd_recall_now(rest),
         "help" | "-h" | "--help" => {
             println!("{USAGE}");
             Ok(())
@@ -1104,6 +1106,105 @@ fn external_id_under(transcript_path: &str, base: &std::path::Path) -> Option<St
         .ok()?
         .to_str()
         .map(str::to_string)
+}
+
+/// `cal recall-now` — a Claude Code UserPromptSubmit hook target. Reads the submitted prompt from
+/// the hook JSON on stdin; when it STRONGLY matches prior solved work, prints a short note that
+/// Claude Code injects into the agent's context ("you may have solved this before"). SILENT +
+/// best-effort: a weak/no match, no index, or any error just exits 0 with no output, so it never
+/// blocks the prompt. A strict floor + per-session dedup keep it signal, not noise.
+fn cmd_recall_now(_args: &[String]) -> anyhow::Result<()> {
+    use std::io::Read;
+    let mut input = String::new();
+    if std::io::stdin().read_to_string(&mut input).is_err() {
+        return Ok(());
+    }
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&input) else {
+        return Ok(());
+    };
+    let prompt = v
+        .get("prompt")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .trim();
+    if prompt.chars().count() < 12 {
+        return Ok(()); // too short to match anything meaningful
+    }
+    if !db::default_index_path().exists() {
+        return Ok(());
+    }
+    let session = v.get("session_id").and_then(|x| x.as_str()).unwrap_or("");
+    let project = v
+        .get("cwd")
+        .and_then(|x| x.as_str())
+        .and_then(crate::indexer::canonical_project);
+
+    let conn = open_db()?;
+    let embedder = embed::Embedder::default();
+    let Some(qv) = embed::embed_query(&embedder, prompt)? else {
+        return Ok(());
+    };
+    let hits = knowledge::find_prior_work(&conn, &qv, project.as_deref(), 5)?;
+
+    // Stricter than the on-demand guard: an UNPROMPTED interruption must be clearly relevant, so
+    // surface only genuinely strong matches.
+    const PROACTIVE_FLOOR: f32 = 0.62;
+    let mut hits: Vec<_> = hits
+        .into_iter()
+        .filter(|h| h.similarity >= PROACTIVE_FLOOR)
+        .collect();
+
+    // Per-session dedup: never surface the same thread twice in one session.
+    let mut seen = load_recall_seen(session);
+    hits.retain(|h| !seen.contains(&h.thread_id));
+    if hits.is_empty() {
+        return Ok(());
+    }
+    hits.truncate(2);
+    for h in &hits {
+        seen.insert(h.thread_id);
+    }
+    save_recall_seen(session, &seen);
+
+    println!("[Callimachus] You may have worked on this before. Reuse it before redoing:");
+    for h in &hits {
+        let title = h.title.as_deref().unwrap_or("(untitled)");
+        println!("  • {title}  ({}: {})", h.kind, h.snippet.trim());
+    }
+    Ok(())
+}
+
+/// Per-session cache of thread ids already surfaced by `recall-now`, so it doesn't repeat itself.
+fn recall_seen_path(session: &str) -> Option<std::path::PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    let safe: String = session
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    let name = if safe.is_empty() { "session" } else { &safe };
+    Some(
+        std::path::Path::new(&home)
+            .join(".callimachus/recall")
+            .join(format!("{name}.json")),
+    )
+}
+
+fn load_recall_seen(session: &str) -> std::collections::HashSet<i64> {
+    recall_seen_path(session)
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_recall_seen(session: &str, seen: &std::collections::HashSet<i64>) {
+    if let Some(p) = recall_seen_path(session) {
+        if let Some(dir) = p.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Ok(json) = serde_json::to_string(seen) {
+            let _ = std::fs::write(p, json);
+        }
+    }
 }
 
 /// `cal issues [project] [-n N] [--json]` — recurring errors across sessions (last 180 days).
