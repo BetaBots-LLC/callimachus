@@ -39,7 +39,11 @@ pub fn get_key(provider: &str) -> Result<Option<String>> {
     let val = match entry(provider)?.get_password() {
         Ok(k) => Some(k),
         Err(keyring::Error::NoEntry) => None,
-        Err(e) => return Err(anyhow::Error::from(e).context("reading key")),
+        // Access denied / cancelled / locked keychain (NOT "no entry"): treat as "no key this
+        // session" and CACHE it, so we respect the user's Deny and never re-prompt in a loop.
+        // Previously this returned an error without caching, so every has_key re-read the
+        // keychain and macOS re-prompted on each click. Restart the app to retry after a deny.
+        Err(_) => None,
     };
     if let Ok(mut c) = CACHE.lock() {
         c.insert(provider.to_string(), val.clone());

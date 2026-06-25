@@ -461,6 +461,8 @@ export const api = {
   // Opt-in proactive recall: inject prior work into Claude before each prompt (reads every prompt).
   setProactiveRecall: (enabled: boolean) =>
     invoke<IntegrationStatus>("set_proactive_recall", { enabled }),
+  // CLI LLM backends (Claude Code / Codex) + whether each is installed — for keyless distillation.
+  cliEngines: () => invoke<CliEngine[]>("cli_engines"),
   // MCP registration for the other detected agents (Codex / Cursor / Gemini).
   agentIntegrationsStatus: () => invoke<AgentIntegration[]>("agent_integrations_status"),
   installAgentIntegrations: () => invoke<AgentIntegration[]>("install_agent_integrations"),
@@ -477,6 +479,14 @@ export interface IntegrationStatus {
   calInstalled: boolean;
   skillPath: string;
   configPath: string;
+}
+
+// A CLI LLM backend (Claude Code / Codex) usable for keyless distillation, with install state.
+export interface CliEngine {
+  id: string; // provider id, e.g. "claude-cli"
+  label: string;
+  bin: string; // binary name probed on PATH
+  installed: boolean;
 }
 
 // One non-Claude agent's MCP integration state.
