@@ -47,6 +47,7 @@ pub const COMMANDS: &[&str] = &[
     "issues",
     "cost",
     "recall-now",
+    "audit-pr",
 ];
 
 const USAGE: &str = "\
@@ -90,6 +91,10 @@ USAGE:
   cal commits [<repo>] [-n LIMIT] [--json]
                                 infer + show which commits your threads produced
                                 (run inside a git repo, or pass its path)
+  cal audit-pr [<repo>] --changed-files a,b --shas s1,s2 [-n CAP]
+                                one JSON bundle for an external PR auditor: per-commit
+                                provenance (the session behind each sha), per-file prior
+                                threads + reasoning, repo recurring errors + project memory
   cal issues [<project>] [-n LIMIT] [--json]
                                 recurring errors you keep hitting across sessions
                                 (last 180 days, most frequent first)
@@ -178,6 +183,7 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
         "issues" => cmd_issues(rest),
         "cost" => cmd_cost(rest),
         "recall-now" => cmd_recall_now(rest),
+        "audit-pr" => cmd_audit_pr(rest),
         "help" | "-h" | "--help" => {
             println!("{USAGE}");
             Ok(())
@@ -683,6 +689,151 @@ fn cmd_check(args: &[String]) -> anyhow::Result<()> {
 
 /// `cal commits [repo] [-n N] [--json]` — infer which commits a project's threads produced and
 /// show the timeline. Run inside a git repo, or pass its path.
+/// Compact distilled knowledge for one thread (summary + decision/gotcha/todo texts), as JSON.
+/// Null when the thread has no knowledge row. Used to inline reasoning into the audit bundle.
+fn audit_thread_knowledge(conn: &Connection, id: i64) -> serde_json::Value {
+    match knowledge::get_thread_knowledge(conn, id) {
+        Ok(k) => serde_json::json!({
+            "summary": k.summary,
+            "decisions": k.decisions.iter().map(|f| f.text.clone()).collect::<Vec<_>>(),
+            "gotchas": k.gotchas.iter().map(|f| f.text.clone()).collect::<Vec<_>>(),
+            "openTodos": k.todos.iter().map(|f| f.text.clone()).collect::<Vec<_>>(),
+            "extracted": k.extracted,
+        }),
+        Err(_) => serde_json::Value::Null,
+    }
+}
+
+/// `cal audit-pr <repo> --changed-files a,b --shas s1,s2` — the one-call PR-audit bundle for an
+/// external reviewer (e.g. a local PR-audit app). Refreshes thread↔commit links, then returns ONE
+/// JSON object: commit provenance (per sha → originating thread + its distilled reasoning),
+/// per-changed-file prior threads + knowledge, the repo's recurring errors, and its project memory.
+/// Always JSON. Degrades gracefully: with distillation off, knowledge fields are null but
+/// provenance, file-touch, open TODOs, and repo errors still populate.
+fn cmd_audit_pr(args: &[String]) -> anyhow::Result<()> {
+    let mut repo: Option<String> = None;
+    let mut files: Vec<String> = Vec::new();
+    let mut shas: Vec<String> = Vec::new();
+    let mut cap: i64 = 5; // per-file / per-sha thread cap
+    let split = |v: &str| -> Vec<String> {
+        v.split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    };
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--changed-files" | "--files" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    files.extend(split(v));
+                }
+            }
+            "--shas" | "--commits" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    shas.extend(split(v));
+                }
+            }
+            "--limit" | "-n" => {
+                i += 1;
+                cap = args.get(i).and_then(|v| v.parse().ok()).unwrap_or(cap);
+            }
+            "--json" => {} // JSON is this command's only output
+            s if !s.starts_with('-') && repo.is_none() => repo = Some(s.to_string()),
+            _ => {}
+        }
+        i += 1;
+    }
+    let repo = repo.unwrap_or_else(cwd_project_root);
+    let key = crate::indexer::canonical_project(&repo).unwrap_or_else(|| repo.clone());
+
+    let conn = open_db_write()?;
+    // Refresh thread↔commit links for the branch first; provenance is empty without this.
+    let links_refreshed = gitlink::link_project(&conn, &repo).unwrap_or(0);
+    let distill_on = knowledge::get_config(&conn)
+        .map(|c| c.enabled)
+        .unwrap_or(false);
+
+    // One distilled-knowledge lookup per referenced thread, deduped across shas + files.
+    let mut kcache: std::collections::HashMap<i64, serde_json::Value> =
+        std::collections::HashMap::new();
+
+    // 1. Commit provenance: per input sha → originating thread(s) + reasoning. Empty array, not
+    //    omitted, when a sha has no inferred link (explicit null case).
+    let commit_threads = gitlink::commits_by_sha(&conn, &shas)?;
+    for c in &commit_threads {
+        kcache
+            .entry(c.thread_id)
+            .or_insert_with(|| audit_thread_knowledge(&conn, c.thread_id));
+    }
+    let mut by_sha = serde_json::Map::new();
+    for sha in &shas {
+        let produced: Vec<_> = commit_threads
+            .iter()
+            .filter(|c| &c.sha == sha)
+            .map(|c| {
+                serde_json::json!({
+                    "id": c.thread_id,
+                    "title": c.title,
+                    "overlap": c.overlap,
+                    "knowledge": kcache.get(&c.thread_id).cloned().unwrap_or(serde_json::Value::Null),
+                })
+            })
+            .collect();
+        by_sha.insert(
+            sha.clone(),
+            serde_json::json!({ "threadsProduced": produced }),
+        );
+    }
+
+    // 2. Per-changed-file history: prior threads that touched each file + their reasoning.
+    let mut by_file = serde_json::Map::new();
+    for path in &files {
+        let threads = search::threads_with_file(&conn, path, cap).unwrap_or_default();
+        for t in &threads {
+            kcache
+                .entry(t.id)
+                .or_insert_with(|| audit_thread_knowledge(&conn, t.id));
+        }
+        let arr: Vec<_> = threads
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "id": t.id,
+                    "title": t.title,
+                    "knowledge": kcache.get(&t.id).cloned().unwrap_or(serde_json::Value::Null),
+                })
+            })
+            .collect();
+        by_file.insert(path.clone(), serde_json::json!({ "threads": arr }));
+    }
+
+    // 3. Repo-scoped recurring errors (no error→file edge exists; the caller intersects with the
+    //    touched-thread set client-side). 4. Repo project memory (decisions/gotchas/open TODOs).
+    let since = chrono::Utc::now().timestamp() - 180 * 24 * 3600;
+    let errors = issues::recurring_issues(&conn, Some(&key), since, 20).unwrap_or_default();
+    let memory = knowledge::get_project_memory(&conn, &key, 20).ok();
+
+    let bundle = serde_json::json!({
+        "repo": key,
+        "bySha": by_sha,
+        "byFile": by_file,
+        "recurringErrors": errors,
+        "projectMemory": memory,
+        "notes": {
+            "distillationEnabled": distill_on,
+            "linksRefreshed": links_refreshed,
+            // When false, knowledge fields above are null but provenance/file-touch/TODOs/errors
+            // still populate — the bundle is meant to degrade, not fail.
+            "threadKnowledgeAvailable": distill_on,
+        },
+    });
+    println!("{}", serde_json::to_string_pretty(&bundle)?);
+    Ok(())
+}
+
 fn cmd_commits(args: &[String]) -> anyhow::Result<()> {
     let o = parse(args)?;
     let repo = if o.positional.is_empty() {

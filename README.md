@@ -24,16 +24,20 @@ Grab the latest signed build from **[Releases](../../releases/latest)** — macO
 - **Indexes** every conversation from 11 coding agents into one local SQLite store — Claude Code, Codex, Cursor, Gemini CLI, Qwen Code, Goose, OpenCode, Continue, Cline, Roo Code, and Kilo Code. Adding another source is a [small, documented contract](apps/desktop/src-tauri/src/indexer/README.md).
 - **Searches** them with hybrid ranking: keyword (SQLite FTS5 / BM25) fused with on-device semantic similarity (sqlite-vec KNN, no cloud) via Reciprocal Rank Fusion. Filter by source, project, subagents, starred, and tags.
 - **Finds code-aware** — type `file:embed/mod.rs` in the search bar (or `cal files <path>`) to find every thread that touched a path; backed by a file-mention index built at index time.
-- **Distills knowledge** — free heuristic TODO extraction, plus opt-in LLM distillation of decisions, gotchas, and summaries, with cross-thread semantic recall of past decisions/gotchas. Optional **auto-distillation** drains new/changed threads in the background so memory self-populates. Needs local Ollama (keyless) or a cloud API key.
+- **Distills knowledge** — free heuristic TODO extraction, plus opt-in LLM distillation of decisions, gotchas, and summaries, with cross-thread semantic recall of past decisions/gotchas. Optional **auto-distillation** drains new/changed threads in the background so memory self-populates. Runs on local Ollama (keyless), your logged-in **Claude Code or Codex CLI** subscription (keyless, no API key), or a cloud API key.
 - **Curates the facts** — pin, edit, or delete distilled facts so your edits survive re-distilling, plus an LLM **"Review conflicts"** pass that flags decisions that contradict each other.
 - **Remembers per project** — a **Projects** tab aggregates each repo's decisions, gotchas, and open TODOs into durable memory (grouped by a canonical project key, so worktrees / symlinks / `~` don't split one repo), with an LLM brief and a managed `.callimachus/memory.md`. That memory is prepended when you "Open in CLI", and you can inject it into any agent automatically: **Update AGENTS.md** (or `cal agents`) writes a managed block into the repo's `AGENTS.md` / `CLAUDE.md`, and `cal hook` feeds it to a Claude Code SessionStart hook.
 - **Asks your history (RAG)** — a synthesized, cited answer over your own threads, with `[thread N]` citations back to the sources it used. Needs an LLM engine (Knowledge/distillation enabled).
 - **Organizes into collections** — star threads and attach free-form tags, then filter the list by starred or by tag.
-- **Chats** with an in-app agent (Anthropic / OpenAI / Gemini / OpenRouter / Ollama — your key, your choice) that can **search your own history** and **run shell commands with your approval**; streaming, cancellable, with live model lists. Chats are saved and become searchable too.
+- **Chats** with an in-app agent (Anthropic / OpenAI / Gemini / OpenRouter / Ollama, or your logged-in **Claude Code / Codex CLI** with no key) that can **search your own history** and **run shell commands with your approval**; streaming, cancellable, with live model lists. Chats are saved and become searchable too.
 - **Carries context across tools** — open any thread in any agent CLI ("Open in Claude / Codex / Gemini …", seeded with the packed transcript), resume a Claude Code / Codex thread in its native CLI, copy context, or export a thread to Obsidian (optionally AI-summarized with decisions / gotchas / TODOs).
 - **Links threads to commits** — infers **on-device** which git commits a thread produced, by overlapping the files a thread discussed with `git log`'s changed files inside the thread's time window (shared-file count = confidence). See it as a thread→commit timeline (`cal commits`), per-thread in the desktop UI ("Produced commits"), or via the `linked_commits` MCP tool.
 - **Snapshots agent sessions** — durable, resumable checkpoints of a thread (packed transcript + carry-forward project memory) for handoff across a context-window compaction or across tools; auto-captured via Claude Code PreCompact / SubagentStop hooks. Take, list, and resume them (`cal snapshot` / `cal snapshots` / `cal resume`, or the `snapshot_session` / `list_snapshots` / `load_snapshot` MCP tools).
 - **Guards decisions** — decisions can carry a **rationale** ("why"), and an active guard surfaces settled decisions on a topic before an agent re-litigates one (`cal check "<proposal>"` / the `check_decision` MCP tool).
+- **Recalls before you redo** — an opt-in Claude Code hook quietly injects "you may have solved this before" into the agent's context on each prompt when it strongly matches prior work (Settings → Claude Code → **Proactive recall**, off by default, signal-floored and per-session deduped).
+- **Mines recurring issues** — surfaces the errors you keep hitting across all your tools (normalized signatures, last 180 days) so you fix the pattern, not the instance (a Coach card, or `cal issues`).
+- **Shows what it cost** — captures per-message token usage and model at index time, then estimates dollar spend by model and your priciest threads (a Stats card, or `cal cost`; reindex once to backfill).
+- **Feeds PR audits** — `cal audit-pr <repo> --changed-files … --shas …` returns one JSON bundle (per-commit provenance back to the session that produced it, per-file prior threads + reasoning, repo recurring errors, project memory) so an external local PR-review tool can show the history behind a diff.
 - **Surfaces to your agents** — a bundled MCP server (`callimachus-mcp`) exposes the index as tools any agent can call mid-session, and it's two-way: agents can write back into Callimachus's own memory (close TODOs, record decisions/gotchas, snapshot a session) without ever touching your files. The `/recall` skill teaches them when to use it.
 - **Stays current** via a background file watcher; **stays private** — API keys live in the OS keychain, nothing is sent anywhere except the LLM provider you pick.
 
@@ -115,6 +119,9 @@ cal done 17                                # mark an open TODO done (id from `ca
 cal remember decision "use sqlite-vec for KNN" --because "no cloud, KNN in SQL"  # record a fact (+ rationale) into the repo's memory
 cal check "switch to pgvector"             # surface settled decisions before re-litigating one
 cal commits                                # infer the thread→commit timeline for this repo (--json; or pass a path)
+cal issues                                 # recurring errors you keep hitting across sessions (last 180 days)
+cal cost                                   # estimated $ spend by model + your priciest threads
+cal audit-pr . --changed-files a,b --shas s1,s2  # one JSON bundle for an external PR auditor
 cal snapshot 42 -l "pre-refactor"          # checkpoint a thread for handoff (transcript + project memory)
 cal snapshots                              # list saved session snapshots (optionally for a project)
 cal resume 7 -a claude                     # resume a snapshot in an agent CLI
@@ -122,7 +129,7 @@ cal agents                                 # write the repo's memory into AGENTS
 cal hook                                   # print the repo's memory (use as a Claude Code SessionStart hook)
 ```
 
-`star`, `tag`, `tags`, `todos`, `knowledge`, `distill`, `decisions`, `gotchas`, and `related` also exist — run `cal help` for all 21.
+`star`, `tag`, `tags`, `todos`, `knowledge`, `distill`, `decisions`, `gotchas`, and `related` also exist — run `cal help` for the full list.
 
 **VS Code / Cursor** — the extension adds a "Callimachus History" sidebar, a status-bar search button, and commands to search / insert / copy threads (it shells out to `cal`). Install from the **[VS Code Marketplace](https://marketplace.visualstudio.com/)** or **[Open VSX](https://open-vsx.org/)** (the registry **Cursor** and VSCodium use), or grab the `.vsix` from [Releases](../../releases). See [apps/vscode/README.md](apps/vscode/README.md).
 

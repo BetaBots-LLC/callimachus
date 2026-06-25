@@ -60,7 +60,8 @@ function DesktopPage() {
           className="lg:col-span-5"
         >
           A built-in, provider-agnostic chat that can search your own history and run shell commands
-          with your approval. Bring your own key — Anthropic, OpenAI, Gemini, OpenRouter, or Ollama.
+          with your approval. Bring your own key — Anthropic, OpenAI, Gemini, OpenRouter, or Ollama,
+          or run it on your logged-in Claude Code / Codex CLI with no key at all.
         </FeaturePanel>
         <FeaturePanel
           icon={Lightbulb}
@@ -69,8 +70,8 @@ function DesktopPage() {
           className="lg:col-span-7"
         >
           Free heuristic TODO extraction, plus opt-in LLM distillation of decisions, gotchas, and
-          summaries — with cross-thread semantic recall of past decisions and gotchas. Needs local
-          Ollama (keyless) or a cloud API key.
+          summaries — with cross-thread semantic recall of past decisions and gotchas. Runs on local
+          Ollama, your logged-in Claude Code / Codex CLI, or a cloud API key.
         </FeaturePanel>
         <FeaturePanel
           icon={MessageCircleQuestion}
@@ -108,8 +109,9 @@ function DesktopPage() {
           title="Know your corpus"
           className="lg:col-span-4"
         >
-          A dashboard of threads and messages per source and role, your busiest projects, and how
-          much of the archive is embedded for semantic search.
+          A dashboard of threads and messages per source and role, your busiest projects, how much
+          of the archive is embedded for semantic search, and a spend card estimating what your AI
+          coding cost by model.
         </FeaturePanel>
         <FeaturePanel
           icon={Trash2}
