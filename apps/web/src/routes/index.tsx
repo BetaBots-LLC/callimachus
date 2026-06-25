@@ -222,6 +222,28 @@ function Home() {
               your own history — from <code className="font-mono">cal check</code> or the MCP — so
               the past gets a vote before the code does.
             </FeaturePanel>
+            <FeaturePanel
+              icon={Terminal}
+              label="No API key"
+              title="Run on your CLI subscription"
+              className="lg:col-span-7"
+            >
+              Distillation, Ask, and the in-app chat can run on your logged-in{" "}
+              <strong>Claude Code or Codex CLI</strong> instead of a cloud API key. Pick it in
+              Settings or the chat provider menu; Callimachus shells out to the CLI you already pay
+              for, nothing new to configure.
+            </FeaturePanel>
+            <FeaturePanel
+              icon={ShieldCheck}
+              label="PR audits"
+              title="The history behind a diff"
+              className="lg:col-span-5"
+            >
+              <code className="font-mono">cal audit-pr</code> returns one JSON bundle for an
+              external review tool: which session produced each commit, prior threads per changed
+              file, and the errors you keep hitting, so a local PR audit sees the context a diff
+              alone hides.
+            </FeaturePanel>
           </div>
         </Container>
       </section>

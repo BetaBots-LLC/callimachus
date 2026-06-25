@@ -279,6 +279,46 @@ pub fn link_project(conn: &Connection, repo_path: &str) -> Result<usize> {
     Ok(links.len())
 }
 
+/// One thread inferred to have produced a given commit (the inverse of `linked_commits`).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommitThread {
+    pub sha: String,
+    pub thread_id: i64,
+    pub title: Option<String>,
+    /// Shared-file count between the thread and the commit (confidence proxy, raw not normalized).
+    pub overlap: i64,
+}
+
+/// The inverse of `linked_commits`: for each of `shas`, the thread(s) inferred to have produced it,
+/// most-overlap first. SHAs with no link are simply absent (the caller fills the null). Requires
+/// `link_project` to have run for the repo first. Matches full SHAs as stored by `link_project`.
+pub fn commits_by_sha(conn: &Connection, shas: &[String]) -> Result<Vec<CommitThread>> {
+    if shas.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = (1..=shas.len())
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT tc.sha, tc.thread_id, t.title, tc.overlap
+         FROM thread_commits tc JOIN threads t ON t.id = tc.thread_id
+         WHERE tc.sha IN ({placeholders})
+         ORDER BY tc.overlap DESC, tc.committed_at DESC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(shas.iter()), |r| {
+        Ok(CommitThread {
+            sha: r.get(0)?,
+            thread_id: r.get(1)?,
+            title: r.get(2)?,
+            overlap: r.get(3)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
 /// The commits inferred for one thread, most recent first.
 pub fn linked_commits(conn: &Connection, thread_id: i64) -> Result<Vec<CommitLink>> {
     let mut stmt = conn.prepare(
@@ -510,6 +550,18 @@ mod tests {
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].subject.as_deref(), Some("wire auth"));
         assert!(links[0].overlap >= 1);
+
+        // Inverse lookup (cal audit-pr): the commit's sha maps back to its originating thread.
+        let inv = commits_by_sha(&conn, &[links[0].sha.clone()]).unwrap();
+        assert_eq!(inv.len(), 1);
+        assert_eq!(inv[0].thread_id, tid);
+        assert_eq!(inv[0].title.as_deref(), Some("auth work"));
+        assert!(inv[0].overlap >= 1);
+        // A sha with no link returns nothing (the caller fills the explicit null).
+        assert!(commits_by_sha(&conn, &["deadbeef".into()])
+            .unwrap()
+            .is_empty());
+        assert!(commits_by_sha(&conn, &[]).unwrap().is_empty());
 
         let tl = commit_timeline(&conn, &key, 10).unwrap();
         assert_eq!(tl.len(), 1, "one commit in the timeline");

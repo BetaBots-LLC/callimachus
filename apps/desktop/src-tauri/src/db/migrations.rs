@@ -49,6 +49,10 @@ pub static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
         M::up(include_str!("../../migrations/0021_thread_commits.sql")),
         // 0022 — per-message token usage + model, for the cost/spend layer.
         M::up(include_str!("../../migrations/0022_message_usage.sql")),
+        // 0023 — index thread_commits by sha for the commits_by_sha inverse lookup (cal audit-pr).
+        M::up(include_str!(
+            "../../migrations/0023_thread_commits_sha_idx.sql"
+        )),
     ])
 });
 
