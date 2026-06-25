@@ -390,6 +390,7 @@ const SELECT_CLASS =
 function DistillationCard() {
   const queryClient = useQueryClient();
   const cfg = useQuery({ queryKey: ["knowledge_config"], queryFn: api.knowledgeConfig });
+  const cliEngines = useQuery({ queryKey: ["cli_engines"], queryFn: api.cliEngines });
   const save = useMutation({
     mutationFn: (next: { enabled: boolean; provider: string; model: string }) =>
       api.setKnowledgeConfig(next.enabled, next.provider || undefined, next.model || undefined),
@@ -417,6 +418,16 @@ function DistillationCard() {
     debouncedSave(merged);
   };
   const local = provider === "ollama";
+  // CLI backends (claude-cli / codex-cli) are keyless like Ollama, but the text DOES leave the
+  // machine (via the CLI's subscription), so they're "no key" without Ollama's privacy claim.
+  const isCli = provider.endsWith("-cli");
+  const keyless = local || isCli;
+  // Offer installed CLI backends alongside the static engines.
+  const installedClis = (cliEngines.data ?? []).filter((e) => e.installed);
+  const engineOptions = [
+    ...DISTILL_ENGINES,
+    ...installedClis.map((e) => ({ id: e.id, label: `${e.label} (subscription · no key)` })),
+  ];
   const autoDistill = c?.autoDistill ?? false;
   const toggleAuto = useMutation({
     mutationFn: (on: boolean) => api.setAutoDistill(on),
@@ -455,21 +466,21 @@ function DistillationCard() {
                   onChange={(e) => update({ provider: e.target.value })}
                   className={SELECT_CLASS}
                 >
-                  {DISTILL_ENGINES.map((e) => (
+                  {engineOptions.map((e) => (
                     <option key={e.id} value={e.id}>
                       {e.label}
                     </option>
                   ))}
                 </select>
               </Field>
-              <Field label={local ? "Model" : "Model (optional)"}>
+              <Field label={keyless ? "Model" : "Model (optional)"}>
                 <Input
                   key={model}
                   defaultValue={model}
                   onBlur={(e) => {
                     if (e.target.value !== model) update({ model: e.target.value });
                   }}
-                  placeholder={local ? "llama3.1" : "default for engine"}
+                  placeholder={local ? "llama3.1" : isCli ? "default for CLI" : "default for engine"}
                   spellCheck={false}
                 />
               </Field>
@@ -477,9 +488,11 @@ function DistillationCard() {
             <p className="text-xs text-muted-foreground">
               {local
                 ? "Runs locally via Ollama — thread text never leaves your machine."
-                : provider
-                  ? `Sends thread text to ${provider} using your stored API key, on demand per thread.`
-                  : "Uses the first provider you've added a key for. Sends thread text to that provider, on demand per thread."}
+                : isCli
+                  ? "Runs through your logged-in CLI subscription — no API key needed. Thread text is sent to that CLI's provider, on demand per thread."
+                  : provider
+                    ? `Sends thread text to ${provider} using your stored API key, on demand per thread.`
+                    : "Uses the first provider you've added a key for. Sends thread text to that provider, on demand per thread."}
             </p>
             <div className="flex items-center gap-2 pt-1 text-sm">
               <Switch checked={autoDistill} onCheckedChange={(v) => toggleAuto.mutate(v)} />
@@ -491,7 +504,9 @@ function DistillationCard() {
               indexing.{" "}
               {local
                 ? "Free and on-device via Ollama."
-                : "Uses your provider key, so it has a per-thread cost."}
+                : isCli
+                  ? "Runs through your CLI subscription (no API key)."
+                  : "Uses your provider key, so it has a per-thread cost."}
             </p>
           </>
         )}

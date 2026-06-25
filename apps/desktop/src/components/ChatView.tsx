@@ -43,6 +43,8 @@ export function ChatView() {
   const hasKey = useQuery({
     queryKey: ["hasKey", provider],
     queryFn: () => api.providerHasKey(provider),
+    // Keyless engines (Ollama, CLI) never need a key — skip the probe so the keychain stays quiet.
+    enabled: provider !== "ollama" && !provider.endsWith("-cli"),
   });
   const saveKey = useMutation({
     mutationFn: () => api.setApiKey(provider, keyDraft.trim()),
@@ -52,12 +54,25 @@ export function ChatView() {
     },
   });
 
-  const needsKey = provider !== "ollama";
+  // CLI backends (claude-cli / codex-cli) use their own logged-in auth — no API key.
+  const isCli = provider.endsWith("-cli");
+  const needsKey = provider !== "ollama" && !isCli;
+
+  // Offer installed CLI backends alongside the keyed providers (CLI has no default model — the
+  // CLI picks one when model is empty).
+  const cliEngines = useQuery({ queryKey: ["cli_engines"], queryFn: api.cliEngines });
+  const providerOptions = [
+    ...PROVIDERS.map((p) => ({ id: p.id, label: p.label, defaultModel: p.defaultModel })),
+    ...(cliEngines.data ?? [])
+      .filter((e) => e.installed)
+      .map((e) => ({ id: e.id, label: `${e.label} (no key)`, defaultModel: "" })),
+  ];
 
   // Live model list from the provider API, cached in localStorage so the dropdown
   // is instant and self-refreshes (TTL / version) — banned models drop off.
   // Only fetch once we can (key present, or providers that don't need one).
-  const canList = provider === "ollama" || provider === "openrouter" || hasKey.data === true;
+  const canList =
+    provider === "ollama" || provider === "openrouter" || isCli || hasKey.data === true;
   const modelsQuery = useQuery({
     queryKey: ["models", provider, baseUrl],
     enabled: canList,
@@ -167,15 +182,15 @@ export function ChatView() {
           <Select
             value={provider}
             onValueChange={(v) => {
-              const p = PROVIDERS.find((x) => x.id === v)!;
-              setProvider(p.id, p.defaultModel);
+              const p = providerOptions.find((x) => x.id === v);
+              if (p) setProvider(p.id, p.defaultModel);
             }}
           >
             <SelectTrigger className="w-40">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              {PROVIDERS.map((p) => (
+              {providerOptions.map((p) => (
                 <SelectItem key={p.id} value={p.id}>
                   {p.label}
                 </SelectItem>

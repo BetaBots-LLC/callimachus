@@ -1455,7 +1455,13 @@ async fn send_chat(
     base_url: Option<String>,
     messages: Vec<agent::ChatMessage>,
 ) -> AppResult<String> {
-    let key = secrets::get_key(&provider)?;
+    // CLI backends are keyless (they use the CLI's own logged-in auth); only keyed providers
+    // need a stored key.
+    let key = if agent::is_cli_provider(&provider) {
+        None
+    } else {
+        secrets::get_key(&provider)?
+    };
     // Publish a fresh cancellation token so cancel_chat can stop this stream.
     let token = tokio_util::sync::CancellationToken::new();
     *generation
@@ -1541,6 +1547,11 @@ fn delete_api_key(provider: String) -> AppResult<()> {
 
 #[tauri::command]
 fn provider_has_key(provider: String) -> AppResult<bool> {
+    // Keyless engines (Ollama, CLI backends) have no key — answer without touching the keychain,
+    // so selecting them never triggers a macOS keychain prompt.
+    if is_keyless(&provider) {
+        return Ok(false);
+    }
     Ok(secrets::has_key(&provider))
 }
 
@@ -1548,6 +1559,9 @@ fn provider_has_key(provider: String) -> AppResult<bool> {
 /// the UI still works; this populates the suggestions with real, current options.
 #[tauri::command]
 async fn list_models(provider: String, base_url: Option<String>) -> AppResult<Vec<String>> {
+    if agent::is_cli_provider(&provider) {
+        return Ok(agent::cli_models(&provider)); // keyless: suggest aliases, no API call
+    }
     let key = secrets::get_key(&provider)?;
     Ok(agent::list_models(&provider, base_url.as_deref(), key.as_deref()).await?)
 }
@@ -1656,19 +1670,29 @@ fn synth_default_model(provider: &str) -> Option<&'static str> {
         .map(|(_, m)| *m)
 }
 
-/// Resolve (provider, model) from an optional pinned choice, else auto-pick. A
-/// pinned provider must have a stored key (except keyless Ollama).
+/// Keyless engines need no stored API key: local Ollama, and the CLI backends (which use the
+/// user's logged-in `claude` / `codex` subscription).
+fn is_keyless(provider: &str) -> bool {
+    provider == "ollama" || agent::is_cli_provider(provider)
+}
+
+/// Resolve (provider, model) from an optional pinned choice, else auto-pick. A pinned KEYED
+/// provider must have a stored key; keyless engines (Ollama, CLIs) don't. A CLI may run with an
+/// empty model (the CLI picks its own default).
 fn resolve_synth(provider: Option<&str>, model: Option<&str>) -> AppResult<(String, String)> {
     match provider.filter(|p| !p.is_empty()) {
         Some(p) => {
-            if p != "ollama" && !secrets::has_key(p) {
+            if !is_keyless(p) && !secrets::has_key(p) {
                 return Err(anyhow::anyhow!("no API key stored for {p}").into());
             }
             let model = model
                 .filter(|m| !m.is_empty())
                 .map(str::to_string)
                 .or_else(|| synth_default_model(p).map(str::to_string))
-                .ok_or_else(|| anyhow::anyhow!("pick a model for {p}"))?;
+                .unwrap_or_default();
+            if model.is_empty() && !agent::is_cli_provider(p) {
+                return Err(anyhow::anyhow!("pick a model for {p}").into());
+            }
             Ok((p.to_string(), model))
         }
         None => {
@@ -1686,6 +1710,13 @@ fn can_synthesize() -> bool {
     pick_synth_provider().is_some()
 }
 
+/// The CLI LLM backends (Claude Code / Codex) and whether each is installed, so the distillation
+/// settings can offer "use my CLI subscription instead of an API key".
+#[tauri::command]
+async fn cli_engines() -> Vec<agent::CliEngine> {
+    agent::cli_engines().await
+}
+
 /// Resolve (provider, model, api_key) for distillation from the saved engine config,
 /// gated on distillation being enabled. Shared by the Tauri command and `cal distill`.
 /// Ollama is keyless; cloud providers must have a stored key.
@@ -1698,7 +1729,7 @@ pub fn resolve_distill_engine(
     }
     let (provider, model) = resolve_synth(cfg.provider.as_deref(), cfg.model.as_deref())
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-    let key = if provider == "ollama" {
+    let key = if is_keyless(&provider) {
         None
     } else {
         secrets::get_key(&provider)?
@@ -1947,6 +1978,7 @@ pub fn run() {
             install_recall_integration,
             uninstall_recall_integration,
             set_proactive_recall,
+            cli_engines,
             agent_integrations_status,
             install_agent_integrations,
             uninstall_agent_integrations,

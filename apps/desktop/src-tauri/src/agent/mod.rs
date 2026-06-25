@@ -109,6 +109,193 @@ fn adapter_for(provider: &str) -> Result<AdapterKind> {
     })
 }
 
+/// A non-interactive CLI LLM backend: runs the user's logged-in agent CLI (Claude Code, Codex)
+/// in print mode and reads its answer from stdout. Lets users distill/ask with their existing
+/// CLI subscription instead of a raw API key. Tools/agentic actions are disabled and the call
+/// runs in a neutral cwd, so it's a plain text completion, not a coding session.
+struct CliBackend {
+    bin: &'static str,
+    /// Fixed args (print mode, text output, tools off).
+    base_args: Vec<&'static str>,
+    /// Flag used to pin a model; appended with the model when one is set.
+    model_flag: &'static str,
+}
+
+/// Map a CLI provider id to its invocation. `None` for the keyed genai providers.
+fn cli_backend_for(provider: &str) -> Option<CliBackend> {
+    match provider {
+        "claude-cli" => Some(CliBackend {
+            bin: "claude",
+            base_args: vec!["-p", "--output-format", "text", "--allowedTools", ""],
+            model_flag: "--model",
+        }),
+        "codex-cli" => Some(CliBackend {
+            bin: "codex",
+            base_args: vec!["exec", "--skip-git-repo-check"],
+            model_flag: "--model",
+        }),
+        _ => None,
+    }
+}
+
+/// True when `provider` is a CLI backend (keyless: it uses the CLI's own logged-in auth).
+pub fn is_cli_provider(provider: &str) -> bool {
+    cli_backend_for(provider).is_some()
+}
+
+/// A selectable CLI LLM backend and whether its binary is reachable.
+#[derive(Debug, Serialize)]
+pub struct CliEngine {
+    /// Provider id used as the engine (e.g. `claude-cli`).
+    pub id: &'static str,
+    pub label: &'static str,
+    pub bin: &'static str,
+    /// The binary resolves on the user's PATH (via their login shell).
+    pub installed: bool,
+}
+
+/// The supported CLI backends, each marked installed/not based on a login-shell PATH lookup.
+pub async fn cli_engines() -> Vec<CliEngine> {
+    let mut out = Vec::new();
+    for (id, label, bin) in [
+        ("claude-cli", "Claude Code CLI", "claude"),
+        ("codex-cli", "Codex CLI", "codex"),
+    ] {
+        out.push(CliEngine {
+            id,
+            label,
+            bin,
+            installed: resolve_cli_bin(bin).await.is_some(),
+        });
+    }
+    out
+}
+
+/// Suggested model names for a CLI backend (free-text still works). Empty = let the CLI pick its
+/// own default model.
+pub fn cli_models(provider: &str) -> Vec<String> {
+    match provider {
+        "claude-cli" => vec!["sonnet".into(), "opus".into(), "haiku".into()],
+        _ => Vec::new(),
+    }
+}
+
+/// Resolve a CLI's absolute path. A GUI app launched from Finder/Dock does NOT inherit the user's
+/// shell PATH (nvm / homebrew / npm-global dirs), so we ask the login shell to resolve it, then
+/// fall back to scanning whatever PATH we do have. Returns `None` if the binary isn't found.
+async fn resolve_cli_bin(bin: &str) -> Option<std::path::PathBuf> {
+    if let Some(shell) = std::env::var_os("SHELL") {
+        if let Ok(out) = tokio::process::Command::new(&shell)
+            .arg("-lc")
+            .arg(format!("command -v {bin}"))
+            .output()
+            .await
+        {
+            if out.status.success() {
+                let line = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                let p = std::path::PathBuf::from(&line);
+                if !line.is_empty() && p.exists() {
+                    return Some(p);
+                }
+            }
+        }
+    }
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|d| d.join(bin))
+            .find(|p| p.is_file())
+    })
+}
+
+/// Run a CLI backend once: spawn the binary, pipe `prompt` to stdin, return trimmed stdout.
+/// Runs in a neutral temp cwd so the CLI never acts on the user's repos.
+async fn cli_complete(provider: &str, model: &str, prompt: &str) -> Result<String> {
+    use tokio::io::AsyncWriteExt;
+    let backend = cli_backend_for(provider)
+        .ok_or_else(|| anyhow::anyhow!("not a CLI provider: {provider}"))?;
+    let bin = resolve_cli_bin(backend.bin).await.ok_or_else(|| {
+        anyhow::anyhow!(
+            "`{}` not found. Install it and make sure it's logged in, then pick it again.",
+            backend.bin
+        )
+    })?;
+    let mut cmd = tokio::process::Command::new(&bin);
+    cmd.args(&backend.base_args);
+    if !model.is_empty() {
+        cmd.arg(backend.model_flag).arg(model);
+    }
+    let mut child = cmd
+        .current_dir(std::env::temp_dir())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "could not launch `{}` ({e}). Is it installed and on PATH?",
+                backend.bin
+            )
+        })?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(prompt.as_bytes()).await.ok();
+        // Drop stdin to send EOF so the CLI stops waiting for more input.
+    }
+    let out = child
+        .wait_with_output()
+        .await
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    if !out.status.success() {
+        let err: String = String::from_utf8_lossy(&out.stderr)
+            .trim()
+            .chars()
+            .take(300)
+            .collect();
+        bail!("`{}` failed ({}): {}", backend.bin, out.status, err);
+    }
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if text.is_empty() {
+        bail!("`{}` returned no output", backend.bin);
+    }
+    Ok(text)
+}
+
+/// One non-streaming completion, routed to the user's CLI (keyless) or to genai (keyed). The CLI
+/// path has no separate system slot, so `system` and `user` are flattened into one prompt.
+async fn complete(
+    provider: &str,
+    model: &str,
+    api_key: Option<&str>,
+    system: &str,
+    user: &str,
+    temperature: f64,
+    max_tokens: u32,
+) -> Result<String> {
+    if is_cli_provider(provider) {
+        return cli_complete(provider, model, &format!("{system}\n\n{user}")).await;
+    }
+    let adapter = adapter_for(provider)?;
+    let key = api_key.map(str::to_string);
+    let client = Client::builder()
+        .with_adapter_kind(adapter)
+        .with_auth_resolver_fn(move |_iden: genai::ModelIden| {
+            Ok(key.clone().map(AuthData::from_single))
+        })
+        .build();
+    let req = ChatRequest::new(Vec::new())
+        .with_system(system)
+        .append_message(GMessage::user(user.to_string()));
+    let options = ChatOptions::default()
+        .with_temperature(temperature)
+        .with_max_tokens(max_tokens);
+    let resp = client
+        .exec_chat(model, req, Some(&options))
+        .await
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    resp.into_first_text()
+        .map(|t| t.trim().to_string())
+        .ok_or_else(|| anyhow::anyhow!("completion returned no text"))
+}
+
 /// System prompt for one-shot thread synthesis (the Obsidian knowledge layer).
 const SYNTH_SYSTEM: &str = "You are summarizing one AI coding-agent session for the developer's \
 Obsidian knowledge base. Read the transcript and output concise Markdown with ONLY these \
@@ -130,28 +317,8 @@ pub async fn synthesize(
     api_key: Option<&str>,
     transcript: &str,
 ) -> Result<String> {
-    let adapter = adapter_for(provider)?;
-    let key = api_key.map(str::to_string);
-    let client = Client::builder()
-        .with_adapter_kind(adapter)
-        .with_auth_resolver_fn(move |_iden: genai::ModelIden| {
-            Ok(key.clone().map(AuthData::from_single))
-        })
-        .build();
-    let req = ChatRequest::new(Vec::new())
-        .with_system(SYNTH_SYSTEM)
-        .append_message(GMessage::user(format!("Transcript:\n\n{transcript}")));
-    let options = ChatOptions::default()
-        .with_temperature(0.2)
-        .with_max_tokens(1500);
-    let resp = client
-        .exec_chat(model, req, Some(&options))
-        .await
-        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-    let text = resp
-        .into_first_text()
-        .ok_or_else(|| anyhow::anyhow!("synthesis returned no text"))?;
-    Ok(text.trim().to_string())
+    let user = format!("Transcript:\n\n{transcript}");
+    complete(provider, model, api_key, SYNTH_SYSTEM, &user, 0.2, 1500).await
 }
 
 /// System prompt for "ask your history" — RAG over the user's own past sessions.
@@ -169,30 +336,8 @@ pub async fn answer(
     question: &str,
     context: &str,
 ) -> Result<String> {
-    let adapter = adapter_for(provider)?;
-    let key = api_key.map(str::to_string);
-    let client = Client::builder()
-        .with_adapter_kind(adapter)
-        .with_auth_resolver_fn(move |_iden: genai::ModelIden| {
-            Ok(key.clone().map(AuthData::from_single))
-        })
-        .build();
-    let req = ChatRequest::new(Vec::new())
-        .with_system(ANSWER_SYSTEM)
-        .append_message(GMessage::user(format!(
-            "Question: {question}\n\nExcerpts from past sessions:\n\n{context}"
-        )));
-    let options = ChatOptions::default()
-        .with_temperature(0.2)
-        .with_max_tokens(900);
-    let resp = client
-        .exec_chat(model, req, Some(&options))
-        .await
-        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-    let text = resp
-        .into_first_text()
-        .ok_or_else(|| anyhow::anyhow!("no answer returned"))?;
-    Ok(text.trim().to_string())
+    let user = format!("Question: {question}\n\nExcerpts from past sessions:\n\n{context}");
+    complete(provider, model, api_key, ANSWER_SYSTEM, &user, 0.2, 900).await
 }
 
 /// System prompt for the project-memory brief — a tight orientation built from facts
@@ -213,30 +358,8 @@ pub async fn project_brief(
     project: &str,
     notes: &str,
 ) -> Result<String> {
-    let adapter = adapter_for(provider)?;
-    let key = api_key.map(str::to_string);
-    let client = Client::builder()
-        .with_adapter_kind(adapter)
-        .with_auth_resolver_fn(move |_iden: genai::ModelIden| {
-            Ok(key.clone().map(AuthData::from_single))
-        })
-        .build();
-    let req = ChatRequest::new(Vec::new())
-        .with_system(BRIEF_SYSTEM)
-        .append_message(GMessage::user(format!(
-            "Project: {project}\n\nDistilled notes:\n\n{notes}"
-        )));
-    let options = ChatOptions::default()
-        .with_temperature(0.2)
-        .with_max_tokens(900);
-    let resp = client
-        .exec_chat(model, req, Some(&options))
-        .await
-        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-    let text = resp
-        .into_first_text()
-        .ok_or_else(|| anyhow::anyhow!("brief returned no text"))?;
-    Ok(text.trim().to_string())
+    let user = format!("Project: {project}\n\nDistilled notes:\n\n{notes}");
+    complete(provider, model, api_key, BRIEF_SYSTEM, &user, 0.2, 900).await
 }
 
 /// System prompt for conflict review over a project's distilled decisions.
@@ -264,31 +387,15 @@ pub async fn find_conflicts(
     api_key: Option<&str>,
     decisions: &[String],
 ) -> Result<Vec<ConflictPair>> {
-    let adapter = adapter_for(provider)?;
-    let key = api_key.map(str::to_string);
-    let client = Client::builder()
-        .with_adapter_kind(adapter)
-        .with_auth_resolver_fn(move |_iden: genai::ModelIden| {
-            Ok(key.clone().map(AuthData::from_single))
-        })
-        .build();
     let list = decisions
         .iter()
         .enumerate()
         .map(|(i, d)| format!("{}. {}", i + 1, d.trim()))
         .collect::<Vec<_>>()
         .join("\n");
-    let req = ChatRequest::new(Vec::new())
-        .with_system(CONFLICT_SYSTEM)
-        .append_message(GMessage::user(format!("Decisions:\n{list}")));
-    let options = ChatOptions::default()
-        .with_temperature(0.1)
-        .with_max_tokens(800);
-    let resp = client
-        .exec_chat(model, req, Some(&options))
-        .await
-        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-    Ok(parse_conflicts(&resp.into_first_text().unwrap_or_default()))
+    let user = format!("Decisions:\n{list}");
+    let text = complete(provider, model, api_key, CONFLICT_SYSTEM, &user, 0.1, 800).await?;
+    Ok(parse_conflicts(&text))
 }
 
 /// Lenient parse of the model's JSON array of conflict pairs (tolerates fences/prose).
@@ -343,27 +450,8 @@ pub async fn distill(
     api_key: Option<&str>,
     transcript: &str,
 ) -> Result<Distilled> {
-    let adapter = adapter_for(provider)?;
-    let key = api_key.map(str::to_string);
-    let client = Client::builder()
-        .with_adapter_kind(adapter)
-        .with_auth_resolver_fn(move |_iden: genai::ModelIden| {
-            Ok(key.clone().map(AuthData::from_single))
-        })
-        .build();
-    let req = ChatRequest::new(Vec::new())
-        .with_system(DISTILL_SYSTEM)
-        .append_message(GMessage::user(format!("Transcript:\n\n{transcript}")));
-    let options = ChatOptions::default()
-        .with_temperature(0.1)
-        .with_max_tokens(1200);
-    let resp = client
-        .exec_chat(model, req, Some(&options))
-        .await
-        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-    let text = resp
-        .into_first_text()
-        .ok_or_else(|| anyhow::anyhow!("distillation returned no text"))?;
+    let user = format!("Transcript:\n\n{transcript}");
+    let text = complete(provider, model, api_key, DISTILL_SYSTEM, &user, 0.1, 1200).await?;
     Ok(parse_distilled(&text))
 }
 
@@ -412,6 +500,40 @@ where
     E: Fn(ToolCall) -> Fut,
     Fut: std::future::Future<Output = Result<String>>,
 {
+    // CLI backends have no genai tool-calling or token streaming. Run one completion over the
+    // flattened conversation and emit the whole answer at once. The history-search `tools` and
+    // `execute_tool` loop are genai-only, so they're intentionally skipped here.
+    if is_cli_provider(provider) {
+        let _ = (&tools, &execute_tool);
+        let mut system = String::new();
+        let mut convo = String::new();
+        for m in messages {
+            match m.role.as_str() {
+                "system" => {
+                    if !system.is_empty() {
+                        system.push_str("\n\n");
+                    }
+                    system.push_str(&m.content);
+                }
+                "assistant" => {
+                    convo.push_str("\n\nAssistant: ");
+                    convo.push_str(&m.content);
+                }
+                _ => {
+                    convo.push_str("\n\nUser: ");
+                    convo.push_str(&m.content);
+                }
+            }
+        }
+        let prompt = format!("{system}\n{convo}\n\nAssistant:");
+        let text = tokio::select! {
+            _ = cancel.cancelled() => return Ok(String::new()),
+            r = cli_complete(provider, model, &prompt) => r?,
+        };
+        on_token(ChunkKind::Text, &text);
+        return Ok(text);
+    }
+
     let adapter = adapter_for(provider)?;
     let key = api_key.map(str::to_string);
     let client = Client::builder()
@@ -691,6 +813,31 @@ mod tests {
         assert!(adapter_for("openrouter").is_ok());
         assert!(adapter_for("ollama").is_ok());
         assert!(adapter_for("bogus").is_err());
+    }
+
+    #[test]
+    fn cli_provider_detection() {
+        assert!(is_cli_provider("claude-cli"));
+        assert!(is_cli_provider("codex-cli"));
+        assert!(!is_cli_provider("anthropic"));
+        assert!(!is_cli_provider("ollama"));
+        // CLI backends are NOT genai adapters.
+        assert!(adapter_for("claude-cli").is_err());
+    }
+
+    /// Live: distill a tiny transcript through the logged-in `claude` CLI (no API key).
+    /// Run with: cargo test -p callimachus --lib cli_distill_smoke -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn cli_distill_smoke() {
+        let transcript = "User: how do I activate a python venv?\n\
+            Assistant: Run `source .venv/bin/activate`. We decided to use a per-project venv. \
+            Gotcha: the fish shell needs `activate.fish`, not the bash script.";
+        let d = distill("claude-cli", "", None, transcript).await.unwrap();
+        eprintln!("summary: {}", d.summary);
+        eprintln!("decisions: {:?}", d.decisions);
+        eprintln!("gotchas: {:?}", d.gotchas);
+        assert!(!d.summary.is_empty() || !d.decisions.is_empty() || !d.gotchas.is_empty());
     }
 
     #[test]
