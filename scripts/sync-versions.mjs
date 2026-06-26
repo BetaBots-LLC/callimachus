@@ -54,6 +54,19 @@ if (cargoBefore === undefined) {
 }
 writeFileSync(cargoPath, head + newSection + tail);
 
+// server.json — the official MCP registry manifest. Changesets bumps the
+// `callimachus-mcp` package.json (it's in the `fixed` group), but server.json is
+// not a package, so sync its top-level `version` and each pinned package version
+// here. They must equal the release version: the npm wrapper downloads the
+// `v<version>` GitHub Release binaries, and the registry entry points at it.
+const serverPath = join(root, "server.json");
+const server = JSON.parse(readFileSync(serverPath, "utf8"));
+const serverBefore = server.version;
+server.version = version;
+for (const pkg of server.packages ?? []) pkg.version = version;
+writeFileSync(serverPath, JSON.stringify(server, null, 2) + "\n");
+
 console.log(`sync-versions: ${version}`);
 console.log(`  tauri.conf.json  ${confBefore} -> ${version}`);
 console.log(`  Cargo.toml       ${cargoBefore} -> ${version}`);
+console.log(`  server.json      ${serverBefore} -> ${version}`);

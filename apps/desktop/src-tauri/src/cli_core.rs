@@ -1520,4 +1520,91 @@ mod tests {
         // A path outside the projects dir maps to nothing (we don't snapshot it).
         assert!(external_id_under("/tmp/elsewhere/x.jsonl", base).is_none());
     }
+
+    // ---- docs-in-sync guards: keep `cal help` + the README/website from drifting ----
+
+    /// `cal help` (USAGE) must document every real command, so a new subcommand can't ship
+    /// undocumented. Internal hook targets are intentionally not user-facing.
+    #[test]
+    fn usage_documents_every_command() {
+        const INTERNAL: &[&str] = &["snapshot-hook", "recall-now"];
+        for &c in COMMANDS {
+            if INTERNAL.contains(&c) {
+                continue;
+            }
+            assert!(
+                USAGE.contains(c),
+                "`cal {c}` is a command but isn't in USAGE (cal help) — document it"
+            );
+        }
+    }
+
+    /// Every `cal <subcommand>` referenced in a CODE context (a command example), so prose like
+    /// "the cal CLI is pipe-friendly" doesn't read as a `cal cli` / `cal pipe-friendly` invocation.
+    /// We only count a `cal ` whose preceding char marks code: a backtick, quote, newline (a
+    /// code-block / cheat-sheet line), or `(` / `$` (a shell substitution).
+    fn cal_commands_in(text: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut from = 0;
+        while let Some(rel) = text[from..].find("cal ") {
+            let start = from + rel;
+            from = start + 4;
+            let before = text[..start].chars().last();
+            let code_ctx = matches!(before, None | Some('`' | '"' | '\n' | '(' | '$'));
+            if !code_ctx {
+                continue;
+            }
+            // The command token is the lowercase [a-z-] run right after "cal ".
+            let cmd: String = text[from..]
+                .chars()
+                .take_while(|c| c.is_ascii_lowercase() || *c == '-')
+                .collect();
+            if cmd.starts_with(|c: char| c.is_ascii_lowercase()) {
+                out.push(cmd);
+            }
+        }
+        out
+    }
+
+    /// The README and the website must only reference commands that actually exist — catches a
+    /// renamed/removed command or a typo'd `cal foo` in the docs. Files missing (partial checkout)
+    /// are skipped, not failed.
+    #[test]
+    fn docs_only_reference_real_commands() {
+        // `help` is dispatched separately, not in COMMANDS, but is a valid documented invocation.
+        let known: std::collections::HashSet<&str> = COMMANDS
+            .iter()
+            .copied()
+            .chain(std::iter::once("help"))
+            .collect();
+        let docs = [
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../../README.md"),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../web/src/routes/cli.tsx"),
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../web/src/routes/index.tsx"
+            ),
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../web/src/routes/desktop.tsx"
+            ),
+        ];
+        let mut checked = 0;
+        for path in docs {
+            let Ok(text) = std::fs::read_to_string(path) else {
+                continue;
+            };
+            checked += 1;
+            for cmd in cal_commands_in(&text) {
+                assert!(
+                    known.contains(cmd.as_str()),
+                    "doc {path} references `cal {cmd}`, which is not a real command (typo or removed?)"
+                );
+            }
+        }
+        assert!(
+            checked > 0,
+            "no docs found to cross-check — are the relative paths right?"
+        );
+    }
 }

@@ -119,6 +119,22 @@ jobs:
           AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
           AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
           AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          # Apple Developer ID signing + notarization — macOS leg only. Empty until
+          # you add the secrets → the mac app builds unsigned (no failure), same as
+          # the Azure/GPG legs. The Tauri bundler decodes APPLE_CERTIFICATE into a
+          # temporary keychain itself, so no manual `security` step is needed. The
+          # ONNX runtime is statically linked (ort download-binaries), so there's no
+          # nested third-party dylib and no entitlements file is required. Hardened
+          # runtime is on by default; with no App Sandbox it does not block the git/
+          # osascript/CLI subprocesses the app spawns. Notarization + stapling run
+          # when APPLE_ID/APPLE_PASSWORD/APPLE_TEAM_ID are present. Harmless on
+          # Windows & Linux legs.
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         with:
           projectPath: apps/desktop
           tagName: ${{ inputs.tag || github.ref_name }}
@@ -161,3 +177,54 @@ jobs:
             "$STAGE/cal-$TRIPLE$EXT" \
             "$STAGE/callimachus-mcp-$TRIPLE$EXT" \
             --clobber
+
+  # Once every platform's binaries are attached to the Release, publish the
+  # `callimachus-mcp` npm wrapper (it downloads those binaries at runtime) and
+  # refresh the entry on the official MCP registry. Runs once, after the matrix.
+  # Skipped on prereleases and when NPM_TOKEN isn't set, so it's inert until you
+  # add that secret. Registry auth is GitHub OIDC (no secret) and needs
+  # `id-token: write`; the namespace `io.github.betabots-llc/*` is verified
+  # against this repo's owning org.
+  publish-mcp:
+    name: Publish npm wrapper + MCP registry
+    needs: release
+    if: ${{ !contains(inputs.tag || github.ref_name, '-rc') && !contains(inputs.tag || github.ref_name, '-beta') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      HAS_NPM: ${{ secrets.NPM_TOKEN != '' }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 20
+          registry-url: "https://registry.npmjs.org"
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Publish wrapper to npm
+        if: env.HAS_NPM == 'true'
+        working-directory: packages/callimachus-mcp
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public
+
+      - name: Install mcp-publisher
+        if: env.HAS_NPM == 'true'
+        run: |
+          curl -L "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" | tar xz mcp-publisher
+
+      - name: Publish to MCP registry (GitHub OIDC)
+        if: env.HAS_NPM == 'true'
+        run: |
+          ./mcp-publisher login github-oidc
+          ./mcp-publisher publish

@@ -288,6 +288,8 @@ importers:
         specifier: ^8.0.16
         version: 8.0.16(@types/node@20.19.43)(jiti@2.7.0)
 
+  packages/callimachus-mcp: {}
+
 packages:
 
   '@azu/format-text@1.0.2':
