@@ -1,0 +1,36 @@
+{
+  "name": "callimachus-mcp",
+  "version": "0.6.2",
+  "description": "MCP server for Callimachus: local index and search of your AI coding-agent threads",
+  "mcpName": "io.github.betabots-llc/callimachus",
+  "type": "module",
+  "bin": {
+    "callimachus-mcp": "bin/callimachus-mcp.mjs"
+  },
+  "files": [
+    "bin/",
+    "lib/"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/BetaBots-LLC/callimachus.git",
+    "directory": "packages/callimachus-mcp"
+  },
+  "homepage": "https://github.com/BetaBots-LLC/callimachus#readme",
+  "bugs": "https://github.com/BetaBots-LLC/callimachus/issues",
+  "license": "AGPL-3.0-or-later",
+  "keywords": [
+    "mcp",
+    "modelcontextprotocol",
+    "callimachus",
+    "ai",
+    "agent",
+    "search"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}

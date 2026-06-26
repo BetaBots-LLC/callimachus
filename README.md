@@ -94,13 +94,13 @@ The `--ignored` tests touch live data on this machine: each source has a `real_<
 
 Beyond the desktop window, the same local index is reachable from your agents, terminal, and editor — all reading one `index.db`.
 
-**MCP server** — let any agent search its own past work mid-session. `callimachus-mcp` ships with the desktop app (on your PATH); just register it with your client:
+**MCP server** — let any agent search its own past work mid-session. The quickest way is `npx` (it downloads the prebuilt binary on first run); it's also listed on the official [MCP registry](https://registry.modelcontextprotocol.io) as `io.github.betabots-llc/callimachus`:
 
 ```bash
-claude mcp add callimachus -- callimachus-mcp        # or any MCP client
+claude mcp add callimachus -- npx -y callimachus-mcp    # or any MCP client
 ```
 
-Building from a checkout instead? `cargo install --path apps/desktop/src-tauri --bin callimachus-mcp`.
+Already running the desktop app? `callimachus-mcp` is on your PATH, so `claude mcp add callimachus -- callimachus-mcp` works without npm. Building from a checkout instead? `cargo install --path apps/desktop/src-tauri --bin callimachus-mcp`.
 
 Tools (21) — now read **and** write. Reads (17): `search_threads`, `search_current_project` (auto-scoped to the repo it runs in), `recent_threads`, `get_thread`, `list_tags`, `list_open_todos`, `get_thread_knowledge`, `recall_decisions`, `recall_gotchas`, `find_prior_work` (the "have I done this before?" guard — prior sessions similar to a task), `project_memory` (a project's aggregated decisions / gotchas / open TODOs), `ask_history` (a cited RAG answer over your history), `threads_for_file` (which sessions touched a path), `check_decision` (surface settled decisions before re-litigating a proposal), `linked_commits` (the commits a thread likely produced), `list_snapshots` (a project's session snapshots), and `load_snapshot` (restore a saved checkpoint). Writes (4, into Callimachus's own memory, never your code): `complete_todo` (close an open TODO), `record_decision` (optionally with a `rationale`), `record_gotcha` (persist a fact into a project's memory), and `snapshot_session` (checkpoint a thread for handoff). The bundled `/recall` skill ([.claude/skills/recall](.claude/skills/recall/SKILL.md)) tells agents when to reach for them.
 

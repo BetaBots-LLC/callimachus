@@ -4,7 +4,11 @@ How versions, changelogs, and release candidates work for both shippable
 artifacts in this monorepo — the **desktop app** (macOS / Windows / Linux
 installers + standalone `cal` / `callimachus-mcp` binaries + auto-updater) and the
 **VS Code / Cursor extension** (`.vsix` on the marketplaces). Both ship together
-on **one shared version**.
+on **one shared version**. Off the same desktop tag, the **`callimachus-mcp` npm
+wrapper** is also published to npm and the
+[official MCP registry](https://registry.modelcontextprotocol.io)
+(`io.github.betabots-llc/callimachus`); it ships on the shared version too, so it
+downloads the matching `v<ver>` release binaries at runtime.
 
 ## How it fits together
 
@@ -76,9 +80,14 @@ Settings → Secrets and variables → Actions:
 | `RELEASE_TOKEN` | A PAT with `contents: write` + `workflows`. Lets the auto-pushed `v<ver>` tag trigger `build.yml` + `publish-extension.yml` (the default `GITHUB_TOKEN` cannot trigger another workflow). |
 | `VSCE_PAT` | *(optional)* Azure DevOps PAT for the VS Code Marketplace. Absent → that publish step is skipped. |
 | `OVSX_PAT` | *(optional)* [Open VSX](https://open-vsx.org) access token — this is the registry **Cursor** & VSCodium install from. Absent → that publish step is skipped. |
+| `NPM_TOKEN` | *(optional)* npm automation token with publish rights to `callimachus-mcp`. Absent → the npm + MCP-registry publish job is skipped. The MCP registry itself uses GitHub OIDC, no secret. |
 
 > The extension always lands as a downloadable `.vsix` on the GitHub Release even
 > with no marketplace tokens set.
+>
+> The first MCP-registry publish should be done by hand (see "MCP registry"
+> below) so you can claim the `io.github.betabots-llc/*` namespace and confirm the
+> npm package validates; after that, every release refreshes it automatically.
 
 ## Normal release (stable)
 
@@ -96,7 +105,9 @@ Settings → Secrets and variables → Actions:
      Windows (x64) and Linux (x64)**, also builds the standalone
      `cal-<triple>` / `callimachus-mcp-<triple>` binaries (for CLI/MCP-only users),
      publishes one GitHub Release, and uploads `latest.json`. Installed apps
-     auto-update.
+     auto-update. Then its `publish-mcp` job publishes the `callimachus-mcp` npm
+     wrapper and refreshes the MCP registry entry (only when `NPM_TOKEN` is set;
+     skipped on prereleases).
    - `publish-extension.yml` packages the extension and pushes it to the VS Code
      Marketplace + Open VSX, then attaches the `.vsix` to **that same Release**.
 
@@ -117,6 +128,44 @@ VSCodium install from Open VSX**, official VS Code from the Marketplace.
   [VS Code Marketplace](https://marketplace.visualstudio.com/manage) and the
   matching namespace on [Open VSX](https://open-vsx.org), then add `VSCE_PAT` /
   `OVSX_PAT` (the publish workflow auto-creates the Open VSX namespace).
+
+## MCP registry
+
+The bundled MCP server is published to the
+[official MCP registry](https://registry.modelcontextprotocol.io) as
+`io.github.betabots-llc/callimachus`, distributed through the **`callimachus-mcp`
+npm package** (`packages/callimachus-mcp`). That package carries no binary: its
+`bin` downloads the prebuilt `callimachus-mcp-<triple>` asset from the matching
+`v<ver>` GitHub Release on first run and caches it. Because it's in the Changesets
+**fixed** group, its version always equals the release version, so the download
+URL always resolves. `scripts/sync-versions.mjs` keeps `server.json` (the registry
+manifest) on the same version.
+
+- Per release, `build.yml`'s `publish-mcp` job (after the binaries are attached)
+  runs `npm publish` then `mcp-publisher publish`, authenticating to the registry
+  with GitHub OIDC (`id-token: write`, no secret). It needs the `NPM_TOKEN` secret
+  and is skipped on `-rc` / `-beta` tags.
+- **One-time, before the first publish**, claim the namespace and verify the npm
+  package by hand from a clean checkout of the tagged commit:
+
+  ```bash
+  # 1. publish the npm wrapper (its package.json carries the matching mcpName)
+  cd packages/callimachus-mcp && npm publish --access public && cd -
+
+  # 2. install the registry CLI
+  brew install mcp-publisher        # or grab the release binary
+
+  # 3. authenticate (device flow) and publish server.json from the repo root
+  mcp-publisher login github        # opens a GitHub device-code prompt
+  mcp-publisher publish             # reads ./server.json
+
+  # 4. verify
+  curl "https://registry.modelcontextprotocol.io/v0.1/servers?search=io.github.betabots-llc/callimachus"
+  ```
+
+  `mcp-publisher login github` must authenticate as a member/owner of the
+  **BetaBots-LLC** org, since the `io.github.betabots-llc/*` namespace maps to that
+  GitHub org. After this first run, the CI job keeps the entry current.
 
 ## Release candidates
 
