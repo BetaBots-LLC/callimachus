@@ -1,5 +1,63 @@
 # callimachus
 
+## 0.7.0
+
+### Minor Changes
+
+- fe1902e: **`cal audit-pr`: a one-call PR-audit context bundle for external tools.** A local PR-audit app (or any reviewer) can now shell out to Callimachus and get, in one JSON object, the history behind a change that a diff alone can't show:
+
+  ```
+  cal audit-pr <repo> --changed-files src/auth.rs,src/lib.rs --shas <sha1>,<sha2>
+  ```
+
+  The bundle:
+
+  - **`bySha`** , commit provenance: for each branch SHA, the AI session(s) inferred to have produced it (by file-overlap) with that thread's distilled summary/decisions/gotchas. "Commit abc came from the session where you decided JWT because X, then flagged an offline-refresh gotcha." SHAs with no link return an explicit empty array, never omitted.
+  - **`byFile`** , for each changed file, prior threads that touched it + their reasoning.
+  - **`recurringErrors`** , the repo's cross-tool recurring error signatures (the caller intersects with the touched-thread set client-side; there's no error→file edge).
+  - **`projectMemory`** , the repo's distilled decisions / gotchas / open TODOs as a standing pre-merge checklist.
+
+  It refreshes thread↔commit links first (so feed branch SHAs pre-squash), and degrades gracefully: with distillation off, knowledge fields are null but provenance, file-touch, open TODOs, and repo errors still populate. Reuses the existing gitlink / search / knowledge / issues primitives; the only net-new query is `commits_by_sha` (the inverse of `linked_commits`), backed by a new `thread_commits(sha)` index (migration 0023). The interactive deep-dive (per-hunk `check_decision`, `get_thread`, snapshots) stays on the existing MCP server.
+
+### Patch Changes
+
+- a6630f8: **Use your agent CLI instead of an API key.** Distillation, Ask, project memory, and the in-app chat can now run on your logged-in **Claude Code** or **Codex** CLI subscription, no raw API key required. Pick "Claude Code CLI (subscription · no key)" as the distillation engine, or select it in the chat provider dropdown, and Callimachus shells out to the CLI in non-interactive print mode (tools off, neutral cwd) to get the completion.
+
+  - **Keyless, like Ollama:** CLI backends need no stored key. The engine/provider pickers offer whichever CLIs are installed, and the key field disappears when one is selected.
+  - **PATH-aware:** a GUI app launched from Finder doesn't inherit your shell PATH (nvm/homebrew/npm dirs), so the CLI is resolved via your login shell, the same `claude` you use in the terminal.
+  - **Honest privacy note:** unlike Ollama, CLI distillation still sends thread text to that CLI's provider (via your subscription); the UI says so. It's "no key", not "on-device".
+  - **Knowledge completions** (distill, ask, project brief, conflict review) route through the CLI cleanly. **In-app chat** runs as a single completion per turn, the genai history-search tools and token streaming are keyed-provider only, so CLI chat is plain Q&A.
+
+  Claude Code is verified end-to-end; Codex is wired to `codex exec` but untested locally. Refactors the five LLM call sites onto one `complete()` helper that branches CLI vs genai.
+
+- a6630f8: **Fix the macOS keychain prompt that re-popped on every Deny.** The in-memory key cache only stored successful reads and "no entry" results, a denied / cancelled / locked-keychain read returned an error without caching, so the next `has_key` probe re-read the keychain and macOS re-prompted, on and on. Denials are now cached for the session (respecting your Deny), so it asks at most once; re-enter a key or restart to retry.
+
+  Paired with the new CLI backends, keyless engines stay out of the keychain entirely: `provider_has_key` short-circuits for Ollama and the CLI providers without a keychain read, and the chat view skips the key probe when a keyless engine is selected. Net effect: pick a CLI (or Ollama) and Callimachus never touches your keychain.
+
+- 0071bfe: **Proactive recall: surface prior work before you redo it.** A new opt-in **Proactive recall** toggle (Settings, under Claude Code) wires up a `UserPromptSubmit` hook that, on every prompt, quietly checks whether you've already solved this in a past session and injects a short "you may have worked on this before" note into Claude's context, so the decision or gotcha gets reused instead of rediscovered. One switch configures the hook for you, no editing `settings.json`.
+
+  - **Opt-in, off by default:** it's a separate toggle from the base integration _because_ it reads every prompt. Flip it on to enable, off to remove the hook cleanly. Enabling also ensures the `cal` CLI is installed so the hook resolves.
+  - **Silent + best-effort:** a fresh process per prompt that exits 0 with no output on a weak/no match, a missing index, or any error, so it never blocks or breaks the prompt.
+  - **Signal, not noise:** a strict similarity floor (well above the on-demand guard) and per-session dedup (`~/.callimachus/recall/<session>.json`) mean it only speaks up on a clearly relevant match and never repeats the same thread twice in a session. Scoped to the repo via the hook's `cwd`.
+  - **Reuses** the existing semantic `find_prior_work` over distilled decisions/gotchas, so it lights up once threads are distilled. All on-device.
+
+  Note: each prompt loads the embedding model in a fresh process, a sub-second pre-flight before the agent starts.
+
+- 592f362: **Publish the bundled MCP server to the official MCP registry.** Adds a
+  `callimachus-mcp` npm package (`packages/callimachus-mcp`): an `npx`-friendly
+  launcher that downloads the prebuilt `callimachus-mcp` binary for your platform on
+  first run and execs it over stdio, so any MCP client can run it with
+  `claude mcp add callimachus -- npx -y callimachus-mcp`. Adds a root `server.json`
+  (listed as `io.github.betabots-llc/callimachus`), keeps it on the shared version
+  via `sync-versions.mjs`, and adds a `publish-mcp` CI job that publishes to npm +
+  the registry after each release.
+- 0a3fe13: **Spend Ledger: what your AI coding actually cost.** Callimachus now captures per-message token usage + model (from the source files' usage blocks, currently Claude Code's input/output/cache tokens) and turns it into dollars with a built-in pricing table. Because it's the only tool with a unified cross-tool index, it's the only place that can show total spend, a per-model breakdown, and your most expensive threads in one view. Surfaces:
+
+  - **Stats:** a "Spend" card (estimated total, by-model, priciest threads).
+  - **`cal cost [project]`:** the same as text/JSON.
+
+  The estimate uses published list prices, it's a cost x-ray, not a billing record, and calls on models with no price on file are flagged, not guessed. Token usage is captured during indexing into new `messages` columns (migration 0022); **run Reindex once** to backfill, since data indexed before this feature has no usage stored (the source files still carry it). All on-device.
+
 ## 0.6.2
 
 ### Patch Changes
