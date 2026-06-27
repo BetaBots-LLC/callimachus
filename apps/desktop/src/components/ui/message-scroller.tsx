@@ -40,7 +40,11 @@ function MessageScrollerViewport({
     <MessageScrollerPrimitive.Viewport
       data-slot="message-scroller-viewport"
       className={cn(
-        "size-full min-h-0 min-w-0 scroll-fade-b scrollbar-thin scrollbar-gutter-stable overflow-y-auto overscroll-contain contain-content data-autoscrolling:scrollbar-none",
+        // NOTE: upstream also has `data-autoscrolling:scrollbar-none`, which hides the scrollbar
+        // during autoscroll. With `scrollbar-gutter: stable` that collapses the reserved gutter to
+        // 0 on every autoscroll burst, so a centered max-width column jitters horizontally as a
+        // reply streams in. Dropped so the gutter stays constant — the scrollbar just stays put.
+        "size-full min-h-0 min-w-0 scroll-fade-b scrollbar-thin scrollbar-gutter-stable overflow-y-auto overscroll-contain contain-content",
         className,
       )}
       {...props}

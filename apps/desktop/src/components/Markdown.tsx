@@ -157,8 +157,13 @@ export const StreamingMarkdown = memo(function StreamingMarkdown({
   return (
     <div className={PROSE}>
       {blocks.map((b, i) => (
+        // Each block fades in once when it first mounts, then grows in place without
+        // re-animating — so the reply reveals smoothly block-by-block instead of snapping in.
+        // Index key is stable (streaming only appends blocks); reduced-motion disables the fade.
         // biome-ignore lint/suspicious/noArrayIndexKey: streaming blocks only append, so the index is a stable identity
-        <Block key={i} src={b} />
+        <div key={i} className="animate-in fade-in duration-300 motion-reduce:animate-none">
+          <Block src={b} />
+        </div>
       ))}
     </div>
   );

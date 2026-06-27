@@ -6,6 +6,23 @@
 
 @custom-variant dark (&:is(.dark *));
 
+/* Back the scrollbar classes the shadcn message-scroller viewport uses but that aren't shipped in
+   shadcn/tailwind.css. scrollbar-gutter-stable reserves the scrollbar's space so the centered chat
+   column never reflows horizontally when the bar appears as a reply streams in. */
+@utility scrollbar-thin {
+  scrollbar-width: thin;
+}
+@utility scrollbar-gutter-stable {
+  scrollbar-gutter: stable;
+}
+/* Used by Attachment's horizontal media row to hide its scrollbar. */
+@utility scrollbar-none {
+  scrollbar-width: none;
+  &::-webkit-scrollbar {
+    display: none;
+  }
+}
+
 @theme inline {
   --font-heading: var(--font-sans);
   --font-sans: "Geist Variable", sans-serif;
@@ -203,25 +220,6 @@
 .dark .hljs-meta,
 .dark .hljs-deletion {
   color: oklch(0.75 0.13 25);
-}
-
-/* Thin, inset scrollbars so they don't crowd content — a code block's horizontal
-   bar no longer sits on the line beneath it. */
-::-webkit-scrollbar {
-  width: 11px;
-  height: 11px;
-}
-::-webkit-scrollbar-track {
-  background: transparent;
-}
-::-webkit-scrollbar-thumb {
-  background-color: color-mix(in oklab, var(--muted-foreground) 30%, transparent);
-  border-radius: 9999px;
-  border: 3px solid transparent;
-  background-clip: content-box;
-}
-::-webkit-scrollbar-thumb:hover {
-  background-color: color-mix(in oklab, var(--muted-foreground) 50%, transparent);
 }
 
 /* Indeterminate progress sweep — used while indexing, whose total isn't known up front. */
