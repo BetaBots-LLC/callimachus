@@ -77,6 +77,7 @@ are embedded; `tool`/`system` are searchable via FTS but skipped by the embedder
 | `qwen` | `~/.qwen/tmp/<hash>/chats/*.jsonl` | JSONL, `type: user`/`assistant`, `message.parts` |
 | `goose` | `~/.local/share/goose/sessions/sessions.db` | SQLite (`sessions` + `messages`, `content_json`) |
 | `opencode` | `~/.local/share/opencode/storage/{session,message,part}/*.json` | JSON tree, join msg+part by id |
+| `opencode` | `~/.local/share/opencode/opencode.db` | SQLite V1 (`session` + `message` + `part`, `data` JSON) |
 | `continue` | `~/.continue/sessions/*.json` | JSON `history[]`, no per-msg ts (use mtime) |
 | `cline` | `<editor>/User/globalStorage/saoudrizwan.claude-dev/tasks/<id>/api_conversation_history.json` | Anthropic Messages array (multi-editor; index-only, no CLI) |
 | `roo` | `<editor>/User/globalStorage/rooveterinaryinc.roo-cline/tasks/<id>/…` | Cline-architecture fork — shares `cline::scan_ext` |

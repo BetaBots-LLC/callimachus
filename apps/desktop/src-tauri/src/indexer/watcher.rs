@@ -36,8 +36,15 @@ fn watch_targets() -> Vec<(PathBuf, &'static str)> {
     {
         v.push((p, super::goose::KIND));
     }
+    // Watch the JSON storage tree (legacy) and the directory holding opencode.db
+    // (V1 SQLite). Both may exist; the indexer dispatches based on DB presence.
     if let Some(p) = super::opencode::storage_root() {
         v.push((p, super::opencode::KIND));
+    }
+    if let Some(db) = super::opencode::db_path() {
+        if let Some(dir) = db.parent() {
+            v.push((dir.to_path_buf(), super::opencode::KIND));
+        }
     }
     if let Some(p) = super::continue_cli::sessions_root() {
         v.push((p, super::continue_cli::KIND));
@@ -101,7 +108,10 @@ fn run(app: AppHandle) -> anyhow::Result<()> {
                     super::qwen::KIND
                 } else if s.contains("/goose/sessions") {
                     super::goose::KIND
-                } else if s.contains("/opencode/storage") {
+                } else if s.contains("/opencode/storage")
+                    || s.ends_with("/opencode.db")
+                    || s.ends_with("/opencode.db-wal")
+                {
                     super::opencode::KIND
                 } else if s.contains("/.continue/sessions") {
                     super::continue_cli::KIND
