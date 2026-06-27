@@ -286,7 +286,9 @@ where
 
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     let bin = resolve_cli_bin("claude").await.ok_or_else(|| {
-        anyhow::anyhow!("`claude` not found. Install it and make sure it's logged in, then pick it again.")
+        anyhow::anyhow!(
+            "`claude` not found. Install it and make sure it's logged in, then pick it again."
+        )
     })?;
     let mut cmd = tokio::process::Command::new(&bin);
     // stream-json in print mode requires --verbose; --include-partial-messages adds token deltas.
