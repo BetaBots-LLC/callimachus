@@ -3,6 +3,15 @@ import type { ComponentType } from "react";
 import { RELEASES_URL } from "@/lib/site";
 import type { Release } from "@/server/releases";
 import { buttonVariants } from "@/components/ui/button";
+import {
+  Item,
+  ItemActions,
+  ItemContent,
+  ItemDescription,
+  ItemGroup,
+  ItemMedia,
+  ItemTitle,
+} from "@/components/ui/item";
 import { cn } from "@/lib/utils";
 
 interface Row {
@@ -52,35 +61,38 @@ const ROWS: Row[] = [
 export function DownloadMatrix({ release }: { release: Release }) {
   return (
     <div>
-      <ul className="border-t border-border">
+      <ItemGroup>
         {ROWS.map((row) => {
           const Icon = row.icon;
           return (
-            <li
-              key={row.no}
-              className="group flex flex-wrap items-center gap-4 border-b border-border py-5 transition-colors hover:bg-card/60"
-            >
+            <Item key={row.no} variant="outline" className="transition-colors hover:border-link/40">
               <span className="hidden w-8 font-mono text-xs text-muted-foreground sm:block">
                 № {row.no}
               </span>
-              <Icon className="size-5 text-muted-foreground transition-colors group-hover:text-link" />
-              <div className="min-w-0 flex-1">
-                <p className="font-display text-lg text-foreground">{row.os}</p>
-                <p className="font-mono text-xs text-muted-foreground">
+              <ItemMedia variant="icon">
+                <Icon className="size-5 text-muted-foreground transition-colors group-hover/item:text-link" />
+              </ItemMedia>
+              <ItemContent>
+                <ItemTitle className="font-display text-lg font-normal text-foreground">
+                  {row.os}
+                </ItemTitle>
+                <ItemDescription className="font-mono text-xs">
                   {row.format} · {row.note}
-                </p>
-              </div>
-              <a
-                href={row.href(release)}
-                className={cn(buttonVariants({ variant: "outline", size: "sm" }))}
-              >
-                <Download />
-                Download
-              </a>
-            </li>
+                </ItemDescription>
+              </ItemContent>
+              <ItemActions>
+                <a
+                  href={row.href(release)}
+                  className={cn(buttonVariants({ variant: "outline", size: "sm" }), "group/btn")}
+                >
+                  <Download className="transition-transform duration-200 ease-[var(--ease-out-quint)] group-hover/btn:translate-y-0.5" />
+                  Download
+                </a>
+              </ItemActions>
+            </Item>
           );
         })}
-      </ul>
+      </ItemGroup>
 
       <p className="mt-5 text-sm text-muted-foreground">
         {release.fallback
