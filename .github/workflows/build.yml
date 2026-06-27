@@ -49,6 +49,10 @@ jobs:
       # AZURE_CLIENT_ID secret → gates the trusted-signing-cli install. The
       # signCommand (tauri.conf.json) only runs on the Windows leg.
       AZURE_SIGN: ${{ secrets.AZURE_CLIENT_ID }}
+      # Apple notarization via App Store Connect API key. Empty until you add the
+      # secret → the mac app is signed but not notarized (no failure). Gates the
+      # .p8 write step below.
+      APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -102,6 +106,15 @@ jobs:
         if: matrix.platform == 'windows-latest' && env.AZURE_SIGN != ''
         run: cargo install trusted-signing-cli --locked
 
+      # Decode the App Store Connect API key (.p8) used for notarization. The base64
+      # secret avoids storing a file; the path is handed to the Tauri bundler below
+      # via APPLE_API_KEY_PATH. macOS leg only, and only when the secret is set.
+      - name: Write App Store Connect API key (macOS)
+        if: startsWith(matrix.platform, 'macos') && env.APPLE_API_KEY != ''
+        env:
+          APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
+        run: echo "$APPLE_API_KEY_BASE64" | base64 --decode > "$RUNNER_TEMP/apple_api_key.p8"
+
       - name: Build, sign & release
         uses: tauri-apps/tauri-action@v0
         env:
@@ -127,14 +140,15 @@ jobs:
           # nested third-party dylib and no entitlements file is required. Hardened
           # runtime is on by default; with no App Sandbox it does not block the git/
           # osascript/CLI subprocesses the app spawns. Notarization + stapling run
-          # when APPLE_ID/APPLE_PASSWORD/APPLE_TEAM_ID are present. Harmless on
-          # Windows & Linux legs.
+          # via the App Store Connect API key (APPLE_API_KEY/ISSUER/KEY_PATH) — far
+          # more robust than an Apple ID + app-specific password, which locks the
+          # account after repeated failed CI auths. Harmless on Windows & Linux legs.
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_PATH: ${{ runner.temp }}/apple_api_key.p8
         with:
           projectPath: apps/desktop
           tagName: ${{ inputs.tag || github.ref_name }}
