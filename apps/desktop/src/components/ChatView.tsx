@@ -15,8 +15,36 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
-import { ArrowUp, Brain, Check, Loader2, Search, Square, Terminal, X } from "lucide-react";
-import { StickToBottom } from "use-stick-to-bottom";
+import {
+  ArrowUp,
+  Brain,
+  Check,
+  Loader2,
+  Paperclip,
+  Search,
+  Square,
+  Terminal,
+  TriangleAlert,
+  X,
+} from "lucide-react";
+import {
+  MessageScroller,
+  MessageScrollerButton,
+  MessageScrollerContent,
+  MessageScrollerItem,
+  MessageScrollerProvider,
+  MessageScrollerViewport,
+} from "@/components/ui/message-scroller";
+import { Message, MessageContent } from "@/components/ui/message";
+import { Bubble, BubbleContent } from "@/components/ui/bubble";
+import { Marker, MarkerContent, MarkerIcon } from "@/components/ui/marker";
+import {
+  Attachment,
+  AttachmentContent,
+  AttachmentDescription,
+  AttachmentMedia,
+  AttachmentTitle,
+} from "@/components/ui/attachment";
 import { ChatSidebar } from "./ChatSidebar";
 import { Markdown, StreamingMarkdown } from "./Markdown";
 
@@ -240,41 +268,51 @@ export function ChatView() {
         )}
 
         <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
-          <StickToBottom
-            className="min-h-0 min-w-0 flex-1 overflow-y-auto overflow-x-hidden"
-            resize="smooth"
-            initial="smooth"
-          >
-            <StickToBottom.Content
-              className="mx-auto flex w-full min-w-0 max-w-3xl flex-col gap-6 px-5 py-6"
-              role="log"
-              aria-live="polite"
-              aria-relevant="additions text"
-            >
-              {messages.length === 0 && !sending && (
-                <div className="m-auto text-muted-foreground">
-                  Ask anything. Replies are saved and searchable.
-                </div>
-              )}
-              {messages.map((m) => (
-                <div
-                  key={m.id}
-                  className="[contain-intrinsic-size:0_80px] [content-visibility:auto]"
+          <MessageScrollerProvider autoScroll>
+            <MessageScroller>
+              <MessageScrollerViewport>
+                <MessageScrollerContent
+                  className="mx-auto w-full min-w-0 max-w-3xl px-5 py-6"
+                  role="log"
+                  aria-live="polite"
+                  aria-relevant="additions text"
                 >
-                  <Bubble role={m.role} content={m.content} />
-                </div>
-              ))}
-              {sending && <StreamingArea />}
-              {error && (
-                <div
-                  role="alert"
-                  className="animate-in fade-in slide-in-from-bottom-2 rounded-lg border border-l-2 border-l-destructive bg-destructive/5 px-3 py-2 text-sm text-destructive"
-                >
-                  {error}
-                </div>
-              )}
-            </StickToBottom.Content>
-          </StickToBottom>
+                  {messages.length === 0 && !sending && (
+                    <Marker variant="separator" className="my-auto">
+                      <MarkerContent>Ask anything. Replies are saved and searchable.</MarkerContent>
+                    </Marker>
+                  )}
+                  {messages.map((m) => (
+                    <MessageScrollerItem
+                      key={m.id}
+                      messageId={m.id}
+                      scrollAnchor={m.role === "user"}
+                    >
+                      <MessageRow role={m.role} content={m.content} />
+                    </MessageScrollerItem>
+                  ))}
+                  {sending && (
+                    <MessageScrollerItem messageId="streaming">
+                      <Message align="start">
+                        <MessageContent>
+                          <StreamingArea />
+                        </MessageContent>
+                      </Message>
+                    </MessageScrollerItem>
+                  )}
+                  {error && (
+                    <Marker role="alert" className="text-destructive">
+                      <MarkerIcon>
+                        <TriangleAlert />
+                      </MarkerIcon>
+                      <MarkerContent>{error}</MarkerContent>
+                    </Marker>
+                  )}
+                </MessageScrollerContent>
+              </MessageScrollerViewport>
+              <MessageScrollerButton direction="end" />
+            </MessageScroller>
+          </MessageScrollerProvider>
           {loadingThread && (
             <div className="absolute inset-0 z-10 flex items-center justify-center bg-background/60 backdrop-blur-[1px]">
               <span className="flex items-center gap-2 text-sm text-muted-foreground">
@@ -337,22 +375,62 @@ export function ChatView() {
   );
 }
 
-/** A committed message: user = grey bubble (right); assistant = borderless markdown.
+/** The prefix `addContext` prepends when injecting context as a user turn (see store/chat.ts);
+ *  such turns render as a compact Attachment chip instead of a wall-of-text bubble. */
+const CONTEXT_PREFIX = "Here is context for our conversation:";
+
+/** A committed message rendered with the shadcn conversation primitives: user = muted bubble
+ *  (right), or a context Attachment; assistant = ghost bubble wrapping markdown; system = marker.
  *  Memoized so streaming a new reply never re-parses prior messages' markdown. */
-const Bubble = memo(function Bubble({ role, content }: { role: string; content: string }) {
-  if (role === "user") {
+const MessageRow = memo(function MessageRow({ role, content }: { role: string; content: string }) {
+  if (role === "system") {
     return (
-      <div className="flex justify-end">
-        <div className="min-w-0 max-w-[85%] whitespace-pre-wrap wrap-break-word rounded-2xl bg-muted px-4 py-2.5 text-[0.95rem] leading-relaxed">
-          {content}
-        </div>
-      </div>
+      <Marker variant="separator">
+        <MarkerContent>{content}</MarkerContent>
+      </Marker>
+    );
+  }
+  if (role === "user") {
+    if (content.startsWith(CONTEXT_PREFIX)) {
+      const body = content.slice(CONTEXT_PREFIX.length).trim();
+      return (
+        <Message align="end">
+          <MessageContent>
+            <Attachment size="sm">
+              <AttachmentMedia>
+                <Paperclip />
+              </AttachmentMedia>
+              <AttachmentContent>
+                <AttachmentTitle>Context</AttachmentTitle>
+                <AttachmentDescription>
+                  {body.length.toLocaleString()} characters
+                </AttachmentDescription>
+              </AttachmentContent>
+            </Attachment>
+          </MessageContent>
+        </Message>
+      );
+    }
+    return (
+      <Message align="end">
+        <MessageContent>
+          <Bubble variant="muted">
+            <BubbleContent className="whitespace-pre-wrap">{content}</BubbleContent>
+          </Bubble>
+        </MessageContent>
+      </Message>
     );
   }
   return (
-    <div className="w-full min-w-0">
-      <Markdown>{content}</Markdown>
-    </div>
+    <Message align="start">
+      <MessageContent>
+        <Bubble variant="ghost">
+          <BubbleContent>
+            <Markdown>{content}</Markdown>
+          </BubbleContent>
+        </Bubble>
+      </MessageContent>
+    </Message>
   );
 });
 
@@ -373,10 +451,12 @@ function StreamingTurn({ reasoning, parts }: { reasoning: string; parts: StreamP
       {reasoning ? <ThinkingBlock text={reasoning} streaming={parts.length === 0} /> : null}
       {parts.map((p, i) =>
         p.kind === "text" ? (
-          <div key={i} className="relative min-w-0">
-            <StreamingMarkdown>{p.text}</StreamingMarkdown>
-            {i === parts.length - 1 && <TrailingDots />}
-          </div>
+          <Bubble key={i} variant="ghost">
+            <BubbleContent className="relative">
+              <StreamingMarkdown>{p.text}</StreamingMarkdown>
+              {i === parts.length - 1 && <TrailingDots />}
+            </BubbleContent>
+          </Bubble>
         ) : (
           <ToolStepView key={i} step={p.step} />
         ),
