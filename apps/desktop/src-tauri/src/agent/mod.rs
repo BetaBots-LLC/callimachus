@@ -259,6 +259,130 @@ async fn cli_complete(provider: &str, model: &str, prompt: &str) -> Result<Strin
     Ok(text)
 }
 
+/// Stream a CLI backend's reply token-by-token. The Claude CLI supports realtime streaming via
+/// `--output-format stream-json --include-partial-messages`: it prints JSONL where each
+/// `content_block_delta` carries a text (or thinking) token, which we forward through `on_token`
+/// as it arrives. Other CLI backends have no token stream we parse, so they fall back to one
+/// completion emitted at once. Returns the full assistant text; honors `cancel` (kills the child).
+async fn cli_stream<F>(
+    provider: &str,
+    model: &str,
+    prompt: &str,
+    cancel: &tokio_util::sync::CancellationToken,
+    mut on_token: F,
+) -> Result<String>
+where
+    F: FnMut(ChunkKind, &str),
+{
+    // Only the Claude CLI exposes a token stream we can parse; others emit one chunk at the end.
+    if provider != "claude-cli" {
+        let text = tokio::select! {
+            _ = cancel.cancelled() => return Ok(String::new()),
+            r = cli_complete(provider, model, prompt) => r?,
+        };
+        on_token(ChunkKind::Text, &text);
+        return Ok(text);
+    }
+
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let bin = resolve_cli_bin("claude").await.ok_or_else(|| {
+        anyhow::anyhow!("`claude` not found. Install it and make sure it's logged in, then pick it again.")
+    })?;
+    let mut cmd = tokio::process::Command::new(&bin);
+    // stream-json in print mode requires --verbose; --include-partial-messages adds token deltas.
+    cmd.args([
+        "-p",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--include-partial-messages",
+        "--allowedTools",
+        "",
+    ]);
+    if !model.is_empty() {
+        cmd.arg("--model").arg(model);
+    }
+    let mut child = cmd
+        .current_dir(std::env::temp_dir())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| {
+            anyhow::anyhow!("could not launch `claude` ({e}). Is it installed and on PATH?")
+        })?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(prompt.as_bytes()).await.ok();
+        // Drop stdin to send EOF so the CLI stops waiting for more input.
+    }
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("claude: no stdout pipe"))?;
+    let mut reader = BufReader::new(stdout).lines();
+    let mut full = String::new();
+
+    loop {
+        let line = tokio::select! {
+            _ = cancel.cancelled() => {
+                let _ = child.start_kill();
+                return Ok(full);
+            }
+            next = reader.next_line() => match next.map_err(|e| anyhow::anyhow!(e.to_string()))? {
+                Some(l) => l,
+                None => break,
+            },
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue; // non-JSON noise — skip
+        };
+        if v.get("type").and_then(serde_json::Value::as_str) != Some("stream_event") {
+            continue;
+        }
+        let Some(delta) = v
+            .get("event")
+            .filter(|e| {
+                e.get("type").and_then(serde_json::Value::as_str) == Some("content_block_delta")
+            })
+            .and_then(|e| e.get("delta"))
+        else {
+            continue;
+        };
+        match delta.get("type").and_then(serde_json::Value::as_str) {
+            Some("text_delta") => {
+                if let Some(t) = delta.get("text").and_then(serde_json::Value::as_str) {
+                    full.push_str(t);
+                    on_token(ChunkKind::Text, t);
+                }
+            }
+            Some("thinking_delta") => {
+                if let Some(t) = delta.get("thinking").and_then(serde_json::Value::as_str) {
+                    on_token(ChunkKind::Reasoning, t);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    if full.is_empty() {
+        if status.success() {
+            bail!("`claude` returned no output");
+        }
+        bail!("`claude` failed ({status}). Is it installed and logged in?");
+    }
+    Ok(full)
+}
+
 /// One non-streaming completion, routed to the user's CLI (keyless) or to genai (keyed). The CLI
 /// path has no separate system slot, so `system` and `user` are flattened into one prompt.
 async fn complete(
@@ -518,9 +642,9 @@ where
     E: Fn(ToolCall) -> Fut,
     Fut: std::future::Future<Output = Result<String>>,
 {
-    // CLI backends have no genai tool-calling or token streaming. Run one completion over the
-    // flattened conversation and emit the whole answer at once. The history-search `tools` and
-    // `execute_tool` loop are genai-only, so they're intentionally skipped here.
+    // CLI backends have no genai tool-calling, so we flatten the conversation into one prompt and
+    // stream the reply (the Claude CLI streams token-by-token; see `cli_stream`). The history-search
+    // `tools` / `execute_tool` loop is genai-only, so it's intentionally skipped here.
     if is_cli_provider(provider) {
         let _ = (&tools, &execute_tool);
         let mut system = String::from(CHAT_SYSTEM);
@@ -544,12 +668,7 @@ where
             }
         }
         let prompt = format!("{system}\n{convo}\n\nAssistant:");
-        let text = tokio::select! {
-            _ = cancel.cancelled() => return Ok(String::new()),
-            r = cli_complete(provider, model, &prompt) => r?,
-        };
-        on_token(ChunkKind::Text, &text);
-        return Ok(text);
+        return cli_stream(provider, model, &prompt, &cancel, on_token).await;
     }
 
     let adapter = adapter_for(provider)?;
@@ -856,6 +975,34 @@ mod tests {
         eprintln!("decisions: {:?}", d.decisions);
         eprintln!("gotchas: {:?}", d.gotchas);
         assert!(!d.summary.is_empty() || !d.decisions.is_empty() || !d.gotchas.is_empty());
+    }
+
+    /// Live: the Claude CLI streams a reply token-by-token (many `on_token` calls, not one).
+    /// Run with: cargo test -p callimachus --lib cli_stream_smoke -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn cli_stream_smoke() {
+        use std::sync::{Arc, Mutex};
+        let chunks = Arc::new(Mutex::new(0usize));
+        let buf = Arc::new(Mutex::new(String::new()));
+        let (c, b) = (chunks.clone(), buf.clone());
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let full = cli_stream(
+            "claude-cli",
+            "",
+            "Reply with exactly: hello world",
+            &cancel,
+            move |_kind, t| {
+                *c.lock().unwrap() += 1;
+                b.lock().unwrap().push_str(t);
+            },
+        )
+        .await
+        .unwrap();
+        let n = *chunks.lock().unwrap();
+        eprintln!("chunks={n} full={full:?}");
+        assert!(!full.is_empty());
+        assert!(n >= 2, "expected multiple streamed chunks, got {n}");
     }
 
     #[test]
