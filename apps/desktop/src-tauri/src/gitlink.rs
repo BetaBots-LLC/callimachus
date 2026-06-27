@@ -494,9 +494,11 @@ mod tests {
         )
         .unwrap();
         let tid: i64 = conn
-            .query_row("SELECT id FROM threads WHERE external_id = 't-sha'", [], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT id FROM threads WHERE external_id = 't-sha'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
 
         // Stored as the full 40-char sha, exactly as link_project writes it.
@@ -519,7 +521,9 @@ mod tests {
         // The full sha still matches.
         assert_eq!(commits_by_sha(&conn, &[full.to_string()]).unwrap().len(), 1);
         // A non-matching prefix yields nothing (no false positives).
-        assert!(commits_by_sha(&conn, &["deadbee".into()]).unwrap().is_empty());
+        assert!(commits_by_sha(&conn, &["deadbee".into()])
+            .unwrap()
+            .is_empty());
         // Blank/empty inputs never match everything.
         assert!(commits_by_sha(&conn, &["".into(), "   ".into()])
             .unwrap()
