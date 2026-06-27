@@ -103,6 +103,16 @@ struct FilePathArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+struct RecurringIssuesArgs {
+    /// Path substring to scope to one repo. Omit to use the repo the server runs in; pass "*" for all projects.
+    project: Option<String>,
+    /// How far back to scan, in days (default 180).
+    since_days: Option<u32>,
+    /// Max error clusters to return (default 20).
+    limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 struct RememberArgs {
     /// What to remember (one concrete sentence).
     text: String,
@@ -296,6 +306,36 @@ impl Callimachus {
         let links = crate::gitlink::linked_commits(&conn, args.thread_id)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         let json = serde_json::to_string_pretty(&links)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(
+        description = "List the recurring ERRORS the user keeps hitting across their indexed sessions — normalized error signatures grouped by how often they recur (count) and how many threads they span. Scoped to the repo the server runs in by default; pass `project` (a path substring) for another repo, or \"*\" for all projects. Use this before retrying an approach to avoid repeating a known failure. Each cluster has an example line, a count, a thread count, and first/last-seen timestamps."
+    )]
+    async fn recurring_issues(
+        &self,
+        Parameters(args): Parameters<RecurringIssuesArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let days = args.since_days.unwrap_or(180).max(1) as i64;
+        let since = chrono::Utc::now().timestamp() - days * 24 * 3600;
+        let limit = args.limit.unwrap_or(20) as usize;
+        // Default: scope to the current repo (matches record_*/search_current_project);
+        // "*"/"all" searches every project.
+        let project: Option<String> = match args.project.as_deref().map(str::trim) {
+            Some("*") | Some("all") => None,
+            Some(p) if !p.is_empty() => {
+                Some(crate::indexer::canonical_project(p).unwrap_or_else(|| p.to_string()))
+            }
+            _ => current_project_root().map(|r| crate::indexer::canonical_project(&r).unwrap_or(r)),
+        };
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let clusters = crate::issues::recurring_issues(&conn, project.as_deref(), since, limit)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let json = serde_json::to_string_pretty(&clusters)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }

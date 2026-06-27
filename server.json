@@ -1,6 +1,6 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
-  "name": "io.github.betabots-llc/callimachus",
+  "name": "io.github.BetaBots-LLC/callimachus",
   "description": "MCP server for Callimachus: local index and search of your AI coding-agent threads",
   "repository": {
     "url": "https://github.com/BetaBots-LLC/callimachus",
