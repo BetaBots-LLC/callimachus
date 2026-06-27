@@ -292,7 +292,18 @@ export function ChatView() {
                     </MessageScrollerItem>
                   ))}
                   {sending && (
-                    <MessageScrollerItem messageId="streaming">
+                    // The live reply must never be paint-deferred. The base MessageScrollerItem
+                    // sets content-visibility:auto (+ contain-intrinsic-size), which lets the
+                    // browser skip rendering the growing reply while it sits a hair below the
+                    // fold — and report a stale placeholder size, so the scroller's
+                    // ResizeObserver never sees the growth, autoScroll doesn't follow, and
+                    // streamed text "pops in" in chunks when it finally scrolls into view.
+                    // Force it visible so tokens paint as they arrive and the scroller stays
+                    // pinned to the live edge.
+                    <MessageScrollerItem
+                      messageId="streaming"
+                      className="[content-visibility:visible]"
+                    >
                       <Message align="start">
                         <MessageContent>
                           <StreamingArea />

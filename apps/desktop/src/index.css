@@ -6,6 +6,23 @@
 
 @custom-variant dark (&:is(.dark *));
 
+/* Back the scrollbar classes the shadcn message-scroller viewport uses but that aren't shipped in
+   shadcn/tailwind.css. scrollbar-gutter-stable reserves the scrollbar's space so the centered chat
+   column never reflows horizontally when the bar appears as a reply streams in. */
+@utility scrollbar-thin {
+  scrollbar-width: thin;
+}
+@utility scrollbar-gutter-stable {
+  scrollbar-gutter: stable;
+}
+/* Used by Attachment's horizontal media row to hide its scrollbar. */
+@utility scrollbar-none {
+  scrollbar-width: none;
+  &::-webkit-scrollbar {
+    display: none;
+  }
+}
+
 @theme inline {
   --font-heading: var(--font-sans);
   --font-sans: "Geist Variable", sans-serif;
