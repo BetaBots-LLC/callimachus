@@ -479,6 +479,24 @@ pub fn parse_distilled(raw: &str) -> Distilled {
     }
 }
 
+/// System prompt for the interactive in-app agent. Unlike the one-shot consts above, this
+/// drives the streaming, tool-calling chat: it tells the model its real edge is the user's own
+/// indexed coding history and when to reach for each tool. `chat_stream` injects it for both the
+/// genai and CLI backends; it is NOT persisted into the saved transcript (it's seeded at send
+/// time, not stored as a message), so saved chats stay clean.
+const CHAT_SYSTEM: &str = "You are the assistant inside Callimachus, a local app that indexes the \
+developer's own AI coding-agent history (Claude Code, Codex, Cursor, and past in-app chats) on \
+their machine. Your advantage over a plain chatbot is that you can search and read that history \
+with your tools — use them.\n\
+- When the user asks about anything they may have done, decided, built, or hit before — prior \
+work, past decisions, recurring errors, how something was solved — call search_history FIRST, \
+then get_thread on the most relevant result (using its threadId) to read details before \
+answering. Don't answer from memory when their own history could hold the answer.\n\
+- Cite the threads you drew on inline as [thread N], using the threadId.\n\
+- Use run_shell only when the user explicitly asks you to run or inspect something locally; keep \
+commands minimal and read-only where possible. Each command needs the user's approval.\n\
+- Be concise, specific, and technical. If a search finds nothing relevant, say so — never invent.";
+
 /// Stream a chat completion via the genai crate (multi-provider, native protocols,
 /// retries). The adapter is forced per `provider`; the API key (from the keychain)
 /// is injected through an auth resolver so it never leaves Rust. `on_token` fires
@@ -505,7 +523,7 @@ where
     // `execute_tool` loop are genai-only, so they're intentionally skipped here.
     if is_cli_provider(provider) {
         let _ = (&tools, &execute_tool);
-        let mut system = String::new();
+        let mut system = String::from(CHAT_SYSTEM);
         let mut convo = String::new();
         for m in messages {
             match m.role.as_str() {
@@ -544,7 +562,7 @@ where
         .build();
 
     // Split system messages out (genai takes system separately); map the rest.
-    let mut system = String::new();
+    let mut system = String::from(CHAT_SYSTEM);
     let mut req = ChatRequest::new(Vec::new());
     for m in messages {
         match m.role.as_str() {

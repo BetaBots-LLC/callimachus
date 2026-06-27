@@ -770,9 +770,12 @@ fn cmd_audit_pr(args: &[String]) -> anyhow::Result<()> {
     }
     let mut by_sha = serde_json::Map::new();
     for sha in &shas {
+        // commits_by_sha prefix-matches, so an abbreviated input maps to the full stored sha;
+        // regroup by the same prefix (keyed by the caller's original sha string below).
+        let needle = sha.trim().to_ascii_lowercase();
         let produced: Vec<_> = commit_threads
             .iter()
-            .filter(|c| &c.sha == sha)
+            .filter(|c| !needle.is_empty() && c.sha.to_ascii_lowercase().starts_with(&needle))
             .map(|c| {
                 serde_json::json!({
                     "id": c.thread_id,

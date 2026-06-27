@@ -292,23 +292,33 @@ pub struct CommitThread {
 
 /// The inverse of `linked_commits`: for each of `shas`, the thread(s) inferred to have produced it,
 /// most-overlap first. SHAs with no link are simply absent (the caller fills the null). Requires
-/// `link_project` to have run for the repo first. Matches full SHAs as stored by `link_project`.
+/// `link_project` to have run for the repo first. Matches full OR abbreviated SHAs: each input is
+/// matched as a prefix of the stored full 40-char sha, so the short hashes that `git log --oneline`
+/// / PR tooling hand to `cal audit-pr` resolve instead of silently returning nothing.
 pub fn commits_by_sha(conn: &Connection, shas: &[String]) -> Result<Vec<CommitThread>> {
-    if shas.is_empty() {
+    // Normalize: git SHAs are lowercase hex; trim and drop empties so a blank never matches all.
+    let needles: Vec<String> = shas
+        .iter()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if needles.is_empty() {
         return Ok(Vec::new());
     }
-    let placeholders = (1..=shas.len())
-        .map(|i| format!("?{i}"))
+    // Prefix-match each input against the stored full sha. SHAs are [0-9a-f], so no LIKE
+    // metacharacters (`%`/`_`) can appear in a needle — concatenating '%' is safe.
+    let clauses = (1..=needles.len())
+        .map(|i| format!("tc.sha LIKE ?{i} || '%'"))
         .collect::<Vec<_>>()
-        .join(",");
+        .join(" OR ");
     let sql = format!(
         "SELECT tc.sha, tc.thread_id, t.title, tc.overlap
          FROM thread_commits tc JOIN threads t ON t.id = tc.thread_id
-         WHERE tc.sha IN ({placeholders})
+         WHERE {clauses}
          ORDER BY tc.overlap DESC, tc.committed_at DESC"
     );
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(rusqlite::params_from_iter(shas.iter()), |r| {
+    let rows = stmt.query_map(rusqlite::params_from_iter(needles.iter()), |r| {
         Ok(CommitThread {
             sha: r.get(0)?,
             thread_id: r.get(1)?,
@@ -458,6 +468,66 @@ mod tests {
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].sha, "in");
         assert_eq!(links[0].overlap, 1);
+    }
+
+    #[test]
+    fn commits_by_sha_matches_abbreviated_and_full() {
+        use crate::indexer::{source_id, upsert_thread, ParsedMessage, ParsedThread};
+
+        let mut conn = temp_db();
+        let sid = source_id(&conn, "claude_code").unwrap();
+        upsert_thread(
+            &mut conn,
+            sid,
+            &ParsedThread {
+                external_id: "t-sha".into(),
+                title: Some("commit producer".into()),
+                project_path: Some("/tmp/repo".into()),
+                messages: vec![ParsedMessage {
+                    role: "user".into(),
+                    text: "did the thing".into(),
+                    tool_name: None,
+                    ts: Some(1_500),
+                }],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let tid: i64 = conn
+            .query_row(
+                "SELECT id FROM threads WHERE external_id = 't-sha'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        // Stored as the full 40-char sha, exactly as link_project writes it.
+        let full = "eb80a83cafef00dd00aa11bb22cc33dd44ee55ff";
+        conn.execute(
+            "INSERT INTO thread_commits
+                (thread_id, sha, short_sha, subject, committed_at, overlap, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![tid, full, &full[..10], "do thing", 1_600, 2_i64, 1_700],
+        )
+        .unwrap();
+
+        // The 7-char form `git log --oneline` hands to `cal audit-pr` must resolve.
+        let short = commits_by_sha(&conn, &["eb80a83".into()]).unwrap();
+        assert_eq!(short.len(), 1);
+        assert_eq!(short[0].sha, full);
+        assert_eq!(short[0].thread_id, tid);
+        // Uppercase input is normalized to lowercase hex.
+        assert_eq!(commits_by_sha(&conn, &["EB80A83".into()]).unwrap().len(), 1);
+        // The full sha still matches.
+        assert_eq!(commits_by_sha(&conn, &[full.to_string()]).unwrap().len(), 1);
+        // A non-matching prefix yields nothing (no false positives).
+        assert!(commits_by_sha(&conn, &["deadbee".into()])
+            .unwrap()
+            .is_empty());
+        // Blank/empty inputs never match everything.
+        assert!(commits_by_sha(&conn, &["".into(), "   ".into()])
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
