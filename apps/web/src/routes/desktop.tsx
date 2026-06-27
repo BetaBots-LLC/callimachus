@@ -16,6 +16,7 @@ import { ldScript, softwareApplicationLd } from "@/lib/jsonld";
 import { SITE_URL } from "@/lib/site";
 import { ProductLayout } from "@/components/site/ProductLayout";
 import { FeaturePanel } from "@/components/site/FeaturePanel";
+import { ScreenshotGallery } from "@/components/site/ScreenshotGallery";
 import { DownloadButton } from "@/components/download/DownloadButton";
 
 export const Route = createFileRoute("/desktop")({
@@ -133,16 +134,7 @@ function DesktopPage() {
         </FeaturePanel>
       </div>
 
-      <figure className="mt-12 rounded-xl border border-border bg-card p-2">
-        <img
-          src="/hero.png"
-          alt="The Callimachus desktop app: a searchable, catalogued list of AI coding threads"
-          width={1200}
-          height={750}
-          className="rounded-lg"
-          loading="lazy"
-        />
-      </figure>
+      <ScreenshotGallery className="mt-12" />
     </ProductLayout>
   );
 }

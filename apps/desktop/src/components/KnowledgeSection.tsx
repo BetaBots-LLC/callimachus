@@ -76,7 +76,7 @@ export function KnowledgeButton({ threadId }: { threadId: number }) {
           </SheetDescription>
         </SheetHeader>
 
-        <div className="flex-1 space-y-4 overflow-y-auto p-4">
+        <div className="min-w-0 flex-1 space-y-4 overflow-y-auto overflow-x-hidden p-4">
           {distill.isError && <p className="text-xs text-destructive">{String(distill.error)}</p>}
           {d.error && !distill.isPending && (
             <p className="text-xs text-destructive">Last distillation failed: {d.error}</p>
@@ -88,7 +88,7 @@ export function KnowledgeButton({ threadId }: { threadId: number }) {
           )}
 
           {d.summary && (
-            <p className="text-sm leading-relaxed">
+            <p className="text-sm leading-relaxed wrap-break-word">
               <InlineMarkdown>{d.summary}</InlineMarkdown>
             </p>
           )}
@@ -118,7 +118,9 @@ function FactList({ label, items }: { label: string; items: KFact[] }) {
         {items.map((f) => (
           <li key={f.id} className="flex gap-2 text-sm leading-snug">
             <span className="text-muted-foreground">•</span>
-            <InlineMarkdown>{f.text}</InlineMarkdown>
+            <span className="min-w-0 wrap-break-word">
+              <InlineMarkdown>{f.text}</InlineMarkdown>
+            </span>
           </li>
         ))}
       </ul>
