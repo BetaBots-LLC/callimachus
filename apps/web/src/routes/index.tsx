@@ -23,6 +23,7 @@ import { Container } from "@/components/site/Container";
 import { SectionHeading } from "@/components/site/Section";
 import { SourceMarquee } from "@/components/site/SourceMarquee";
 import { FeaturePanel } from "@/components/site/FeaturePanel";
+import { ScreenshotGallery } from "@/components/site/ScreenshotGallery";
 import { FaqAccordion } from "@/components/ui/accordion";
 import { DownloadButton } from "@/components/download/DownloadButton";
 import { buttonVariants } from "@/components/ui/button";
@@ -245,6 +246,8 @@ function Home() {
               alone hides.
             </FeaturePanel>
           </div>
+
+          <ScreenshotGallery className="mt-16 sm:mt-20" label="the plates" />
         </Container>
       </section>
 
