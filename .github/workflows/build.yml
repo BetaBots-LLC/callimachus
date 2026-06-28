@@ -169,6 +169,12 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ inputs.tag || github.ref_name }}
+          # Azure Trusted Signing creds — same as the tauri-action leg. Used to
+          # Authenticode-sign the standalone Windows .exe bins below, which bypass
+          # the Tauri bundler's signCommand. Empty/unused on macOS & Linux.
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
         run: |
           set -euo pipefail
           TARGET="${{ matrix.rust_target }}"
@@ -187,6 +193,15 @@ jobs:
           mkdir -p "$STAGE"
           cp "$OUT/cal$EXT"             "$STAGE/cal-$TRIPLE$EXT"
           cp "$OUT/callimachus-mcp$EXT" "$STAGE/callimachus-mcp-$TRIPLE$EXT"
+          # Authenticode-sign the staged Windows bins (matches the app's signCommand)
+          # so they don't trip SmartScreen "Unknown publisher". Gated on the Azure
+          # secret, so it's a no-op until Trusted Signing is configured. The CLI is
+          # already installed by the "Install Trusted Signing CLI (Windows)" step.
+          if [ "${{ runner.os }}" = "Windows" ] && [ -n "${AZURE_CLIENT_ID:-}" ]; then
+            for f in "$STAGE/cal-$TRIPLE$EXT" "$STAGE/callimachus-mcp-$TRIPLE$EXT"; do
+              trusted-signing-cli -e https://eus.codesigning.azure.net -a betabots -c callimachus -d Callimachus "$f"
+            done
+          fi
           gh release upload "$TAG" \
             "$STAGE/cal-$TRIPLE$EXT" \
             "$STAGE/callimachus-mcp-$TRIPLE$EXT" \
