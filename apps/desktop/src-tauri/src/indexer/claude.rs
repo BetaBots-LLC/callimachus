@@ -18,7 +18,7 @@ pub const KIND: &str = "claude_code";
 
 /// `~/.claude/projects`, or None if HOME is unset.
 pub fn projects_root() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".claude").join("projects"))
+    dirs::home_dir().map(|h| h.join(".claude").join("projects"))
 }
 
 /// Recursively collect every `.jsonl` file under `dir`.

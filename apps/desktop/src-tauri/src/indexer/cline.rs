@@ -28,10 +28,11 @@ const EDITORS: &[&str] = &["Code", "Code - Insiders", "Cursor", "VSCodium", "Win
 
 /// All existing `…/<editor>/User/globalStorage/<ext_id>/tasks` dirs.
 pub fn task_roots_for(ext_id: &str) -> Vec<PathBuf> {
-    let Some(home) = std::env::var_os("HOME") else {
+    // VSCode-family per-user config dir: macOS `~/Library/Application Support`,
+    // Windows `%APPDATA%`, Linux `~/.config` — where editors keep User/globalStorage.
+    let Some(support) = dirs::config_dir() else {
         return Vec::new();
     };
-    let support = PathBuf::from(home).join("Library/Application Support");
     EDITORS
         .iter()
         .map(|ed| {

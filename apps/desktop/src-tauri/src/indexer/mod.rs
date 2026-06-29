@@ -123,9 +123,9 @@ pub fn canonical_project(path: &str) -> Option<String> {
     }
     // Expand a leading `~`.
     let expanded: PathBuf = match p.strip_prefix("~/") {
-        Some(rest) => std::env::var("HOME")
-            .map(|h| PathBuf::from(h).join(rest))
-            .unwrap_or_else(|_| PathBuf::from(p)),
+        Some(rest) => dirs::home_dir()
+            .map(|h| h.join(rest))
+            .unwrap_or_else(|| PathBuf::from(p)),
         None => PathBuf::from(p),
     };
     // If it exists: resolve symlinks + absolutize, then walk up to the git root.

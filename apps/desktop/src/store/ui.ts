@@ -24,7 +24,7 @@ interface UiState {
   targetMessageId: number | null; // scroll-to target when opening from a search hit
   selectedProject: string | null; // active project in the Projects view
   openProject: (project: string) => void; // jump to a project's memory
-  commandOpen: boolean; // the Cmd-K command palette
+  commandOpen: boolean; // the Cmd/Ctrl-K command palette
   setCommandOpen: (open: boolean) => void;
   setQuery: (q: string) => void;
   toggleSource: (s: SourceKind) => void;

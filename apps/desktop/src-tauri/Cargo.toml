@@ -65,4 +65,9 @@ rmcp = { version = "1.7.0", features = ["server", "transport-io", "macros"] }
 schemars = "1"
 tokio-util = "0.7.18"
 r2d2 = "0.8.10"
+# Cross-platform per-user dirs (data/home). macOS values match the prior
+# hardcoded ~/Library/Application Support path exactly; Windows resolves to
+# %LOCALAPPDATA% / %USERPROFILE% (the old code assumed a Unix $HOME and crashed
+# on Windows). Used by db::default_index_path and the per-agent indexers.
+dirs = "6"
 

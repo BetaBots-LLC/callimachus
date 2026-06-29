@@ -15,7 +15,7 @@ pub const KIND: &str = "codex";
 
 /// `~/.codex`, or None if HOME is unset.
 pub fn codex_root() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".codex"))
+    dirs::home_dir().map(|h| h.join(".codex"))
 }
 
 /// Path to the Codex state DB holding thread metadata.

@@ -18,9 +18,7 @@ pub const SKILL_MD: &str = include_str!("../resources/recall/SKILL.md");
 const MCP_NAME: &str = "callimachus";
 
 fn home() -> Result<PathBuf> {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or_else(|| anyhow::anyhow!("HOME unset"))
+    dirs::home_dir().ok_or_else(|| anyhow::anyhow!("could not resolve home directory"))
 }
 
 /// `~/.claude/skills/recall/SKILL.md`
