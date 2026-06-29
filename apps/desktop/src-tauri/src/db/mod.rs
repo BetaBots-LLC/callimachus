@@ -187,6 +187,22 @@ pub fn read_pool(path: &Path, size: u32) -> Result<ReadPool> {
 mod tests {
     use super::*;
 
+    /// Regression guard: the cross-platform path switch must NOT move an existing
+    /// macOS user's index. `default_index_path()` on macOS must stay byte-identical
+    /// to the original hardcoded `~/Library/Application Support/...` location.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn default_index_path_unchanged_on_macos() {
+        // Only meaningful without the override; never mutate process env in a test.
+        if std::env::var_os("CALLIMACHUS_DB").is_some() {
+            return;
+        }
+        let home = std::env::var("HOME").expect("HOME is set on macOS");
+        let expected = std::path::PathBuf::from(home)
+            .join("Library/Application Support/dev.shaller.callimachus/index.db");
+        assert_eq!(default_index_path(), expected);
+    }
+
     fn temp_db() -> Connection {
         // Unique temp path per test run; an in-memory DB would also work but a file
         // exercises the real open() path including WAL pragmas. A process-wide
