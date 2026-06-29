@@ -27,6 +27,21 @@ use std::path::{Path, PathBuf};
 
 pub const KIND: &str = "opencode";
 
+/// One row of the V1 `session` table:
+/// (id, title, directory, parent_id, time_created, time_updated).
+type SessionRow = (
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    Option<i64>,
+);
+
+/// A message assembled from its text parts:
+/// (message id, role, time_created, text parts).
+type GroupedMessage = (String, Option<String>, Option<i64>, Vec<String>);
+
 /// OpenCode data root. Honors OPENCODE_DATA_DIR (first entry of its list),
 /// then XDG_DATA_HOME, else ~/.local/share/opencode.
 ///
@@ -150,14 +165,7 @@ fn scan_sqlite(conn: &mut Connection, db: &Path, tick: &mut dyn FnMut()) -> Resu
     let mut session_stmt = ro.prepare(
         "SELECT id, title, directory, parent_id, time_created, time_updated FROM session",
     )?;
-    let sessions: Vec<(
-        String,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<i64>,
-        Option<i64>,
-    )> = session_stmt
+    let sessions: Vec<SessionRow> = session_stmt
         .query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,         // id
@@ -192,7 +200,7 @@ fn scan_sqlite(conn: &mut Connection, db: &Path, tick: &mut dyn FnMut()) -> Resu
             ))
         })?;
 
-        let mut grouped: Vec<(String, Option<String>, Option<i64>, Vec<String>)> = Vec::new();
+        let mut grouped: Vec<GroupedMessage> = Vec::new();
         for row in rows {
             let (msg_id, role, ts, text) = row?;
             if let Some(last) = grouped.last_mut() {
