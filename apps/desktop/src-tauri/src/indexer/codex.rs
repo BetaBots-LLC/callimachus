@@ -208,7 +208,11 @@ fn meta_from_rollout(path: &Path) -> Option<ThreadMeta> {
         .get("timestamp")
         .and_then(Value::as_str)
         .and_then(parse_ts)
-        .or_else(|| obj.get("timestamp").and_then(Value::as_str).and_then(parse_ts));
+        .or_else(|| {
+            obj.get("timestamp")
+                .and_then(Value::as_str)
+                .and_then(parse_ts)
+        });
     let updated_at = fs::metadata(path)
         .ok()
         .and_then(|m| m.modified().ok())
