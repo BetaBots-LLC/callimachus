@@ -19,7 +19,7 @@ pub const KIND: &str = "gemini";
 /// `~/.gemini/tmp` (per-project chat history is partitioned beneath it), or None
 /// if HOME is unset.
 pub fn tmp_root() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".gemini").join("tmp"))
+    dirs::home_dir().map(|h| h.join(".gemini").join("tmp"))
 }
 
 /// Recursively collect every chat `.jsonl` under `dir`. Restricted to files inside

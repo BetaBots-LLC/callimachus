@@ -23,7 +23,7 @@ pub const KIND: &str = "goose";
 pub fn sessions_db_path() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))?;
+        .or_else(|| dirs::home_dir().map(|h| h.join(".local/share")))?;
     Some(base.join("goose/sessions/sessions.db"))
 }
 

@@ -17,11 +17,11 @@ use std::path::{Path, PathBuf};
 
 pub const KIND: &str = "cursor";
 
-/// Path to Cursor's global state DB (macOS).
+/// Path to Cursor's global state DB. Uses the platform per-user config dir
+/// (macOS `~/Library/Application Support`, Windows `%APPDATA%`, Linux `~/.config`),
+/// which is where VSCode-family editors keep `User/globalStorage`.
 pub fn global_db_path() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|h| {
-        PathBuf::from(h).join("Library/Application Support/Cursor/User/globalStorage/state.vscdb")
-    })
+    dirs::config_dir().map(|c| c.join("Cursor/User/globalStorage/state.vscdb"))
 }
 
 struct Composer {

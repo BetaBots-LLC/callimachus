@@ -18,7 +18,7 @@ pub const KIND: &str = "continue";
 
 /// `~/.continue/sessions`, or None if HOME is unset.
 pub fn sessions_root() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".continue").join("sessions"))
+    dirs::home_dir().map(|h| h.join(".continue").join("sessions"))
 }
 
 pub fn scan(conn: &mut Connection, tick: &mut dyn FnMut()) -> Result<IndexReport> {

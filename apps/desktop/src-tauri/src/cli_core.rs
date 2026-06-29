@@ -1246,11 +1246,8 @@ fn cmd_snapshot_hook(_args: &[String]) -> anyhow::Result<()> {
 /// Map a Claude Code hook's absolute `transcript_path` back to the indexed thread's
 /// `external_id` (the path relative to `~/.claude/projects`).
 fn claude_external_id(transcript_path: &str) -> Option<String> {
-    let home = std::env::var("HOME").ok()?;
-    external_id_under(
-        transcript_path,
-        &std::path::Path::new(&home).join(".claude/projects"),
-    )
+    let home = dirs::home_dir()?;
+    external_id_under(transcript_path, &home.join(".claude/projects"))
 }
 
 /// The path of `transcript_path` relative to `base`, as a string (the indexed `external_id`).
@@ -1330,15 +1327,14 @@ fn cmd_recall_now(_args: &[String]) -> anyhow::Result<()> {
 
 /// Per-session cache of thread ids already surfaced by `recall-now`, so it doesn't repeat itself.
 fn recall_seen_path(session: &str) -> Option<std::path::PathBuf> {
-    let home = std::env::var("HOME").ok()?;
+    let home = dirs::home_dir()?;
     let safe: String = session
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
         .collect();
     let name = if safe.is_empty() { "session" } else { &safe };
     Some(
-        std::path::Path::new(&home)
-            .join(".callimachus/recall")
+        home.join(".callimachus/recall")
             .join(format!("{name}.json")),
     )
 }

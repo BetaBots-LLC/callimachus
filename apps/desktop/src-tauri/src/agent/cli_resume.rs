@@ -93,10 +93,9 @@ pub fn launch_with_context(
     context_md: &str,
     project_path: Option<&str>,
 ) -> Result<String> {
-    let home = std::env::var("HOME").map_err(|_| anyhow::anyhow!("HOME unset"))?;
-    let dir = std::path::Path::new(&home)
-        .join(".callimachus")
-        .join("context");
+    let home =
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("could not resolve home directory"))?;
+    let dir = home.join(".callimachus").join("context");
     std::fs::create_dir_all(&dir)?;
     let ts = chrono::Utc::now().timestamp_millis();
     let file = dir.join(format!("ctx-{ts}.md"));

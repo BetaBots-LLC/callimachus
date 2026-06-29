@@ -16,7 +16,9 @@ import { UpdateBanner } from "./components/UpdateBanner";
 import { StatsView } from "./components/StatsView";
 import { SettingsView } from "./components/SettingsView";
 import { Button } from "@/components/ui/button";
+import { Kbd, KbdGroup } from "@/components/ui/kbd";
 import { api } from "./lib/api";
+import { MOD_KEY } from "./lib/platform";
 import { useUi, type View } from "./store/ui";
 import { useTheme } from "./store/theme";
 
@@ -69,9 +71,13 @@ function App() {
             type="button"
             onClick={() => setCommandOpen(true)}
             title="Command palette"
-            className="mr-1 hidden cursor-pointer items-center gap-1 rounded-md border px-2 py-1 text-[0.7rem] text-muted-foreground transition-colors hover:bg-muted hover:text-foreground sm:flex"
+            aria-label="Open command palette"
+            className="mr-1 hidden cursor-pointer items-center transition-opacity hover:opacity-80 sm:flex"
           >
-            <kbd className="font-sans">⌘K</kbd>
+            <KbdGroup>
+              <Kbd>{MOD_KEY}</Kbd>
+              <Kbd>K</Kbd>
+            </KbdGroup>
           </button>
           <TooltipProvider delay={200}>
             <Tooltip>

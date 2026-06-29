@@ -27,14 +27,29 @@ fn register_vec() {
 
 /// The desktop app's index.db location, shared by the sidecar binaries (MCP
 /// server, `cal` CLI) so they all read the same store. `CALLIMACHUS_DB` overrides;
-/// otherwise the Tauri `app_data_dir` for bundle id `dev.shaller.callimachus`.
+/// otherwise a per-user, writable app-data dir for bundle id
+/// `dev.shaller.callimachus`.
+///
+/// Resolved with `dirs::data_local_dir()` so it is correct on every platform:
+/// - macOS:   `~/Library/Application Support/dev.shaller.callimachus/index.db`
+///   (byte-identical to the previous hardcoded path, so existing indexes move nowhere)
+/// - Windows: `%LOCALAPPDATA%\dev.shaller.callimachus\index.db`
+/// - Linux:   `$XDG_DATA_HOME` (or `~/.local/share`)`/dev.shaller.callimachus/index.db`
+///
+/// The old implementation hardcoded the macOS `~/Library/...` layout off `$HOME`.
+/// On Windows `$HOME` is normally unset, so the path collapsed to a *relative*
+/// `Library/Application Support/...` resolved against the process CWD (the install
+/// dir, e.g. `C:\Program Files\Callimachus`), which a standard user cannot write —
+/// the app crashed unless launched as administrator. `data_local_dir` (not the
+/// roaming `data_dir`) keeps the index out of the Windows roaming profile.
 pub fn default_index_path() -> PathBuf {
     if let Ok(p) = std::env::var("CALLIMACHUS_DB") {
         return PathBuf::from(p);
     }
-    let home = std::env::var("HOME").unwrap_or_default();
-    PathBuf::from(home)
-        .join("Library/Application Support/dev.shaller.callimachus")
+    dirs::data_local_dir()
+        .or_else(dirs::home_dir)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("dev.shaller.callimachus")
         .join("index.db")
 }
 
@@ -171,6 +186,22 @@ pub fn read_pool(path: &Path, size: u32) -> Result<ReadPool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression guard: the cross-platform path switch must NOT move an existing
+    /// macOS user's index. `default_index_path()` on macOS must stay byte-identical
+    /// to the original hardcoded `~/Library/Application Support/...` location.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn default_index_path_unchanged_on_macos() {
+        // Only meaningful without the override; never mutate process env in a test.
+        if std::env::var_os("CALLIMACHUS_DB").is_some() {
+            return;
+        }
+        let home = std::env::var("HOME").expect("HOME is set on macOS");
+        let expected = std::path::PathBuf::from(home)
+            .join("Library/Application Support/dev.shaller.callimachus/index.db");
+        assert_eq!(default_index_path(), expected);
+    }
 
     fn temp_db() -> Connection {
         // Unique temp path per test run; an in-memory DB would also work but a file

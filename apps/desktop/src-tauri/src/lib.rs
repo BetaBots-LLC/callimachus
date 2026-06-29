@@ -1581,13 +1581,11 @@ fn thread_context(pool: tauri::State<'_, db::ReadPool>, thread_id: i64) -> AppRe
 #[tauri::command]
 fn obsidian_vaults() -> Vec<String> {
     let mut configs: Vec<std::path::PathBuf> = Vec::new();
-    if let Some(home) = std::env::var_os("HOME") {
-        let home = std::path::PathBuf::from(home);
-        configs.push(home.join("Library/Application Support/obsidian/obsidian.json"));
-        configs.push(home.join(".config/obsidian/obsidian.json"));
-    }
-    if let Some(appdata) = std::env::var_os("APPDATA") {
-        configs.push(std::path::PathBuf::from(appdata).join("obsidian/obsidian.json"));
+    // Obsidian stores its config under the platform per-user config dir: macOS
+    // `~/Library/Application Support/obsidian`, Windows `%APPDATA%\obsidian`,
+    // Linux `~/.config/obsidian` — exactly `dirs::config_dir()`.
+    if let Some(cfg) = dirs::config_dir() {
+        configs.push(cfg.join("obsidian/obsidian.json"));
     }
     for cfg in configs {
         let Ok(text) = std::fs::read_to_string(&cfg) else {

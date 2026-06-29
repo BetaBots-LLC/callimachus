@@ -18,7 +18,7 @@ pub const KIND: &str = "qwen";
 
 /// `~/.qwen/tmp`, or None if HOME is unset.
 pub fn tmp_root() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".qwen").join("tmp"))
+    dirs::home_dir().map(|h| h.join(".qwen").join("tmp"))
 }
 
 /// Recursively collect chat `.jsonl` files (inside a `chats/` segment).

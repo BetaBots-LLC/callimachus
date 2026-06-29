@@ -6,6 +6,7 @@ import { humanizeApiError } from "../lib/errors";
 import { loadModelCache, saveModelCache, MODELS_TTL } from "../lib/models";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Kbd, KbdGroup } from "@/components/ui/kbd";
 import { Textarea } from "@/components/ui/textarea";
 import {
   Select,
@@ -376,9 +377,13 @@ export function ChatView() {
               </Button>
             )}
           </div>
-          <p className="mt-1.5 text-center text-[0.7rem] text-muted-foreground">
-            <kbd className="font-sans">Enter</kbd> to send · <kbd className="font-sans">Shift</kbd>+
-            <kbd className="font-sans">Enter</kbd> for newline
+          <p className="mt-1.5 flex items-center justify-center gap-1 text-[0.7rem] text-muted-foreground">
+            <Kbd>Enter</Kbd> to send ·{" "}
+            <KbdGroup>
+              <Kbd>Shift</Kbd>
+              <Kbd>Enter</Kbd>
+            </KbdGroup>{" "}
+            for newline
           </p>
         </form>
       </div>
