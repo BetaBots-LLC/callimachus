@@ -263,6 +263,7 @@ mod tests {
                     text: "how do I add fts5".into(),
                     tool_name: None,
                     ts: None,
+                    model: None,
                 },
                 MessageRow {
                     id: 2,
@@ -270,6 +271,7 @@ mod tests {
                     text: "use an external-content table".into(),
                     tool_name: None,
                     ts: None,
+                    model: None,
                 },
                 MessageRow {
                     id: 3,
@@ -277,6 +279,7 @@ mod tests {
                     text: "ok".into(),
                     tool_name: Some("Bash".into()),
                     ts: None,
+                    model: None,
                 },
             ],
         }

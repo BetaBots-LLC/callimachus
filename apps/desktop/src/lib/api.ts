@@ -14,6 +14,7 @@ export type SourceKind =
   | "cline"
   | "roo"
   | "kilo"
+  | "copilot"
   | "in_app";
 
 export interface DbStats {
@@ -81,6 +82,7 @@ export interface MessageRow {
   text: string;
   toolName: string | null;
   ts: number | null;
+  model: string | null;
 }
 
 export interface ThreadDetail {
@@ -576,6 +578,7 @@ export const SOURCE_LABELS: Record<SourceKind, string> = {
   cline: "Cline",
   roo: "Roo Code",
   kilo: "Kilo Code",
+  copilot: "Copilot Chat",
   in_app: "Chat",
 };
 
@@ -596,4 +599,5 @@ export const INDEXABLE_SOURCES: SourceKind[] = [
   "cline",
   "roo",
   "kilo",
+  "copilot",
 ];

@@ -348,8 +348,13 @@ const Message = memo(function Message({ m, highlight }: { m: MessageRow; highlig
         ring,
       )}
     >
-      <div className="mb-1 text-[0.68rem] uppercase tracking-wide text-muted-foreground">
-        {m.role}
+      <div className="mb-1 flex items-center gap-2 text-[0.68rem] uppercase tracking-wide text-muted-foreground">
+        <span>{m.role}</span>
+        {m.model && (
+          <span className="rounded bg-muted px-1.5 py-0.5 font-mono text-[0.62rem] normal-case text-foreground/70">
+            {m.model}
+          </span>
+        )}
       </div>
       <Markdown>{m.text}</Markdown>
     </div>

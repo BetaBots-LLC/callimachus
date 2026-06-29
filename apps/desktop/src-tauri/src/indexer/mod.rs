@@ -7,6 +7,7 @@ pub mod claude;
 pub mod cline;
 pub mod codex;
 pub mod continue_cli;
+pub mod copilot;
 pub mod cursor;
 pub mod gemini;
 pub mod goose;
@@ -73,7 +74,7 @@ pub fn scan_all_with_progress(
     mut on_progress: impl FnMut(usize, &str),
 ) -> Result<IndexReport> {
     type Scan = fn(&mut Connection, &mut dyn FnMut()) -> Result<IndexReport>;
-    let sources: [(&str, Scan); 11] = [
+    let sources: [(&str, Scan); 12] = [
         ("claude_code", claude::scan),
         ("codex", codex::scan),
         ("cursor", cursor::scan),
@@ -85,6 +86,7 @@ pub fn scan_all_with_progress(
         ("cline", cline::scan),
         ("roo", roo::scan),
         ("kilo", kilo::scan),
+        ("copilot", copilot::scan),
     ];
     // Progress is THREAD-granular, not source-granular: each source ticks once per thread
     // it processes (indexed OR skipped), so the bar keeps moving even while one big source
