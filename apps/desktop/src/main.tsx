@@ -51,6 +51,10 @@ void listen("distill:done", () => {
 // Background re-index finished — clear progress, refresh results/stats/button state.
 void listen("index:done", () => {
   queryClient.setQueryData(["index_progress"], null);
+  // A reindex has now completed at least once this session. The empty-state
+  // (Onboarding) reads this to say "no threads found" instead of re-offering the
+  // first-run "Index my history" button, which read as "nothing happened".
+  queryClient.setQueryData(["index_ran"], true);
   for (const key of ["results", "db_stats", "index_stats", "index_status"]) {
     void queryClient.invalidateQueries({ queryKey: [key] });
   }

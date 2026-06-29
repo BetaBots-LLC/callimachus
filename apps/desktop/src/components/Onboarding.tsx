@@ -25,8 +25,19 @@ export function Onboarding() {
     mutationFn: api.indexAll,
     onSuccess: () => qc.invalidateQueries({ queryKey: ["index_status"] }),
   });
+  // db_stats is the shared header cache (no extra fetch). `index_ran` is set by the
+  // index:done listener in main.tsx, so it's true once a reindex has finished this session.
+  const stats = useQuery({ queryKey: ["db_stats"], queryFn: api.dbStats });
+  const ran = useQuery<boolean>({
+    queryKey: ["index_ran"],
+    queryFn: () => qc.getQueryData<boolean>(["index_ran"]) ?? false,
+    staleTime: Number.POSITIVE_INFINITY,
+  });
 
   const busy = !!indexing.data || reindex.isPending;
+  // A reindex finished but the store is still empty → say so, instead of silently
+  // re-offering the same "Index my history" button (which read as "nothing happened").
+  const emptyAfterRun = !!ran.data && !busy && (stats.data?.threads ?? 0) === 0;
   const ip = progress.data;
   const source = ip?.current ? (SOURCE_LABELS[ip.current as SourceKind] ?? ip.current) : "…";
   // Determinate % when we have an estimated total (re-index); indeterminate on first run.
@@ -35,10 +46,13 @@ export function Onboarding() {
   return (
     <div className="mx-auto flex h-full w-full max-w-lg flex-col items-center justify-center gap-6 p-8 text-center">
       <div className="space-y-2">
-        <h1 className="text-2xl font-semibold tracking-tight">Welcome to Callimachus</h1>
+        <h1 className="text-2xl font-semibold tracking-tight">
+          {emptyAfterRun ? "No threads found" : "Welcome to Callimachus"}
+        </h1>
         <p className="text-sm text-muted-foreground">
-          One local, searchable index of every AI coding-agent conversation you've had. Let's build
-          it from your history on this machine.
+          {emptyAfterRun
+            ? "Callimachus scanned this machine for Claude Code, Codex, Cursor, and 8 more agents but found no history to index. If you just used one, reindex to pick it up."
+            : "One local, searchable index of every AI coding-agent conversation you've had. Let's build it from your history on this machine."}
         </p>
       </div>
 
@@ -58,7 +72,7 @@ export function Onboarding() {
         </div>
       ) : (
         <Button size="lg" onClick={() => reindex.mutate()}>
-          Index my history
+          {emptyAfterRun ? "Reindex" : "Index my history"}
         </Button>
       )}
 
