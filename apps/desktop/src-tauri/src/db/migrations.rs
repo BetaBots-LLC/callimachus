@@ -53,6 +53,8 @@ pub static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
         M::up(include_str!(
             "../../migrations/0023_thread_commits_sha_idx.sql"
         )),
+        // 0024 — VS Code-native / GitHub Copilot chat as a source (per-turn model).
+        M::up(include_str!("../../migrations/0024_copilot.sql")),
     ])
 });
 

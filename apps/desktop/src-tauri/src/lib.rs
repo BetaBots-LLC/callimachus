@@ -444,6 +444,7 @@ fn index_source(kind: String) -> AppResult<indexer::IndexReport> {
         "cline" => indexer::cline::scan(&mut conn, noop)?,
         "roo" => indexer::roo::scan(&mut conn, noop)?,
         "kilo" => indexer::kilo::scan(&mut conn, noop)?,
+        "copilot" => indexer::copilot::scan(&mut conn, noop)?,
         other => return Err(anyhow::anyhow!("unknown source kind: {other}").into()),
     };
     Ok(report)

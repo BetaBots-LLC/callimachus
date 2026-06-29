@@ -58,6 +58,8 @@ pub struct MessageRow {
     pub text: String,
     pub tool_name: Option<String>,
     pub ts: Option<i64>,
+    /// The model that produced this turn (assistant rows), when the source records it.
+    pub model: Option<String>,
 }
 
 /// Full thread detail.
@@ -762,7 +764,7 @@ pub fn thread_detail(conn: &Connection, thread_id: i64) -> Result<Option<ThreadD
     detail.tags = thread_tags(conn, thread_id)?;
 
     let mut stmt = conn.prepare(
-        "SELECT id, role, text, tool_name, ts FROM messages
+        "SELECT id, role, text, tool_name, ts, model FROM messages
          WHERE thread_id = ?1 ORDER BY seq",
     )?;
     let rows = stmt.query_map([thread_id], |r| {
@@ -772,6 +774,7 @@ pub fn thread_detail(conn: &Connection, thread_id: i64) -> Result<Option<ThreadD
             text: r.get(2)?,
             tool_name: r.get(3)?,
             ts: r.get(4)?,
+            model: r.get(5)?,
         })
     })?;
     detail.messages = rows.collect::<rusqlite::Result<Vec<_>>>()?;

@@ -58,6 +58,10 @@ fn watch_targets() -> Vec<(PathBuf, &'static str)> {
     for p in super::kilo::task_roots() {
         v.push((p, super::kilo::KIND));
     }
+    // VS Code-native / Copilot chat: each editor's workspaceStorage + emptyWindowChatSessions.
+    for p in super::copilot::watch_roots() {
+        v.push((p, super::copilot::KIND));
+    }
     v
 }
 
@@ -95,11 +99,17 @@ fn run(app: AppHandle) -> anyhow::Result<()> {
         let mut kinds = Vec::new();
         for ev in &events {
             for path in &ev.paths {
-                let s = path.to_string_lossy();
+                // Normalize to forward slashes so the substring routing below also
+                // matches on Windows, where to_string_lossy() yields backslashes.
+                let s = path.to_string_lossy().replace('\\', "/");
                 let kind = if s.contains("/.claude/") {
                     super::claude::KIND
                 } else if s.contains("/.codex/") {
                     super::codex::KIND
+                } else if s.contains("/chatSessions/") || s.contains("/emptyWindowChatSessions/") {
+                    // Must precede the editor-name checks: these live under <editor>/User,
+                    // so a Cursor chat path also contains "/Cursor/".
+                    super::copilot::KIND
                 } else if s.contains("/Cursor/") {
                     super::cursor::KIND
                 } else if s.contains("/.gemini/") {
