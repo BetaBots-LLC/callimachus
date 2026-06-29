@@ -1,5 +1,15 @@
 # callimachus
 
+## 0.9.0
+
+### Minor Changes
+
+- ff7caff: feat: add OpenCode SQLite session DB support — reads V1 tables from `opencode.db`, combines with legacy JSON tree when both exist (SQLite wins on conflict)
+
+### Patch Changes
+
+- 89534de: fix: Authenticode-sign the standalone Windows `cal` and `callimachus-mcp` binaries via Azure Trusted Signing. They previously bypassed the Tauri bundler's signCommand and shipped unsigned, tripping SmartScreen's "Unknown publisher" warning. Gated on the Azure secret, so it's a no-op until Trusted Signing is configured.
+
 ## 0.8.2
 
 ### Patch Changes
