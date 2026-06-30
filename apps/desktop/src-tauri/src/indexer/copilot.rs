@@ -1,10 +1,11 @@
 //! VS Code-native / GitHub Copilot chat indexer. VS Code and its forks (Cursor,
 //! VSCodium, Windsurf, Insiders) persist the built-in chat panel — whatever agent
 //! or model drives it, Copilot included — as one JSON file per session:
-//!   <editor>/User/workspaceStorage/<hash>/chatSessions/<uuid>.jsonl  (workspace chats)
-//!   <editor>/User/globalStorage/emptyWindowChatSessions/<uuid>.jsonl (no-folder chats)
+//!   <editor>/User/workspaceStorage/<hash>/chatSessions/<uuid>.{json,jsonl}  (workspace chats)
+//!   <editor>/User/globalStorage/emptyWindowChatSessions/<uuid>.{json,jsonl} (no-folder chats)
 //!
-//! Despite the `.jsonl` extension each file is a SINGLE JSON object `{ kind, v }`,
+//! The extension is `.json` on some VS Code versions/platforms and `.jsonl` on others,
+//! but each file is a SINGLE JSON object `{ kind, v }` regardless,
 //! where `v.requests[]` are the turns. Per request: `message.text` (the user turn),
 //! `response[]` (the assistant markdown), and `modelId` (e.g. "copilot/gpt-5.3-codex").
 //! The model is recorded per assistant message via the usage/model column, so a chat
@@ -93,7 +94,10 @@ fn index_dir(
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+        // Session files are `<uuid>.json` on some VS Code versions/platforms and
+        // `<uuid>.jsonl` on others; both hold the same single `{kind, v}` JSON.
+        let ext = path.extension().and_then(|e| e.to_str());
+        if ext != Some("json") && ext != Some("jsonl") {
             continue;
         }
         tick();
