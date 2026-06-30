@@ -1,5 +1,26 @@
 # callimachus
 
+## 0.9.1
+
+### Patch Changes
+
+- 9914f5d: feat: index VS Code-native / GitHub Copilot chat and capture per-message models. A new
+  `copilot` source reads `chatSessions` and `emptyWindowChatSessions` across VS Code-family
+  editors (Code, Cursor, VSCodium, Windsurf, Insiders), extracting user/assistant turns, the
+  project, timestamps, and the model that produced each assistant turn (e.g. `gpt-5.3-codex`).
+  The per-message model is now surfaced in the thread view. Also fixes the file watcher's
+  live-reindex routing on Windows (it matched forward-slash paths only), so auto-reindex now
+  works on Windows for every source.
+- 86ffcfc: fix(windows): resolve the index DB and per-agent data dirs with platform-correct
+  per-user paths. The DB location and every agent indexer were hardcoded to the
+  macOS `$HOME/Library/Application Support` layout. On Windows `$HOME` is normally
+  unset, so the DB path collapsed to a relative path under the install dir (e.g.
+  `C:\Program Files\Callimachus`), which a standard user cannot write: the app
+  crashed unless run as administrator, and indexing never found any agent data.
+  Now uses `dirs::data_local_dir` for the index and `dirs::home_dir` /
+  `dirs::config_dir` for agent discovery. macOS paths are byte-identical (no
+  migration); Windows and Linux now resolve correctly.
+
 ## 0.9.0
 
 ### Minor Changes
