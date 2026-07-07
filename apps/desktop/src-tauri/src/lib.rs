@@ -735,6 +735,23 @@ fn knowledge_config(pool: tauri::State<'_, db::ReadPool>) -> AppResult<knowledge
     Ok(knowledge::get_config(&conn)?)
 }
 
+/// Read a provider's saved custom base URL ("" = unset, use the provider default). Non-secret
+/// config; used for local Ollama pointed at a remote host and for Ollama Cloud / authed proxies.
+#[tauri::command]
+fn provider_base_url(pool: tauri::State<'_, db::ReadPool>, provider: String) -> AppResult<String> {
+    let conn = read(&pool)?;
+    Ok(knowledge::get_provider_base_url(&conn, &provider)?.unwrap_or_default())
+}
+
+/// Persist a provider's custom base URL. A blank string clears it (falls back to the default).
+#[tauri::command]
+fn set_provider_base_url(app: AppHandle, provider: String, url: String) -> AppResult<()> {
+    let db = app.state::<db::Db>();
+    let conn = lock(&db)?;
+    knowledge::set_provider_base_url(&conn, &provider, &url)?;
+    Ok(())
+}
+
 /// Toggle background auto-distillation. Turning it ON kicks an immediate drain.
 #[tauri::command]
 fn set_auto_distill(app: AppHandle, on: bool) -> AppResult<()> {
@@ -803,15 +820,23 @@ async fn distill_thread(
     thread_id: i64,
 ) -> AppResult<knowledge::ThreadKnowledge> {
     // Resolve engine + pack the transcript under the lock, then release it.
-    let (provider, model, key, packed) = {
+    let (provider, model, key, base_url, packed) = {
         let conn = lock(&db)?;
-        let (provider, model, key) = resolve_distill_engine(&conn)?;
+        let (provider, model, key, base_url) = resolve_distill_engine(&conn)?;
         let packed = context::pack_thread(&conn, thread_id, context::DEFAULT_BUDGET_CHARS)?
             .ok_or_else(|| anyhow::anyhow!("thread {thread_id} not found"))?;
-        (provider, model, key, packed)
+        (provider, model, key, base_url, packed)
     };
 
-    match agent::distill(&provider, &model, key.as_deref(), &packed).await {
+    match agent::distill(
+        &provider,
+        &model,
+        key.as_deref(),
+        base_url.as_deref(),
+        &packed,
+    )
+    .await
+    {
         Ok(distilled) => {
             {
                 let mut conn = lock(&db)?;
@@ -930,17 +955,24 @@ async fn detect_conflicts(
     pool: tauri::State<'_, db::ReadPool>,
     project: String,
 ) -> AppResult<Vec<Conflict>> {
-    let (provider, model, key, decisions) = {
+    let (provider, model, key, base_url, decisions) = {
         let conn = read(&pool)?;
-        let (provider, model, key) = resolve_distill_engine(&conn)?;
+        let (provider, model, key, base_url) = resolve_distill_engine(&conn)?;
         let decisions = knowledge::project_decisions(&conn, &project)?;
-        (provider, model, key, decisions)
+        (provider, model, key, base_url, decisions)
     };
     if decisions.len() < 2 {
         return Ok(Vec::new());
     }
     let texts: Vec<String> = decisions.iter().map(|(_, t)| t.clone()).collect();
-    let pairs = agent::find_conflicts(&provider, &model, key.as_deref(), &texts).await?;
+    let pairs = agent::find_conflicts(
+        &provider,
+        &model,
+        key.as_deref(),
+        base_url.as_deref(),
+        &texts,
+    )
+    .await?;
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for p in pairs {
@@ -1006,16 +1038,24 @@ fn format_memory_notes(m: &knowledge::ProjectMemory) -> String {
 /// enabled (it reuses the distill engine). Returns "" if there are no facts yet.
 #[tauri::command]
 async fn project_brief(pool: tauri::State<'_, db::ReadPool>, project: String) -> AppResult<String> {
-    let (provider, model, key, notes) = {
+    let (provider, model, key, base_url, notes) = {
         let conn = read(&pool)?;
-        let (provider, model, key) = resolve_distill_engine(&conn)?;
+        let (provider, model, key, base_url) = resolve_distill_engine(&conn)?;
         let mem = knowledge::get_project_memory(&conn, &project, 80)?;
-        (provider, model, key, format_memory_notes(&mem))
+        (provider, model, key, base_url, format_memory_notes(&mem))
     };
     if notes.trim().is_empty() {
         return Ok(String::new());
     }
-    Ok(agent::project_brief(&provider, &model, key.as_deref(), &project, &notes).await?)
+    Ok(agent::project_brief(
+        &provider,
+        &model,
+        key.as_deref(),
+        base_url.as_deref(),
+        &project,
+        &notes,
+    )
+    .await?)
 }
 
 /// Write a project's memory (optionally with an LLM brief) to `<project>/.callimachus/
@@ -1037,14 +1077,21 @@ async fn write_project_memory_file(
         (mem, engine)
     };
     let brief = match engine {
-        Some((provider, model, key)) => {
+        Some((provider, model, key, base_url)) => {
             let notes = format_memory_notes(&mem);
             if notes.trim().is_empty() {
                 None
             } else {
-                agent::project_brief(&provider, &model, key.as_deref(), &project, &notes)
-                    .await
-                    .ok()
+                agent::project_brief(
+                    &provider,
+                    &model,
+                    key.as_deref(),
+                    base_url.as_deref(),
+                    &project,
+                    &notes,
+                )
+                .await
+                .ok()
             }
         }
         None => None,
@@ -1134,7 +1181,7 @@ async fn run_distill(app: &AppHandle, ids: Vec<i64>) -> anyhow::Result<()> {
     }
     let db = app.state::<db::Db>();
     let embedder = app.state::<embed::Embedder>();
-    let (provider, model, key) = {
+    let (provider, model, key, base_url) = {
         let conn = lock_anyhow(&db)?;
         resolve_distill_engine(&conn)?
     };
@@ -1153,7 +1200,15 @@ async fn run_distill(app: &AppHandle, ids: Vec<i64>) -> anyhow::Result<()> {
             context::pack_thread(&conn, tid, context::DEFAULT_BUDGET_CHARS)?
         };
         let Some(packed) = packed else { continue };
-        match agent::distill(&provider, &model, key.as_deref(), &packed).await {
+        match agent::distill(
+            &provider,
+            &model,
+            key.as_deref(),
+            base_url.as_deref(),
+            &packed,
+        )
+        .await
+        {
             Ok(distilled) => {
                 {
                     let mut conn = lock_anyhow(&db)?;
@@ -1337,6 +1392,7 @@ pub struct AskPrep {
     pub provider: String,
     pub model: String,
     pub key: Option<String>,
+    pub base_url: Option<String>,
     pub context: String,
     pub sources: Vec<AskSource>,
 }
@@ -1350,7 +1406,7 @@ pub fn prepare_ask(
     question: &str,
     qv: Option<&[f32]>,
 ) -> anyhow::Result<Option<AskPrep>> {
-    let (provider, model, key) = resolve_distill_engine(conn)?;
+    let (provider, model, key, base_url) = resolve_distill_engine(conn)?;
     let filters = SearchFilters {
         limit: Some(30),
         ..Default::default()
@@ -1386,6 +1442,7 @@ pub fn prepare_ask(
         provider,
         model,
         key,
+        base_url,
         context,
         sources,
     }))
@@ -1419,6 +1476,7 @@ async fn ask_history(
         &prep.provider,
         &prep.model,
         prep.key.as_deref(),
+        prep.base_url.as_deref(),
         &q,
         &prep.context,
     )
@@ -1652,9 +1710,12 @@ const SYNTH_MODELS: &[(&str, &str)] = &[
     ("gemini", "gemini-2.5-flash"),
     ("openrouter", "anthropic/claude-sonnet-4.6"),
     ("ollama", "llama3.1"),
+    // Ollama Cloud (ollama.com). Small/cheap default; user-overridable in Settings.
+    ("ollama_cloud", "gemma3:4b"),
 ];
 
-/// First provider with a stored key (Ollama is keyless, so never auto-picked).
+/// First provider with a stored key (local `ollama` is keyless, so never auto-picked;
+/// `ollama_cloud` is keyed, so it can be).
 pub fn pick_synth_provider() -> Option<(&'static str, &'static str)> {
     SYNTH_MODELS
         .iter()
@@ -1716,12 +1777,13 @@ async fn cli_engines() -> Vec<agent::CliEngine> {
     agent::cli_engines().await
 }
 
-/// Resolve (provider, model, api_key) for distillation from the saved engine config,
-/// gated on distillation being enabled. Shared by the Tauri command and `cal distill`.
-/// Ollama is keyless; cloud providers must have a stored key.
+/// Resolve (provider, model, api_key, base_url) for distillation from the saved engine config,
+/// gated on distillation being enabled. Shared by the Tauri command and `cal distill`. Local
+/// Ollama is keyless; cloud providers (including Ollama Cloud) must have a stored key. `base_url`
+/// is the provider's optional saved custom endpoint (local Ollama host, Ollama Cloud / proxy).
 pub fn resolve_distill_engine(
     conn: &rusqlite::Connection,
-) -> anyhow::Result<(String, String, Option<String>)> {
+) -> anyhow::Result<(String, String, Option<String>, Option<String>)> {
     let cfg = knowledge::get_config(conn)?;
     if !cfg.enabled {
         anyhow::bail!("distillation is off — enable it in Settings (local Ollama or an API key)");
@@ -1733,7 +1795,8 @@ pub fn resolve_distill_engine(
     } else {
         secrets::get_key(&provider)?
     };
-    Ok((provider, model, key))
+    let base_url = knowledge::get_provider_base_url(conn, &provider)?;
+    Ok((provider, model, key, base_url))
 }
 
 /// Synthesized export: pack the thread, run the chosen (or first available) LLM to
@@ -1749,16 +1812,24 @@ async fn synthesize_export(
 ) -> AppResult<String> {
     let (provider, model) = resolve_synth(provider.as_deref(), model.as_deref())?;
     // Pull detail + packed transcript on a pooled read conn, dropped before the network call.
-    let (detail, packed) = {
+    let (detail, packed, base_url) = {
         let conn = read(&pool)?;
         let detail = search::thread_detail(&conn, thread_id)?
             .ok_or_else(|| anyhow::anyhow!("thread not found"))?;
         let packed = context::pack_thread(&conn, thread_id, context::DEFAULT_BUDGET_CHARS)?
             .ok_or_else(|| anyhow::anyhow!("thread not found"))?;
-        (detail, packed)
+        let base_url = knowledge::get_provider_base_url(&conn, &provider)?;
+        (detail, packed, base_url)
     };
     let key = secrets::get_key(&provider)?;
-    let synthesis = agent::synthesize(&provider, &model, key.as_deref(), &packed).await?;
+    let synthesis = agent::synthesize(
+        &provider,
+        &model,
+        key.as_deref(),
+        base_url.as_deref(),
+        &packed,
+    )
+    .await?;
     write_note(&detail, Some(&synthesis), &vault_dir)
 }
 
@@ -1986,6 +2057,8 @@ pub fn run() {
             list_tags,
             list_open_todos,
             knowledge_config,
+            provider_base_url,
+            set_provider_base_url,
             set_complete,
             coach_overview,
             set_knowledge_config,

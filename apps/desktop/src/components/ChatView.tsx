@@ -52,14 +52,12 @@ import { Markdown, StreamingMarkdown } from "./Markdown";
 export function ChatView() {
   const provider = useChat((s) => s.provider);
   const model = useChat((s) => s.model);
-  const baseUrl = useChat((s) => s.baseUrl);
   const messages = useChat((s) => s.messages);
   const loadingThread = useChat((s) => s.loadingThread);
   const error = useChat((s) => s.error);
 
   const setProvider = useChat((s) => s.setProvider);
   const setModel = useChat((s) => s.setModel);
-  const setBaseUrl = useChat((s) => s.setBaseUrl);
   const newChat = useChat((s) => s.newChat);
 
   const [draft, setDraft] = useState("");
@@ -68,6 +66,28 @@ export function ChatView() {
   // updates the instant we send, independent of the store flag's render timing.
   const [sending, setSending] = useState(false);
   const queryClient = useQueryClient();
+
+  // Local Ollama and Ollama Cloud take a custom endpoint, persisted per provider and shared with
+  // Settings. react-query is the source of truth (no store mirror): the saved URL feeds the model
+  // list and send directly; edits persist on blur and re-key the model list via invalidation.
+  const isOllamaLike = provider === "ollama" || provider === "ollama_cloud";
+  const savedBaseUrl = useQuery({
+    queryKey: ["providerBaseUrl", provider],
+    queryFn: () => api.providerBaseUrl(provider),
+    enabled: isOllamaLike,
+  });
+  const baseUrl = savedBaseUrl.data ?? "";
+  // `null` = not editing → show the saved value (updates live as the query resolves or the
+  // provider switches). While editing, this local draft overrides it, so an in-flight query
+  // result can never clobber what the user is typing.
+  const [urlEdit, setUrlEdit] = useState<string | null>(null);
+  const saveBaseUrl = useMutation({
+    mutationFn: (url: string) => api.setProviderBaseUrl(provider, url),
+    // Update the cache immediately so the box + model list reflect the new URL without waiting
+    // on the round-trip; the invalidate then reconciles with what the backend actually stored.
+    onMutate: (url: string) => queryClient.setQueryData(["providerBaseUrl", provider], url),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["providerBaseUrl", provider] }),
+  });
 
   const hasKey = useQuery({
     queryKey: ["hasKey", provider],
@@ -238,11 +258,21 @@ export function ChatView() {
               ))}
             </SelectContent>
           </Select>
-          {provider === "ollama" && (
+          {isOllamaLike && (
             <Input
-              value={baseUrl}
-              onChange={(e) => setBaseUrl(e.currentTarget.value)}
-              placeholder="http://localhost:11434"
+              // Controlled: show the saved URL, but a local draft overrides it while editing so an
+              // async query result never clobbers in-progress typing. Persist on blur — which fires
+              // before a provider switch, so it always writes under the correct provider.
+              value={urlEdit ?? baseUrl}
+              onChange={(e) => setUrlEdit(e.currentTarget.value)}
+              onBlur={(e) => {
+                const url = e.currentTarget.value.trim();
+                setUrlEdit(null);
+                if (url !== baseUrl) saveBaseUrl.mutate(url);
+              }}
+              placeholder={
+                provider === "ollama_cloud" ? "https://ollama.com" : "http://localhost:11434"
+              }
             />
           )}
           <Button size="sm" variant="outline" onClick={newChat}>

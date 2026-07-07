@@ -444,6 +444,11 @@ export const api = {
   setApiKey: (provider: string, key: string) => invoke<void>("set_api_key", { provider, key }),
   deleteApiKey: (provider: string) => invoke<void>("delete_api_key", { provider }),
   providerHasKey: (provider: string) => invoke<boolean>("provider_has_key", { provider }),
+  // Saved custom base URL for a provider ("" = use the provider default). Used by local Ollama
+  // (remote host) and Ollama Cloud / authed proxies.
+  providerBaseUrl: (provider: string) => invoke<string>("provider_base_url", { provider }),
+  setProviderBaseUrl: (provider: string, url: string) =>
+    invoke<void>("set_provider_base_url", { provider, url }),
   resumeThread: (threadId: number) => invoke<void>("resume_thread", { threadId }),
   threadContext: (threadId: number) => invoke<string>("thread_context", { threadId }),
   openThreadInCli: (threadId: number, program?: string) =>
@@ -552,6 +557,12 @@ export const PROVIDERS = [
     label: "Ollama (local)",
     defaultModel: "llama3.1",
     models: ["llama3.1", "qwen2.5-coder", "deepseek-r1", "mistral", "gemma2"],
+  },
+  {
+    id: "ollama_cloud",
+    label: "Ollama Cloud",
+    defaultModel: "gemma3:4b",
+    models: ["gemma3:4b", "gpt-oss:120b", "deepseek-v3.2", "qwen3-coder:480b"],
   },
 ] as const;
 

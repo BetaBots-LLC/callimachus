@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import { type ReactNode, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useDebouncedCallback } from "@tanstack/react-pacer";
 import {
@@ -377,6 +377,7 @@ function Field({ label, children }: { label: string; children: ReactNode }) {
 const DISTILL_ENGINES = [
   { id: "", label: "Auto (first API key)" },
   { id: "ollama", label: "Ollama (local · private)" },
+  { id: "ollama_cloud", label: "Ollama Cloud" },
   { id: "anthropic", label: "Anthropic" },
   { id: "openai", label: "OpenAI" },
   { id: "gemini", label: "Gemini" },
@@ -521,6 +522,25 @@ function ProviderRow({ id, label }: { id: string; label: string }) {
   const invalidate = () => queryClient.invalidateQueries({ queryKey: ["hasKey", id] });
   const remove = useMutation({ mutationFn: () => api.deleteApiKey(id), onSuccess: invalidate });
 
+  // Local Ollama and Ollama Cloud accept a custom server URL (persisted; shared with the chat
+  // header). Local Ollama is keyless; Ollama Cloud needs a key like any cloud provider.
+  const isOllamaLike = id === "ollama" || id === "ollama_cloud";
+  const baseUrl = useQuery({
+    queryKey: ["providerBaseUrl", id],
+    queryFn: () => api.providerBaseUrl(id),
+    enabled: isOllamaLike,
+  });
+  const saveUrl = useMutation({
+    mutationFn: (url: string) => api.setProviderBaseUrl(id, url),
+    // Reflect the new URL immediately (also mirrors to the chat header, same query key); the
+    // invalidate reconciles with what the backend actually stored.
+    onMutate: (url: string) => queryClient.setQueryData(["providerBaseUrl", id], url),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["providerBaseUrl", id] }),
+  });
+  // `null` = not editing → show the saved value; a local draft overrides it while typing so an
+  // in-flight query result can't clobber the input.
+  const [urlEdit, setUrlEdit] = useState<string | null>(null);
+
   const form = useAppForm({
     defaultValues: { key: "" },
     onSubmit: async ({ value }) => {
@@ -535,49 +555,68 @@ function ProviderRow({ id, label }: { id: string; label: string }) {
   // Fixed-width slots (label · status · input · Save · Remove) so a row never
   // reflows when a key is saved — Remove is always rendered, just hidden when unset.
   return (
-    <form
-      className="flex items-center gap-2 border-b pb-2 last:border-0"
-      onSubmit={(e) => {
-        e.preventDefault();
-        form.handleSubmit();
-      }}
-    >
-      <div className="flex w-40 shrink-0 items-center gap-2">
-        <span className="truncate text-sm">{label}</span>
-        {hasKey.data && (
-          <span className="rounded-full bg-emerald-500/15 px-2 py-0.5 text-[0.6rem] font-medium uppercase tracking-wide text-emerald-600 dark:text-emerald-400">
-            set
-          </span>
-        )}
-      </div>
-      <form.AppField name="key">
-        {(field) => (
-          <field.TextField
-            type="password"
-            className="ml-auto w-56"
-            placeholder={
-              id === "ollama"
-                ? "no key needed"
-                : hasKey.data
-                  ? "saved — type to replace"
-                  : "API key"
-            }
-            disabled={id === "ollama"}
-          />
-        )}
-      </form.AppField>
-      <form.AppForm>
-        <form.SubmitButton>Save</form.SubmitButton>
-      </form.AppForm>
-      <Button
-        size="sm"
-        variant="ghost"
-        type="button"
-        onClick={() => remove.mutate()}
-        className={hasKey.data ? "" : "invisible"}
+    <div className="space-y-2 border-b pb-2 last:border-0">
+      <form
+        className="flex items-center gap-2"
+        onSubmit={(e) => {
+          e.preventDefault();
+          form.handleSubmit();
+        }}
       >
-        Remove
-      </Button>
-    </form>
+        <div className="flex w-40 shrink-0 items-center gap-2">
+          <span className="truncate text-sm">{label}</span>
+          {hasKey.data && (
+            <span className="rounded-full bg-emerald-500/15 px-2 py-0.5 text-[0.6rem] font-medium uppercase tracking-wide text-emerald-600 dark:text-emerald-400">
+              set
+            </span>
+          )}
+        </div>
+        <form.AppField name="key">
+          {(field) => (
+            <field.TextField
+              type="password"
+              className="ml-auto w-56"
+              placeholder={
+                id === "ollama"
+                  ? "no key needed"
+                  : hasKey.data
+                    ? "saved — type to replace"
+                    : "API key"
+              }
+              disabled={id === "ollama"}
+            />
+          )}
+        </form.AppField>
+        <form.AppForm>
+          <form.SubmitButton>Save</form.SubmitButton>
+        </form.AppForm>
+        <Button
+          size="sm"
+          variant="ghost"
+          type="button"
+          onClick={() => remove.mutate()}
+          className={hasKey.data ? "" : "invisible"}
+        >
+          Remove
+        </Button>
+      </form>
+      {isOllamaLike && (
+        <div className="flex items-center gap-2">
+          <span className="w-40 shrink-0 text-xs text-muted-foreground">Server URL</span>
+          <Input
+            value={urlEdit ?? (baseUrl.data ?? "")}
+            onChange={(e) => setUrlEdit(e.target.value)}
+            onBlur={(e) => {
+              const url = e.target.value.trim();
+              setUrlEdit(null);
+              if (url !== (baseUrl.data ?? "")) saveUrl.mutate(url);
+            }}
+            placeholder={id === "ollama_cloud" ? "https://ollama.com" : "http://localhost:11434"}
+            spellCheck={false}
+            className="ml-auto w-56"
+          />
+        </div>
+      )}
+    </div>
   );
 }

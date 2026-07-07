@@ -7,7 +7,8 @@ export function humanizeApiError(raw: string, provider: string, model: string): 
   const has = (...keys: string[]) => keys.some((k) => low.includes(k));
   // The provider's own human message, if the body carried one.
   const detail = s.match(/"message"\s*:\s*"([^"]+)"/)?.[1];
-  const name = cap(provider);
+  // Underscored ids (e.g. ollama_cloud) don't title-case cleanly — give it its real label.
+  const name = provider === "ollama_cloud" ? "Ollama Cloud" : cap(provider);
 
   if (has("not_found", "404", "not available", "does not exist", "no such model")) {
     return `Model "${model}" isn't available on ${name}${detail ? ` — ${detail}` : "."} Pick another from the dropdown.`;

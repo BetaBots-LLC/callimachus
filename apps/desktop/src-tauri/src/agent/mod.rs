@@ -13,8 +13,8 @@ use genai::chat::{
     ChatMessage as GMessage, ChatOptions, ChatRequest, ChatStreamEvent, Tool, ToolCall,
     ToolResponse,
 };
-use genai::resolver::AuthData;
-use genai::Client;
+use genai::resolver::{AuthData, Endpoint, ServiceTargetResolver};
+use genai::{Client, ServiceTarget};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -105,8 +105,56 @@ fn adapter_for(provider: &str) -> Result<AdapterKind> {
         "openrouter" => AdapterKind::OpenRouter,
         "gemini" => AdapterKind::Gemini,
         "ollama" => AdapterKind::Ollama,
+        // Ollama Cloud (ollama.com): native Ollama protocol with Bearer auth. Distinct genai
+        // adapter from local `ollama`, which never sends an Authorization header.
+        "ollama_cloud" => AdapterKind::OllamaCloud,
         other => bail!("unknown provider: {other}"),
     })
+}
+
+/// Build a genai client for a keyed/keyless provider, applying an optional custom endpoint
+/// (`base_url`) and API key. genai builds request URLs as `{base_url}api/...`, so a custom
+/// URL is normalized to end with `/`. When a custom endpoint is set we route through a
+/// `ServiceTargetResolver` — the only hook that overrides the endpoint — and inject the key
+/// as the request auth there; otherwise the key flows through the normal auth resolver
+/// (which also covers Ollama Cloud at its default `https://ollama.com/`). This is what lets
+/// local Ollama point at a remote host and Ollama Cloud reach a custom/self-hosted endpoint.
+fn build_client(provider: &str, api_key: Option<&str>, base_url: Option<&str>) -> Result<Client> {
+    let adapter = adapter_for(provider)?;
+    let key = api_key.map(str::to_string);
+    let endpoint = base_url.map(str::trim).filter(|b| !b.is_empty()).map(|b| {
+        if b.ends_with('/') {
+            b.to_string()
+        } else {
+            format!("{b}/")
+        }
+    });
+
+    let builder = Client::builder().with_adapter_kind(adapter);
+    let client = match endpoint {
+        Some(url) => {
+            // Override the endpoint, and (when present) set the key as the request auth so
+            // Bearer-authenticated endpoints (Ollama Cloud, authed proxies) work.
+            let resolver = ServiceTargetResolver::from_resolver_fn(
+                move |st: ServiceTarget| -> std::result::Result<ServiceTarget, genai::resolver::Error> {
+                    let ServiceTarget { auth, model, .. } = st;
+                    let endpoint = Endpoint::from_owned(url.clone());
+                    let auth = match &key {
+                        Some(k) => AuthData::from_single(k.clone()),
+                        None => auth,
+                    };
+                    Ok(ServiceTarget { endpoint, auth, model })
+                },
+            );
+            builder.with_service_target_resolver(resolver).build()
+        }
+        None => builder
+            .with_auth_resolver_fn(move |_iden: genai::ModelIden| {
+                Ok(key.clone().map(AuthData::from_single))
+            })
+            .build(),
+    };
+    Ok(client)
 }
 
 /// A non-interactive CLI LLM backend: runs the user's logged-in agent CLI (Claude Code, Codex)
@@ -387,10 +435,12 @@ where
 
 /// One non-streaming completion, routed to the user's CLI (keyless) or to genai (keyed). The CLI
 /// path has no separate system slot, so `system` and `user` are flattened into one prompt.
+#[allow(clippy::too_many_arguments)] // provider/model/key/base_url/system/user/temp/max — all distinct
 async fn complete(
     provider: &str,
     model: &str,
     api_key: Option<&str>,
+    base_url: Option<&str>,
     system: &str,
     user: &str,
     temperature: f64,
@@ -399,14 +449,7 @@ async fn complete(
     if is_cli_provider(provider) {
         return cli_complete(provider, model, &format!("{system}\n\n{user}")).await;
     }
-    let adapter = adapter_for(provider)?;
-    let key = api_key.map(str::to_string);
-    let client = Client::builder()
-        .with_adapter_kind(adapter)
-        .with_auth_resolver_fn(move |_iden: genai::ModelIden| {
-            Ok(key.clone().map(AuthData::from_single))
-        })
-        .build();
+    let client = build_client(provider, api_key, base_url)?;
     let req = ChatRequest::new(Vec::new())
         .with_system(system)
         .append_message(GMessage::user(user.to_string()));
@@ -441,10 +484,21 @@ pub async fn synthesize(
     provider: &str,
     model: &str,
     api_key: Option<&str>,
+    base_url: Option<&str>,
     transcript: &str,
 ) -> Result<String> {
     let user = format!("Transcript:\n\n{transcript}");
-    complete(provider, model, api_key, SYNTH_SYSTEM, &user, 0.2, 1500).await
+    complete(
+        provider,
+        model,
+        api_key,
+        base_url,
+        SYNTH_SYSTEM,
+        &user,
+        0.2,
+        1500,
+    )
+    .await
 }
 
 /// System prompt for "ask your history" — RAG over the user's own past sessions.
@@ -459,11 +513,22 @@ pub async fn answer(
     provider: &str,
     model: &str,
     api_key: Option<&str>,
+    base_url: Option<&str>,
     question: &str,
     context: &str,
 ) -> Result<String> {
     let user = format!("Question: {question}\n\nExcerpts from past sessions:\n\n{context}");
-    complete(provider, model, api_key, ANSWER_SYSTEM, &user, 0.2, 900).await
+    complete(
+        provider,
+        model,
+        api_key,
+        base_url,
+        ANSWER_SYSTEM,
+        &user,
+        0.2,
+        900,
+    )
+    .await
 }
 
 /// System prompt for the project-memory brief — a tight orientation built from facts
@@ -481,11 +546,22 @@ pub async fn project_brief(
     provider: &str,
     model: &str,
     api_key: Option<&str>,
+    base_url: Option<&str>,
     project: &str,
     notes: &str,
 ) -> Result<String> {
     let user = format!("Project: {project}\n\nDistilled notes:\n\n{notes}");
-    complete(provider, model, api_key, BRIEF_SYSTEM, &user, 0.2, 900).await
+    complete(
+        provider,
+        model,
+        api_key,
+        base_url,
+        BRIEF_SYSTEM,
+        &user,
+        0.2,
+        900,
+    )
+    .await
 }
 
 /// System prompt for conflict review over a project's distilled decisions.
@@ -511,6 +587,7 @@ pub async fn find_conflicts(
     provider: &str,
     model: &str,
     api_key: Option<&str>,
+    base_url: Option<&str>,
     decisions: &[String],
 ) -> Result<Vec<ConflictPair>> {
     let list = decisions
@@ -520,7 +597,17 @@ pub async fn find_conflicts(
         .collect::<Vec<_>>()
         .join("\n");
     let user = format!("Decisions:\n{list}");
-    let text = complete(provider, model, api_key, CONFLICT_SYSTEM, &user, 0.1, 800).await?;
+    let text = complete(
+        provider,
+        model,
+        api_key,
+        base_url,
+        CONFLICT_SYSTEM,
+        &user,
+        0.1,
+        800,
+    )
+    .await?;
     Ok(parse_conflicts(&text))
 }
 
@@ -574,10 +661,21 @@ pub async fn distill(
     provider: &str,
     model: &str,
     api_key: Option<&str>,
+    base_url: Option<&str>,
     transcript: &str,
 ) -> Result<Distilled> {
     let user = format!("Transcript:\n\n{transcript}");
-    let text = complete(provider, model, api_key, DISTILL_SYSTEM, &user, 0.1, 1200).await?;
+    let text = complete(
+        provider,
+        model,
+        api_key,
+        base_url,
+        DISTILL_SYSTEM,
+        &user,
+        0.1,
+        1200,
+    )
+    .await?;
     Ok(parse_distilled(&text))
 }
 
@@ -631,7 +729,7 @@ commands minimal and read-only where possible. Each command needs the user's app
 pub async fn chat_stream<F, E, Fut>(
     provider: &str,
     model: &str,
-    _base_url: Option<&str>,
+    base_url: Option<&str>,
     api_key: Option<&str>,
     messages: &[ChatMessage],
     tools: Vec<Tool>,
@@ -673,14 +771,7 @@ where
         return cli_stream(provider, model, &prompt, &cancel, on_token).await;
     }
 
-    let adapter = adapter_for(provider)?;
-    let key = api_key.map(str::to_string);
-    let client = Client::builder()
-        .with_adapter_kind(adapter)
-        .with_auth_resolver_fn(move |_iden: genai::ModelIden| {
-            Ok(key.clone().map(AuthData::from_single))
-        })
-        .build();
+    let client = build_client(provider, api_key, base_url)?;
 
     // Split system messages out (genai takes system separately); map the rest.
     let mut system = String::from(CHAT_SYSTEM);
@@ -899,43 +990,55 @@ pub async fn list_models(
                 .json()
                 .await?
         }
-        "ollama" => {
+        "ollama" | "ollama_cloud" => {
+            let default = if provider == "ollama_cloud" {
+                "https://ollama.com"
+            } else {
+                "http://localhost:11434"
+            };
+            // The native tags API is called as `{base}/api/tags`, so trim any trailing slash the
+            // user saved (genai's chat path wants the slash; this one supplies it).
             let base = base_url
+                .map(str::trim)
                 .filter(|b| !b.is_empty())
-                .unwrap_or("http://localhost:11434");
-            client
-                .get(format!("{base}/api/tags"))
-                .send()
-                .await?
-                .error_for_status()?
-                .json()
-                .await?
+                .unwrap_or(default)
+                .trim_end_matches('/');
+            let mut req = client.get(format!("{base}/api/tags"));
+            // Only Ollama Cloud authenticates; local Ollama ignores auth. Never forward a key to
+            // it — a stray `ollama` key must not leak as a Bearer token to a custom local host.
+            if provider == "ollama_cloud" {
+                if let Some(key) = api_key {
+                    req = req.bearer_auth(key);
+                }
+            }
+            req.send().await?.error_for_status()?.json().await?
         }
         other => bail!("unknown provider: {other}"),
     };
 
     // Ollama and Gemini use `models[].name`; the OpenAI-style APIs use `data[].id`.
-    let mut ids: Vec<String> = if provider == "ollama" || provider == "gemini" {
-        json.get("models")
-            .and_then(Value::as_array)
-            .map(|a| {
-                a.iter()
-                    .filter_map(|m| m.get("name").and_then(Value::as_str))
-                    // Gemini returns "models/gemini-..."; genai wants the bare id.
-                    .map(|n| n.strip_prefix("models/").unwrap_or(n).to_string())
-                    .collect()
-            })
-            .unwrap_or_default()
-    } else {
-        json.get("data")
-            .and_then(Value::as_array)
-            .map(|a| {
-                a.iter()
-                    .filter_map(|m| m.get("id").and_then(Value::as_str).map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
+    let mut ids: Vec<String> =
+        if provider == "ollama" || provider == "ollama_cloud" || provider == "gemini" {
+            json.get("models")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|m| m.get("name").and_then(Value::as_str))
+                        // Gemini returns "models/gemini-..."; genai wants the bare id.
+                        .map(|n| n.strip_prefix("models/").unwrap_or(n).to_string())
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            json.get("data")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|m| m.get("id").and_then(Value::as_str).map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
     ids.sort();
     ids.dedup();
     Ok(ids)
@@ -951,6 +1054,7 @@ mod tests {
         assert!(adapter_for("openai").is_ok());
         assert!(adapter_for("openrouter").is_ok());
         assert!(adapter_for("ollama").is_ok());
+        assert!(adapter_for("ollama_cloud").is_ok());
         assert!(adapter_for("bogus").is_err());
     }
 
@@ -972,7 +1076,9 @@ mod tests {
         let transcript = "User: how do I activate a python venv?\n\
             Assistant: Run `source .venv/bin/activate`. We decided to use a per-project venv. \
             Gotcha: the fish shell needs `activate.fish`, not the bash script.";
-        let d = distill("claude-cli", "", None, transcript).await.unwrap();
+        let d = distill("claude-cli", "", None, None, transcript)
+            .await
+            .unwrap();
         eprintln!("summary: {}", d.summary);
         eprintln!("decisions: {:?}", d.decisions);
         eprintln!("gotchas: {:?}", d.gotchas);

@@ -623,6 +623,7 @@ impl Callimachus {
             &prep.provider,
             &prep.model,
             prep.key.as_deref(),
+            prep.base_url.as_deref(),
             &q,
             &prep.context,
         )
