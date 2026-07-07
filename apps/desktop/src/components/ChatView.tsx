@@ -1,4 +1,4 @@
-import { memo, useState } from "react";
+import { memo, useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, type ChatChunk, PROVIDERS } from "../lib/api";
 import { useChat, type StreamPart, type ToolStep } from "../store/chat";
@@ -68,6 +68,24 @@ export function ChatView() {
   // updates the instant we send, independent of the store flag's render timing.
   const [sending, setSending] = useState(false);
   const queryClient = useQueryClient();
+
+  // Local Ollama and Ollama Cloud take a custom endpoint. The chat header box mirrors the
+  // persisted Settings value: seed it when the provider changes, and write edits back.
+  const isOllamaLike = provider === "ollama" || provider === "ollama_cloud";
+  const savedBaseUrl = useQuery({
+    queryKey: ["providerBaseUrl", provider],
+    queryFn: () => api.providerBaseUrl(provider),
+    enabled: isOllamaLike,
+  });
+  useEffect(() => {
+    if (isOllamaLike) {
+      if (savedBaseUrl.data !== undefined) setBaseUrl(savedBaseUrl.data);
+    } else {
+      setBaseUrl("");
+    }
+    // Seed once per provider; `setBaseUrl` is a stable zustand action.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [provider, savedBaseUrl.data]);
 
   const hasKey = useQuery({
     queryKey: ["hasKey", provider],
@@ -238,11 +256,16 @@ export function ChatView() {
               ))}
             </SelectContent>
           </Select>
-          {provider === "ollama" && (
+          {isOllamaLike && (
             <Input
               value={baseUrl}
+              // Live edits drive the model list + send immediately; persist on blur (which fires
+              // before a provider switch, so it always writes under the correct provider).
               onChange={(e) => setBaseUrl(e.currentTarget.value)}
-              placeholder="http://localhost:11434"
+              onBlur={(e) => void api.setProviderBaseUrl(provider, e.currentTarget.value.trim())}
+              placeholder={
+                provider === "ollama_cloud" ? "https://ollama.com" : "http://localhost:11434"
+              }
             />
           )}
           <Button size="sm" variant="outline" onClick={newChat}>

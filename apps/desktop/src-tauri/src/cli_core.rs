@@ -508,12 +508,18 @@ fn cmd_distill(args: &[String]) -> anyhow::Result<()> {
     let o = parse(args)?;
     let id = thread_id_arg(&o, "distill")?;
     let mut conn = open_db_write()?;
-    let (provider, model, key) = crate::resolve_distill_engine(&conn)?;
+    let (provider, model, key, base_url) = crate::resolve_distill_engine(&conn)?;
     let packed = context::pack_thread(&conn, id, context::DEFAULT_BUDGET_CHARS)?
         .ok_or_else(|| anyhow::anyhow!("thread {id} not found"))?;
     eprintln!("distilling thread {id} with {provider}/{model}…");
     let rt = tokio::runtime::Runtime::new()?;
-    let distilled = rt.block_on(agent::distill(&provider, &model, key.as_deref(), &packed))?;
+    let distilled = rt.block_on(agent::distill(
+        &provider,
+        &model,
+        key.as_deref(),
+        base_url.as_deref(),
+        &packed,
+    ))?;
     let now = chrono::Utc::now().timestamp();
     knowledge::store_distilled(&mut conn, id, &distilled, now)?;
     print_knowledge(&knowledge::get_thread_knowledge(&conn, id)?);
@@ -919,6 +925,7 @@ fn cmd_ask(args: &[String]) -> anyhow::Result<()> {
         &prep.provider,
         &prep.model,
         prep.key.as_deref(),
+        prep.base_url.as_deref(),
         &question,
         &prep.context,
     ))?;
@@ -1081,11 +1088,18 @@ fn cmd_export(args: &[String]) -> anyhow::Result<()> {
         let (provider, model) = crate::pick_synth_provider()
             .ok_or_else(|| anyhow::anyhow!("--synthesize needs an API key; add one in the app"))?;
         let key = secrets::get_key(provider)?;
+        let base_url = knowledge::get_provider_base_url(&conn, provider)?;
         let packed = context::pack_thread(&conn, id, context::DEFAULT_BUDGET_CHARS)?
             .ok_or_else(|| anyhow::anyhow!("thread {id} not found"))?;
         eprintln!("synthesizing with {provider}/{model}…");
         let rt = tokio::runtime::Runtime::new()?;
-        Some(rt.block_on(agent::synthesize(provider, model, key.as_deref(), &packed))?)
+        Some(rt.block_on(agent::synthesize(
+            provider,
+            model,
+            key.as_deref(),
+            base_url.as_deref(),
+            &packed,
+        ))?)
     } else {
         None
     };

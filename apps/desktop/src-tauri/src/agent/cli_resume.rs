@@ -200,6 +200,7 @@ mod tests {
         assert!(resume_command("in_app", "x", false, None).is_err());
     }
 
+    #[cfg(target_os = "macos")] // build_shell_command is macOS-only
     #[test]
     fn shell_command_quotes_paths_with_spaces() {
         let cmd = ResumeCommand {
@@ -214,6 +215,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")] // applescript_escape is macOS-only
     #[test]
     fn applescript_escapes_quotes() {
         assert_eq!(applescript_escape(r#"a "b" \c"#), r#"a \"b\" \\c"#);

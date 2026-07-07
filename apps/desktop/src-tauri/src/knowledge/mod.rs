@@ -326,6 +326,23 @@ pub fn set_auto_distill(conn: &Connection, on: bool) -> Result<()> {
     Ok(())
 }
 
+/// Read a provider's saved custom base URL (unset / blank -> None). Non-secret config; API
+/// keys live in the OS keychain. Used for local Ollama pointed at a remote host, and for
+/// Ollama Cloud / authenticated proxies (paired with a keychain key).
+pub fn get_provider_base_url(conn: &Connection, provider: &str) -> Result<Option<String>> {
+    Ok(config_get(conn, &format!("provider.{provider}.base_url"))?.filter(|s| !s.trim().is_empty()))
+}
+
+/// Persist a provider's custom base URL. A blank string clears it (falls back to the default).
+pub fn set_provider_base_url(conn: &Connection, provider: &str, url: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO app_config (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = ?2",
+        params![format!("provider.{provider}.base_url"), url.trim()],
+    )?;
+    Ok(())
+}
+
 /// Persist the distillation config. Enabling it is the user's consent to send thread
 /// text to the chosen engine (cloud key) — or to keep it local (Ollama).
 pub fn set_config(

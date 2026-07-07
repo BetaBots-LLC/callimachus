@@ -15,8 +15,11 @@ Callimachus is **local-first**. Specifically:
   features: (1) the **in-app chat**, (2) **Knowledge distillation** (`agent::distill`)
   of decisions, gotchas, and summaries, and (3) **Ask your history / RAG**
   (`agent::answer`). Choosing **local Ollama** keeps distillation and Ask fully
-  on-device. Indexing, search, and embeddings are **always local** regardless of
-  which engine you pick.
+  on-device — even with a custom server URL, as long as it points at a host you
+  control. **Ollama Cloud** (ollama.com) is a cloud provider like any other: picking
+  it sends conversation content off your machine to Ollama's hosted service, keyed by
+  your Ollama API key. Indexing, search, and embeddings are **always local** regardless
+  of which engine you pick.
 - The in-app agent's `run_shell` tool requires **explicit per-command approval**
   before anything executes.
 
