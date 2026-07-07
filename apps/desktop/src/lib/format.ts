@@ -25,9 +25,22 @@ export function renderSnippet(snippet: string): string {
   return escaped.split(MARK_START).join("<mark>").split(MARK_END).join("</mark>");
 }
 
+// USD spend formatter: thousands separators + cents, with a sub-cent floor so a
+// tiny-but-nonzero estimate reads as "<$0.01" instead of collapsing to "$0.00".
+export function formatUsd(n: number): string {
+  if (n <= 0) return "$0.00";
+  if (n < 0.01) return "<$0.01";
+  return n.toLocaleString("en-US", {
+    style: "currency",
+    currency: "USD",
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
+}
+
 // Shorten a long absolute project path to its last two segments.
 export function shortPath(path: string | null): string {
   if (!path) return "";
   const parts = path.split("/").filter(Boolean);
-  return parts.length <= 2 ? path : "…/" + parts.slice(-2).join("/");
+  return parts.length <= 2 ? path : `…/${parts.slice(-2).join("/")}`;
 }

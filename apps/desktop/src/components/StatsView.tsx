@@ -1,7 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { api, SOURCE_LABELS, type SourceKind } from "../lib/api";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { formatTime, shortPath } from "../lib/format";
+import { formatTime, formatUsd, shortPath } from "../lib/format";
 import { Loading } from "./Loading";
 
 export function StatsView() {
@@ -108,7 +108,6 @@ export function StatsView() {
 function SpendCard() {
   const { data } = useQuery({ queryKey: ["spend"], queryFn: () => api.spend() });
   if (!data) return null;
-  const usd = (n: number) => `$${n.toFixed(2)}`;
 
   if (data.trackedCalls === 0 && data.untrackedCalls === 0) {
     return (
@@ -132,7 +131,7 @@ function SpendCard() {
       <CardHeader>
         <CardTitle className="flex items-baseline justify-between">
           <span>Spend (estimate)</span>
-          <span className="text-2xl font-semibold tabular-nums">{usd(data.totalCost)}</span>
+          <span className="text-2xl font-semibold tabular-nums">{formatUsd(data.totalCost)}</span>
         </CardTitle>
       </CardHeader>
       <CardContent className="space-y-4">
@@ -143,7 +142,7 @@ function SpendCard() {
               <div key={m.model} className="flex items-baseline justify-between gap-2 text-sm">
                 <span className="truncate">{m.model}</span>
                 <span className="shrink-0 tabular-nums text-muted-foreground">
-                  {usd(m.cost)} · {m.calls.toLocaleString()} calls
+                  {formatUsd(m.cost)} · {m.calls.toLocaleString()} calls
                 </span>
               </div>
             ))}
@@ -159,7 +158,7 @@ function SpendCard() {
                   <span className="truncate" title={t.title ?? undefined}>
                     {t.title || `Thread #${t.threadId}`}
                   </span>
-                  <span className="shrink-0 tabular-nums text-muted-foreground">{usd(t.cost)}</span>
+                  <span className="shrink-0 tabular-nums text-muted-foreground">{formatUsd(t.cost)}</span>
                 </div>
               ))}
             </div>
