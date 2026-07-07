@@ -268,10 +268,12 @@ mod tests {
         assert!(price_for("claude-haiku-4-5").is_some());
         assert!(price_for("gpt-5").is_some());
         assert!(price_for("some-unknown-local-model").is_none());
-        // Fable/Mythos are priced, not left untracked.
+        // Fable/Mythos are priced, not left untracked; guard the cache ratios (1.25×/0.1×).
         let fable = price_for("claude-fable-5").unwrap();
         assert_eq!(fable.input, 10.0);
         assert_eq!(fable.output, 50.0);
+        assert_eq!(fable.cache_write, 12.5);
+        assert_eq!(fable.cache_read, 1.0);
         assert!(price_for("claude-mythos-5").is_some());
     }
 
