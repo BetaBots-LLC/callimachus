@@ -24,7 +24,9 @@ use search::{SearchFilters, SearchHit, ThreadDetail, ThreadSummary};
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::{AppHandle, Emitter, Manager, WindowEvent};
 
 /// Guards against launching more than one background embedding job at a time.
 #[derive(Default)]
@@ -38,6 +40,12 @@ struct IndexJob(AtomicBool);
 /// (via `cancel_distill`) also signals the running job to stop.
 #[derive(Default)]
 struct DistillJob(AtomicBool);
+
+/// Live mirror of the `window.close_to_tray` preference, so the window-close handler can
+/// decide without touching the DB on every close. Seeded at startup, kept in sync by
+/// `set_close_to_tray`.
+#[derive(Default)]
+struct CloseToTray(AtomicBool);
 
 /// Tracks frontend + backend startup readiness so the splash window is dismissed only
 /// once BOTH are ready (the Tauri splashscreen pattern).
@@ -1953,6 +1961,86 @@ fn uninstall_agent_integrations() -> AppResult<()> {
     Ok(())
 }
 
+/// Stable id for the tray icon, so it can be added on enable and removed on disable.
+const TRAY_ID: &str = "close-to-tray";
+
+/// Show + focus the main window (used to restore it from the tray).
+fn reveal_main_window(app: &AppHandle) {
+    if let Some(win) = app.get_webview_window("main") {
+        let _ = win.show();
+        let _ = win.unminimize();
+        let _ = win.set_focus();
+    }
+}
+
+/// Put the tray icon up (idempotent): a Show / Quit menu, with a left-click restoring the
+/// window. Present only while close-to-tray is enabled.
+fn show_tray(app: &AppHandle) -> tauri::Result<()> {
+    if app.tray_by_id(TRAY_ID).is_some() {
+        return Ok(()); // already showing
+    }
+    let show = MenuItem::with_id(app, "tray-show", "Show Callimachus", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "tray-quit", "Quit", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&show, &quit])?;
+    let mut builder = TrayIconBuilder::with_id(TRAY_ID)
+        .tooltip("Callimachus")
+        .menu(&menu)
+        // Left-click restores the window; the menu opens on right-click.
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "tray-show" => reveal_main_window(app),
+            "tray-quit" => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                reveal_main_window(tray.app_handle());
+            }
+        });
+    if let Some(icon) = app.default_window_icon().cloned() {
+        builder = builder.icon(icon);
+    }
+    builder.build(app)?;
+    Ok(())
+}
+
+/// Remove the tray icon (no-op if it isn't showing).
+fn hide_tray(app: &AppHandle) {
+    app.remove_tray_by_id(TRAY_ID);
+}
+
+/// Whether the main window hides to the system tray on close (vs. quitting).
+#[tauri::command]
+fn get_close_to_tray(pool: tauri::State<'_, db::ReadPool>) -> AppResult<bool> {
+    let conn = read(&pool)?;
+    Ok(knowledge::get_close_to_tray(&conn)?)
+}
+
+/// Toggle close-to-tray: persist the pref, update the live flag the close handler reads,
+/// and add/remove the tray icon (shown only while enabled).
+#[tauri::command]
+fn set_close_to_tray(app: AppHandle, on: bool) -> AppResult<()> {
+    {
+        let db = app.state::<db::Db>();
+        let conn = lock(&db)?;
+        knowledge::set_close_to_tray(&conn, on)?;
+    }
+    app.state::<CloseToTray>().0.store(on, Ordering::Relaxed);
+    if on {
+        if let Err(e) = show_tray(&app) {
+            eprintln!("[tray] failed to create tray icon: {e}");
+        }
+    } else {
+        hide_tray(&app);
+    }
+    Ok(())
+}
+
 pub fn run() {
     let mut builder = tauri::Builder::default().plugin(tauri_plugin_opener::init());
 
@@ -1981,6 +2069,8 @@ pub fn run() {
             if let Err(e) = indexer::backfill_project_keys(&conn) {
                 eprintln!("[index] project-key backfill: {e}");
             }
+            // Read the close-to-tray pref before `conn` is moved into the managed writer.
+            let close_to_tray_on = knowledge::get_close_to_tray(&conn).unwrap_or(false);
             app.manage(db::Db(Mutex::new(conn)));
             // Read pool (after the writer migrated): UI read commands run concurrently
             // here instead of serializing behind the writer mutex.
@@ -1995,6 +2085,14 @@ pub fn run() {
             app.manage(SetupState::default());
             app.manage(ChatGeneration::default());
             app.manage(PendingApprovals::default());
+            // Close-to-tray: cache the pref for the window-close handler, and if it's
+            // already on, put the tray icon up now so a hidden window can be restored.
+            app.manage(CloseToTray(AtomicBool::new(close_to_tray_on)));
+            if close_to_tray_on {
+                if let Err(e) = show_tray(app.handle()) {
+                    eprintln!("[tray] startup: {e}");
+                }
+            }
             // Background watcher keeps the index fresh as agents write new threads.
             indexer::watcher::spawn(app.handle().clone());
             // Drain any distilled facts that aren't embedded yet (e.g. distilled before
@@ -2015,6 +2113,22 @@ pub fn run() {
             // backend is ready. The splash stays up until the frontend also signals ready.
             complete_setup(app.handle(), "backend");
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            // Close-to-tray: intercept the MAIN window's close and hide it instead of
+            // quitting, when the pref is on. Other windows (splash) close normally.
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                if window.label() == "main"
+                    && window
+                        .app_handle()
+                        .state::<CloseToTray>()
+                        .0
+                        .load(Ordering::Relaxed)
+                {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
         })
         .invoke_handler(tauri::generate_handler![
             db_stats,
@@ -2087,7 +2201,9 @@ pub fn run() {
             set_todo_done,
             remember,
             edit_fact,
-            detect_conflicts
+            detect_conflicts,
+            get_close_to_tray,
+            set_close_to_tray
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

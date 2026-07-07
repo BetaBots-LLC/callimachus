@@ -183,8 +183,39 @@ export function SettingsView() {
         </CardContent>
       </Card>
 
+      <GeneralCard />
       <CleanupCard />
     </div>
+  );
+}
+
+/** App-level behavior toggles (e.g. close-to-system-tray). */
+function GeneralCard() {
+  const queryClient = useQueryClient();
+  const closeToTray = useQuery({ queryKey: ["close_to_tray"], queryFn: api.getCloseToTray });
+  const setCloseToTray = useMutation({
+    mutationFn: api.setCloseToTray,
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["close_to_tray"] }),
+  });
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>General</CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-2">
+        <div className="flex items-center gap-2 text-sm">
+          <Switch
+            checked={!!closeToTray.data}
+            onCheckedChange={(v) => setCloseToTray.mutate(v)}
+          />
+          Keep running in the system tray when the window is closed
+        </div>
+        <p className="text-xs text-muted-foreground">
+          When on, closing the window hides Callimachus to the system tray instead of quitting.
+          Click the tray icon to reopen it, or use the tray menu to quit.
+        </p>
+      </CardContent>
+    </Card>
   );
 }
 

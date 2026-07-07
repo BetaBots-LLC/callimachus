@@ -326,6 +326,22 @@ pub fn set_auto_distill(conn: &Connection, on: bool) -> Result<()> {
     Ok(())
 }
 
+/// Whether closing the main window hides the app to the system tray instead of quitting
+/// (default off). Read by the Rust window-close handler at startup.
+pub fn get_close_to_tray(conn: &Connection) -> Result<bool> {
+    Ok(config_get(conn, "window.close_to_tray")?.as_deref() == Some("1"))
+}
+
+/// Persist the close-to-tray preference.
+pub fn set_close_to_tray(conn: &Connection, on: bool) -> Result<()> {
+    conn.execute(
+        "INSERT INTO app_config (key, value) VALUES ('window.close_to_tray', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = ?1",
+        params![if on { "1" } else { "0" }],
+    )?;
+    Ok(())
+}
+
 /// Read a provider's saved custom base URL (unset / blank -> None). Non-secret config; API
 /// keys live in the OS keychain. Used for local Ollama pointed at a remote host, and for
 /// Ollama Cloud / authenticated proxies (paired with a keychain key).
