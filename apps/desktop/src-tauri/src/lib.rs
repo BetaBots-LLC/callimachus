@@ -1714,7 +1714,8 @@ const SYNTH_MODELS: &[(&str, &str)] = &[
     ("ollama_cloud", "gemma3:4b"),
 ];
 
-/// First provider with a stored key (Ollama is keyless, so never auto-picked).
+/// First provider with a stored key (local `ollama` is keyless, so never auto-picked;
+/// `ollama_cloud` is keyed, so it can be).
 pub fn pick_synth_provider() -> Option<(&'static str, &'static str)> {
     SYNTH_MODELS
         .iter()

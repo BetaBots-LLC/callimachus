@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import { type ReactNode, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useDebouncedCallback } from "@tanstack/react-pacer";
 import {
@@ -532,8 +532,14 @@ function ProviderRow({ id, label }: { id: string; label: string }) {
   });
   const saveUrl = useMutation({
     mutationFn: (url: string) => api.setProviderBaseUrl(id, url),
+    // Reflect the new URL immediately (also mirrors to the chat header, same query key); the
+    // invalidate reconciles with what the backend actually stored.
+    onMutate: (url: string) => queryClient.setQueryData(["providerBaseUrl", id], url),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["providerBaseUrl", id] }),
   });
+  // `null` = not editing → show the saved value; a local draft overrides it while typing so an
+  // in-flight query result can't clobber the input.
+  const [urlEdit, setUrlEdit] = useState<string | null>(null);
 
   const form = useAppForm({
     defaultValues: { key: "" },
@@ -598,10 +604,12 @@ function ProviderRow({ id, label }: { id: string; label: string }) {
         <div className="flex items-center gap-2">
           <span className="w-40 shrink-0 text-xs text-muted-foreground">Server URL</span>
           <Input
-            key={baseUrl.data}
-            defaultValue={baseUrl.data ?? ""}
+            value={urlEdit ?? (baseUrl.data ?? "")}
+            onChange={(e) => setUrlEdit(e.target.value)}
             onBlur={(e) => {
-              if (e.target.value.trim() !== (baseUrl.data ?? "")) saveUrl.mutate(e.target.value);
+              const url = e.target.value.trim();
+              setUrlEdit(null);
+              if (url !== (baseUrl.data ?? "")) saveUrl.mutate(url);
             }}
             placeholder={id === "ollama_cloud" ? "https://ollama.com" : "http://localhost:11434"}
             spellCheck={false}

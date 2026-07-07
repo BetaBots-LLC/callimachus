@@ -77,8 +77,15 @@ export function ChatView() {
     enabled: isOllamaLike,
   });
   const baseUrl = savedBaseUrl.data ?? "";
+  // `null` = not editing → show the saved value (updates live as the query resolves or the
+  // provider switches). While editing, this local draft overrides it, so an in-flight query
+  // result can never clobber what the user is typing.
+  const [urlEdit, setUrlEdit] = useState<string | null>(null);
   const saveBaseUrl = useMutation({
     mutationFn: (url: string) => api.setProviderBaseUrl(provider, url),
+    // Update the cache immediately so the box + model list reflect the new URL without waiting
+    // on the round-trip; the invalidate then reconciles with what the backend actually stored.
+    onMutate: (url: string) => queryClient.setQueryData(["providerBaseUrl", provider], url),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["providerBaseUrl", provider] }),
   });
 
@@ -253,13 +260,14 @@ export function ChatView() {
           </Select>
           {isOllamaLike && (
             <Input
-              // Uncontrolled, re-keyed on the saved value so it shows the persisted URL and
-              // remounts when it (or the provider) changes. Persist on blur — which fires before
-              // a provider switch, so it always writes under the correct provider.
-              key={baseUrl}
-              defaultValue={baseUrl}
+              // Controlled: show the saved URL, but a local draft overrides it while editing so an
+              // async query result never clobbers in-progress typing. Persist on blur — which fires
+              // before a provider switch, so it always writes under the correct provider.
+              value={urlEdit ?? baseUrl}
+              onChange={(e) => setUrlEdit(e.currentTarget.value)}
               onBlur={(e) => {
                 const url = e.currentTarget.value.trim();
+                setUrlEdit(null);
                 if (url !== baseUrl) saveBaseUrl.mutate(url);
               }}
               placeholder={

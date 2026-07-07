@@ -1004,9 +1004,12 @@ pub async fn list_models(
                 .unwrap_or(default)
                 .trim_end_matches('/');
             let mut req = client.get(format!("{base}/api/tags"));
-            // Ollama Cloud (and authed proxies) need the Bearer token to list models.
-            if let Some(key) = api_key {
-                req = req.bearer_auth(key);
+            // Only Ollama Cloud authenticates; local Ollama ignores auth. Never forward a key to
+            // it — a stray `ollama` key must not leak as a Bearer token to a custom local host.
+            if provider == "ollama_cloud" {
+                if let Some(key) = api_key {
+                    req = req.bearer_auth(key);
+                }
             }
             req.send().await?.error_for_status()?.json().await?
         }
