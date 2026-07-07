@@ -122,10 +122,13 @@ fn adapter_for(provider: &str) -> Result<AdapterKind> {
 fn build_client(provider: &str, api_key: Option<&str>, base_url: Option<&str>) -> Result<Client> {
     let adapter = adapter_for(provider)?;
     let key = api_key.map(str::to_string);
-    let endpoint = base_url
-        .map(str::trim)
-        .filter(|b| !b.is_empty())
-        .map(|b| if b.ends_with('/') { b.to_string() } else { format!("{b}/") });
+    let endpoint = base_url.map(str::trim).filter(|b| !b.is_empty()).map(|b| {
+        if b.ends_with('/') {
+            b.to_string()
+        } else {
+            format!("{b}/")
+        }
+    });
 
     let builder = Client::builder().with_adapter_kind(adapter);
     let client = match endpoint {
@@ -485,7 +488,17 @@ pub async fn synthesize(
     transcript: &str,
 ) -> Result<String> {
     let user = format!("Transcript:\n\n{transcript}");
-    complete(provider, model, api_key, base_url, SYNTH_SYSTEM, &user, 0.2, 1500).await
+    complete(
+        provider,
+        model,
+        api_key,
+        base_url,
+        SYNTH_SYSTEM,
+        &user,
+        0.2,
+        1500,
+    )
+    .await
 }
 
 /// System prompt for "ask your history" — RAG over the user's own past sessions.
@@ -505,7 +518,17 @@ pub async fn answer(
     context: &str,
 ) -> Result<String> {
     let user = format!("Question: {question}\n\nExcerpts from past sessions:\n\n{context}");
-    complete(provider, model, api_key, base_url, ANSWER_SYSTEM, &user, 0.2, 900).await
+    complete(
+        provider,
+        model,
+        api_key,
+        base_url,
+        ANSWER_SYSTEM,
+        &user,
+        0.2,
+        900,
+    )
+    .await
 }
 
 /// System prompt for the project-memory brief — a tight orientation built from facts
@@ -528,7 +551,17 @@ pub async fn project_brief(
     notes: &str,
 ) -> Result<String> {
     let user = format!("Project: {project}\n\nDistilled notes:\n\n{notes}");
-    complete(provider, model, api_key, base_url, BRIEF_SYSTEM, &user, 0.2, 900).await
+    complete(
+        provider,
+        model,
+        api_key,
+        base_url,
+        BRIEF_SYSTEM,
+        &user,
+        0.2,
+        900,
+    )
+    .await
 }
 
 /// System prompt for conflict review over a project's distilled decisions.
@@ -564,7 +597,17 @@ pub async fn find_conflicts(
         .collect::<Vec<_>>()
         .join("\n");
     let user = format!("Decisions:\n{list}");
-    let text = complete(provider, model, api_key, base_url, CONFLICT_SYSTEM, &user, 0.1, 800).await?;
+    let text = complete(
+        provider,
+        model,
+        api_key,
+        base_url,
+        CONFLICT_SYSTEM,
+        &user,
+        0.1,
+        800,
+    )
+    .await?;
     Ok(parse_conflicts(&text))
 }
 
@@ -622,7 +665,17 @@ pub async fn distill(
     transcript: &str,
 ) -> Result<Distilled> {
     let user = format!("Transcript:\n\n{transcript}");
-    let text = complete(provider, model, api_key, base_url, DISTILL_SYSTEM, &user, 0.1, 1200).await?;
+    let text = complete(
+        provider,
+        model,
+        api_key,
+        base_url,
+        DISTILL_SYSTEM,
+        &user,
+        0.1,
+        1200,
+    )
+    .await?;
     Ok(parse_distilled(&text))
 }
 
@@ -961,27 +1014,28 @@ pub async fn list_models(
     };
 
     // Ollama and Gemini use `models[].name`; the OpenAI-style APIs use `data[].id`.
-    let mut ids: Vec<String> = if provider == "ollama" || provider == "ollama_cloud" || provider == "gemini" {
-        json.get("models")
-            .and_then(Value::as_array)
-            .map(|a| {
-                a.iter()
-                    .filter_map(|m| m.get("name").and_then(Value::as_str))
-                    // Gemini returns "models/gemini-..."; genai wants the bare id.
-                    .map(|n| n.strip_prefix("models/").unwrap_or(n).to_string())
-                    .collect()
-            })
-            .unwrap_or_default()
-    } else {
-        json.get("data")
-            .and_then(Value::as_array)
-            .map(|a| {
-                a.iter()
-                    .filter_map(|m| m.get("id").and_then(Value::as_str).map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
+    let mut ids: Vec<String> =
+        if provider == "ollama" || provider == "ollama_cloud" || provider == "gemini" {
+            json.get("models")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|m| m.get("name").and_then(Value::as_str))
+                        // Gemini returns "models/gemini-..."; genai wants the bare id.
+                        .map(|n| n.strip_prefix("models/").unwrap_or(n).to_string())
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            json.get("data")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|m| m.get("id").and_then(Value::as_str).map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
     ids.sort();
     ids.dedup();
     Ok(ids)
@@ -1019,7 +1073,9 @@ mod tests {
         let transcript = "User: how do I activate a python venv?\n\
             Assistant: Run `source .venv/bin/activate`. We decided to use a per-project venv. \
             Gotcha: the fish shell needs `activate.fish`, not the bash script.";
-        let d = distill("claude-cli", "", None, None, transcript).await.unwrap();
+        let d = distill("claude-cli", "", None, None, transcript)
+            .await
+            .unwrap();
         eprintln!("summary: {}", d.summary);
         eprintln!("decisions: {:?}", d.decisions);
         eprintln!("gotchas: {:?}", d.gotchas);

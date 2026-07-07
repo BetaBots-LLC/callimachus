@@ -1,4 +1,4 @@
-import { memo, useEffect, useState } from "react";
+import { memo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, type ChatChunk, PROVIDERS } from "../lib/api";
 import { useChat, type StreamPart, type ToolStep } from "../store/chat";
@@ -52,14 +52,12 @@ import { Markdown, StreamingMarkdown } from "./Markdown";
 export function ChatView() {
   const provider = useChat((s) => s.provider);
   const model = useChat((s) => s.model);
-  const baseUrl = useChat((s) => s.baseUrl);
   const messages = useChat((s) => s.messages);
   const loadingThread = useChat((s) => s.loadingThread);
   const error = useChat((s) => s.error);
 
   const setProvider = useChat((s) => s.setProvider);
   const setModel = useChat((s) => s.setModel);
-  const setBaseUrl = useChat((s) => s.setBaseUrl);
   const newChat = useChat((s) => s.newChat);
 
   const [draft, setDraft] = useState("");
@@ -69,23 +67,20 @@ export function ChatView() {
   const [sending, setSending] = useState(false);
   const queryClient = useQueryClient();
 
-  // Local Ollama and Ollama Cloud take a custom endpoint. The chat header box mirrors the
-  // persisted Settings value: seed it when the provider changes, and write edits back.
+  // Local Ollama and Ollama Cloud take a custom endpoint, persisted per provider and shared with
+  // Settings. react-query is the source of truth (no store mirror): the saved URL feeds the model
+  // list and send directly; edits persist on blur and re-key the model list via invalidation.
   const isOllamaLike = provider === "ollama" || provider === "ollama_cloud";
   const savedBaseUrl = useQuery({
     queryKey: ["providerBaseUrl", provider],
     queryFn: () => api.providerBaseUrl(provider),
     enabled: isOllamaLike,
   });
-  useEffect(() => {
-    if (isOllamaLike) {
-      if (savedBaseUrl.data !== undefined) setBaseUrl(savedBaseUrl.data);
-    } else {
-      setBaseUrl("");
-    }
-    // Seed once per provider; `setBaseUrl` is a stable zustand action.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [provider, savedBaseUrl.data]);
+  const baseUrl = savedBaseUrl.data ?? "";
+  const saveBaseUrl = useMutation({
+    mutationFn: (url: string) => api.setProviderBaseUrl(provider, url),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["providerBaseUrl", provider] }),
+  });
 
   const hasKey = useQuery({
     queryKey: ["hasKey", provider],
@@ -258,11 +253,15 @@ export function ChatView() {
           </Select>
           {isOllamaLike && (
             <Input
-              value={baseUrl}
-              // Live edits drive the model list + send immediately; persist on blur (which fires
-              // before a provider switch, so it always writes under the correct provider).
-              onChange={(e) => setBaseUrl(e.currentTarget.value)}
-              onBlur={(e) => void api.setProviderBaseUrl(provider, e.currentTarget.value.trim())}
+              // Uncontrolled, re-keyed on the saved value so it shows the persisted URL and
+              // remounts when it (or the provider) changes. Persist on blur — which fires before
+              // a provider switch, so it always writes under the correct provider.
+              key={baseUrl}
+              defaultValue={baseUrl}
+              onBlur={(e) => {
+                const url = e.currentTarget.value.trim();
+                if (url !== baseUrl) saveBaseUrl.mutate(url);
+              }}
               placeholder={
                 provider === "ollama_cloud" ? "https://ollama.com" : "http://localhost:11434"
               }

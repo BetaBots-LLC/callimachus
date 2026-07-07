@@ -330,7 +330,10 @@ pub fn set_auto_distill(conn: &Connection, on: bool) -> Result<()> {
 /// keys live in the OS keychain. Used for local Ollama pointed at a remote host, and for
 /// Ollama Cloud / authenticated proxies (paired with a keychain key).
 pub fn get_provider_base_url(conn: &Connection, provider: &str) -> Result<Option<String>> {
-    Ok(config_get(conn, &format!("provider.{provider}.base_url"))?.filter(|s| !s.trim().is_empty()))
+    Ok(
+        config_get(conn, &format!("provider.{provider}.base_url"))?
+            .filter(|s| !s.trim().is_empty()),
+    )
 }
 
 /// Persist a provider's custom base URL. A blank string clears it (falls back to the default).

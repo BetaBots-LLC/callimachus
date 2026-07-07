@@ -22,7 +22,6 @@ interface ChatState {
   threadId: string;
   provider: string;
   model: string;
-  baseUrl: string;
   messages: StoredMessage[];
   reasoning: string; // in-progress "thinking" text
   parts: StreamPart[]; // in-progress answer, interleaved text + tool steps
@@ -32,7 +31,6 @@ interface ChatState {
 
   setProvider: (p: string, defaultModel: string) => void;
   setModel: (m: string) => void;
-  setBaseUrl: (u: string) => void;
   newChat: () => void;
   loadChat: (threadId: string, messages: ChatMessage[]) => void;
   pushUser: (content: string) => void;
@@ -57,7 +55,6 @@ export const useChat = create<ChatState>((set) => ({
   threadId: newId(),
   provider: "anthropic",
   model: "claude-opus-4-8",
-  baseUrl: "",
   messages: [],
   reasoning: "",
   parts: [],
@@ -67,7 +64,6 @@ export const useChat = create<ChatState>((set) => ({
 
   setProvider: (provider, defaultModel) => set({ provider, model: defaultModel }),
   setModel: (model) => set({ model }),
-  setBaseUrl: (baseUrl) => set({ baseUrl }),
   newChat: () => set({ threadId: newId(), messages: [], reasoning: "", parts: [], error: null }),
   loadChat: (threadId, messages) =>
     set({

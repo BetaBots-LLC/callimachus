@@ -828,7 +828,15 @@ async fn distill_thread(
         (provider, model, key, base_url, packed)
     };
 
-    match agent::distill(&provider, &model, key.as_deref(), base_url.as_deref(), &packed).await {
+    match agent::distill(
+        &provider,
+        &model,
+        key.as_deref(),
+        base_url.as_deref(),
+        &packed,
+    )
+    .await
+    {
         Ok(distilled) => {
             {
                 let mut conn = lock(&db)?;
@@ -957,9 +965,14 @@ async fn detect_conflicts(
         return Ok(Vec::new());
     }
     let texts: Vec<String> = decisions.iter().map(|(_, t)| t.clone()).collect();
-    let pairs =
-        agent::find_conflicts(&provider, &model, key.as_deref(), base_url.as_deref(), &texts)
-            .await?;
+    let pairs = agent::find_conflicts(
+        &provider,
+        &model,
+        key.as_deref(),
+        base_url.as_deref(),
+        &texts,
+    )
+    .await?;
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for p in pairs {
@@ -1034,7 +1047,15 @@ async fn project_brief(pool: tauri::State<'_, db::ReadPool>, project: String) ->
     if notes.trim().is_empty() {
         return Ok(String::new());
     }
-    Ok(agent::project_brief(&provider, &model, key.as_deref(), base_url.as_deref(), &project, &notes).await?)
+    Ok(agent::project_brief(
+        &provider,
+        &model,
+        key.as_deref(),
+        base_url.as_deref(),
+        &project,
+        &notes,
+    )
+    .await?)
 }
 
 /// Write a project's memory (optionally with an LLM brief) to `<project>/.callimachus/
@@ -1061,9 +1082,16 @@ async fn write_project_memory_file(
             if notes.trim().is_empty() {
                 None
             } else {
-                agent::project_brief(&provider, &model, key.as_deref(), base_url.as_deref(), &project, &notes)
-                    .await
-                    .ok()
+                agent::project_brief(
+                    &provider,
+                    &model,
+                    key.as_deref(),
+                    base_url.as_deref(),
+                    &project,
+                    &notes,
+                )
+                .await
+                .ok()
             }
         }
         None => None,
@@ -1172,7 +1200,15 @@ async fn run_distill(app: &AppHandle, ids: Vec<i64>) -> anyhow::Result<()> {
             context::pack_thread(&conn, tid, context::DEFAULT_BUDGET_CHARS)?
         };
         let Some(packed) = packed else { continue };
-        match agent::distill(&provider, &model, key.as_deref(), base_url.as_deref(), &packed).await {
+        match agent::distill(
+            &provider,
+            &model,
+            key.as_deref(),
+            base_url.as_deref(),
+            &packed,
+        )
+        .await
+        {
             Ok(distilled) => {
                 {
                     let mut conn = lock_anyhow(&db)?;
@@ -1785,8 +1821,14 @@ async fn synthesize_export(
         (detail, packed, base_url)
     };
     let key = secrets::get_key(&provider)?;
-    let synthesis =
-        agent::synthesize(&provider, &model, key.as_deref(), base_url.as_deref(), &packed).await?;
+    let synthesis = agent::synthesize(
+        &provider,
+        &model,
+        key.as_deref(),
+        base_url.as_deref(),
+        &packed,
+    )
+    .await?;
     write_note(&detail, Some(&synthesis), &vault_dir)
 }
 
