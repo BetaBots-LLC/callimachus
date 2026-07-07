@@ -21,12 +21,21 @@ pub struct ModelPrice {
 pub fn price_for(model: &str) -> Option<ModelPrice> {
     let m = model.to_ascii_lowercase();
     // Anthropic (Claude): cache write ≈ 1.25× input, cache read ≈ 0.1× input.
+    // Fable/Mythos are the top tier and share list pricing.
+    if m.contains("fable") || m.contains("mythos") {
+        return Some(ModelPrice {
+            input: 10.0,
+            output: 50.0,
+            cache_write: 12.5,
+            cache_read: 1.0,
+        });
+    }
     if m.contains("opus") {
         return Some(ModelPrice {
-            input: 15.0,
-            output: 75.0,
-            cache_write: 18.75,
-            cache_read: 1.5,
+            input: 5.0,
+            output: 25.0,
+            cache_write: 6.25,
+            cache_read: 0.5,
         });
     }
     if m.contains("sonnet") {
@@ -39,10 +48,10 @@ pub fn price_for(model: &str) -> Option<ModelPrice> {
     }
     if m.contains("haiku") {
         return Some(ModelPrice {
-            input: 0.8,
-            output: 4.0,
-            cache_write: 1.0,
-            cache_read: 0.08,
+            input: 1.0,
+            output: 5.0,
+            cache_write: 1.25,
+            cache_read: 0.1,
         });
     }
     // OpenAI: no separate cache-write charge; cached input is discounted.
@@ -259,13 +268,20 @@ mod tests {
         assert!(price_for("claude-haiku-4-5").is_some());
         assert!(price_for("gpt-5").is_some());
         assert!(price_for("some-unknown-local-model").is_none());
+        // Fable/Mythos are priced, not left untracked; guard the cache ratios (1.25×/0.1×).
+        let fable = price_for("claude-fable-5").unwrap();
+        assert_eq!(fable.input, 10.0);
+        assert_eq!(fable.output, 50.0);
+        assert_eq!(fable.cache_write, 12.5);
+        assert_eq!(fable.cache_read, 1.0);
+        assert!(price_for("claude-mythos-5").is_some());
     }
 
     #[test]
     fn cost_math() {
         let p = price_for("claude-opus-4-8").unwrap();
-        // 1M input @ $15 + 1M output @ $75 = $90.
-        assert!((cost_of(1_000_000, 1_000_000, 0, 0, &p) - 90.0).abs() < 1e-6);
+        // 1M input @ $5 + 1M output @ $25 = $30.
+        assert!((cost_of(1_000_000, 1_000_000, 0, 0, &p) - 30.0).abs() < 1e-6);
         // cache read is far cheaper than fresh input.
         assert!(cost_of(0, 0, 0, 1_000_000, &p) < cost_of(1_000_000, 0, 0, 0, &p));
     }
@@ -305,12 +321,12 @@ mod tests {
             1_000_000,
             1_000_000,
             0,
-        ); // $90
+        ); // $30
         ins("assistant", Some("mystery-model"), 1_000_000, 0, 1); // untracked
         ins("user", None, 0, 0, 2); // no model
 
         let s = spend(&conn, 0, None, 5).unwrap();
-        assert!((s.total_cost - 90.0).abs() < 1e-6, "total {}", s.total_cost);
+        assert!((s.total_cost - 30.0).abs() < 1e-6, "total {}", s.total_cost);
         assert_eq!(s.tracked_calls, 1);
         assert_eq!(s.untracked_calls, 1);
         assert_eq!(s.top_threads.len(), 1);

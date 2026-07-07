@@ -25,9 +25,24 @@ export function renderSnippet(snippet: string): string {
   return escaped.split(MARK_START).join("<mark>").split(MARK_END).join("</mark>");
 }
 
+// USD spend formatter: thousands separators + cents. A positive sub-cent amount reads
+// as "<$0.01" instead of collapsing to "$0.00"; at $0.01 and above, toLocaleString rounds
+// half-up as usual. Negatives fall through to toLocaleString ("-$…") so an upstream data
+// bug surfaces in the UI rather than being masked as "$0.00".
+export function formatUsd(n: number): string {
+  if (n === 0) return "$0.00";
+  if (n > 0 && n < 0.01) return "<$0.01";
+  return n.toLocaleString("en-US", {
+    style: "currency",
+    currency: "USD",
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
+}
+
 // Shorten a long absolute project path to its last two segments.
 export function shortPath(path: string | null): string {
   if (!path) return "";
   const parts = path.split("/").filter(Boolean);
-  return parts.length <= 2 ? path : "…/" + parts.slice(-2).join("/");
+  return parts.length <= 2 ? path : `…/${parts.slice(-2).join("/")}`;
 }
