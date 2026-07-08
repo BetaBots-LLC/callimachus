@@ -2025,19 +2025,19 @@ fn get_close_to_tray(pool: tauri::State<'_, db::ReadPool>) -> AppResult<bool> {
 /// and add/remove the tray icon (shown only while enabled).
 #[tauri::command]
 fn set_close_to_tray(app: AppHandle, on: bool) -> AppResult<()> {
+    // Create/remove the tray FIRST: enabling only takes effect if the tray icon actually
+    // comes up, so we never persist a state that hides the window with no way to restore it.
+    if on {
+        show_tray(&app).map_err(anyhow::Error::from)?;
+    } else {
+        hide_tray(&app);
+    }
     {
         let db = app.state::<db::Db>();
         let conn = lock(&db)?;
         knowledge::set_close_to_tray(&conn, on)?;
     }
     app.state::<CloseToTray>().0.store(on, Ordering::Relaxed);
-    if on {
-        if let Err(e) = show_tray(&app) {
-            eprintln!("[tray] failed to create tray icon: {e}");
-        }
-    } else {
-        hide_tray(&app);
-    }
     Ok(())
 }
 
@@ -2085,14 +2085,19 @@ pub fn run() {
             app.manage(SetupState::default());
             app.manage(ChatGeneration::default());
             app.manage(PendingApprovals::default());
-            // Close-to-tray: cache the pref for the window-close handler, and if it's
-            // already on, put the tray icon up now so a hidden window can be restored.
-            app.manage(CloseToTray(AtomicBool::new(close_to_tray_on)));
-            if close_to_tray_on {
-                if let Err(e) = show_tray(app.handle()) {
-                    eprintln!("[tray] startup: {e}");
-                }
-            }
+            // Close-to-tray: bring the tray up if the pref is on. The cached flag reflects
+            // whether it ACTUALLY came up, so a failed tray never leaves the window
+            // hideable-but-unrecoverable. The saved pref is left intact so it retries next
+            // launch.
+            let tray_up = close_to_tray_on
+                && match show_tray(app.handle()) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        eprintln!("[tray] startup: {e}");
+                        false
+                    }
+                };
+            app.manage(CloseToTray(AtomicBool::new(tray_up)));
             // Background watcher keeps the index fresh as agents write new threads.
             indexer::watcher::spawn(app.handle().clone());
             // Drain any distilled facts that aren't embedded yet (e.g. distilled before
@@ -2116,14 +2121,14 @@ pub fn run() {
         })
         .on_window_event(|window, event| {
             // Close-to-tray: intercept the MAIN window's close and hide it instead of
-            // quitting, when the pref is on. Other windows (splash) close normally.
+            // quitting — but ONLY when a tray icon actually exists to restore it, so an
+            // absent/failed tray can never trap the user with a hidden window. Other
+            // windows (splash) close normally.
             if let WindowEvent::CloseRequested { api, .. } = event {
+                let app = window.app_handle();
                 if window.label() == "main"
-                    && window
-                        .app_handle()
-                        .state::<CloseToTray>()
-                        .0
-                        .load(Ordering::Relaxed)
+                    && app.state::<CloseToTray>().0.load(Ordering::Relaxed)
+                    && app.tray_by_id(TRAY_ID).is_some()
                 {
                     api.prevent_close();
                     let _ = window.hide();
