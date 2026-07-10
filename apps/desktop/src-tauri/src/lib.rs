@@ -1993,7 +1993,13 @@ fn show_tray(app: &AppHandle) -> tauri::Result<()> {
         true,
         None::<&str>,
     )?;
-    let quit = MenuItem::with_id(app, format!("tray-quit-{generation}"), "Quit", true, None::<&str>)?;
+    let quit = MenuItem::with_id(
+        app,
+        format!("tray-quit-{generation}"),
+        "Quit",
+        true,
+        None::<&str>,
+    )?;
     let menu = Menu::with_items(app, &[&show, &quit])?;
     let mut builder = TrayIconBuilder::with_id(TRAY_ID)
         .tooltip("Callimachus")
