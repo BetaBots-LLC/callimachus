@@ -206,6 +206,7 @@ function GeneralCard() {
         <div className="flex items-center gap-2 text-sm">
           <Switch
             checked={!!closeToTray.data}
+            disabled={closeToTray.isPending || setCloseToTray.isPending}
             onCheckedChange={(v) => setCloseToTray.mutate(v)}
           />
           Keep running in the system tray when the window is closed

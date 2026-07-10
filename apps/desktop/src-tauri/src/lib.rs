@@ -22,7 +22,7 @@ pub mod snapshot;
 use error::AppResult;
 use search::{SearchFilters, SearchHit, ThreadDetail, ThreadSummary};
 use serde::Serialize;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -1964,6 +1964,9 @@ fn uninstall_agent_integrations() -> AppResult<()> {
 /// Stable id for the tray icon, so it can be added on enable and removed on disable.
 const TRAY_ID: &str = "close-to-tray";
 
+/// Bumped on every tray (re)build so each menu gets unique item ids (see `show_tray`).
+static TRAY_GEN: AtomicUsize = AtomicUsize::new(0);
+
 /// Show + focus the main window (used to restore it from the tray).
 fn reveal_main_window(app: &AppHandle) {
     if let Some(win) = app.get_webview_window("main") {
@@ -1979,18 +1982,32 @@ fn show_tray(app: &AppHandle) -> tauri::Result<()> {
     if app.tray_by_id(TRAY_ID).is_some() {
         return Ok(()); // already showing
     }
-    let show = MenuItem::with_id(app, "tray-show", "Show Callimachus", true, None::<&str>)?;
-    let quit = MenuItem::with_id(app, "tray-quit", "Quit", true, None::<&str>)?;
+    // Fresh menu-item ids on every (re)build: a disable/re-enable cycle drops the old menu
+    // and builds a new one, so a generation suffix guarantees no collision with a prior
+    // menu's ids regardless of when muda clears them. Matched by stable prefix below.
+    let generation = TRAY_GEN.fetch_add(1, Ordering::Relaxed);
+    let show = MenuItem::with_id(
+        app,
+        format!("tray-show-{generation}"),
+        "Show Callimachus",
+        true,
+        None::<&str>,
+    )?;
+    let quit = MenuItem::with_id(app, format!("tray-quit-{generation}"), "Quit", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&show, &quit])?;
     let mut builder = TrayIconBuilder::with_id(TRAY_ID)
         .tooltip("Callimachus")
         .menu(&menu)
         // Left-click restores the window; the menu opens on right-click.
         .show_menu_on_left_click(false)
-        .on_menu_event(|app, event| match event.id.as_ref() {
-            "tray-show" => reveal_main_window(app),
-            "tray-quit" => app.exit(0),
-            _ => {}
+        .on_menu_event(|app, event| {
+            // Ids carry a generation suffix (see above); match on the stable prefix.
+            let id = event.id.as_ref();
+            if id.starts_with("tray-show") {
+                reveal_main_window(app);
+            } else if id.starts_with("tray-quit") {
+                app.exit(0);
+            }
         })
         .on_tray_icon_event(|tray, event| {
             if let TrayIconEvent::Click {
@@ -2032,10 +2049,21 @@ fn set_close_to_tray(app: AppHandle, on: bool) -> AppResult<()> {
     } else {
         hide_tray(&app);
     }
-    {
+    // Persist. If the DB write fails, roll the tray change back so the icon, the saved
+    // pref, and the in-memory flag never diverge.
+    let persisted: AppResult<()> = (|| {
         let db = app.state::<db::Db>();
         let conn = lock(&db)?;
         knowledge::set_close_to_tray(&conn, on)?;
+        Ok(())
+    })();
+    if let Err(e) = persisted {
+        if on {
+            hide_tray(&app);
+        } else {
+            let _ = show_tray(&app);
+        }
+        return Err(e);
     }
     app.state::<CloseToTray>().0.store(on, Ordering::Relaxed);
     Ok(())
