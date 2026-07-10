@@ -324,6 +324,9 @@ export const api = {
     invoke<IssueCluster[]>("recurring_issues", { project: project ?? null }),
   // Estimated $ spend by model + priciest threads (needs a reindex to capture token usage).
   spend: (project?: string) => invoke<Spend>("spend", { project: project ?? null }),
+  // Whether closing the window hides the app to the system tray instead of quitting.
+  getCloseToTray: () => invoke<boolean>("get_close_to_tray"),
+  setCloseToTray: (on: boolean) => invoke<void>("set_close_to_tray", { on }),
   findPriorWork: (query: string, opts?: { project?: string; limit?: number }) =>
     invoke<PriorWork[]>("find_prior_work", {
       query,

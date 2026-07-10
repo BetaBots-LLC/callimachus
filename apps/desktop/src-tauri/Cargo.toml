@@ -31,7 +31,7 @@ path = "src/cli.rs"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-opener = "2"
 # native-tls (OS TLS), NOT rustls: rustls pulls aws-lc-sys/ring, which need libclang_rt.osx.a
 # at link time — absent in recent macos-latest Xcodes. native-tls keeps CI on macos-latest.
