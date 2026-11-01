@@ -1,5 +1,9 @@
 # callimachus-vscode
 
+## 0.11.1
+
+No changes in this release.
+
 ## 0.11.0
 
 ## 0.10.0
