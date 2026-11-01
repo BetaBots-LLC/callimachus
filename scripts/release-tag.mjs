@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Release tagger. Wired as the Changesets Action `publish` step, so it runs
+// Release tagger. Wired as the Changesets Action `publish-script`, so it runs
 // right after a "Version Packages" PR merges (no changesets left).
 //
 // Every shippable package (desktop app, VS Code extension, `callimachus-mcp`
@@ -17,7 +17,7 @@
 // release workflows (the default GITHUB_TOKEN cannot trigger other workflows).
 
 import { execSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
@@ -47,3 +47,10 @@ for (const { pkg, prefix } of ARTIFACTS) {
 }
 
 if (pushed === 0) console.log("release-tag: nothing new to tag");
+
+// changesets/action v2 reads this file after the publish script to see what
+// Changesets published. Nothing is published through Changesets here, so leave
+// it empty instead of letting the action warn that it is missing.
+// biome-ignore lint/suspicious/noUndeclaredEnvVars: set by changesets/action for this script, which is not a turbo task
+const changesetsOutput = process.env.CHANGESETS_OUTPUT;
+if (changesetsOutput) writeFileSync(changesetsOutput, "", { flag: "a" });

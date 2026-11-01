@@ -11,6 +11,3 @@ updateConfig:
     - "@types/vscode"
     # Tracks the Node major CI and the extension tooling run on (22), not the latest typings.
     - "@types/node"
-    # v3 stops versioning private packages by default, which silently halts desktop/vscode
-    # releases. Needs `privatePackages` config and a dry-run release cycle before moving.
-    - "@changesets/cli"

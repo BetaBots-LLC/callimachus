@@ -33,11 +33,14 @@ function fail(message) {
 const { version } = JSON.parse(readFileSync(pkgPath, "utf8"));
 if (!version) fail("no version in apps/desktop/package.json");
 
-// tauri.conf.json: plain JSON, top-level "version" key.
-const conf = JSON.parse(readFileSync(confPath, "utf8"));
-const confBefore = conf.version;
-conf.version = version;
-writeFileSync(confPath, `${JSON.stringify(conf, null, 2)}\n`);
+// tauri.conf.json: swap only the top-level "version" value in place.
+// Re-serializing with JSON.stringify expands the one-line bundle.linux
+// `depends` arrays, which Biome then reports as a format error.
+const confText = readFileSync(confPath, "utf8");
+const confBefore = JSON.parse(confText).version;
+const topLevelVersion = /^ {2}"version": "[^"]*"/m;
+if (!topLevelVersion.test(confText)) fail('no top-level "version" in tauri.conf.json');
+writeFileSync(confPath, confText.replace(topLevelVersion, `  "version": "${version}"`));
 
 // Cargo.toml: replace ONLY the `version` inside the [package] table, never a
 // dependency's version. Scope the replace to the [package] block.

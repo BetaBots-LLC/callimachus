@@ -236,10 +236,13 @@ pnpm rc:enter            # = changeset pre enter rc
 
 # From here, every Version Packages merge produces vX.Y.Z-rc.0, -rc.1, …
 # (e.g. v0.6.0-rc.1). build.yml publishes these as GitHub *prereleases*
-# (never marked Latest), and publish-extension.yml skips them.
+# (never marked Latest), and publish-extension.yml skips them. Each one moves
+# the changesets it used into .changeset/pre/ (Changesets v3).
 
 # When the RC is good, leave prerelease mode:
 pnpm rc:exit             # = changeset pre exit
+# Review .changeset/pre/ first: its changesets become the stable changelog, so
+# edit or delete any that no longer apply.
 # The next Version Packages merge produces the stable vX.Y.Z.
 ```
 

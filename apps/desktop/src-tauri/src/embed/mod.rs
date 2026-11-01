@@ -1425,6 +1425,95 @@ mod tests {
         }
     }
 
+    /// Re-embeds chunks that already have vectors in a real index and compares them with
+    /// the stored ones. Run it before a fastembed / ort bump: a new runtime that moves vectors
+    /// leaves old and new ones in one KNN space, which then needs a full re-embed. Reads an
+    /// APFS clone read-only (never the live index) and downloads into FASTEMBED_CACHE_DIR:
+    /// `CALLIMACHUS_DB=<clone>/index.db FASTEMBED_CACHE_DIR=<dir> cargo test --release --lib
+    /// -- --ignored embedding_drift --nocapture`
+    #[test]
+    #[ignore]
+    fn embedding_drift_against_stored_vectors() {
+        let db = std::env::var_os("CALLIMACHUS_DB").expect("CALLIMACHUS_DB = a cloned index");
+        let root = env_path(CACHE_DIR_ENV).expect("FASTEMBED_CACHE_DIR = a model dir");
+        let want: usize = std::env::var("DRIFT_CHUNKS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(200);
+        let conn = crate::db::open_readonly(Path::new(&db)).unwrap();
+        // A fixed pseudo-random spread (multiplicative hash of the rowid), so runs on two
+        // fastembed versions compare the same chunks.
+        let mut sample = conn
+            .prepare(
+                "SELECT m.id, m.text FROM messages m WHERE m.id IN (
+                     SELECT message_id FROM vec_chunk_owner GROUP BY message_id
+                     ORDER BY (min(chunk_rowid) * 2654435761) % 4294967296 LIMIT ?1)",
+            )
+            .unwrap();
+        let rows: Vec<(i64, String)> = sample
+            .query_map([want as i64], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let mut owned = conn
+            .prepare("SELECT chunk_rowid FROM vec_chunk_owner WHERE message_id = ?1 ORDER BY 1")
+            .unwrap();
+        let mut stored_vec = conn
+            .prepare("SELECT embedding FROM vec_chunks WHERE rowid = ?1")
+            .unwrap();
+        // store_batch inserts a message's vectors in chunk_text order, so the i-th rowid is
+        // the i-th chunk. A count mismatch means the text changed since; skip those.
+        let (mut texts, mut stored) = (Vec::new(), Vec::new());
+        for (id, text) in &rows {
+            let chunks = chunk_text(text);
+            let rowids: Vec<i64> = owned
+                .query_map([id], |r| r.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            if chunks.len() != rowids.len() {
+                continue;
+            }
+            for (chunk, rowid) in chunks.into_iter().zip(rowids) {
+                let blob: Vec<u8> = stored_vec.query_row([rowid], |r| r.get(0)).unwrap();
+                let v: Vec<f32> = blob
+                    .chunks_exact(4)
+                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                    .collect();
+                texts.push(chunk);
+                stored.push(v);
+            }
+            if texts.len() >= want {
+                break;
+            }
+        }
+        assert!(!texts.is_empty(), "no comparable chunks in the sample");
+
+        let e = Embedder::new(true, Some(root), bulk_intra_threads());
+        e.ensure_loaded().unwrap();
+        let fresh = e.embed(texts.clone()).unwrap();
+        let mut scored: Vec<(f32, usize)> = fresh
+            .iter()
+            .zip(&stored)
+            .enumerate()
+            .map(|(i, (a, b))| (cosine(a, b), i))
+            .collect();
+        scored.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let median = scored[scored.len() / 2].0;
+        println!(
+            "drift: {} chunks from {} messages, min {:.6} (1 - min = {:.1e}), median {:.6}",
+            scored.len(),
+            rows.len(),
+            scored[0].0,
+            1.0 - scored[0].0,
+            median
+        );
+        for &(c, i) in scored.iter().take(3) {
+            println!("  worst {c:.6}: {} chars", texts[i].chars().count());
+        }
+        assert!(scored[0].0 >= 0.999, "min cosine {} < 0.999", scored[0].0);
+    }
+
     #[test]
     fn lookup_roots_are_absolute_and_include_the_app_dir() {
         let roots = lookup_roots();

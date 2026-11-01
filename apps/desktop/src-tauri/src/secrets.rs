@@ -72,6 +72,10 @@ pub fn has_key(provider: &str) -> bool {
 mod tests {
     use super::*;
 
+    fn forget_cached(provider: &str) {
+        CACHE.lock().unwrap().remove(provider);
+    }
+
     /// Real credential-store roundtrip (writes to the OS keychain). Ignored by
     /// default: `cargo test -- --ignored keychain_roundtrip`
     #[test]
@@ -81,7 +85,11 @@ mod tests {
         set_key(provider, "sk-test-123").unwrap();
         assert_eq!(get_key(provider).unwrap().as_deref(), Some("sk-test-123"));
         assert!(has_key(provider));
+        // Read back from the store itself, not the in-memory cache that set_key filled.
+        forget_cached(provider);
+        assert_eq!(get_key(provider).unwrap().as_deref(), Some("sk-test-123"));
         delete_key(provider).unwrap();
+        forget_cached(provider);
         assert_eq!(get_key(provider).unwrap(), None);
     }
 }

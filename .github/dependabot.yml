@@ -23,6 +23,13 @@ updates:
     groups:
       actions-minor-patch:
         update-types: [minor, patch]
+    ignore:
+      # tauri-action 1.0 writes API asset URLs (api.github.com/.../releases/assets/<id>)
+      # into latest.json, so every auto-update download counts against GitHub's
+      # unauthenticated 60 requests/hour/IP limit. 0.6.x keeps the browser download
+      # URLs. Take 1.x only together with a finalize step that rewrites those URLs.
+      - dependency-name: "tauri-apps/tauri-action"
+        update-types: ["version-update:semver-major"]
     commit-message:
       prefix: "chore(ci)"
 
@@ -35,6 +42,9 @@ updates:
     schedule:
       interval: weekly
       day: monday
+    # Passed to pnpm as `minimum-release-age`, which also checks every existing
+    # manifest range: a hand bump to a version under 3 days old fails the whole
+    # job (ERR_PNPM_NO_MATURE_MATCHING_VERSION) until that version ages out.
     cooldown:
       default-days: 3
     groups:
@@ -48,10 +58,6 @@ updates:
       - dependency-name: "@types/vscode"
       # Tracks the Node major CI and the extension tooling run on (22).
       - dependency-name: "@types/node"
-        update-types: ["version-update:semver-major"]
-      # v3 stops versioning private packages by default, which silently halts
-      # desktop/vscode releases (see pnpm-workspace.yaml).
-      - dependency-name: "@changesets/cli"
         update-types: ["version-update:semver-major"]
     commit-message:
       prefix: "chore(deps)"
