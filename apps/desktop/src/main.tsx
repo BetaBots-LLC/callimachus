@@ -1,12 +1,12 @@
 import React, { useEffect } from "react";
 import ReactDOM from "react-dom/client";
-import { QueryClientProvider, useQuery } from "@tanstack/react-query";
+import { QueryClientProvider } from "@tanstack/react-query";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import App from "./App";
 import { ErrorBoundary } from "./components/ErrorBoundary";
-import { api, type EmbedStatus, type IndexProgress } from "./lib/api";
+import type { EmbedStatus, IndexProgress } from "./lib/api";
 import { EMBED_ERROR_KEY, INDEX_ERROR_KEY } from "./lib/queries";
 import { AGGREGATE_KEYS, invalidateIndexDerived, queryClient } from "./lib/queryClient";
 import { isSafeExternalHref } from "./lib/safeLinks";
@@ -52,7 +52,14 @@ void listen<{ done: number; total: number }>("distill:progress", (e) => {
 });
 void listen("distill:done", () => {
   queryClient.setQueryData(["distill_progress"], null);
-  for (const key of ["distill_status", "project_memory", "projects", "knowledge_config"]) {
+  // auto_distill_budget: an auto-distill round spends today's allowance (Settings shows it).
+  for (const key of [
+    "distill_status",
+    "project_memory",
+    "projects",
+    "knowledge_config",
+    "auto_distill_budget",
+  ]) {
     void queryClient.invalidateQueries({ queryKey: [key] });
   }
 });
@@ -110,7 +117,14 @@ function refreshAfterWatcherUpdate() {
     void queryClient.invalidateQueries({ queryKey: [key], refetchType: "none" });
   }
 }
-void listen("index:updated", () => {
+void listen<string | null>("index:updated", (e) => {
+  // No source kind: startup housekeeping rewrote rows (re-keyed projects), not a scan. It
+  // fires at most once per launch, so refresh what groups by project now, including an
+  // open Project Memory list, which would otherwise keep showing keys that no longer exist.
+  if (e.payload == null) {
+    invalidateIndexDerived(); // ["projects"] and the other aggregates, refetched if mounted
+    void queryClient.invalidateQueries({ queryKey: ["project_memory"], refetchType: "active" });
+  }
   if (liveTimer) return; // a trailing refresh is already scheduled; it covers this event
   const wait = liveLastRun + LIVE_UPDATE_THROTTLE_MS - Date.now();
   if (wait <= 0)
@@ -166,16 +180,15 @@ setTimeout(() => {
 }, SPLASH_FALLBACK_MS);
 
 /** The main window is hidden at launch (tauri.conf) while the splash WINDOW shows. The
- *  app loads here behind it; once our initial data settles we signal the backend, which
- *  closes the splash and reveals this window only when its own setup is also done. The
- *  db_stats query shares the header's ["db_stats"] cache, so this adds no extra fetch. */
+ *  app loads here behind it; once it has mounted we signal the backend, which closes the
+ *  splash and reveals this window only when its own setup is also done. Deliberately not
+ *  gated on any query: on a cold page cache even db_stats' message count took 0.6-0.8 s,
+ *  all of it spent behind the splash. The header count fills in a moment later. */
 function AppShell() {
-  const stats = useQuery({ queryKey: ["db_stats"], queryFn: api.dbStats, retry: 0 });
   useEffect(() => {
-    // Settled (success OR error) → frontend is ready. set_complete is idempotent, so an
-    // extra call is harmless; the backend reveals the window only when its half is done too.
-    if (!stats.isLoading) void invoke("set_complete", { task: "frontend" });
-  }, [stats.isLoading]);
+    // set_complete is idempotent, so StrictMode's double effect (dev) is harmless.
+    void invoke("set_complete", { task: "frontend" }).catch(() => {});
+  }, []);
   return <App />;
 }
 

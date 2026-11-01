@@ -1,6 +1,6 @@
 # Callimachus for VS Code & Cursor
 
-Search your AI coding-agent conversation history — across **Claude Code, Codex, Cursor, Gemini, Qwen, Goose, OpenCode, Continue, Cline, Roo Code, Kilo Code** and in-app chats — without leaving the editor. Pick a past thread and open its full transcript as a markdown doc.
+Search your AI coding-agent conversation history across **Claude Code, Codex, Cursor, Gemini, Qwen, Goose, OpenCode, Continue, Cline, Roo Code, Kilo Code, Copilot Chat** and in-app chats, without leaving the editor. Pick a past thread and open its full transcript as a markdown doc.
 
 This extension is a thin client over the **`cal`** CLI, so it shares the exact same local index as the Callimachus desktop app and MCP server. No separate database, no separate indexing.
 
@@ -12,7 +12,7 @@ This extension is a thin client over the **`cal`** CLI, so it shares the exact s
 
 ## Requirements
 
-- The **Callimachus desktop app** installed and run at least once — it builds the index and puts the **`cal`** CLI on your `PATH`, which this extension shells out to. (Building `cal` yourself from a checkout: `cargo install --path apps/desktop/src-tauri --bin cal`; or set `callimachus.calPath` to its absolute path.)
+- The **Callimachus desktop app** installed and run at least once: it builds the index, and its **`cal`** CLI is what this extension shells out to. The extension finds it without `PATH`: it checks the `~/.local/bin/cal` link that **Settings → Claude Code → Enable for Claude Code** adds and, on macOS and Windows, the installed app itself, which answers `cal` commands too (this also covers a per-machine Windows install that can't write `cal.exe`). On Linux, enable that integration or set `callimachus.calPath`. (Building `cal` yourself from a checkout: `cargo install --locked --path apps/desktop/src-tauri --bin cal`, then set `callimachus.calPath` if it isn't on your `PATH`.)
 
 ## Sidebar
 

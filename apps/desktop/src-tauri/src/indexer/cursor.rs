@@ -15,6 +15,7 @@
 //! Without this, every checkpoint re-extracted every bubble (gigabytes of JSON) and
 //! rewrote every thread.
 
+use super::common::truncate_title;
 use super::{
     file_change_state, set_file_state, source_id, upsert_thread, IndexReport, ParsedMessage,
     ParsedThread,
@@ -218,7 +219,7 @@ fn scan_path(conn: &mut Connection, db: &Path, tick: &mut dyn FnMut()) -> Result
         let title = c
             .name
             .filter(|n| !n.trim().is_empty())
-            .or_else(|| first_user.map(truncate_title));
+            .or_else(|| first_user.as_deref().map(truncate_title));
         let thread = ParsedThread {
             external_id: c.id,
             title,
@@ -268,15 +269,6 @@ fn list_composers(ro: &Connection) -> Result<Vec<Composer>> {
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-}
-
-fn truncate_title(s: String) -> String {
-    let s = s.trim();
-    if s.chars().count() > 80 {
-        format!("{}…", s.chars().take(80).collect::<String>())
-    } else {
-        s.to_string()
-    }
 }
 
 #[cfg(test)]

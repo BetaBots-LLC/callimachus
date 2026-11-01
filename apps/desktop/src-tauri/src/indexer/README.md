@@ -30,6 +30,7 @@ pub struct ParsedThread {
     pub updated_at: Option<i64>,
     pub is_subagent: bool,
     pub messages: Vec<ParsedMessage>,
+    pub usage: Vec<(usize, MsgUsage)>, // optional: token usage per assistant turn, keyed by message index (Claude Code fills it)
 }
 pub struct ParsedMessage {
     pub role: String,             // user | assistant | tool | system
@@ -39,13 +40,15 @@ pub struct ParsedMessage {
 }
 ```
 
+`ParsedThread` derives `Default`, so a source with no token usage ends the literal with `..Default::default()`.
+
 ## Six steps to add a source
 
 1. **Migration** — `migrations/00NN_*.sql`: `INSERT OR IGNORE INTO sources (kind) VALUES ('<kind>');` and register it in `db/migrations.rs`.
-2. **Indexer** — `indexer/<kind>.rs` with `KIND` + `scan()`. Parse to `ParsedThread`, call `upsert_thread`. Skip unchanged work (see change-detection below).
-3. **Register** — add `pub mod <kind>;` and `("<kind>", <kind>::scan)` to the `sources` array in `scan_all_with_progress` in `indexer/mod.rs`.
-4. **Watcher** — `indexer/watcher.rs`: add the store dir to `watch_targets` and an arm in `scanner_for` (routing is by root, so no classifier branch is needed).
-5. **Manual reindex** — add a `"<kind>" =>` arm to `index_source` in `lib.rs`.
+2. **Indexer** — `indexer/<kind>.rs` with `KIND` + `scan()`. Parse to `ParsedThread`, call `upsert_thread`. Skip unchanged work (see change-detection below). The small shared helpers (titles, timestamps, text parts, `push_message`) are in `indexer/common.rs`, and `IndexReport::record` tallies each file.
+3. **Register** — add `pub mod <kind>;` and a `Source { kind, scan, caps_tool_output }` entry to `SOURCES` in `indexer/mod.rs`. The full reindex, the per-source reindex command (`index_source` in `lib.rs`), the watcher's dispatch and tool-output cleanup all read this one list; tests check it against the `sources` table, `telemetry::SOURCES` and whether the indexer calls `cap_tool_text`. Add your indexer's file to the `match` in `caps_tool_output_matches_the_indexers` as well; until you do, that test panics with "add <kind>'s indexer source here".
+4. **Watcher** — `indexer/watcher.rs`: add the store dir to `watch_targets` (routing is by root, so no classifier branch is needed).
+5. **Telemetry** — add the kind to `telemetry::SOURCES` (a test checks it against `SOURCES`). Nothing in `apps/desktop/src/lib/telemetry.ts` needs to change: its `thread_opened` event takes `SourceKind` from `api.ts`, which step 6 extends.
 6. **Frontend** — extend `SourceKind`, `SOURCE_LABELS`, and `INDEXABLE_SOURCES` in `apps/desktop/src/lib/api.ts` (the filter chips and reindex buttons derive from the last one). Optionally add to `OPEN_TARGETS` / `cli_resume` if the CLI is launchable.
 
 Tests: a parse test over a synthetic sample, a search round-trip, and an
@@ -55,8 +58,8 @@ Tests: a parse test over a synthetic sample, a search round-trip, and an
 
 Re-upserting an unchanged thread churns message ids and forces re-embedding. Avoid:
 
-- **One file per thread** (JSONL) — skip on `(mtime, size)` via `file_state` / `set_file_state` (see `gemini.rs`).
-- **Append-only JSONL** (Claude Code) — `claude.rs` also keeps a byte cursor per file in `index_state` (`last_offset` = end of the last complete line, `hash` = FNV-1a of the 4 KB at each end of the indexed region). When a file only grew, only the new lines are read and parsed and folded onto the stored prefix; a shrink, a fingerprint mismatch or a missing thread falls back to a full parse. A half-written last line is left for the next pass.
+- **One file per thread** (JSONL) — skip on `(mtime, size)` via `file_change_state` / `set_file_state` (see `gemini.rs`).
+- **Append-only JSONL** (Claude Code) — `claude.rs` also keeps a byte cursor per file in `index_state` (`last_offset` = end of the last complete line, `hash` = FNV-1a of the 4 KB at each end of the indexed region). When a file only grew, only the new lines are read and parsed and folded onto the stored prefix; a shrink, a fingerprint mismatch or a missing thread falls back to a full parse. A half-written last line is left for the next pass. A full scan groups its writes into short batched transactions (one commit per thread spent a quarter of a cold index in COMMIT); `upsert_thread` runs as a savepoint when the caller already has a transaction open.
 - **One DB for all threads** (SQLite) — skip the whole pass with `file_change_state` (read-only) on the DB file, then `set_file_state` only after the upserts succeed (see `goose.rs`). If the store runs in WAL mode, include the `-wal` file in the change key, since new rows land there first (see `cursor.rs`).
 - **One DB, many threads that change independently** (Cursor) — fingerprint each thread from cheap metadata (`lastUpdatedAt`, row count, `octet_length` sums, which read only record headers) in `index_state` under a synthetic `<db>#composer:<id>` key, and only extract threads whose fingerprint moved.
 - **Many files per thread** (OpenCode) — fingerprint the message dir as `(max mtime, file count)` and store it in `file_state` keyed by the session file.
@@ -71,8 +74,7 @@ deterministic and the incremental prefix check stays stable. Rows indexed before
 are not a mismatch either: `upsert_thread` treats a stored `tool` row whose capped form is
 the new text as matching and rewrites it in place, so the first re-parse after an upgrade
 doesn't full-replace the thread. `cleanup::compact_tool_output` rewrites such rows in bulk
-with the same function; add a source's kind to `cleanup::CAPPED_TOOL_SOURCES` once its
-indexer caps.
+with the same function, for the sources registered with `caps_tool_output: true`.
 
 ## Things every indexer must skip
 
@@ -96,9 +98,12 @@ never sees shell env vars.
 
 `watcher.rs` routes each event to the most specific watched root that contains it (both
 the configured and the symlink-resolved spelling), with an optional file-name filter for
-directories shared with unrelated files. Every kind it can route must have an arm in
-`scanner_for` (a test enforces this). Claude Code events are indexed per changed file via
-`claude::index_paths`; other sources re-run their fingerprint-skipping `scan`.
+directories shared with unrelated files. Every kind it can route must be in `SOURCES` (a
+test enforces this). Claude Code events are indexed per changed file via
+`claude::index_paths`; other sources re-run their fingerprint-skipping `scan`. Watch
+events only start when the watch does, so at launch (once anything has been indexed) the
+watcher also runs one catch-up pass over every source for what changed while the app was
+closed, holding the reindex flag meanwhile.
 
 ## Tolerant parsing
 

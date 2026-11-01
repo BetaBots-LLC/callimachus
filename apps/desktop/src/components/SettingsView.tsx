@@ -1,9 +1,12 @@
-import { type ReactNode, useRef, useState } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { type ReactNode, useId, useRef, useState } from "react";
+import { useMutation, useMutationState, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useDebouncedCallback } from "@tanstack/react-pacer";
 import {
+  type AgentIntegration,
   api,
+  type DataRoots,
   INDEXABLE_SOURCES,
+  type IntegrationStatus,
   type KnowledgeConfig,
   PROVIDERS,
   SOURCE_LABELS,
@@ -17,7 +20,17 @@ import { useAppForm } from "@/lib/form";
 import { describeKeySaveError } from "../lib/errors";
 import { baseName } from "../lib/format";
 import { invalidateIndexDerived } from "../lib/queryClient";
-import { EMBED_ERROR_KEY, useEmbedError, useEmbedStatus, useIndexError } from "../lib/queries";
+import {
+  EMBED_ERROR_KEY,
+  fetchJobsStatus,
+  useEmbedError,
+  useEmbedStatus,
+  useIndexError,
+  useIndexRewriting,
+  reindexBlocked,
+  usePushed,
+  waitForReindexSlot,
+} from "../lib/queries";
 import { track } from "../lib/telemetry";
 import { useSettings } from "../store/settings";
 import { CleanupCard } from "./CleanupCard";
@@ -25,22 +38,78 @@ import { TelemetrySetting } from "./TelemetryConsent";
 
 const INDEXABLE: SourceKind[] = INDEXABLE_SOURCES;
 
+/** Every single-source reindex (the row buttons and the one after a data-folder change)
+ *  runs under this key, so each row reads its own pending state from the mutation cache:
+ *  two sources can be in flight at once, and the state survives leaving Settings. */
+const INDEX_SOURCE_KEY = ["index_source"] as const;
+
+/** Sources whose reindex after a data-folder change is waiting for another job to end. */
+const REINDEX_WAITING_KEY = ["reindex_waiting"] as const;
+
 export function SettingsView() {
   const queryClient = useQueryClient();
   const stats = useQuery({ queryKey: ["db_stats"], queryFn: api.dbStats });
   // Event-driven; never polls while idle (see lib/queries.ts).
   const embed = useEmbedStatus();
+  // Reindex and Build refuse or do nothing while Shrink index / Reclaim space runs.
+  const rewriting = useIndexRewriting();
 
+  const onIndexed = () => {
+    queryClient.invalidateQueries({ queryKey: ["db_stats"] });
+    queryClient.invalidateQueries({ queryKey: ["results"] });
+    // index_source emits no index:done, so refresh Stats / Coach / Projects here.
+    invalidateIndexDerived();
+  };
   const indexOne = useMutation({
+    mutationKey: INDEX_SOURCE_KEY,
     mutationFn: (kind: SourceKind) => api.indexSource(kind),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["db_stats"] });
-      queryClient.invalidateQueries({ queryKey: ["results"] });
-      // index_source emits no index:done, so refresh Stats / Coach / Projects here.
-      invalidateIndexDerived();
-    },
+    onSuccess: onIndexed,
     onError: () => track("error_shown", { kind: "index_failed" }),
   });
+  // After a data-folder change. index_source refuses while another reindex holds the flag
+  // (a full reindex, the launch catch-up scan, the other folder's reindex) or the index is
+  // being rewritten, and the new folder is already saved, so wait for that job and scan
+  // then rather than leave the relocated history unindexed until the next launch.
+  const reindexMoved = useMutation({
+    mutationKey: INDEX_SOURCE_KEY,
+    mutationFn: async (kind: SourceKind) => {
+      const setWaiting = (on: boolean) =>
+        // `?? []`, not a default parameter: the slot reads as null before anything is set.
+        queryClient.setQueryData<SourceKind[] | null>(REINDEX_WAITING_KEY, (prev) => {
+          const others = (prev ?? []).filter((k) => k !== kind);
+          return on ? [...others, kind] : others;
+        });
+      try {
+        for (;;) {
+          try {
+            return await api.indexSource(kind);
+          } catch (e) {
+            // Only a held flag is worth waiting out; anything else is a real failure.
+            const jobs = await fetchJobsStatus(queryClient).catch(() => null);
+            if (!reindexBlocked(jobs)) throw e;
+          }
+          setWaiting(true);
+          await waitForReindexSlot(queryClient);
+          setWaiting(false);
+        }
+      } finally {
+        setWaiting(false);
+      }
+    },
+    onSuccess: onIndexed,
+    onError: () => track("error_shown", { kind: "index_failed" }),
+  });
+  const indexRuns = useMutationState({
+    filters: { mutationKey: INDEX_SOURCE_KEY },
+    select: (m) => ({
+      kind: m.state.variables as SourceKind,
+      status: m.state.status,
+      error: m.state.error,
+    }),
+  });
+  const indexing = new Set(indexRuns.filter((r) => r.status === "pending").map((r) => r.kind));
+  const lastIndexRun = indexRuns.length > 0 ? indexRuns[indexRuns.length - 1] : null;
+  const waiting = usePushed<SourceKind[]>(REINDEX_WAITING_KEY) ?? [];
   const embedError = useEmbedError();
   // Why the last full reindex failed (index:error, see main.tsx), until one succeeds.
   const indexError = useIndexError();
@@ -104,15 +173,22 @@ export function SettingsView() {
                 size="sm"
                 variant="outline"
                 onClick={() => indexOne.mutate(k)}
-                disabled={indexOne.isPending && indexOne.variables === k}
+                disabled={indexing.has(k) || rewriting}
               >
-                {indexOne.isPending && indexOne.variables === k ? "Indexing…" : "Reindex"}
+                {waiting.includes(k) ? "Waiting…" : indexing.has(k) ? "Indexing…" : "Reindex"}
               </Button>
             </div>
           ))}
-          {indexOne.isError && indexOne.variables && (
+          {waiting.length > 0 && (
+            <p className="text-xs text-muted-foreground">
+              Another reindex or an index rewrite is running.{" "}
+              {waiting.map((k) => SOURCE_LABELS[k]).join(" and ")} will reindex from the new folder
+              as soon as it finishes.
+            </p>
+          )}
+          {lastIndexRun?.status === "error" && (
             <p role="alert" className="text-xs text-destructive">
-              Couldn't reindex {SOURCE_LABELS[indexOne.variables]}: {String(indexOne.error)}
+              Couldn't reindex {SOURCE_LABELS[lastIndexRun.kind]}: {String(lastIndexRun.error)}
             </p>
           )}
           {indexError && (
@@ -120,6 +196,7 @@ export function SettingsView() {
               The last full reindex failed: {indexError}
             </p>
           )}
+          <DataRootFields onChanged={(kind) => reindexMoved.mutate(kind)} />
         </CardContent>
       </Card>
 
@@ -137,7 +214,7 @@ export function SettingsView() {
             size="sm"
             variant="outline"
             onClick={() => buildIndex.mutate()}
-            disabled={embed.data?.running}
+            disabled={embed.data?.running || rewriting}
           >
             {embed.data?.running ? "Building…" : "Build / update semantic index"}
           </Button>
@@ -240,6 +317,147 @@ export function SettingsView() {
 
       <GeneralCard />
       <CleanupCard />
+    </div>
+  );
+}
+
+type RootKey = "claudeConfigDir" | "codexHome";
+
+const DATA_ROOTS: {
+  key: RootKey;
+  effective: "effectiveClaudeConfigDir" | "effectiveCodexHome";
+  kind: SourceKind;
+  label: string;
+  fallback: string;
+}[] = [
+  {
+    key: "claudeConfigDir",
+    effective: "effectiveClaudeConfigDir",
+    kind: "claude_code",
+    label: "Claude Code data folder",
+    fallback: "~/.claude",
+  },
+  {
+    key: "codexHome",
+    effective: "effectiveCodexHome",
+    kind: "codex",
+    label: "Codex data folder",
+    fallback: "~/.codex",
+  },
+];
+
+/** How many parts of the Claude Code integration a status shows installed. */
+function claudeSetupParts(s: IntegrationStatus | undefined): number {
+  return s ? [s.skillInstalled, s.mcpRegistered, s.hookInstalled].filter(Boolean).length : 0;
+}
+
+function codexRegistered(agents: AgentIntegration[] | undefined): boolean {
+  return !!agents?.some((a) => a.id === "codex" && a.registered);
+}
+
+/** Overrides for relocated Claude Code / Codex data. An app opened from the Dock, Finder or
+ *  Start menu never sees the shell's CLAUDE_CONFIG_DIR / CODEX_HOME, so without these it
+ *  indexes the default folder. A change reindexes that source, since the watcher only
+ *  sees new writes. */
+function DataRootFields({ onChanged }: { onChanged: (kind: SourceKind) => void }) {
+  const queryClient = useQueryClient();
+  const roots = useQuery({ queryKey: ["data_roots"], queryFn: api.getDataRoots });
+  // No draft = not editing: show the saved value. A draft overrides it while typing, so a
+  // refetch landing mid-edit can't clobber the input (same as the Ollama URL field).
+  const [drafts, setDrafts] = useState<Partial<Record<RootKey, string>>>({});
+  // The skill, hooks and MCP entries live in the agent's own folder, and their status now
+  // reads the new one. Same queries as the integration cards above (no extra fetch).
+  const recall = useQuery({
+    queryKey: ["recall_integration"],
+    queryFn: api.recallIntegrationStatus,
+  });
+  const agents = useQuery({
+    queryKey: ["agent_integrations"],
+    queryFn: api.agentIntegrationsStatus,
+  });
+  // What was set up when a folder moved, to tell whether that setup stayed behind.
+  const [setupBefore, setSetupBefore] = useState<{ claudeParts?: number; codex?: boolean }>({});
+  const leftBehind = [
+    setupBefore.claudeParts !== undefined &&
+      claudeSetupParts(recall.data) < setupBefore.claudeParts &&
+      "Claude Code",
+    setupBefore.codex && !codexRegistered(agents.data) && "Codex",
+  ].filter((name): name is string => !!name);
+  function onFoldersMoved(moved: SourceKind[]) {
+    setSetupBefore({
+      claudeParts: moved.includes("claude_code") ? claudeSetupParts(recall.data) : undefined,
+      codex: moved.includes("codex") && codexRegistered(agents.data),
+    });
+    // Neither card refetches on its own (no window-focus refetch), so they would keep
+    // showing the old folder's setup while recall quietly stops working.
+    void queryClient.invalidateQueries({ queryKey: ["recall_integration"] });
+    void queryClient.invalidateQueries({ queryKey: ["agent_integrations"] });
+  }
+  const save = useMutation({
+    mutationFn: api.setDataRoots,
+    // Show the new value at once (the draft is gone after blur). Only the saved fields
+    // change here; the effective ones still hold the old paths for the comparison below.
+    onMutate: (vars) =>
+      queryClient.setQueryData<DataRoots>(["data_roots"], (prev) =>
+        prev ? { ...prev, ...vars } : prev,
+      ),
+    onSuccess: (next) => {
+      const prev = queryClient.getQueryData<DataRoots>(["data_roots"]);
+      queryClient.setQueryData(["data_roots"], next);
+      const moved = DATA_ROOTS.filter((r) => prev && prev[r.effective] !== next[r.effective]);
+      for (const r of moved) onChanged(r.kind);
+      if (moved.length > 0) onFoldersMoved(moved.map((r) => r.kind));
+    },
+    onError: () => queryClient.invalidateQueries({ queryKey: ["data_roots"] }),
+  });
+
+  const r = roots.data;
+  return (
+    <div className="space-y-2 border-t pt-3">
+      <div className="grid grid-cols-2 gap-3">
+        {DATA_ROOTS.map((root) => (
+          <Field key={root.key} label={root.label}>
+            <Input
+              value={drafts[root.key] ?? r?.[root.key] ?? ""}
+              onChange={(e) => {
+                const value = e.target.value;
+                setDrafts((d) => ({ ...d, [root.key]: value }));
+              }}
+              onBlur={(e) => {
+                const value = e.target.value.trim();
+                setDrafts(({ [root.key]: _, ...rest }) => rest);
+                if (r && value !== r[root.key]) save.mutate({ [root.key]: value });
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") e.currentTarget.blur();
+              }}
+              placeholder={r?.[root.effective] ?? root.fallback}
+              disabled={!r}
+              spellCheck={false}
+            />
+          </Field>
+        ))}
+      </div>
+      <p className="text-xs text-muted-foreground">
+        Only needed if you moved them (<code>CLAUDE_CONFIG_DIR</code> / <code>CODEX_HOME</code>).
+        Leave blank for the default.
+      </p>
+      {roots.isError && (
+        <p role="alert" className="text-xs text-destructive">
+          Couldn't read the data folders: {String(roots.error)}
+        </p>
+      )}
+      {save.isError && (
+        <p role="alert" className="text-xs text-destructive">
+          Couldn't save the folder: {String(save.error)}
+        </p>
+      )}
+      {leftBehind.length > 0 && (
+        <p role="status" className="text-xs text-muted-foreground">
+          The {leftBehind.join(" and ")} integration is still set up in the old folder. Set it up
+          again above so it works from the new one.
+        </p>
+      )}
     </div>
   );
 }
@@ -593,6 +811,18 @@ function DistillationCard() {
     ...installedClis.map((e) => ({ id: e.id, label: `${e.label} (subscription · no key)` })),
   ];
   const autoDistill = c?.autoDistill ?? false;
+  // Refreshed on distill:done (main.tsx), when an auto-distill round spends the allowance.
+  const budget = useQuery({
+    queryKey: ["auto_distill_budget"],
+    queryFn: api.autoDistillBudget,
+    enabled,
+  });
+  const setCap = useMutation({
+    mutationFn: (cap: number) => api.setAutoDistillDailyCap(cap),
+    onSuccess: (next) => queryClient.setQueryData(["auto_distill_budget"], next),
+  });
+  const b = budget.data;
+  const capId = useId();
   const toggleAuto = useMutation({
     mutationFn: (on: boolean) => api.setAutoDistill(on),
     onMutate: (on: boolean) =>
@@ -666,6 +896,33 @@ function DistillationCard() {
             <div className="flex items-center gap-2 pt-1 text-sm">
               <Switch checked={autoDistill} onCheckedChange={(v) => toggleAuto.mutate(v)} />
               Auto-distill in the background
+              {b && (
+                <div className="ml-auto flex items-center gap-1.5 text-xs text-muted-foreground">
+                  <label htmlFor={capId}>Up to</label>
+                  <Input
+                    id={capId}
+                    // Keyed on the saved cap so a save (or a rejected entry) resets the field.
+                    key={b.dailyCap}
+                    type="number"
+                    min={0}
+                    step={1}
+                    inputMode="numeric"
+                    defaultValue={b.dailyCap}
+                    onBlur={(e) => {
+                      const cap = Number.parseInt(e.target.value, 10);
+                      if (Number.isFinite(cap) && cap >= 0 && cap !== b.dailyCap)
+                        setCap.mutate(cap);
+                      else e.target.value = String(b.dailyCap);
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") e.currentTarget.blur();
+                    }}
+                    disabled={setCap.isPending}
+                    className="h-7 w-16 text-right tabular-nums"
+                  />
+                  <span>threads a day</span>
+                </div>
+              )}
             </div>
             <p className="text-xs text-muted-foreground">
               Distill new and changed threads automatically as they're indexed, so Ask, recall, and
@@ -677,6 +934,20 @@ function DistillationCard() {
                   ? "Runs through your CLI subscription (no API key)."
                   : "Uses your provider key, so it has a per-thread cost."}
             </p>
+            {b && (
+              <p className="text-xs text-muted-foreground">
+                {b.dailyCap === 0
+                  ? "A daily limit of 0 pauses auto-distill."
+                  : autoDistill
+                    ? `${b.remainingToday} of ${b.dailyCap} left today (resets at midnight UTC) · ${b.eligibleThreads} threads from the last ${b.recentDays} days still to distill.`
+                    : `${b.eligibleThreads} threads from the last ${b.recentDays} days would be distilled, up to ${b.dailyCap} a day.`}
+              </p>
+            )}
+            {setCap.isError && (
+              <p role="alert" className="text-xs text-destructive">
+                Couldn't save the daily limit: {String(setCap.error)}
+              </p>
+            )}
           </>
         )}
       </CardContent>

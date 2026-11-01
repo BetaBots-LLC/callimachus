@@ -64,7 +64,8 @@ const MIN_GLIBC = [2, 38];
 // so instead of pointing here.
 const BUILD_FROM_SOURCE =
   `To build it yourself you need Rust and, on Linux, the pkg-config, OpenSSL, ` +
-  `webkit2gtk-4.1 and librsvg2 development packages:\n` +
+  `D-Bus and webkit2gtk-4.1 development packages (on Debian/Ubuntu: pkg-config ` +
+  `libssl-dev libdbus-1-dev libwebkit2gtk-4.1-dev):\n` +
   `  git clone --depth 1 --branch v${version} https://github.com/${REPO}\n` +
   `  cd callimachus/apps/desktop\n` +
   `  mkdir dist\n` +

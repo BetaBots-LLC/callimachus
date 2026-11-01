@@ -291,6 +291,12 @@ const BULK_SUB_BATCH: usize = 16;
 /// stream of queries can slow the background build but never stall it.
 const MAX_BULK_YIELD: Duration = Duration::from_secs(2);
 
+/// ONNX intra-op threads for a query-only embedder (`cached_only`: hooks, `cal`, MCP).
+/// One short query is fastest around here: on a 24-core M2 Ultra a query took 3-5 ms at 4
+/// threads but 6-10 ms at the bulk setting (22), where thread sync outweighs the work. It
+/// also spares each hook and MCP process ~18 idle ORT pool threads.
+const QUERY_INTRA_THREADS: usize = 4;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum LoadMode {
     /// `ensure_loaded`: always attempts (ignores the failure cooldown); downloads if the
@@ -324,23 +330,28 @@ pub struct Embedder {
     /// Test-only cache root override: the only root looked in and downloaded into. `None`
     /// means `lookup_roots()` / `model_cache_dir()`.
     cache_root: Option<PathBuf>,
+    /// ONNX intra-op threads the model is loaded with (`bulk_intra_threads` or
+    /// `query_intra_threads`). Thread count does not change the vectors.
+    intra_threads: usize,
 }
 
 impl Default for Embedder {
-    /// The app's embedder: downloads the model on first use if it isn't cached yet.
+    /// The app's embedder: downloads the model on first use if it isn't cached yet, and
+    /// uses the bulk thread count since it runs the semantic-index build.
     fn default() -> Self {
-        Self::new(true, None)
+        Self::new(true, None, bulk_intra_threads())
     }
 }
 
 impl Embedder {
-    fn new(allow_download: bool, cache_root: Option<PathBuf>) -> Self {
+    fn new(allow_download: bool, cache_root: Option<PathBuf>, intra_threads: usize) -> Self {
         Self {
             model: OnceLock::new(),
             init: Mutex::new(None),
             interactive: AtomicUsize::new(0),
             allow_download,
             cache_root,
+            intra_threads,
         }
     }
 
@@ -349,8 +360,11 @@ impl Embedder {
     /// `embed_query` returns `Ok(None)` (callers fall back to keyword search),
     /// `embed_pending_facts*` leave facts pending for the app, and `embed` /
     /// `ensure_loaded` return `EmbedError::ModelNotCached`.
+    ///
+    /// Every caller embeds only queries and a handful of facts, so it loads with the small
+    /// `query_intra_threads` pool instead of the app's bulk-build setting.
     pub fn cached_only() -> Self {
-        Self::new(false, None)
+        Self::new(false, None, query_intra_threads())
     }
 
     /// True once the model is loaded in this process.
@@ -425,8 +439,8 @@ impl Embedder {
         let may_download = self.allow_download && mode != LoadMode::CachedNoWait;
         let roots = self.lookup_roots();
         let loaded = match find_snapshot(&roots) {
-            Some(snapshot) => load_snapshot(&snapshot),
-            None if may_download => download_model(&self.download_root()),
+            Some(snapshot) => load_snapshot(&snapshot, self.intra_threads),
+            None if may_download => download_model(&self.download_root(), self.intra_threads),
             // Not a failure (nothing was attempted), so it doesn't start the cooldown.
             None => return Err(EmbedError::ModelNotCached(roots)),
         };
@@ -444,18 +458,28 @@ impl Embedder {
     }
 
     /// Bulk inference: one short locked call per sub-batch, deferring to queries between.
+    ///
+    /// Sub-batches are cut in length order, not arrival order. fastembed pads each batch
+    /// to its longest member, and the pending backlog is skewed (p50 ~75 tokens, p90 ~446),
+    /// so arrival-order batches ran ~3x the real tokens. Grouping similar lengths about
+    /// doubles chunks/s and shortens the worst model-lock hold a query can wait behind.
+    /// Vectors are written back to their input positions, so the output stays parallel
+    /// to `texts` (callers zip it with owner ids).
     fn infer_bulk(
         &self,
         model: &Mutex<TextEmbedding>,
         texts: &[String],
     ) -> Result<Vec<Vec<f32>>, EmbedError> {
-        let mut out = Vec::with_capacity(texts.len());
-        for sub in texts.chunks(BULK_SUB_BATCH) {
+        let mut out = vec![Vec::new(); texts.len()];
+        for idxs in length_order(texts).chunks(BULK_SUB_BATCH) {
             self.yield_to_interactive();
+            let sub: Vec<&str> = idxs.iter().map(|&i| texts[i].as_str()).collect();
             let vecs = lock_model(model)
-                .embed(sub, None)
+                .embed(&sub, None)
                 .map_err(inference_error)?;
-            out.extend(vecs);
+            for (&i, v) in idxs.iter().zip(vecs) {
+                out[i] = v;
+            }
         }
         debug_assert!(
             out.iter().all(|v| v.len() == DIM),
@@ -493,19 +517,30 @@ impl Embedder {
     }
 }
 
-/// ONNX intra-op threads: capped so a build doesn't pin every core and starve the UI
-/// thread. fastembed counts logical cores; leave 2 free.
-fn intra_threads() -> usize {
+/// Logical cores (fastembed counts these too), or 1 if unknown.
+fn available_cores() -> usize {
     std::thread::available_parallelism()
-        .map(|n| n.get().saturating_sub(2).max(1))
+        .map(|n| n.get())
         .unwrap_or(1)
+}
+
+/// ONNX intra-op threads for the app's bulk build: capped so a build doesn't pin every
+/// core and starve the UI thread; leave 2 free. Throughput still scales to here (79
+/// chunks/s at 22 threads vs 55 at 8 on a 24-core machine), so the app keeps n-2.
+fn bulk_intra_threads() -> usize {
+    available_cores().saturating_sub(2).max(1)
+}
+
+/// ONNX intra-op threads for a query-only embedder (see `QUERY_INTRA_THREADS`).
+fn query_intra_threads() -> usize {
+    available_cores().min(QUERY_INTRA_THREADS)
 }
 
 /// Load bge-small from a complete snapshot directory (see `cached_snapshot`), reading the
 /// files directly. Going through fastembed's hf-hub loader instead would re-resolve the
 /// cache from `$HF_HOME`, which may point somewhere else entirely. Same session options,
 /// tokenizer, pooling and quantization as `TextEmbedding::try_new`, so the vectors match.
-fn load_snapshot(snapshot: &Path) -> Result<TextEmbedding> {
+fn load_snapshot(snapshot: &Path, intra_threads: usize) -> Result<TextEmbedding> {
     let context = || format!("loading bge-small-en-v1.5 from {}", snapshot.display());
     let info = TextEmbedding::get_model_info(&MODEL).with_context(context)?;
     let read = |file: &str| {
@@ -534,7 +569,7 @@ fn load_snapshot(snapshot: &Path) -> Result<TextEmbedding> {
     }
     TextEmbedding::try_new_from_user_defined(
         model,
-        InitOptionsUserDefined::new().with_intra_threads(intra_threads()),
+        InitOptionsUserDefined::new().with_intra_threads(intra_threads),
     )
     .with_context(context)
 }
@@ -542,7 +577,7 @@ fn load_snapshot(snapshot: &Path) -> Result<TextEmbedding> {
 /// Download bge-small into `cache_root` (an absolute dir) through fastembed's hf-hub
 /// loader, then load it. Only the app does this; callers decide beforehand whether a
 /// download is allowed.
-fn download_model(cache_root: &Path) -> Result<TextEmbedding> {
+fn download_model(cache_root: &Path, intra_threads: usize) -> Result<TextEmbedding> {
     // hf-hub uses `$HF_HOME` verbatim when it is set, in preference to `cache_root`. An
     // empty or relative value would put 128 MB under this process's CWD, so refuse it.
     if let Some(hf_home) = std::env::var_os(HF_HOME_ENV) {
@@ -559,9 +594,17 @@ fn download_model(cache_root: &Path) -> Result<TextEmbedding> {
         TextInitOptions::new(MODEL)
             .with_cache_dir(cache_root.to_path_buf())
             .with_show_download_progress(false)
-            .with_intra_threads(intra_threads()),
+            .with_intra_threads(intra_threads),
     )
     .with_context(|| format!("loading bge-small-en-v1.5 from {}", cache_root.display()))
+}
+
+/// Indices of `texts`, shortest first. Byte length tracks token count closely enough to
+/// group similar inputs, and the stable sort keeps equal lengths in arrival order.
+fn length_order(texts: &[String]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..texts.len()).collect();
+    order.sort_by_key(|&i| texts[i].len());
+    order
 }
 
 /// Lock the loaded model. A panic during inference poisons the mutex; the ONNX session
@@ -623,9 +666,9 @@ fn chunk_text(s: &str) -> Vec<String> {
 // (search, recent, stats…) and freeze the app. The background job in lib.rs drives
 // these three; `embed_batch` below is the all-in-one convenience for tests.
 
-/// Select up to `batch` not-yet-embedded messages that pass `EMBEDDABLE_SQL`. The
-/// `embedded` flag is maintained by a partial index, so this is O(batch), not a growing
-/// scan.
+/// Select up to `batch` not-yet-embedded messages that pass `EMBEDDABLE_SQL`. 0026's
+/// covering (role, tool_name, embedded) index serves this predicate (0031 dropped 0008's
+/// partial index), so this is O(batch), not a growing scan.
 pub fn pending_batch(conn: &Connection, batch: usize) -> Result<Vec<(i64, String)>> {
     let mut stmt = conn.prepare(&format!(
         "SELECT m.id, m.text FROM messages m
@@ -972,26 +1015,122 @@ pub fn semantic_search_vec(
     project: Option<&str>,
     k: usize,
 ) -> Result<Vec<(i64, f32)>> {
+    let filtered = !sources.is_empty() || project.is_some_and(|p| !p.is_empty());
+    let prefilter = filtered && owner_prefilter_usable(conn);
+    let (sql, args) = semantic_knn_sql(qv, include_subagents, sources, project, k, prefilter);
+    let arg_refs: Vec<&dyn ToSql> = args.iter().map(|b| b.as_ref()).collect();
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(arg_refs.as_slice(), |r| {
+        let id: i64 = r.get(0)?;
+        let dist: f64 = r.get(1)?;
+        Ok((id, (1.0 - dist) as f32)) // cosine distance -> similarity
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// sqlite-vec's ceiling on a KNN's `k` (SQLITE_VEC_VEC0_K_MAX); a larger one is an error.
+const VEC0_MAX_K: usize = 4096;
+
+/// Whether a scoped KNN can pre-filter through `vec_chunk_owner` without losing vectors.
+/// Not when the table is missing: read-only sidecars (`cal search`, hooks) never migrate,
+/// so a newer binary can be reading an index from before 0025. Not while some vectors lack
+/// an owner row (an older app kept embedding after a newer process migrated the index):
+/// the pre-filter would drop them, while the post-filter still finds them. Search runs on
+/// read-only connections and can't repair that; `cleanup::reconcile_vec_owners` does, at
+/// the end of every embedding build and in Reclaim space. Both checks are per query and
+/// cheap (a cached schema lookup, two b-tree counts), so a repair or upgrade that lands
+/// under a long-lived pooled reader switches it back to the pre-filter.
+fn owner_prefilter_usable(conn: &Connection) -> bool {
+    crate::db::has_table(conn, "vec_chunk_owner")
+        && !crate::cleanup::vectors_missing_owners(conn).unwrap_or(true)
+}
+
+/// The statement and bind values behind `semantic_search_vec`, split out so tests can
+/// check its query plan. `owner_prefilter` pushes the project/source filters into the KNN
+/// (see [`owner_prefilter_usable`]); without it they only post-filter an over-fetch.
+fn semantic_knn_sql(
+    qv: &[f32],
+    include_subagents: bool,
+    sources: &[String],
+    project: Option<&str>,
+    k: usize,
+    owner_prefilter: bool,
+) -> (String, Vec<Box<dyn ToSql>>) {
     let project = project.filter(|p| !p.is_empty());
-    // Over-fetch chunks so dedup + filtering still leaves k messages. vec0 applies the
-    // source/subagent/project filter AFTER the KNN, so a selective filter can starve
-    // results — over-fetch far more candidates when one is active. sqlite-vec requires `k`
-    // as a literal (not a bound parameter), so inline our own integer.
-    let selective = !sources.is_empty() || project.is_some();
-    let knn_k = if selective {
+    // Bind order: ?1 the query vector, then the project pattern, then the source kinds.
+    // Each is bound once and referenced by number from both the pre-filter and the outer
+    // query.
+    let mut args: Vec<Box<dyn ToSql>> = vec![Box::new(vec_to_bytes(qv))];
+    let project_ph = project.map(|p| {
+        args.push(Box::new(format!("%{p}%")));
+        args.len()
+    });
+    let first_source_ph = args.len() + 1;
+    for s in sources {
+        args.push(Box::new(s.clone()));
+    }
+    let source_list = (first_source_ph..first_source_ph + sources.len())
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    // Project and source filters are pushed INTO the KNN as a `rowid IN (...)` pre-filter
+    // over the matching threads' chunks, which vec0 serves by skipping every vector outside
+    // the list. Post-filtering a global top-k instead starved narrow filters (a project with
+    // 0.6% of the vectors got 4-11 of 100 hits; codex, with 3 vectors, got none) despite a
+    // 2000-chunk over-fetch. Measured on a 117k-vector index: one project 160 -> 27 ms, a
+    // source holding half the vectors 160 -> 80 ms, and every filter gets its full k. A
+    // vector with no vec_chunk_owner row would be left out, so the caller only asks for the
+    // pre-filter when every vector has one (store_batch writes one per vector).
+    let filtered = project_ph.is_some() || !sources.is_empty();
+    let pushed_down = filtered && owner_prefilter;
+    let prefilter = if pushed_down {
+        let mut joins = String::from(
+            "SELECT o.chunk_rowid FROM vec_chunk_owner o
+             JOIN messages m ON m.id = o.message_id
+             JOIN threads t ON t.id = m.thread_id",
+        );
+        let mut conds = Vec::new();
+        if let Some(ph) = project_ph {
+            conds.push(format!(
+                "COALESCE(t.project_key, t.project_path) LIKE ?{ph}"
+            ));
+        }
+        if !sources.is_empty() {
+            joins.push_str(" JOIN sources s ON s.id = t.source_id");
+            conds.push(format!("s.kind IN ({source_list})"));
+        }
+        // Matches the outer filter, shrinks the list, and lets the planner build it from
+        // idx_threads_subagent (a few ms per thousand chunks) instead of every owner row.
+        if !include_subagents {
+            conds.push("t.is_subagent = 0".to_string());
+        }
+        format!(" AND rowid IN ({joins} WHERE {})", conds.join(" AND "))
+    } else {
+        String::new()
+    };
+
+    // Over-fetch chunks so dedup (several chunks per message) and the remaining
+    // post-filters (subagents, legacy tool-call vectors) still leave k messages. A filter
+    // that could not be pushed into the KNN post-filters a global top-k, so it fetches far
+    // more (a narrow one can still come up short, as before the pre-filter). sqlite-vec
+    // requires `k` as a literal (not a bound parameter), so inline our own integer.
+    let knn_k = if filtered && !pushed_down {
         (k * 20).max(800)
     } else {
         (k * 5).max(200)
-    };
+    }
+    .min(VEC0_MAX_K);
 
     // MATERIALIZED so SQLite doesn't inline the KNN into the outer query (vec0 only
     // permits `ORDER BY distance` on the KNN query itself, not the outer ORDER BY).
     // EMBEDDABLE_SQL drops vectors that older builds stored for tool-call rows, so they
-    // can't crowd prose out of the results before a migration deletes them.
+    // can't crowd prose out of the results before a migration deletes them. The outer
+    // filters repeat the pre-filter's; the subagent one is what scopes an unfiltered search.
     let mut sql = format!(
         "WITH knn AS MATERIALIZED (
             SELECT message_id, distance FROM vec_chunks
-            WHERE embedding MATCH ?1 AND k = {knn_k} ORDER BY distance
+            WHERE embedding MATCH ?1 AND k = {knn_k}{prefilter} ORDER BY distance
          )
          SELECT knn.message_id, MIN(knn.distance) AS d
          FROM knn
@@ -1000,28 +1139,17 @@ pub fn semantic_search_vec(
          JOIN sources s ON s.id = t.source_id
          WHERE {EMBEDDABLE_SQL}"
     );
-    let mut args: Vec<Box<dyn ToSql>> = vec![Box::new(vec_to_bytes(qv))];
     if !include_subagents {
         sql.push_str(" AND t.is_subagent = 0");
     }
     if !sources.is_empty() {
-        let placeholders: Vec<String> = sources
-            .iter()
-            .enumerate()
-            .map(|(i, _)| format!("?{}", i + 2))
-            .collect();
-        sql.push_str(&format!(" AND s.kind IN ({})", placeholders.join(", ")));
-        for s in sources {
-            args.push(Box::new(s.clone()));
-        }
+        sql.push_str(&format!(" AND s.kind IN ({source_list})"));
     }
     // Scope the semantic arm to the project too (was previously ignored, leaking cross-
     // project hits into a project-scoped hybrid search). Match how facts/threads aggregate.
-    if let Some(p) = project {
-        args.push(Box::new(format!("%{p}%")));
+    if let Some(ph) = project_ph {
         sql.push_str(&format!(
-            " AND COALESCE(t.project_key, t.project_path) LIKE ?{}",
-            args.len()
+            " AND COALESCE(t.project_key, t.project_path) LIKE ?{ph}"
         ));
     }
     // Similarity floor: KNN always returns its k-nearest, so a query with no good semantic
@@ -1034,15 +1162,7 @@ pub fn semantic_search_vec(
     sql.push_str(&format!(
         " GROUP BY knn.message_id HAVING d <= ?{dist_ph} ORDER BY d LIMIT ?{limit_ph}"
     ));
-
-    let arg_refs: Vec<&dyn ToSql> = args.iter().map(|b| b.as_ref()).collect();
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(arg_refs.as_slice(), |r| {
-        let id: i64 = r.get(0)?;
-        let dist: f64 = r.get(1)?;
-        Ok((id, (1.0 - dist) as f32)) // cosine distance -> similarity
-    })?;
-    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    (sql, args)
 }
 
 /// Count of embedded messages vs total embeddable (for UI progress). Both counts use
@@ -1241,13 +1361,68 @@ mod tests {
             "how do I activate a python virtualenv",
             "sqlite busy timeout",
         ];
-        let mut direct = load_snapshot(&snapshot).unwrap();
+        let mut direct = load_snapshot(&snapshot, bulk_intra_threads()).unwrap();
         let mut hub =
             TextEmbedding::try_new(TextInitOptions::new(MODEL).with_cache_dir(root)).unwrap();
         assert_eq!(
             direct.embed(texts, None).unwrap(),
             hub.embed(texts, None).unwrap()
         );
+    }
+
+    fn cosine(a: &[f32], b: &[f32]) -> f32 {
+        let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+        let norm = |v: &[f32]| v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        dot / (norm(a) * norm(b))
+    }
+
+    /// Needs a downloaded model. The sidecar's small thread pool must not change vectors.
+    #[test]
+    #[ignore]
+    fn thread_count_does_not_change_vectors() {
+        let snapshot = find_snapshot(&lookup_roots()).expect("a cached model");
+        let texts = [
+            "how do I activate a python virtualenv",
+            "sqlite busy timeout",
+        ];
+        let few = load_snapshot(&snapshot, QUERY_INTRA_THREADS)
+            .unwrap()
+            .embed(texts, None)
+            .unwrap();
+        let many = load_snapshot(&snapshot, bulk_intra_threads())
+            .unwrap()
+            .embed(texts, None)
+            .unwrap();
+        for (a, b) in few.iter().zip(&many) {
+            assert!(cosine(a, b) > 0.99999, "cosine {}", cosine(a, b));
+        }
+    }
+
+    /// Needs a downloaded model. Bulk inference runs in length order; every vector must
+    /// still land at its input's position. Each text is compared with embedding it alone
+    /// (no padding at all), so a mis-permuted output would show up as a low cosine.
+    #[test]
+    #[ignore]
+    fn bulk_length_sort_keeps_input_order() {
+        let e = Embedder::cached_only();
+        e.ensure_loaded().unwrap();
+        let model = e.model.get().unwrap();
+        let texts: Vec<String> = (0..(BULK_SUB_BATCH * 2 + 5))
+            .map(|i| {
+                // Lengths deliberately out of order: long, short, medium, ...
+                let words = [40, 2, 15, 7, 60, 1][i % 6];
+                format!("note {i} about {}", "sqlite vector search ".repeat(words))
+            })
+            .collect();
+        let bulk = e.embed(texts.clone()).unwrap();
+        assert_eq!(bulk.len(), texts.len());
+        for (text, got) in texts.iter().zip(&bulk) {
+            let alone = e
+                .infer_interactive(model, std::slice::from_ref(text))
+                .unwrap();
+            let c = cosine(got, &alone[0]);
+            assert!(c > 0.99999, "{text:?}: cosine {c}");
+        }
     }
 
     #[test]
@@ -1263,7 +1438,7 @@ mod tests {
     #[test]
     fn cached_only_embedder_never_downloads() {
         let root = temp_dir("nocache");
-        let e = Embedder::new(false, Some(root.clone()));
+        let e = Embedder::new(false, Some(root.clone()), query_intra_threads());
 
         // Queries degrade to keyword-only instead of erroring or downloading.
         assert!(embed_query(&e, "how do I activate a venv")
@@ -1292,7 +1467,7 @@ mod tests {
     #[test]
     fn empty_query_skips_the_model() {
         // Even a download-allowed embedder must not load anything for a blank query.
-        let e = Embedder::new(true, Some(temp_dir("blank")));
+        let e = Embedder::new(true, Some(temp_dir("blank")), bulk_intra_threads());
         assert!(embed_query(&e, "   ").unwrap().is_none());
         assert!(!e.is_loaded());
     }
@@ -1302,7 +1477,7 @@ mod tests {
         // A cached model is read from its snapshot directly, so HF_HOME can't redirect this.
         let root = temp_dir("corrupt");
         fake_model_cache(&root, None);
-        let e = Embedder::new(false, Some(root.clone()));
+        let e = Embedder::new(false, Some(root.clone()), query_intra_threads());
 
         // Files are "cached", so a load is attempted (offline) and fails on the bad ONNX.
         let first = e.ensure_loaded().unwrap_err();
@@ -1332,6 +1507,29 @@ mod tests {
             Err(EmbedError::ModelNotCached(_))
         ));
         assert!(!e.is_loaded());
+    }
+
+    #[test]
+    fn sidecar_embedder_uses_the_small_thread_pool() {
+        let sidecar = Embedder::cached_only();
+        assert!((1..=QUERY_INTRA_THREADS).contains(&sidecar.intra_threads));
+        assert_eq!(
+            sidecar.intra_threads,
+            available_cores().min(QUERY_INTRA_THREADS)
+        );
+        // The app's embedder runs the bulk build and keeps n-2.
+        assert_eq!(Embedder::default().intra_threads, bulk_intra_threads());
+    }
+
+    #[test]
+    fn length_order_is_shortest_first_and_stable() {
+        let texts: Vec<String> = ["ccc", "a", "bb", "x", "dddd", ""]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        // Equal lengths ("a", "x") keep arrival order.
+        assert_eq!(length_order(&texts), vec![5, 1, 3, 2, 0, 4]);
+        assert!(length_order(&[]).is_empty());
     }
 
     #[test]
@@ -1500,6 +1698,237 @@ mod tests {
         let hits = semantic_search_vec(&db.conn, &v, true, &[], None, 10).unwrap();
         let ids: Vec<i64> = hits.iter().map(|(id, _)| *id).collect();
         assert_eq!(ids, vec![prose]);
+    }
+
+    /// A new thread (the target of later `insert_msg` calls). Source 1 is claude_code and
+    /// 2 is codex in the seeded `sources` table.
+    fn insert_thread(conn: &Connection, ext: &str, project: &str, source_id: i64, subagent: bool) {
+        conn.execute(
+            "INSERT INTO threads (source_id, external_id, title, project_path, is_subagent)
+             VALUES (?1, ?2, 't', ?3, ?4)",
+            params![source_id, ext, project, subagent as i64],
+        )
+        .unwrap();
+    }
+
+    /// A vector at a known cosine from the query `direction(0.0)`: cos = 1/sqrt(1 + x^2).
+    fn direction(x: f32) -> Vec<f32> {
+        let mut v = vec![0.0_f32; DIM];
+        v[0] = 1.0;
+        v[1] = x;
+        v
+    }
+
+    #[test]
+    fn project_and_source_filters_prefilter_the_knn() {
+        let mut db = temp_db("semproj");
+        // 900 claude_code vectors in one project, all nearer the query than anything else
+        // and more than any over-fetch: a post-filtered global top-k finds nothing outside.
+        insert_thread(&db.conn, "big", "/w/big", 1, false);
+        let big: Vec<i64> = (0..900)
+            .map(|i| insert_msg(&db.conn, i, "user", "big", None))
+            .collect();
+        insert_thread(&db.conn, "small", "/w/small", 1, false);
+        let small = insert_msg(&db.conn, 0, "assistant", "small", None);
+        insert_thread(&db.conn, "small-codex", "/w/small", 2, false);
+        let small_codex = insert_msg(&db.conn, 0, "user", "small, codex", None);
+        insert_thread(&db.conn, "small-sub", "/w/small", 1, true);
+        let small_sub = insert_msg(&db.conn, 0, "user", "small, subagent", None);
+
+        let mut ids = big.clone();
+        let mut vecs = vec![direction(0.05); big.len()];
+        ids.extend([small, small_codex, small_sub]);
+        vecs.extend([direction(0.5), direction(0.6), direction(0.4)]);
+        store_batch(&mut db.conn, &ids, &ids, &vecs).unwrap();
+
+        let q = direction(0.0);
+        let search = |subagents: bool, sources: &[&str], project: Option<&str>, k: usize| {
+            let sources: Vec<String> = sources.iter().map(|s| s.to_string()).collect();
+            semantic_search_vec(&db.conn, &q, subagents, &sources, project, k)
+                .unwrap()
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect::<Vec<i64>>()
+        };
+
+        // Nearest first, subagent thread hidden by default.
+        assert_eq!(
+            search(false, &[], Some("small"), 10),
+            vec![small, small_codex]
+        );
+        assert_eq!(search(false, &[], Some("small"), 1), vec![small]);
+        assert_eq!(
+            search(true, &[], Some("small"), 10),
+            vec![small_sub, small, small_codex]
+        );
+        // Source kinds apply inside the pre-filter, with or without a project.
+        assert_eq!(
+            search(false, &["codex"], Some("small"), 10),
+            vec![small_codex]
+        );
+        assert_eq!(search(false, &["codex"], None, 10), vec![small_codex]);
+        assert_eq!(
+            search(true, &["claude_code"], Some("small"), 10),
+            vec![small_sub, small]
+        );
+        assert!(search(false, &["cursor"], None, 10).is_empty());
+        // A broad pattern (the list holds every vector) still ranks globally.
+        let broad = search(false, &[], Some("/w/"), 5);
+        assert_eq!(broad.len(), 5);
+        assert!(broad.iter().all(|id| big.contains(id)), "{broad:?}");
+        // Unscoped: the big project's nearer vectors win, as before.
+        let all = search(false, &[], None, 5);
+        assert_eq!(all.len(), 5);
+        assert!(all.iter().all(|id| big.contains(id)), "{all:?}");
+    }
+
+    /// EXPLAIN QUERY PLAN detail lines for the `semantic_search_vec` statement.
+    fn semantic_plan(
+        conn: &Connection,
+        include_subagents: bool,
+        sources: &[String],
+        project: Option<&str>,
+        owner_prefilter: bool,
+    ) -> Vec<String> {
+        let (sql, args) = semantic_knn_sql(
+            &direction(0.0),
+            include_subagents,
+            sources,
+            project,
+            10,
+            owner_prefilter,
+        );
+        let refs: Vec<&dyn ToSql> = args.iter().map(|b| b.as_ref()).collect();
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        stmt.query_map(refs.as_slice(), |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn filtered_search_plan_uses_vec0_rowid_in() {
+        let db = temp_db("semplan");
+        let codex = vec!["codex".to_string()];
+        for include_subagents in [false, true] {
+            for (sources, project) in [
+                (&codex, None),
+                (&vec![], Some("cal")),
+                (&codex, Some("cal")),
+            ] {
+                let plan = semantic_plan(&db.conn, include_subagents, sources, project, true);
+                // vec0 marks a consumed `rowid IN` with '[' in its index string. Without
+                // it the list would be checked after a global top-k: starvation again.
+                assert!(
+                    plan.iter()
+                        .any(|l| l.contains("VIRTUAL TABLE INDEX") && l.contains('[')),
+                    "{plan:#?}"
+                );
+                // Building the list must never walk the whole messages table.
+                assert!(!plan.iter().any(|l| l.starts_with("SCAN m")), "{plan:#?}");
+                // The fallback never touches the owner map.
+                let plan = semantic_plan(&db.conn, include_subagents, sources, project, false);
+                assert!(!plan.iter().any(|l| l.contains('[')), "{plan:#?}");
+                assert!(
+                    !plan.iter().any(|l| l.contains("vec_chunk_owner")),
+                    "{plan:#?}"
+                );
+            }
+        }
+        // An unfiltered search has no list to build.
+        for include_subagents in [false, true] {
+            let plan = semantic_plan(&db.conn, include_subagents, &[], None, true);
+            assert!(!plan.iter().any(|l| l.contains('[')), "{plan:#?}");
+        }
+    }
+
+    #[test]
+    fn knn_k_fits_vec0_and_over_fetches_without_the_prefilter() {
+        let q = direction(0.0);
+        let codex = vec!["codex".to_string()];
+        let knn_k = |sources: &[String], prefilter: bool, k: usize| {
+            let (sql, _) = semantic_knn_sql(&q, false, sources, None, k, prefilter);
+            let tail = &sql[sql.find("AND k = ").unwrap() + "AND k = ".len()..];
+            tail.split(|c: char| !c.is_ascii_digit())
+                .next()
+                .unwrap()
+                .parse::<usize>()
+                .unwrap()
+        };
+        assert_eq!(knn_k(&[], true, 10), 200);
+        assert_eq!(
+            knn_k(&codex, true, 10),
+            200,
+            "pre-filtered: the list does the work"
+        );
+        assert_eq!(knn_k(&codex, false, 10), 800, "post-filtered: over-fetch");
+        assert_eq!(knn_k(&codex, false, 1000), VEC0_MAX_K);
+        assert_eq!(knn_k(&[], true, 1000), VEC0_MAX_K);
+    }
+
+    /// Scoped search must not lose vectors the owner map can't vouch for: ones an older
+    /// app wrote without an owner row, or every vector on an index from before 0025 (read
+    /// by a sidecar that never migrates). Both fall back to post-filtering.
+    #[test]
+    fn scoped_search_falls_back_when_the_owner_map_cannot_serve_it() {
+        let mut db = temp_db("semfallback");
+        insert_thread(&db.conn, "a", "/w/alpha", 1, false);
+        let alpha = insert_msg(&db.conn, 0, "user", "alpha", None);
+        insert_thread(&db.conn, "b", "/w/beta", 2, false);
+        let beta = insert_msg(&db.conn, 0, "user", "beta", None);
+        store_batch(
+            &mut db.conn,
+            &[alpha, beta],
+            &[alpha, beta],
+            &[direction(0.1), direction(0.2)],
+        )
+        .unwrap();
+        // An older app (no owner map) embeds after a newer process migrated the index.
+        insert_thread(&db.conn, "c", "/w/alpha", 1, false);
+        let unowned = insert_msg(&db.conn, 0, "assistant", "alpha, unowned", None);
+        db.conn
+            .execute(
+                "INSERT INTO vec_chunks (message_id, embedding) VALUES (?1, ?2)",
+                params![unowned, vec_to_bytes(&direction(0.3))],
+            )
+            .unwrap();
+        db.conn
+            .execute("UPDATE messages SET embedded = 1 WHERE id = ?1", [unowned])
+            .unwrap();
+
+        let q = direction(0.0);
+        let search = |conn: &Connection, sources: &[&str], project: Option<&str>| {
+            let sources: Vec<String> = sources.iter().map(|s| s.to_string()).collect();
+            semantic_search_vec(conn, &q, false, &sources, project, 10)
+                .unwrap()
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect::<Vec<i64>>()
+        };
+
+        assert!(!owner_prefilter_usable(&db.conn), "an unowned vector");
+        assert_eq!(search(&db.conn, &[], Some("alpha")), vec![alpha, unowned]);
+        assert_eq!(
+            search(&db.conn, &["claude_code"], None),
+            vec![alpha, unowned]
+        );
+
+        // Repaired: back on the pre-filter, same answers.
+        assert_eq!(crate::cleanup::reconcile_vec_owners(&db.conn).unwrap(), 1);
+        assert!(owner_prefilter_usable(&db.conn));
+        assert_eq!(search(&db.conn, &[], Some("alpha")), vec![alpha, unowned]);
+        assert_eq!(
+            search(&db.conn, &["claude_code"], None),
+            vec![alpha, unowned]
+        );
+
+        // No owner map at all: a hard "no such table" before this fallback.
+        db.conn.execute_batch("DROP TABLE vec_chunk_owner").unwrap();
+        assert!(!owner_prefilter_usable(&db.conn));
+        assert_eq!(search(&db.conn, &[], Some("alpha")), vec![alpha, unowned]);
+        assert_eq!(search(&db.conn, &["codex"], Some("beta")), vec![beta]);
+        assert_eq!(search(&db.conn, &["codex"], None), vec![beta]);
+        assert!(search(&db.conn, &["cursor"], Some("alpha")).is_empty());
     }
 
     /// A query issued while a big bulk batch runs must wait at most about one sub-batch,

@@ -12,6 +12,7 @@ import { UpdateBanner } from "./components/UpdateBanner";
 import { TelemetryConsent } from "./components/TelemetryConsent";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { Loading } from "./components/Loading";
+import { preloadMarkdown } from "./components/LazyMarkdown";
 import { Button } from "@/components/ui/button";
 import { Kbd, KbdGroup } from "@/components/ui/kbd";
 import { api } from "./lib/api";
@@ -44,6 +45,10 @@ const SettingsView = lazy(() => loadSettings().then((m) => ({ default: m.Setting
 const PREFETCH_DELAY_MS = 2_000;
 function usePrefetchViews() {
   useEffect(() => {
+    // The markdown stack is split out of the entry only to keep it off the splash path,
+    // and opening a thread is the first thing most people do, so fetch it right after
+    // first paint rather than with the other views.
+    preloadMarkdown().catch(() => {}); // a real failure resurfaces on render, inside the boundary
     const id = setTimeout(() => {
       for (const load of [
         loadChat,

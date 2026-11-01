@@ -16,10 +16,7 @@ use crate::search::ThreadDetail;
 /// when present, is the LLM-extracted decisions/gotchas/TODOs block (already
 /// `##`-headed Markdown) and is placed above the transcript — the knowledge layer.
 pub fn to_obsidian(detail: &ThreadDetail, synthesis: Option<&str>) -> String {
-    let title = detail
-        .title
-        .clone()
-        .unwrap_or_else(|| format!("Thread {}", detail.id));
+    let title = redacted_title(detail);
     let created = fmt_date(detail.created_at);
     let updated = fmt_date(detail.updated_at);
     let project = project_basename(detail.project_path.as_deref());
@@ -104,12 +101,19 @@ fn project_basename(project_path: Option<&str>) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The thread's title for an exported note, redacted like its body (a title is often the
+/// first prompt, pasted key and all), or "Thread N" when it has none.
+fn redacted_title(detail: &ThreadDetail) -> String {
+    detail
+        .title
+        .as_deref()
+        .map(|t| redact_secrets(t).into_owned())
+        .unwrap_or_else(|| format!("Thread {}", detail.id))
+}
+
 /// A filesystem-safe note filename (no extension), unique via the thread id.
 pub fn note_filename(detail: &ThreadDetail) -> String {
-    let base = detail
-        .title
-        .clone()
-        .unwrap_or_else(|| format!("Thread {}", detail.id));
+    let base = redacted_title(detail);
     let safe: String = base
         .chars()
         .map(|c| {
@@ -702,6 +706,18 @@ mod tests {
         assert!(md.contains("### 🤖 Assistant"));
         assert!(md.contains("### 🔧 Tool · Bash"));
         assert!(md.contains("how do I add fts5"));
+    }
+
+    #[test]
+    fn exported_title_and_filename_redact_a_planted_key() {
+        let mut d = detail();
+        d.title = Some("deploy with sk-ant-api03-AbCdEfGhIjKlMnOpQrStUv0123456789".into());
+        let md = to_obsidian(&d, None);
+        let name = note_filename(&d);
+        for out in [&md, &name] {
+            assert!(out.contains("deploy with [REDACTED]"), "{out}");
+            assert!(!out.contains("sk-ant-api03"), "{out}");
+        }
     }
 
     #[test]

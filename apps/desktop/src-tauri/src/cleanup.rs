@@ -264,11 +264,32 @@ fn parse_df(text: &str) -> Option<VolumeSpace> {
 // Vector owner map (migration 0025)
 // ---------------------------------------------------------------------------------------
 
+/// Whether some vectors have no owner row, such as ones an older build (no owner map) kept
+/// writing after a newer process migrated the shared index. Two b-tree counts, well under
+/// a millisecond warm at ~115k vectors, not a scan of the vectors. Owner rows never
+/// outnumber vectors (deleting one deletes its vector, and nothing deletes a vector that
+/// still has one), so more vectors than owner rows means at least one is unowned.
+pub fn vectors_missing_owners(conn: &Connection) -> Result<bool> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT (SELECT COUNT(*) FROM vec_chunks_rowids)
+                  > (SELECT COUNT(*) FROM vec_chunk_owner)",
+        )?
+        .query_row([], |r| r.get(0))?)
+}
+
 /// Add owner rows for any vectors written without one (e.g. by an embedder build that
-/// predates migration 0025), so their message's delete still removes them. One full
-/// scan of the vector table (sub-second at a few hundred thousand chunks); safe to run
-/// after every embedding job. Returns how many rows were added.
+/// predates migration 0025), so their message's delete still removes them and the
+/// project/source-scoped KNN pre-filter sees them (until then semantic search falls back to
+/// post-filtering; see `embed::semantic_search_vec`). Checks [`vectors_missing_owners`]
+/// first, so when nothing is missing it costs two counts and is cheap enough for every
+/// launch; otherwise one full scan of the vector table (sub-second at a few hundred
+/// thousand chunks). Search can't do this repair itself: it runs on read-only connections.
+/// Returns how many rows were added.
 pub fn reconcile_vec_owners(conn: &Connection) -> Result<usize> {
+    if !vectors_missing_owners(conn)? {
+        return Ok(0);
+    }
     Ok(conn.execute(
         "INSERT OR IGNORE INTO vec_chunk_owner (chunk_rowid, message_id)
          SELECT rowid, message_id FROM vec_chunks",
@@ -284,6 +305,137 @@ pub fn sweep_orphan_vectors(conn: &Connection) -> Result<usize> {
          WHERE NOT EXISTS (SELECT 1 FROM messages m WHERE m.id = vec_chunk_owner.message_id)",
         [],
     )?)
+}
+
+/// Compact `vec_chunks` once live vectors fill less than this share of its slots.
+const VEC_COMPACT_OCCUPANCY: f64 = 0.7;
+
+/// What one [`compact_vec_chunks`] rebuild did.
+#[derive(Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VecCompaction {
+    pub vectors: i64,
+    pub chunks_before: i64,
+    pub chunks_after: i64,
+}
+
+/// Rebuild `vec_chunks` without the holes deletes leave in it, keeping every rowid.
+///
+/// vec0 (0.1.9) stores vectors in fixed 1024-slot chunks and only ever appends to the
+/// newest one, so a deleted vector's slot is never reused; only a chunk that empties
+/// completely is freed. Migration 0029's tool-vector purge left a 4.7 GB index at 56%
+/// occupancy (205 chunks for 117k vectors), and KNN reads and ranks every slot of every
+/// chunk. Rebuilt, it fit in 115 chunks, and a k=500 KNN went from 165 ms to 106 ms.
+///
+/// Does nothing (returns `None`) unless occupancy is under [`VEC_COMPACT_OCCUPANCY`] and the
+/// rebuild would free at least one chunk, so it is cheap to call after every embedding
+/// build. Otherwise it holds the write lock for one IMMEDIATE transaction (4-9 s for 117k
+/// vectors, depending on how warm the cache is), so run it from a background job, never
+/// from a migration a hook might run. vec0 can't be renamed, so the vectors go through a
+/// scratch table in the main database (TEMP would sit in RAM under temp_store = MEMORY).
+///
+/// It returns no disk space; the file grows. The scratch copy is written before the old
+/// chunks are dropped, so it lands at the end of the file (+229 MB on that index), and the
+/// old chunks and the scratch table then become free pages inside the file (~366 MB there).
+/// Later writes reuse them; only a VACUUM (Shrink index / Reclaim space) gives them back to
+/// the disk. What the rebuild buys is a faster KNN, not a smaller file.
+///
+/// The table is recreated from its own stored CREATE statement. Triggers that reference
+/// `vec_chunks` (0025's owner map) survive the DROP / CREATE, and the rowid sequence is
+/// carried over so a later insert never reuses the rowid of a vector deleted before the
+/// rebuild.
+pub fn compact_vec_chunks(conn: &mut Connection) -> Result<Option<VecCompaction>> {
+    if !vec_chunks_fragmented(conn)? {
+        return Ok(None);
+    }
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    // Re-check under the write lock: another writer may have changed the table meanwhile.
+    if !vec_chunks_fragmented(&tx)? {
+        return Ok(None);
+    }
+    let chunks_before = count_vec_chunk_rows(&tx)?;
+    let create: String = tx.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'vec_chunks'",
+        [],
+        |r| r.get(0),
+    )?;
+    let seq: Option<i64> = tx
+        .query_row(
+            "SELECT seq FROM sqlite_sequence WHERE name = 'vec_chunks_rowids'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    tx.execute_batch(
+        "DROP TABLE IF EXISTS vec_compact_scratch;
+         CREATE TABLE vec_compact_scratch (
+             rid INTEGER PRIMARY KEY, message_id INTEGER, embedding BLOB NOT NULL
+         );
+         INSERT INTO vec_compact_scratch (rid, message_id, embedding)
+             SELECT rowid, message_id, embedding FROM vec_chunks;
+         DROP TABLE vec_chunks;",
+    )?;
+    tx.execute_batch(&create)?;
+    let vectors = tx.execute(
+        "INSERT INTO vec_chunks (rowid, message_id, embedding)
+         SELECT rid, message_id, embedding FROM vec_compact_scratch ORDER BY rid",
+        [],
+    )? as i64;
+    // Leave the owner map exact: no owner row for a vector that is gone (its rowid must
+    // stay free), and one for every vector that kept none.
+    tx.execute_batch(
+        "DELETE FROM vec_chunk_owner
+             WHERE chunk_rowid NOT IN (SELECT rid FROM vec_compact_scratch);
+         INSERT OR IGNORE INTO vec_chunk_owner (chunk_rowid, message_id)
+             SELECT rid, message_id FROM vec_compact_scratch;
+         DROP TABLE vec_compact_scratch;",
+    )?;
+    if let Some(seq) = seq {
+        let updated = tx.execute(
+            "UPDATE sqlite_sequence SET seq = MAX(seq, ?1) WHERE name = 'vec_chunks_rowids'",
+            [seq],
+        )?;
+        if updated == 0 {
+            // An empty rebuild has no sequence row yet.
+            tx.execute(
+                "INSERT INTO sqlite_sequence (name, seq) VALUES ('vec_chunks_rowids', ?1)",
+                [seq],
+            )?;
+        }
+    }
+    let chunks_after = count_vec_chunk_rows(&tx)?;
+    tx.commit()?;
+    Ok(Some(VecCompaction {
+        vectors,
+        chunks_before,
+        chunks_after,
+    }))
+}
+
+fn count_vec_chunk_rows(conn: &Connection) -> Result<i64> {
+    Ok(conn.query_row("SELECT COUNT(*) FROM vec_chunks_chunks", [], |r| r.get(0))?)
+}
+
+/// Whether a [`compact_vec_chunks`] rebuild is worth its write lock.
+fn vec_chunks_fragmented(conn: &Connection) -> Result<bool> {
+    // `size` is each chunk's slot capacity; the rowids shadow table holds one row per live
+    // vector. Both are small b-tree counts, not a scan of the vectors.
+    let (chunks, slots): (i64, i64) = conn.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(size), 0) FROM vec_chunks_chunks",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let live: i64 = conn.query_row("SELECT COUNT(*) FROM vec_chunks_rowids", [], |r| r.get(0))?;
+    Ok(worth_compacting(live, chunks, slots))
+}
+
+fn worth_compacting(live: i64, chunks: i64, slots: i64) -> bool {
+    if chunks == 0 || slots == 0 {
+        return false;
+    }
+    let per_chunk = slots / chunks;
+    let needed = (live + per_chunk - 1) / per_chunk;
+    chunks > needed && (live as f64) < VEC_COMPACT_OCCUPANCY * slots as f64
 }
 
 // ---------------------------------------------------------------------------------------
@@ -369,23 +521,14 @@ pub fn purge_app_cli_sessions(conn: &mut Connection) -> Result<usize> {
 /// Run [`purge_app_cli_sessions`] once per index (remembered in `app_config`). Cheap to
 /// call at every startup; returns how many threads it removed this time.
 pub fn purge_app_cli_sessions_once(conn: &mut Connection) -> Result<usize> {
-    let done: Option<String> = conn
-        .query_row(
-            "SELECT value FROM app_config WHERE key = ?1",
-            [PURGED_APP_SESSIONS_KEY],
-            |r| r.get(0),
-        )
-        .optional()?;
-    if done.is_some() {
+    if crate::knowledge::app_config::get(conn, PURGED_APP_SESSIONS_KEY)?.is_some() {
         return Ok(0);
     }
     let n = purge_app_cli_sessions(conn)?;
-    conn.execute(
-        "INSERT OR REPLACE INTO app_config (key, value) VALUES (?1, ?2)",
-        params![
-            PURGED_APP_SESSIONS_KEY,
-            chrono::Utc::now().timestamp().to_string()
-        ],
+    crate::knowledge::app_config::put(
+        conn,
+        PURGED_APP_SESSIONS_KEY,
+        &chrono::Utc::now().timestamp().to_string(),
     )?;
     Ok(n)
 }
@@ -402,20 +545,6 @@ fn like_escape(s: &str) -> String {
     out
 }
 
-/// Sources whose indexers cap tool output at index time (`indexer::claude::cap_tool_text`).
-/// Compacting another source's rows would only make its next re-index see a mismatch and
-/// rewrite the thread with the uncapped text again.
-pub const CAPPED_TOOL_SOURCES: &[&str] = &[
-    "claude_code",
-    "codex",
-    "gemini",
-    "qwen",
-    "cline",
-    "roo",
-    "kilo",
-    "continue",
-];
-
 /// Progress of one [`compact_tool_output`] call.
 #[derive(Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -431,8 +560,9 @@ pub struct CompactReport {
 /// The next `batch` oversized tool rows after id `?1`, for [`compact_tool_output`].
 fn compact_select_sql(batch: usize) -> String {
     use crate::indexer::claude::TOOL_TEXT_CAP_CHARS;
-    let kinds = CAPPED_TOOL_SOURCES
-        .iter()
+    // The registry flags which indexers cap tool output (`indexer::Source::caps_tool_output`);
+    // compacting any other source's rows would just be undone by its next re-index.
+    let kinds = crate::indexer::capped_tool_sources()
         .map(|k| format!("'{k}'"))
         .collect::<Vec<_>>()
         .join(", ");
@@ -459,7 +589,8 @@ fn compact_select_sql(batch: usize) -> String {
 /// FTS size. Processes at most `max_rows` rows per call (in short transactions) so the
 /// caller can loop from a background thread and release the write lock in between; FTS
 /// stays in sync through the update trigger. Run `vacuum` afterwards to return the space
-/// to the OS. Only touches [`CAPPED_TOOL_SOURCES`].
+/// to the OS. Only touches the sources whose indexers cap tool output
+/// (`indexer::capped_tool_sources`).
 pub fn compact_tool_output(conn: &mut Connection, max_rows: usize) -> Result<CompactReport> {
     use crate::indexer::claude::cap_tool_text;
     const BATCH: usize = 200;
@@ -725,13 +856,16 @@ mod tests {
             .query_row("SELECT MIN(id) FROM messages", [], |r| r.get(0))
             .unwrap();
         let blob: Vec<u8> = (0..384).flat_map(|_| 0.5_f32.to_le_bytes()).collect();
+        assert!(!vectors_missing_owners(&conn).unwrap(), "empty index");
         // A vector written without its owner row (an embedder that predates 0025).
         conn.execute(
             "INSERT INTO vec_chunks (message_id, embedding) VALUES (?1, ?2)",
             params![mid, blob],
         )
         .unwrap();
+        assert!(vectors_missing_owners(&conn).unwrap());
         assert_eq!(reconcile_vec_owners(&conn).unwrap(), 1);
+        assert!(!vectors_missing_owners(&conn).unwrap());
         assert_eq!(reconcile_vec_owners(&conn).unwrap(), 0, "idempotent");
 
         // The message vanishes without the delete trigger firing (embedded = 0 here), so
@@ -741,6 +875,157 @@ mod tests {
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM vec_chunks"), 1);
         assert_eq!(sweep_orphan_vectors(&conn).unwrap(), 1);
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM vec_chunks"), 0);
+    }
+
+    #[test]
+    fn compaction_threshold() {
+        assert!(!worth_compacting(0, 0, 0), "no vectors yet");
+        assert!(
+            !worth_compacting(10, 1, 1024),
+            "one sparse chunk frees nothing"
+        );
+        assert!(!worth_compacting(1500, 2, 2048), "73% full");
+        assert!(
+            worth_compacting(114_811, 205, 205 * 1024),
+            "the 0029-purged index"
+        );
+        assert!(
+            !worth_compacting(113 * 1024 - 5, 113, 113 * 1024),
+            "dense after a rebuild"
+        );
+    }
+
+    #[test]
+    fn vec_compaction_keeps_rowids_owners_and_triggers() {
+        let mut conn = temp_db();
+        conn.execute(
+            "INSERT INTO threads (source_id, external_id, title) VALUES (1, 'vc', 't')",
+            [],
+        )
+        .unwrap();
+        let tid = conn.last_insert_rowid();
+        // A distinct direction per vector, so KNN can name the exact one back.
+        let blob = |i: usize| -> Vec<u8> {
+            let mut v = vec![0.0_f32; 384];
+            v[i % 384] = 1.0;
+            v[(i / 384) % 384] += 0.5;
+            v.iter().flat_map(|f| f.to_le_bytes()).collect()
+        };
+        let mut rows = Vec::new(); // (message_id, chunk_rowid, i)
+        {
+            let tx = conn.transaction().unwrap();
+            for i in 0..2100_usize {
+                tx.execute(
+                    "INSERT INTO messages (thread_id, seq, role, text, embedded)
+                     VALUES (?1, ?2, 'user', 'v', 1)",
+                    params![tid, i as i64],
+                )
+                .unwrap();
+                let mid = tx.last_insert_rowid();
+                tx.execute(
+                    "INSERT INTO vec_chunks (message_id, embedding) VALUES (?1, ?2)",
+                    params![mid, blob(i)],
+                )
+                .unwrap();
+                let rid = tx.last_insert_rowid();
+                tx.execute(
+                    "INSERT INTO vec_chunk_owner (chunk_rowid, message_id) VALUES (?1, ?2)",
+                    params![rid, mid],
+                )
+                .unwrap();
+                rows.push((mid, rid, i));
+            }
+            tx.commit().unwrap();
+        }
+        let chunks = |c: &Connection| count(c, "SELECT COUNT(*) FROM vec_chunks_chunks");
+        assert_eq!(chunks(&conn), 3);
+        assert_eq!(
+            compact_vec_chunks(&mut conn).unwrap(),
+            None,
+            "dense: nothing to do"
+        );
+
+        // Delete most messages, scattered so every chunk keeps a few live slots.
+        {
+            let tx = conn.transaction().unwrap();
+            for (mid, _, i) in &rows {
+                if i % 7 != 0 {
+                    tx.execute("DELETE FROM messages WHERE id = ?1", [mid])
+                        .unwrap();
+                }
+            }
+            tx.commit().unwrap();
+        }
+        let kept: Vec<(i64, i64, usize)> = rows.iter().filter(|r| r.2 % 7 == 0).copied().collect();
+        assert_eq!(chunks(&conn), 3, "vec0 never reuses the holes");
+        let top_rowid = rows.last().unwrap().1;
+
+        let report = compact_vec_chunks(&mut conn).unwrap().expect("fragmented");
+        assert_eq!(
+            report,
+            VecCompaction {
+                vectors: kept.len() as i64,
+                chunks_before: 3,
+                chunks_after: 1,
+            }
+        );
+        assert_eq!(chunks(&conn), 1);
+        assert_eq!(compact_vec_chunks(&mut conn).unwrap(), None, "dense again");
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'vec_compact_scratch'"
+            ),
+            0
+        );
+
+        // Every survivor keeps its rowid, message and vector, and the owner map is exact.
+        for (mid, rid, i) in &kept {
+            let (m, e): (i64, Vec<u8>) = conn
+                .query_row(
+                    "SELECT message_id, embedding FROM vec_chunks WHERE rowid = ?1",
+                    [rid],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!((m, e), (*mid, blob(*i)));
+        }
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM vec_chunk_owner"),
+            kept.len() as i64
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM vec_chunk_owner o
+                 WHERE NOT EXISTS (SELECT 1 FROM vec_chunks_rowids r WHERE r.rowid = o.chunk_rowid)"
+            ),
+            0
+        );
+        let (_, want, i) = kept[3];
+        let nearest: i64 = conn
+            .query_row(
+                "SELECT rowid FROM vec_chunks WHERE embedding MATCH ?1 AND k = 1",
+                [blob(i)],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(nearest, want, "KNN works on the rebuilt table");
+
+        // The owner-map triggers still remove a deleted message's vector.
+        conn.execute("DELETE FROM messages WHERE id = ?1", [kept[0].0])
+            .unwrap();
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM vec_chunks"),
+            kept.len() as i64 - 1
+        );
+        // A new vector gets a rowid no deleted vector ever had.
+        conn.execute(
+            "INSERT INTO vec_chunks (message_id, embedding) VALUES (?1, ?2)",
+            params![kept[1].0, blob(9999)],
+        )
+        .unwrap();
+        assert!(conn.last_insert_rowid() > top_rowid);
     }
 
     #[test]

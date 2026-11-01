@@ -120,8 +120,9 @@ function DesktopPage() {
           title="Reclaim the shelves"
           className="lg:col-span-4"
         >
-          A paginated, size-aware table to prune old threads and reclaim disk space when the archive
-          gets heavy.
+          A paginated, size-aware table to prune old threads when the archive gets heavy, plus
+          Shrink index, which trims the tool output older versions stored and returns the space to
+          disk.
         </FeaturePanel>
         <FeaturePanel
           icon={Boxes}

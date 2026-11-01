@@ -11,7 +11,7 @@ import {
   SheetTrigger,
 } from "@/components/ui/sheet";
 import { Sparkles } from "lucide-react";
-import { InlineMarkdown } from "./Markdown";
+import { InlineMarkdown } from "./LazyMarkdown";
 
 /**
  * Distilled knowledge for a thread, in a right-side sheet so it floats over the

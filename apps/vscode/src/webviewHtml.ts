@@ -1,6 +1,7 @@
 // Builds the CSP'd HTML document both webview surfaces load. The same bundle
 // (media/webview.js + media/webview.css) serves the sidebar and the thread panel;
 // the host tells each which root to mount via the init message (see protocol.ts).
+// The thread panel's code is a lazy chunk under media/assets/ (see webview/main.tsx).
 
 import * as vscode from "vscode";
 
@@ -23,7 +24,10 @@ export function getHtml(webview: vscode.Webview, extensionUri: vscode.Uri): stri
     `img-src ${webview.cspSource} https: data:`,
     `style-src ${webview.cspSource} 'unsafe-inline'`,
     `font-src ${webview.cspSource}`,
-    `script-src 'nonce-${nonce}'`,
+    // cspSource admits the lazy chunks in media/assets/ by origin. Chromium also passes the
+    // nonce on to import(), but a modulepreload link the bundler may add carries none. It
+    // only covers localResourceRoots, which both webviews limit to media/.
+    `script-src 'nonce-${nonce}' ${webview.cspSource}`,
     "connect-src 'none'",
   ].join("; ");
 

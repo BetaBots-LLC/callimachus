@@ -513,7 +513,9 @@ function StreamingTurn({ reasoning, parts }: { reasoning: string; parts: StreamP
             variant="ghost"
           >
             <BubbleContent className="relative">
-              <StreamingMarkdown>{p.text}</StreamingMarkdown>
+              {/* Only the last part can still grow: an earlier one is followed by a tool
+                  step, so its blocks are final and get language detection. */}
+              <StreamingMarkdown streaming={i === parts.length - 1}>{p.text}</StreamingMarkdown>
               {i === parts.length - 1 && <TrailingDots />}
             </BubbleContent>
           </Bubble>

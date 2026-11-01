@@ -15,6 +15,7 @@
 //!
 //! Schema verified against opencode `packages/sdk/js/src/gen/types.gen.ts`.
 
+use super::common::{read_json, truncate_title};
 use super::{
     file_change_state, file_state, open_external_readonly, set_file_state, source_id,
     upsert_thread, IndexReport, ParsedMessage, ParsedThread,
@@ -136,14 +137,7 @@ fn scan_combined(
                 continue;
             }
 
-            match index_session(conn, sid, root, &sf) {
-                Ok(Some(n)) => {
-                    report.threads_indexed += 1;
-                    report.messages_indexed += n;
-                }
-                Ok(None) => report.threads_skipped += 1,
-                Err(_) => report.errors += 1,
-            }
+            report.record(index_session(conn, sid, root, &sf));
         }
     }
 
@@ -260,7 +254,7 @@ fn scan_sqlite(conn: &mut Connection, db: &Path, tick: &mut dyn FnMut()) -> Resu
             .as_deref()
             .filter(|t| !t.trim().is_empty())
             .map(str::to_string)
-            .or_else(|| first_user.map(truncate_title));
+            .or_else(|| first_user.as_deref().map(truncate_title));
         let is_subagent = parent_id.is_some();
 
         let thread = ParsedThread {
@@ -303,14 +297,7 @@ fn scan_root(conn: &mut Connection, root: &Path, tick: &mut dyn FnMut()) -> Resu
 
     for sf in session_files {
         tick();
-        match index_session(conn, sid, root, &sf) {
-            Ok(Some(n)) => {
-                report.threads_indexed += 1;
-                report.messages_indexed += n;
-            }
-            Ok(None) => report.threads_skipped += 1,
-            Err(_) => report.errors += 1,
-        }
+        report.record(index_session(conn, sid, root, &sf));
     }
     Ok(report)
 }
@@ -412,7 +399,7 @@ fn index_session(conn: &mut Connection, sid: i64, root: &Path, sf: &Path) -> Res
         .and_then(Value::as_str)
         .map(str::to_string)
         .filter(|t| !t.trim().is_empty())
-        .or_else(|| first_user.map(truncate_title));
+        .or_else(|| first_user.as_deref().map(truncate_title));
     let project_path = session
         .get("directory")
         .and_then(Value::as_str)
@@ -465,10 +452,6 @@ fn read_parts_text(root: &Path, message_id: &str) -> String {
     out.join("\n")
 }
 
-fn read_json(path: &Path) -> Option<Value> {
-    serde_json::from_str(&fs::read_to_string(path).ok()?).ok()
-}
-
 fn read_dir_sorted(dir: &Path) -> Vec<PathBuf> {
     let Ok(entries) = fs::read_dir(dir) else {
         return Vec::new();
@@ -493,15 +476,6 @@ fn dir_fingerprint(dir: &Path) -> (i64, i64) {
         .max()
         .unwrap_or(0);
     (max_mtime, count)
-}
-
-fn truncate_title(s: String) -> String {
-    let s = s.trim();
-    if s.chars().count() > 80 {
-        format!("{}…", s.chars().take(80).collect::<String>())
-    } else {
-        s.to_string()
-    }
 }
 
 #[cfg(test)]

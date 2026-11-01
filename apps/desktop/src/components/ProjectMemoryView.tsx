@@ -1,10 +1,10 @@
 import { type ReactNode, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Pencil, Pin, Trash2 } from "lucide-react";
+import { Pencil, Pin, Plus, Trash2 } from "lucide-react";
 import { api, type MemoryFact, type ProjectMemory } from "../lib/api";
 import { useUi } from "../store/ui";
 import { shortPath } from "../lib/format";
-import { useEmbedStatus } from "../lib/queries";
+import { useEmbedStatus, useIndexRewriting } from "../lib/queries";
 import { AGGREGATE_STALE_MS } from "../lib/queryClient";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -60,6 +60,7 @@ export function ProjectMemoryView() {
     queryFn: api.indexingStatus,
     refetchInterval: (q) => (q.state.data ? 2000 : false),
   });
+  const rewriting = useIndexRewriting(); // Shrink index / Reclaim space
   const progress = useQuery<{ done: number; total: number } | null>({
     queryKey: ["distill_progress"],
     queryFn: () => qc.getQueryData<{ done: number; total: number }>(["distill_progress"]) ?? null,
@@ -82,6 +83,9 @@ export function ProjectMemoryView() {
     mutationFn: () => api.writeAgentMemoryFile(project as string, "AGENTS.md"),
   });
   const conflicts = useMutation({ mutationFn: () => api.detectConflicts(project as string) });
+  // The project the inline "Remember" form is open for (null = closed). Keyed on the
+  // project, so switching projects closes it instead of saving to the wrong one.
+  const [remembering, setRemembering] = useState<string | null>(null);
 
   // Curation actions (pin / hide / edit). Each updates the cached memory optimistically
   // so the UI reacts instantly, rolls back + surfaces the error if the write fails, and
@@ -161,9 +165,14 @@ export function ProjectMemoryView() {
       ? Math.round((progress.data.done / progress.data.total) * 100)
       : 0;
   const empty = mem && !mem.decisions.length && !mem.gotchas.length && !mem.openTodos.length;
-  // A reindex / embedding build is running → distill would no-op (shared write lock).
-  const otherBusy = embed.data?.running || indexing.data;
-  const otherBusyLabel = embed.data?.running ? "Embedding… (wait)" : "Indexing… (wait)";
+  // A reindex / embedding build / index rewrite is running → distill would no-op (shared
+  // write lock).
+  const otherBusy = embed.data?.running || indexing.data || rewriting;
+  const otherBusyLabel = embed.data?.running
+    ? "Embedding… (wait)"
+    : indexing.data
+      ? "Indexing… (wait)"
+      : "Rewriting index… (wait)";
 
   return (
     <div className="mx-auto flex h-full w-full max-w-3xl flex-col p-6">
@@ -206,6 +215,15 @@ export function ProjectMemoryView() {
                   : "Memory up to date"}
             </Button>
           )}
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => setRemembering(project)}
+            disabled={!project || remembering === project}
+            title="Record a decision or gotcha for this project yourself"
+          >
+            <Plus /> Remember
+          </Button>
           <Button
             size="sm"
             variant="outline"
@@ -264,6 +282,9 @@ export function ProjectMemoryView() {
           <Loading label="Loading memory…" />
         ) : mem ? (
           <div className="space-y-5">
+            {remembering === project && (
+              <RememberForm project={project} onClose={() => setRemembering(null)} />
+            )}
             {brief.data && (
               <div className="rounded-lg border p-3">
                 <Markdown>{brief.data}</Markdown>
@@ -321,6 +342,77 @@ export function ProjectMemoryView() {
         ) : null}
       </div>
     </div>
+  );
+}
+
+/** Write-back: record a decision or gotcha for the project by hand. Saved pinned (the
+ *  user's own words are trusted), so it ranks first and survives a re-distill. */
+function RememberForm({ project, onClose }: { project: string; onClose: () => void }) {
+  const qc = useQueryClient();
+  const [kind, setKind] = useState<"decision" | "gotcha">("decision");
+  const [text, setText] = useState("");
+  const save = useMutation({
+    mutationFn: () => api.remember(project, kind, text.trim()),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: ["project_memory", project] });
+      onClose();
+    },
+  });
+  const submit = () => {
+    if (text.trim() && !save.isPending) save.mutate();
+  };
+
+  return (
+    <Item variant="outline" className="items-stretch gap-2 ring-1 ring-ring/30">
+      <div className="flex min-w-0 flex-1 flex-col gap-2">
+        <div className="flex gap-1">
+          {(["decision", "gotcha"] as const).map((k) => (
+            <Button
+              key={k}
+              size="xs"
+              variant={kind === k ? "secondary" : "ghost"}
+              aria-pressed={kind === k}
+              onClick={() => setKind(k)}
+            >
+              {k === "decision" ? "Decision" : "Gotcha"}
+            </Button>
+          ))}
+        </div>
+        <textarea
+          // biome-ignore lint/a11y/noAutofocus: focus the field the user just opened
+          autoFocus
+          value={text}
+          onChange={(e) => setText(e.currentTarget.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) submit();
+            if (e.key === "Escape") onClose();
+          }}
+          placeholder={
+            kind === "decision"
+              ? "e.g. Store timestamps as UTC seconds, not ISO strings"
+              : "e.g. The dev server has to run on port 1420 for Tauri to find it"
+          }
+          aria-label={kind === "decision" ? "Decision" : "Gotcha"}
+          className="min-h-16 resize-y bg-transparent text-sm leading-relaxed outline-none placeholder:text-muted-foreground"
+        />
+        <p className="text-xs text-muted-foreground">
+          Pinned to {shortPath(project)}'s memory, so recall and memory files include it.
+        </p>
+        {save.isError && (
+          <p role="alert" className="text-xs text-destructive">
+            Couldn't save: {String(save.error)}
+          </p>
+        )}
+      </div>
+      <div className="flex shrink-0 flex-col gap-1">
+        <Button size="xs" onClick={submit} disabled={!text.trim() || save.isPending}>
+          {save.isPending ? "Saving…" : "Save"}
+        </Button>
+        <Button size="xs" variant="ghost" onClick={onClose} disabled={save.isPending}>
+          Cancel
+        </Button>
+      </div>
+    </Item>
   );
 }
 

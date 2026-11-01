@@ -30,11 +30,10 @@
 //!   Offline means silence, never a growing backlog. Every event carries a client-side
 //!   `uuid`, so PostHog dedups a retry of a batch it had in fact already accepted.
 
+use crate::knowledge::app_config::{delete as config_delete, get as config_get, put as config_put};
 use anyhow::Result;
 use chrono::{NaiveDate, SecondsFormat, Utc};
-use rusqlite::{
-    params, Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
-};
+use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::future::Future;
@@ -532,28 +531,6 @@ impl Consent {
             _ => Consent::Unset,
         }
     }
-}
-
-fn config_get(conn: &Connection, key: &str) -> Result<Option<String>> {
-    Ok(conn
-        .query_row("SELECT value FROM app_config WHERE key = ?1", [key], |r| {
-            r.get::<_, String>(0)
-        })
-        .optional()?)
-}
-
-fn config_put(conn: &Connection, key: &str, value: &str) -> Result<()> {
-    conn.execute(
-        "INSERT INTO app_config (key, value) VALUES (?1, ?2)
-         ON CONFLICT(key) DO UPDATE SET value = ?2",
-        params![key, value],
-    )?;
-    Ok(())
-}
-
-fn config_delete(conn: &Connection, key: &str) -> Result<()> {
-    conn.execute("DELETE FROM app_config WHERE key = ?1", [key])?;
-    Ok(())
 }
 
 /// The stored consent. A read error counts as `Unset` (nothing is sent).

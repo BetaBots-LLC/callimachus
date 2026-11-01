@@ -1,8 +1,8 @@
 //! Agent session snapshots: durable, resumable checkpoints of an indexed thread. A snapshot
 //! captures the thread's packed transcript (via `context::pack_thread`) plus a carry-forward
 //! block of the project's distilled decisions / gotchas / open TODOs (via
-//! `knowledge::get_project_memory`), so the next agent can continue across a context-window
-//! compaction or across tools (Claude Code -> Codex -> Cursor). Resume reuses
+//! `knowledge::get_project_memory_facts`), so the next agent can continue across a
+//! context-window compaction or across tools (Claude Code -> Codex -> Cursor). Resume reuses
 //! `agent::cli_resume::launch_with_context` to relaunch any agent CLI with the checkpoint.
 
 use crate::{context, export, knowledge, search};
@@ -87,7 +87,8 @@ fn build(conn: &Connection, thread_id: i64, label: Option<&str>) -> Result<NewSn
     let carry = match project_key.as_deref() {
         Some(pk) if !pk.is_empty() => {
             let budget = export::MemoryBudget::COMPACT;
-            let mem = knowledge::get_project_memory(conn, pk, budget.fetch_limit())?;
+            // Facts only: the budgeted renderer never shows the coverage counts.
+            let mem = knowledge::get_project_memory_facts(conn, pk, budget.fetch_limit())?;
             if mem.decisions.is_empty()
                 && mem.gotchas.is_empty()
                 && !mem.open_todos.iter().any(|t| t.pinned)

@@ -11,7 +11,11 @@
 //!
 //! Path verified against cline/cline task-history docs.
 
-use super::{set_file_state, source_id, upsert_thread, IndexReport, ParsedMessage, ParsedThread};
+use super::common::{join_text_parts, push_message, read_json, truncate_title};
+use super::{
+    file_change_state, set_file_state, source_id, upsert_thread, IndexReport, ParsedMessage,
+    ParsedThread,
+};
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use serde_json::Value;
@@ -82,14 +86,7 @@ pub fn scan_ext(
             if !dir.is_dir() {
                 continue;
             }
-            match index_task(conn, sid, kind, &editor, &dir) {
-                Ok(Some(n)) => {
-                    report.threads_indexed += 1;
-                    report.messages_indexed += n;
-                }
-                Ok(None) => report.threads_skipped += 1,
-                Err(_) => report.errors += 1,
-            }
+            report.record(index_task(conn, sid, kind, &editor, &dir));
         }
     }
     Ok(report)
@@ -118,18 +115,9 @@ fn index_task(
         return Ok(None);
     }
     let path_str = history.to_string_lossy().to_string();
-    let meta = fs::metadata(&history)?;
-    let size = meta.len() as i64;
-    let mtime = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    if let Some((prev_mtime, prev_size)) = super::file_state(conn, &path_str)? {
-        if prev_mtime == mtime && prev_size == size {
-            return Ok(None);
-        }
+    let (unchanged, mtime, size) = file_change_state(conn, &history)?;
+    if unchanged {
+        return Ok(None);
     }
 
     let task_id = dir.file_name().and_then(|n| n.to_str()).unwrap_or("task");
@@ -191,7 +179,7 @@ pub fn parse_history(
     }
     Ok(Some(ParsedThread {
         external_id: external_id.to_string(),
-        title: first_user.map(truncate_title),
+        title: first_user.as_deref().map(truncate_title),
         project_path,
         git_branch: None,
         created_at,
@@ -209,25 +197,14 @@ fn extract_blocks(
     content: Option<&Value>,
     ts: Option<i64>,
 ) {
-    let push = |out: &mut Vec<ParsedMessage>, role: &str, text: String, tool: Option<String>| {
-        let text = text.trim().to_string();
-        if !text.is_empty() {
-            out.push(ParsedMessage {
-                role: role.to_string(),
-                text,
-                tool_name: tool,
-                ts,
-            });
-        }
-    };
     match content {
-        Some(Value::String(s)) => push(out, role, s.clone(), None),
+        Some(Value::String(s)) => push_message(out, role, s, None, ts),
         Some(Value::Array(blocks)) => {
             for b in blocks {
                 match b.get("type").and_then(Value::as_str) {
                     Some("text") => {
                         if let Some(t) = b.get("text").and_then(Value::as_str) {
-                            push(out, role, t.to_string(), None);
+                            push_message(out, role, t, None, ts);
                         }
                     }
                     Some("tool_use") => {
@@ -237,12 +214,14 @@ fn extract_blocks(
                             .unwrap_or("tool")
                             .to_string();
                         let input = b.get("input").map(|v| v.to_string()).unwrap_or_default();
-                        push(out, "assistant", format!("{name}: {input}"), Some(name));
+                        let text = format!("{name}: {input}");
+                        push_message(out, "assistant", &text, Some(name), ts);
                     }
                     Some("tool_result") => {
                         // Same head + tail cap as the Claude indexer.
-                        let text = stringify_tool_result(b.get("content"));
-                        push(out, "tool", super::claude::cap_tool_text(text.trim()), None);
+                        let text = join_text_parts(b.get("content"));
+                        let text = super::claude::cap_tool_text(text.trim());
+                        push_message(out, "tool", &text, None, ts);
                     }
                     _ => {}
                 }
@@ -252,34 +231,13 @@ fn extract_blocks(
     }
 }
 
-fn stringify_tool_result(content: Option<&Value>) -> String {
-    match content {
-        Some(Value::String(s)) => s.clone(),
-        Some(Value::Array(blocks)) => blocks
-            .iter()
-            .filter_map(|b| b.get("text").and_then(Value::as_str))
-            .collect::<Vec<_>>()
-            .join("\n"),
-        _ => String::new(),
-    }
-}
-
 /// Pull a `cwd` out of Cline's task_metadata.json if present.
 fn read_cwd(meta_path: &Path) -> Option<String> {
-    let v: Value = serde_json::from_str(&fs::read_to_string(meta_path).ok()?).ok()?;
-    v.get("cwd")
+    read_json(meta_path)?
+        .get("cwd")
         .and_then(Value::as_str)
         .filter(|c| !c.is_empty())
         .map(str::to_string)
-}
-
-fn truncate_title(s: String) -> String {
-    let s = s.trim();
-    if s.chars().count() > 80 {
-        format!("{}…", s.chars().take(80).collect::<String>())
-    } else {
-        s.to_string()
-    }
 }
 
 #[cfg(test)]

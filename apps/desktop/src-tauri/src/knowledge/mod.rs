@@ -5,6 +5,8 @@
 //! The LLM tier (decisions / gotchas / summaries, lazy on-demand) reuses the same table, as
 //! do facts recorded by the user or by agents (`record_fact_with_origin`).
 
+pub mod app_config;
+
 use crate::agent::Distilled;
 use anyhow::Result;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -384,69 +386,43 @@ pub struct KnowledgeConfig {
     pub auto_distill: bool,
 }
 
-fn config_get(conn: &Connection, key: &str) -> Result<Option<String>> {
-    Ok(conn
-        .query_row("SELECT value FROM app_config WHERE key = ?1", [key], |r| {
-            r.get::<_, String>(0)
-        })
-        .optional()?)
-}
-
 /// Read the distillation config (defaults to disabled / unset).
 pub fn get_config(conn: &Connection) -> Result<KnowledgeConfig> {
     Ok(KnowledgeConfig {
-        enabled: config_get(conn, "knowledge.enabled")?.as_deref() == Some("1"),
-        provider: config_get(conn, "knowledge.provider")?.filter(|s| !s.is_empty()),
-        model: config_get(conn, "knowledge.model")?.filter(|s| !s.is_empty()),
-        auto_distill: config_get(conn, "knowledge.auto_distill")?.as_deref() == Some("1"),
+        enabled: app_config::get_flag(conn, "knowledge.enabled")?,
+        provider: app_config::get_nonblank(conn, "knowledge.provider")?,
+        model: app_config::get_nonblank(conn, "knowledge.model")?,
+        auto_distill: app_config::get_flag(conn, "knowledge.auto_distill")?,
     })
 }
 
 /// Toggle background auto-distillation (separate from `set_config` so the consent flag
 /// and engine choice aren't disturbed). Only meaningful when distillation is enabled.
 pub fn set_auto_distill(conn: &Connection, on: bool) -> Result<()> {
-    conn.execute(
-        "INSERT INTO app_config (key, value) VALUES ('knowledge.auto_distill', ?1)
-         ON CONFLICT(key) DO UPDATE SET value = ?1",
-        params![if on { "1" } else { "0" }],
-    )?;
-    Ok(())
+    app_config::put_flag(conn, "knowledge.auto_distill", on)
 }
 
 /// Whether closing the main window hides the app to the system tray instead of quitting
 /// (default off). Read by the Rust window-close handler at startup.
 pub fn get_close_to_tray(conn: &Connection) -> Result<bool> {
-    Ok(config_get(conn, "window.close_to_tray")?.as_deref() == Some("1"))
+    app_config::get_flag(conn, "window.close_to_tray")
 }
 
 /// Persist the close-to-tray preference.
 pub fn set_close_to_tray(conn: &Connection, on: bool) -> Result<()> {
-    conn.execute(
-        "INSERT INTO app_config (key, value) VALUES ('window.close_to_tray', ?1)
-         ON CONFLICT(key) DO UPDATE SET value = ?1",
-        params![if on { "1" } else { "0" }],
-    )?;
-    Ok(())
+    app_config::put_flag(conn, "window.close_to_tray", on)
 }
 
 /// Read a provider's saved custom base URL (unset / blank -> None). Non-secret config; API
 /// keys live in the OS keychain. Used for local Ollama pointed at a remote host, and for
 /// Ollama Cloud / authenticated proxies (paired with a keychain key).
 pub fn get_provider_base_url(conn: &Connection, provider: &str) -> Result<Option<String>> {
-    Ok(
-        config_get(conn, &format!("provider.{provider}.base_url"))?
-            .filter(|s| !s.trim().is_empty()),
-    )
+    app_config::get_nonblank(conn, &format!("provider.{provider}.base_url"))
 }
 
 /// Persist a provider's custom base URL. A blank string clears it (falls back to the default).
 pub fn set_provider_base_url(conn: &Connection, provider: &str, url: &str) -> Result<()> {
-    conn.execute(
-        "INSERT INTO app_config (key, value) VALUES (?1, ?2)
-         ON CONFLICT(key) DO UPDATE SET value = ?2",
-        params![format!("provider.{provider}.base_url"), url.trim()],
-    )?;
-    Ok(())
+    app_config::put(conn, &format!("provider.{provider}.base_url"), url.trim())
 }
 
 /// Persist the distillation config. Enabling it is the user's consent to send thread
@@ -457,18 +433,9 @@ pub fn set_config(
     provider: Option<&str>,
     model: Option<&str>,
 ) -> Result<()> {
-    for (k, v) in [
-        ("knowledge.enabled", if enabled { "1" } else { "0" }),
-        ("knowledge.provider", provider.unwrap_or("")),
-        ("knowledge.model", model.unwrap_or("")),
-    ] {
-        conn.execute(
-            "INSERT INTO app_config (key, value) VALUES (?1, ?2)
-             ON CONFLICT(key) DO UPDATE SET value = ?2",
-            params![k, v],
-        )?;
-    }
-    Ok(())
+    app_config::put_flag(conn, "knowledge.enabled", enabled)?;
+    app_config::put(conn, "knowledge.provider", provider.unwrap_or(""))?;
+    app_config::put(conn, "knowledge.model", model.unwrap_or(""))
 }
 
 /// Replace a thread's LLM-distilled facts with a fresh set and mark it extracted at
@@ -971,6 +938,7 @@ pub fn get_project_memory(
     project: &str,
     per_kind: usize,
 ) -> Result<ProjectMemory> {
+    let mut mem = get_project_memory_facts(conn, project, per_kind)?;
     let count = |extra: &str| -> Result<i64> {
         Ok(conn.query_row(
             &format!(
@@ -981,15 +949,29 @@ pub fn get_project_memory(
             |r| r.get(0),
         )?)
     };
-    let thread_count = count("")?;
-    let distilled_count = count(" AND knowledge_extracted = 1")?;
+    mem.thread_count = count("")?;
+    mem.distilled_count = count(" AND knowledge_extracted = 1")?;
+    mem.pending_count = (mem.thread_count - mem.distilled_count).max(0);
+    Ok(mem)
+}
+
+/// [`get_project_memory`] without the coverage counts, which stay 0: just the facts. For
+/// callers that never show "N/M distilled", i.e. everything rendered through
+/// `export::agent_memory_md_budgeted` (the SessionStart hook, the compaction carry). The two
+/// counts can't use an index (`COALESCE(project_key, project_path)`), so skipping them
+/// saves about 0.85 ms on every hook run.
+pub fn get_project_memory_facts(
+    conn: &Connection,
+    project: &str,
+    per_kind: usize,
+) -> Result<ProjectMemory> {
     Ok(ProjectMemory {
         decisions: project_facts(conn, "decision", project, false, per_kind)?,
         gotchas: project_facts(conn, "gotcha", project, false, per_kind)?,
         open_todos: project_facts(conn, "todo", project, true, per_kind)?,
-        thread_count,
-        distilled_count,
-        pending_count: (thread_count - distilled_count).max(0),
+        thread_count: 0,
+        distilled_count: 0,
+        pending_count: 0,
         project: project.to_string(),
     })
 }
@@ -1155,7 +1137,7 @@ pub const AUTO_DISTILL_RECENT_DAYS: i64 = 30;
 
 /// The per-day auto-distill allowance (`knowledge.auto_distill_daily_cap`).
 pub fn auto_distill_daily_cap(conn: &Connection) -> Result<i64> {
-    Ok(config_get(conn, "knowledge.auto_distill_daily_cap")?
+    Ok(app_config::get(conn, "knowledge.auto_distill_daily_cap")?
         .and_then(|v| v.trim().parse::<i64>().ok())
         .filter(|v| *v >= 0)
         .unwrap_or(AUTO_DISTILL_DEFAULT_DAILY_CAP))
@@ -1163,12 +1145,11 @@ pub fn auto_distill_daily_cap(conn: &Connection) -> Result<i64> {
 
 /// Set the per-day auto-distill allowance (0 pauses auto-distill without turning it off).
 pub fn set_auto_distill_daily_cap(conn: &Connection, cap: i64) -> Result<()> {
-    conn.execute(
-        "INSERT INTO app_config (key, value) VALUES ('knowledge.auto_distill_daily_cap', ?1)
-         ON CONFLICT(key) DO UPDATE SET value = ?1",
-        params![cap.max(0).to_string()],
-    )?;
-    Ok(())
+    app_config::put(
+        conn,
+        "knowledge.auto_distill_daily_cap",
+        &cap.max(0).to_string(),
+    )
 }
 
 fn utc_day(now: i64) -> String {
@@ -1179,10 +1160,12 @@ fn utc_day(now: i64) -> String {
 
 /// Threads already reserved by auto-distill today.
 fn auto_distill_used_today(conn: &Connection, now: i64) -> Result<i64> {
-    if config_get(conn, "knowledge.auto_distill_day")?.as_deref() != Some(utc_day(now).as_str()) {
+    if app_config::get(conn, "knowledge.auto_distill_day")?.as_deref()
+        != Some(utc_day(now).as_str())
+    {
         return Ok(0);
     }
-    Ok(config_get(conn, "knowledge.auto_distill_used")?
+    Ok(app_config::get(conn, "knowledge.auto_distill_used")?
         .and_then(|v| v.parse().ok())
         .unwrap_or(0))
 }
@@ -1205,16 +1188,8 @@ pub fn auto_distill_worklist(conn: &Connection, batch: i64, now: i64) -> Result<
     let ids = pending_threads_since(conn, take, Some(since))?;
     if !ids.is_empty() {
         let used = auto_distill_used_today(conn, now)? + ids.len() as i64;
-        for (k, v) in [
-            ("knowledge.auto_distill_day", utc_day(now)),
-            ("knowledge.auto_distill_used", used.to_string()),
-        ] {
-            conn.execute(
-                "INSERT INTO app_config (key, value) VALUES (?1, ?2)
-                 ON CONFLICT(key) DO UPDATE SET value = ?2",
-                params![k, v],
-            )?;
-        }
+        app_config::put(conn, "knowledge.auto_distill_day", &utc_day(now))?;
+        app_config::put(conn, "knowledge.auto_distill_used", &used.to_string())?;
     }
     Ok(ids)
 }
@@ -1300,6 +1275,22 @@ pub fn has_keyword_candidates(
     sql.push(')');
     let arg_refs: Vec<&dyn rusqlite::ToSql> = args.iter().map(|b| b.as_ref()).collect();
     Ok(conn.query_row(&sql, arg_refs.as_slice(), |r| r.get::<_, i64>(0))? != 0)
+}
+
+/// The project key for `raw` (a path, a `~/...` path, or an already-canonical key):
+/// `indexer::canonical_project`, which resolves a worktree to its main repo and stops the
+/// walk at $HOME, falling back to `raw` itself when it is blank. Every surface that scopes
+/// to a project (`cal`, the hooks, the MCP tools) goes through this, so they all match the
+/// key the indexer stored.
+pub fn project_key(raw: &str) -> String {
+    crate::indexer::canonical_project(raw).unwrap_or_else(|| raw.to_string())
+}
+
+/// [`project_key`] for the process's working directory, or None when it can't be read
+/// (deleted out from under us). What `cal` and the MCP server scope to by default.
+pub fn cwd_project_key() -> Option<String> {
+    let cwd = std::env::current_dir().ok()?;
+    Some(project_key(&cwd.to_string_lossy()))
 }
 
 /// Recompute `threads.project_key` where the stored key is out of date with
@@ -1615,6 +1606,39 @@ mod tests {
             !mem.decisions.iter().any(|f| f.text == "use sqlite"),
             "hidden fact stays hidden"
         );
+    }
+
+    #[test]
+    fn facts_only_memory_matches_full_memory_without_counts() {
+        let mut conn = temp_db();
+        let t = seed_thread(&mut conn, "cov", "/proj/c", false, &["a", "b", "c", "d"]);
+        conn.execute(
+            "UPDATE threads SET knowledge_extracted = 1 WHERE id = ?1",
+            [t],
+        )
+        .unwrap();
+        record_fact(&conn, "/proj/c", "gotcha", "watch the WAL", None, 10).unwrap();
+        record_fact(&conn, "/proj/c", "decision", "keep sqlite", None, 11).unwrap();
+
+        let full = get_project_memory(&conn, "/proj/c", 40).unwrap();
+        assert_eq!(full.distilled_count, 1);
+        assert!(full.thread_count >= 1);
+        let facts = get_project_memory_facts(&conn, "/proj/c", 40).unwrap();
+        assert_eq!(
+            (
+                facts.thread_count,
+                facts.distilled_count,
+                facts.pending_count
+            ),
+            (0, 0, 0)
+        );
+        let texts = |m: &ProjectMemory| {
+            [&m.decisions, &m.gotchas, &m.open_todos]
+                .iter()
+                .map(|l| l.iter().map(|f| f.text.clone()).collect::<Vec<_>>())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(texts(&full), texts(&facts));
     }
 
     #[test]

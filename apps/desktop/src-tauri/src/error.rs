@@ -16,4 +16,30 @@ impl serde::Serialize for AppError {
     }
 }
 
+impl AppError {
+    /// The wrapped error with its whole chain, for code that continues in anyhow.
+    pub fn into_inner(self) -> anyhow::Error {
+        match self {
+            AppError::Other(e) => e,
+        }
+    }
+}
+
 pub type AppResult<T> = Result<T, AppError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn into_inner_keeps_the_whole_chain() {
+        let err: AppError = anyhow::anyhow!("disk I/O error")
+            .context("writing the index")
+            .into();
+        // The old `anyhow!(e.to_string())` kept only the outer layer; logs print `{e:#}`.
+        assert_eq!(
+            format!("{:#}", err.into_inner()),
+            "writing the index: disk I/O error"
+        );
+    }
+}

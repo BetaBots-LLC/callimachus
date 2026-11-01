@@ -1,7 +1,8 @@
 // The editor-tab transcript view, styled to match the desktop app: user turns as
 // right-aligned bubbles, assistant turns as full-width rendered markdown (the
-// desktop Markdown component, so it looks identical), tool turns collapsed. The
+// desktop markdown renderer, so it looks identical), tool turns collapsed. The
 // packed `cal cat` blob is split into role turns client-side (see transcript.ts).
+// Loaded as its own chunk (see main.tsx), so the sidebar never parses the markdown stack.
 
 import { useEffect, useMemo, useState } from "react";
 import { CornerDownLeft, Copy, FileDown, Terminal } from "lucide-react";
@@ -48,9 +49,13 @@ function TurnBlock({ turn }: { turn: Turn }) {
     );
   }
 
+  // Not the desktop's static Markdown: that collapses anything over 16k chars into a plain
+  // "Large message" block, and in this panel a long plan or generated doc should read as
+  // markdown (only tool bodies collapse, above). streaming={false}: the text is final, so
+  // every block, the last included, gets language auto-detection.
   return (
     <div className="w-full min-w-0">
-      <StreamingMarkdown>{turn.text}</StreamingMarkdown>
+      <StreamingMarkdown streaming={false}>{turn.text}</StreamingMarkdown>
     </div>
   );
 }

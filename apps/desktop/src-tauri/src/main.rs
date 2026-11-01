@@ -15,32 +15,16 @@ fn main() {
         std::process::exit(uninstall_integration());
     }
 
-    // Dual-mode: when launched with `--mcp`, act as the stdio MCP server instead
-    // of opening the GUI. This lets the installed app register *itself* as an MCP
-    // server for Claude Code (no separate binary to ship).
-    if argv.iter().any(|a| a == "--mcp") {
-        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-        let result = rt.block_on(async {
-            // Writable: the MCP server has write tools now (complete_todo, record_*).
-            // WAL + busy_timeout let it coexist with the desktop app's writer; the sidecar
-            // open also waits out an index upgrade another process is running.
-            let conn =
-                callimachus_lib::db::open_sidecar(&callimachus_lib::db::default_index_path())?;
-            callimachus_lib::mcp_server::serve(conn).await
-        });
-        if let Err(e) = result {
-            // A lock held past the sidecar wait is almost always an upgrade in progress: say
-            // that instead of SQLite's raw "database is locked".
-            if callimachus_lib::db::is_busy(&e) {
-                eprintln!(
-                    "callimachus --mcp: the index is busy (an upgrade may be running); try again shortly"
-                );
-            } else {
-                eprintln!("callimachus --mcp: {e}");
-            }
-            std::process::exit(1);
-        }
-        return;
+    // Dual-mode: `--mcp` runs the stdio MCP server instead of the GUI, so the installed app
+    // registers *itself* as an MCP server (no separate binary to ship). The same server
+    // process as the `callimachus-mcp` binary, so the two can't drift. Only as the FIRST
+    // argument, which is how every registration passes it: matching anywhere would turn
+    // `cal search --mcp` into an MCP server waiting on stdin instead of a search.
+    if argv.get(1).map(String::as_str) == Some("--mcp") {
+        std::process::exit(callimachus_lib::mcp_server::serve_stdio(
+            "callimachus --mcp",
+            &callimachus_lib::db::default_index_path(),
+        ));
     }
 
     // Tri-mode: act as the `cal` CLI when invoked as `cal` (argv0 — i.e. via the

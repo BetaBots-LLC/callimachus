@@ -14,7 +14,7 @@ The Callimachus marketing + download site. Server-rendered, SEO-optimized.
 
 ```bash
 pnpm --filter callimachus-web dev      # http://localhost:3000
-pnpm --filter callimachus-web build    # emits .vercel/output (Build Output API v3)
+pnpm --filter callimachus-web build    # emits .output/ (Node server); on Vercel, .vercel/output (Build Output API v3)
 pnpm --filter callimachus-web typecheck
 ```
 

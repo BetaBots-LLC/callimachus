@@ -22,7 +22,8 @@ import { ExternalLink, GitCommitHorizontal, MoreHorizontal, Star } from "lucide-
 import { TagsEditor } from "./TagsEditor";
 import { KnowledgeButton } from "./KnowledgeSection";
 import { Loading } from "./Loading";
-import { Markdown, asCodeBlock } from "./Markdown";
+// Lazy: keeps the markdown + highlight stack off the startup path (see LazyMarkdown).
+import { Markdown } from "./LazyMarkdown";
 
 /** An inline notice tied to the thread it is about. */
 type Notice = { threadId: number; text: string };
@@ -48,6 +49,10 @@ export function ThreadView() {
     queryKey: ["thread", threadId],
     queryFn: () => api.getThread(threadId as number),
     enabled: threadId != null,
+    // A long transcript is ~12 MB of heap, and nothing reads a thread once it is closed, so
+    // drop it after a minute instead of the default five. Not shorter: this view remounts
+    // on every tab switch, and a quick look at Chat shouldn't refetch the open thread.
+    gcTime: 60_000,
   });
 
   // Once per opened thread, not per refetch (live updates refetch open threads).
@@ -389,6 +394,15 @@ function MessageList({ messages }: { messages: MessageRow[] }) {
       </div>
     </div>
   );
+}
+
+/** Wrap arbitrary text (e.g. tool output) as one fenced code block so it renders
+ *  monospaced + syntax-highlighted through the Markdown pipeline. The fence is one
+ *  backtick longer than any run already in the text, so embedded fences can't escape. */
+function asCodeBlock(text: string, lang = ""): string {
+  const longest = (text.match(/`+/g) ?? []).reduce((m, s) => Math.max(m, s.length), 0);
+  const fence = "`".repeat(Math.max(3, longest + 1));
+  return `${fence}${lang}\n${text}\n${fence}`;
 }
 
 /** Render a tool message body: pretty-print JSON args (tool calls are stored as

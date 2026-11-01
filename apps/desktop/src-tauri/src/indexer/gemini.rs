@@ -7,7 +7,11 @@
 //!
 //! Schema verified against google-gemini/gemini-cli `chatRecordingService.ts`.
 
-use super::{set_file_state, source_id, upsert_thread, IndexReport, ParsedMessage, ParsedThread};
+use super::common::{parse_rfc3339, push_message, truncate_title};
+use super::{
+    file_change_state, set_file_state, source_id, upsert_thread, IndexReport, ParsedMessage,
+    ParsedThread,
+};
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use serde_json::Value;
@@ -22,86 +26,101 @@ pub fn tmp_root() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".gemini").join("tmp"))
 }
 
-/// Recursively collect every chat `.jsonl` under `dir`. Restricted to files inside
-/// a `chats/` segment so we skip the sibling `logs/` and `checkpoints/` dirs.
-fn collect_chat_jsonl(dir: &Path, out: &mut Vec<PathBuf>) {
+/// Walk every project tmp dir, (re)indexing chat files whose mtime/size changed.
+pub fn scan(conn: &mut Connection, tick: &mut dyn FnMut()) -> Result<IndexReport> {
+    match tmp_root() {
+        Some(root) => scan_chats(conn, KIND, &root, parse_file, tick),
+        None => Ok(IndexReport::default()),
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Shared with Qwen Code, a Gemini CLI fork that keeps the same `tmp/<project>/chats/`
+// layout and Gemini `parts`, with its own record shape.
+// ---------------------------------------------------------------------------------------
+
+/// Parses one chat file into a thread keyed by the given external id.
+pub(super) type ParseChat = fn(&Path, &str) -> Result<Option<ParsedThread>>;
+
+/// Index every chat `.jsonl` under `root` (a `<cli home>/tmp` dir) into source `kind`,
+/// skipping files whose (mtime, size) is unchanged.
+pub(super) fn scan_chats(
+    conn: &mut Connection,
+    kind: &str,
+    root: &Path,
+    parse: ParseChat,
+    tick: &mut dyn FnMut(),
+) -> Result<IndexReport> {
+    let mut report = IndexReport::default();
+    if !root.is_dir() {
+        return Ok(report);
+    }
+    let sid = source_id(conn, kind)?;
+
+    let mut files = Vec::new();
+    collect_chat_jsonl(root, root, &mut files);
+    for path in files {
+        tick();
+        report.record(index_chat(conn, sid, kind, root, &path, parse));
+    }
+    Ok(report)
+}
+
+/// Recursively collect every chat `.jsonl` under `dir`. Restricted to files inside a
+/// `chats` directory below `root`, so the sibling `logs/` and `checkpoints/` dirs are
+/// skipped. Compared by path component, so it holds for Windows separators too.
+fn collect_chat_jsonl(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            collect_chat_jsonl(&path, out);
+            collect_chat_jsonl(root, &path, out);
         } else if path.extension().and_then(|e| e.to_str()) == Some("jsonl")
-            && path.to_string_lossy().contains("/chats/")
+            && in_chats_dir(root, &path)
         {
             out.push(path);
         }
     }
 }
 
-/// Walk every project tmp dir, (re)indexing chat files whose mtime/size changed.
-pub fn scan(conn: &mut Connection, tick: &mut dyn FnMut()) -> Result<IndexReport> {
-    let mut report = IndexReport::default();
-    let Some(root) = tmp_root() else {
-        return Ok(report);
-    };
-    if !root.is_dir() {
-        return Ok(report);
-    }
-    let sid = source_id(conn, KIND)?;
-
-    let mut files = Vec::new();
-    collect_chat_jsonl(&root, &mut files);
-
-    for path in files {
-        tick();
-        match index_file(conn, sid, &root, &path) {
-            Ok(Some(n)) => {
-                report.threads_indexed += 1;
-                report.messages_indexed += n;
-            }
-            Ok(None) => report.threads_skipped += 1,
-            Err(_) => report.errors += 1,
-        }
-    }
-    Ok(report)
+fn in_chats_dir(root: &Path, path: &Path) -> bool {
+    path.strip_prefix(root)
+        .ok()
+        .and_then(Path::parent)
+        .is_some_and(|dir| dir.components().any(|c| c.as_os_str() == "chats"))
 }
 
 /// Index one chat file. Returns Some(message_count) if indexed, None if unchanged.
-fn index_file(conn: &mut Connection, sid: i64, root: &Path, path: &Path) -> Result<Option<usize>> {
-    let path_str = path.to_string_lossy().to_string();
-    let meta = fs::metadata(path)?;
-    let size = meta.len() as i64;
-    let mtime = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-
-    if let Some((prev_mtime, prev_size)) = super::file_state(conn, &path_str)? {
-        if prev_mtime == mtime && prev_size == size {
-            return Ok(None); // unchanged
-        }
+fn index_chat(
+    conn: &mut Connection,
+    sid: i64,
+    kind: &str,
+    root: &Path,
+    path: &Path,
+    parse: ParseChat,
+) -> Result<Option<usize>> {
+    let (unchanged, mtime, size) = file_change_state(conn, path)?;
+    if unchanged {
+        return Ok(None);
     }
 
     // external_id = path relative to the tmp root: stable and unique per file, joined with
     // '/' on every OS (the `chats/` segment check below splits on '/').
     let rel = super::claude::external_id_for(root, path);
-
-    let mut thread = parse_file(path, &rel).with_context(|| format!("parsing {path_str}"))?;
+    let path_str = path.to_string_lossy();
+    let mut thread = parse(path, &rel).with_context(|| format!("parsing {path_str}"))?;
     if let Some(t) = thread.as_mut() {
         // Top-level sessions are `<id>/chats/session-*.jsonl` (one segment after
         // `chats/`); subagent transcripts nest one level deeper.
         t.is_subagent = segments_after_chats(&rel) >= 2;
     }
-    let n = if let Some(t) = thread {
-        upsert_thread(conn, sid, &t)?
-    } else {
-        0
+    let n = match thread {
+        Some(t) => upsert_thread(conn, sid, &t)?,
+        None => 0,
     };
-    set_file_state(conn, &path_str, KIND, mtime, size)?;
+    set_file_state(conn, &path_str, kind, mtime, size)?;
     Ok(Some(n))
 }
 
@@ -113,16 +132,23 @@ fn segments_after_chats(rel: &str) -> usize {
     }
 }
 
-/// Parse a Gemini chat `.jsonl` file. `external_id` keys the thread. Returns None
-/// if it has no user/assistant messages.
-pub fn parse_file(path: &Path, external_id: &str) -> Result<Option<ParsedThread>> {
+/// Folds one parsed JSONL record into the thread under construction, recording the
+/// first user message's text (the title fallback).
+pub(super) type IngestLine = fn(&mut ParsedThread, &Value, &mut Option<String>);
+
+/// Parse a chat `.jsonl` file line by line with `ingest`, tolerating malformed lines.
+/// Returns None if it yields no messages.
+pub(super) fn parse_chat_jsonl(
+    path: &Path,
+    external_id: &str,
+    ingest: IngestLine,
+) -> Result<Option<ParsedThread>> {
     let content = fs::read_to_string(path)?;
     let mut thread = ParsedThread {
         external_id: external_id.to_string(),
         ..Default::default()
     };
     let mut first_user_text: Option<String> = None;
-
     for line in content.lines() {
         if line.trim().is_empty() {
             continue;
@@ -130,23 +156,76 @@ pub fn parse_file(path: &Path, external_id: &str) -> Result<Option<ParsedThread>
         let Ok(obj) = serde_json::from_str::<Value>(line) else {
             continue; // tolerate the occasional malformed line
         };
-        ingest_line(&mut thread, &obj, &mut first_user_text);
+        ingest(&mut thread, &obj, &mut first_user_text);
     }
-
     if thread.messages.is_empty() {
         return Ok(None);
     }
     if thread.title.is_none() {
-        thread.title = first_user_text.map(|t| {
-            let t = t.trim();
-            if t.chars().count() > 80 {
-                format!("{}…", t.chars().take(80).collect::<String>())
-            } else {
-                t.to_string()
-            }
-        });
+        thread.title = first_user_text.as_deref().map(truncate_title);
     }
     Ok(Some(thread))
+}
+
+/// Flatten one record's Gemini parts (a string or an array of `{text}` /
+/// `{functionCall}` / `{functionResponse}`) into the thread, keeping the record's first
+/// message as the title fallback when it is the first user text.
+pub(super) fn ingest_parts(
+    thread: &mut ParsedThread,
+    role: &str,
+    parts: Option<&Value>,
+    ts: Option<i64>,
+    first_user_text: &mut Option<String>,
+) {
+    let before = thread.messages.len();
+    extract_parts(&mut thread.messages, role, parts, ts);
+    if role == "user" && first_user_text.is_none() {
+        if let Some(m) = thread.messages.get(before).filter(|m| m.role == "user") {
+            *first_user_text = Some(m.text.clone());
+        }
+    }
+}
+
+fn extract_parts(out: &mut Vec<ParsedMessage>, role: &str, parts: Option<&Value>, ts: Option<i64>) {
+    match parts {
+        Some(Value::String(s)) => push_message(out, role, s, None, ts),
+        Some(Value::Array(parts)) => {
+            for part in parts {
+                if let Some(t) = part.get("text").and_then(Value::as_str) {
+                    push_message(out, role, t, None, ts);
+                } else if let Some(call) = part.get("functionCall") {
+                    let name = call
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("tool")
+                        .to_string();
+                    let args = call.get("args").map(|v| v.to_string()).unwrap_or_default();
+                    let text = format!("{name}: {args}");
+                    push_message(out, "assistant", &text, Some(name), ts);
+                } else if let Some(resp) = part.get("functionResponse") {
+                    let text = resp
+                        .get("response")
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| resp.to_string());
+                    // Same head + tail cap as the Claude indexer (tool output is never
+                    // embedded or distilled, and dominated the index size).
+                    let text = super::claude::cap_tool_text(text.trim());
+                    push_message(out, "tool", &text, None, ts);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Gemini's record shape
+// ---------------------------------------------------------------------------------------
+
+/// Parse a Gemini chat `.jsonl` file. `external_id` keys the thread. Returns None
+/// if it has no user/assistant messages.
+pub fn parse_file(path: &Path, external_id: &str) -> Result<Option<ParsedThread>> {
+    parse_chat_jsonl(path, external_id, ingest_line)
 }
 
 /// Fold one JSONL line into the thread under construction. Handles both the
@@ -165,7 +244,7 @@ fn ingest_line(thread: &mut ParsedThread, obj: &Value, first_user_text: &mut Opt
     // Metadata carries startTime/lastUpdated; messages carry timestamp. Fold all
     // ISO-8601 stamps into the thread's created/updated bounds.
     for key in ["startTime", "lastUpdated", "timestamp"] {
-        if let Some(ts) = obj.get(key).and_then(Value::as_str).and_then(parse_ts) {
+        if let Some(ts) = obj.get(key).and_then(Value::as_str).and_then(parse_rfc3339) {
             thread.created_at = Some(thread.created_at.map_or(ts, |c| c.min(ts)));
             thread.updated_at = Some(thread.updated_at.map_or(ts, |u| u.max(ts)));
         }
@@ -174,82 +253,13 @@ fn ingest_line(thread: &mut ParsedThread, obj: &Value, first_user_text: &mut Opt
     let ts = obj
         .get("timestamp")
         .and_then(Value::as_str)
-        .and_then(parse_ts);
+        .and_then(parse_rfc3339);
     let role = match obj.get("type").and_then(Value::as_str) {
         Some("user") => "user",
         Some("gemini") => "assistant",
         _ => return, // info / error / warning / tool records — skipped for now
     };
-
-    let before = thread.messages.len();
-    extract_content(thread, role, obj.get("content"), ts);
-    if role == "user" && first_user_text.is_none() {
-        if let Some(m) = thread.messages.get(before) {
-            if m.role == "user" {
-                *first_user_text = Some(m.text.clone());
-            }
-        }
-    }
-}
-
-/// Turn a record's `content` (a string or an array of Gemini parts) into messages.
-fn extract_content(
-    thread: &mut ParsedThread,
-    role: &str,
-    content: Option<&Value>,
-    ts: Option<i64>,
-) {
-    let push = |thread: &mut ParsedThread, role: &str, text: String, tool: Option<String>| {
-        let text = text.trim().to_string();
-        if !text.is_empty() {
-            thread.messages.push(ParsedMessage {
-                role: role.to_string(),
-                text,
-                tool_name: tool,
-                ts,
-            });
-        }
-    };
-
-    match content {
-        Some(Value::String(s)) => push(thread, role, s.clone(), None),
-        Some(Value::Array(parts)) => {
-            for part in parts {
-                if let Some(t) = part.get("text").and_then(Value::as_str) {
-                    push(thread, role, t.to_string(), None);
-                } else if let Some(call) = part.get("functionCall") {
-                    let name = call
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .unwrap_or("tool")
-                        .to_string();
-                    let args = call.get("args").map(|v| v.to_string()).unwrap_or_default();
-                    push(thread, "assistant", format!("{name}: {args}"), Some(name));
-                } else if let Some(resp) = part.get("functionResponse") {
-                    let text = resp
-                        .get("response")
-                        .map(|v| v.to_string())
-                        .unwrap_or_else(|| resp.to_string());
-                    // Same head + tail cap as the Claude indexer (tool output is never
-                    // embedded or distilled, and dominated the index size).
-                    push(
-                        thread,
-                        "tool",
-                        super::claude::cap_tool_text(text.trim()),
-                        None,
-                    );
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
-/// ISO-8601 / RFC-3339 timestamp -> epoch seconds.
-fn parse_ts(s: &str) -> Option<i64> {
-    chrono::DateTime::parse_from_rfc3339(s)
-        .ok()
-        .map(|d| d.timestamp())
+    ingest_parts(thread, role, obj.get("content"), ts, first_user_text);
 }
 
 #[cfg(test)]
@@ -327,6 +337,47 @@ mod tests {
             crate::search::search(&conn, "fts5", &crate::search::SearchFilters::default()).unwrap();
         assert_eq!(hits.len(), 2); // user message + "using FTS5"
         assert!(hits.iter().all(|h| h.source == "gemini"));
+    }
+
+    /// The shared walk keeps only files under a `chats` dir, keys them by their '/'-joined
+    /// path below the root, and marks deeper (subagent) transcripts.
+    #[test]
+    fn scan_chats_walks_only_chat_dirs() {
+        let root = temp_path("gem_root");
+        for dir in ["p1/chats/parent", "p1/logs", "p1/checkpoints"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        for file in [
+            "p1/chats/session-a.jsonl",
+            "p1/chats/parent/child.jsonl",
+            "p1/logs/log.jsonl",
+            "p1/checkpoints/cp.jsonl",
+        ] {
+            std::fs::write(root.join(file), SAMPLE).unwrap();
+        }
+        let mut conn = crate::db::open(&temp_path("gem_walk.db")).unwrap();
+        let report = scan_chats(&mut conn, KIND, &root, parse_file, &mut || {}).unwrap();
+        assert_eq!(
+            report.threads_indexed, 2,
+            "logs/ and checkpoints/ are skipped"
+        );
+        let rows: Vec<(String, bool)> = conn
+            .prepare("SELECT external_id, is_subagent FROM threads ORDER BY external_id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("p1/chats/parent/child.jsonl".to_string(), true),
+                ("p1/chats/session-a.jsonl".to_string(), false),
+            ]
+        );
+        let again = scan_chats(&mut conn, KIND, &root, parse_file, &mut || {}).unwrap();
+        assert_eq!(again.threads_skipped, 2, "unchanged files are skipped");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Real-data smoke test against live ~/.gemini history. Ignored by default;

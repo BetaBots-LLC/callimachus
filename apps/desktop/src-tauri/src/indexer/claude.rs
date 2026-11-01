@@ -14,7 +14,10 @@
 //! like a pure append (shrink, rewrite, fingerprint mismatch, thread missing from the
 //! index) falls back to a full parse.
 
-use super::{source_id, upsert_thread, IndexReport, MsgUsage, ParsedMessage, ParsedThread};
+use super::common::{join_text_parts, parse_rfc3339, push_message, truncate_title};
+use super::{
+    file_stamp, source_id, upsert_thread, IndexReport, MsgUsage, ParsedMessage, ParsedThread,
+};
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value;
@@ -22,6 +25,7 @@ use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
+use std::time::{Duration, Instant};
 
 pub const KIND: &str = "claude_code";
 
@@ -74,15 +78,11 @@ pub fn load_config_dir_setting(conn: &Connection) {
 
 /// A non-empty path stored under `key` in `app_config`, if any.
 pub(crate) fn read_path_setting(conn: &Connection, key: &str) -> Option<PathBuf> {
-    conn.query_row("SELECT value FROM app_config WHERE key = ?1", [key], |r| {
-        r.get::<_, String>(0)
-    })
-    .optional()
-    .ok()
-    .flatten()
-    .map(|v| v.trim().to_string())
-    .filter(|v| !v.is_empty())
-    .map(PathBuf::from)
+    // A read error reads as unset, the same as a missing row.
+    crate::knowledge::app_config::get_nonblank(conn, key)
+        .ok()
+        .flatten()
+        .map(PathBuf::from)
 }
 
 /// Expand a leading `~` (env vars and settings values are often written that way).
@@ -94,6 +94,44 @@ pub(crate) fn expand_tilde(p: PathBuf) -> PathBuf {
         Some(home) => home.join(rest),
         None => p,
     }
+}
+
+/// Check a data folder typed in Settings and return the spelling to store: `~` expanded,
+/// absolute, canonical (symlinks and `..` resolved, no Windows `\\?\` prefix), and naming a
+/// folder that exists. Every process that opens the index (the app, the watcher, `cal
+/// hook`) applies the stored value, so a relative or unexpanded path would resolve against
+/// each one's own working directory, and a typo would index nothing without any error.
+/// The errors are shown as is in Settings.
+pub(crate) fn normalize_data_root(raw: &str) -> Result<String> {
+    let raw = raw.trim();
+    let path = expand_tilde(PathBuf::from(raw));
+    if !path.is_absolute() {
+        if raw.contains('$') || raw.contains('%') {
+            anyhow::bail!(
+                "\"{raw}\" uses an environment variable, which isn't expanded here. \
+                 Enter the folder's full path."
+            );
+        }
+        let example = if cfg!(windows) {
+            "such as C:\\Users\\you\\.claude"
+        } else {
+            "starting with / or ~"
+        };
+        anyhow::bail!("\"{raw}\" isn't a full path. Enter the folder's full path, {example}.");
+    }
+    let real = match fs::canonicalize(&path) {
+        Ok(real) => super::strip_verbatim_prefix(&real),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            anyhow::bail!("There's no folder at {}.", path.display())
+        }
+        Err(e) => anyhow::bail!("Can't open {}: {e}.", path.display()),
+    };
+    if !real.is_dir() {
+        anyhow::bail!("{} is a file, not a folder.", real.display());
+    }
+    real.into_os_string()
+        .into_string()
+        .map_err(|p| anyhow::anyhow!("{} isn't a valid Unicode path.", Path::new(&p).display()))
 }
 
 /// The thread's stable id: the transcript path relative to the projects root, always
@@ -178,24 +216,174 @@ fn is_jsonl(path: &Path) -> bool {
 
 /// Walk every project dir, (re)indexing thread files whose mtime/size changed.
 pub fn scan(conn: &mut Connection, tick: &mut dyn FnMut()) -> Result<IndexReport> {
-    let mut report = IndexReport::default();
     load_config_dir_setting(conn);
     let Some(root) = projects_root() else {
-        return Ok(report);
+        return Ok(IndexReport::default());
     };
+    scan_root(conn, &root, tick)
+}
+
+/// [`scan`] over one projects root, with the writes grouped into [`Batch`]es.
+fn scan_root(conn: &mut Connection, root: &Path, tick: &mut dyn FnMut()) -> Result<IndexReport> {
+    let mut report = IndexReport::default();
     if !root.is_dir() {
         return Ok(report);
     }
     let sid = source_id(conn, KIND)?;
 
     let mut files = Vec::new();
-    collect_jsonl(&root, &mut files);
+    collect_jsonl(root, &mut files);
 
+    let mut batch = Batch::new(conn);
     for path in files {
         tick();
-        tally(&mut report, index_file(conn, sid, &root, &path));
+        // Checked on every file, not only in Batch::run: unchanged files never reach run(),
+        // so a batch opened by an early changed file would otherwise keep the write lock
+        // through the whole rest of the walk (seconds on a cold cache or on Windows).
+        if batch.commit_if_due().is_err() {
+            report.errors += 1;
+        }
+        // Unchanged files (nearly all of them on a re-scan) are skipped before the batch
+        // is consulted, so a no-op pass never takes the write lock.
+        let size = match changed_size(batch.conn(), &path) {
+            Ok(Some(size)) => size,
+            Ok(None) => {
+                report.record(Ok(None));
+                continue;
+            }
+            Err(e) => {
+                report.record(Err(e));
+                continue;
+            }
+        };
+        report.record(batch.run(size, |conn| index_file(conn, sid, root, &path)));
+    }
+    if batch.finish().is_err() {
+        report.errors += 1;
     }
     Ok(report)
+}
+
+/// Files written per batch commit, at most.
+const BATCH_FILES: usize = 32;
+/// How long a batch may hold the write lock before it commits.
+const BATCH_WINDOW: Duration = Duration::from_millis(250);
+/// Files at least this big are indexed outside any batch. A full parse runs at roughly
+/// 75 MB/s, so a smaller file adds at most ~30 ms to the lock hold.
+const BATCH_MAX_FILE: i64 = 2 << 20;
+
+/// Groups a full scan's writes into a few large transactions. One commit per thread spent
+/// about a quarter of a cold index in COMMIT (FTS5 flushes and later merges a segment per
+/// transaction), so a batch commits every [`BATCH_FILES`] files or [`BATCH_WINDOW`],
+/// whichever comes first. Each file runs in its own savepoint inside the batch: a failing
+/// file rolls back alone, and its cursor commits together with its thread.
+///
+/// The lock is taken lazily, right before a file that changed, and a file of
+/// [`BATCH_MAX_FILE`] bytes or more first commits the batch and runs on its own, so the lock
+/// is never held across a long parse: the worst hold is about one window plus one small
+/// file, well under every connection's busy timeout. Dropping a batch without
+/// [`Batch::finish`] (an early return, a panic) rolls back its uncommitted files, whose
+/// cursors roll back with them, so the next pass redoes them.
+struct Batch<'c> {
+    conn: &'c mut Connection,
+    /// When the open transaction began, and how many files it holds.
+    open: Option<(Instant, usize)>,
+}
+
+impl<'c> Batch<'c> {
+    fn new(conn: &'c mut Connection) -> Self {
+        Self { conn, open: None }
+    }
+
+    fn conn(&self) -> &Connection {
+        self.conn
+    }
+
+    /// Index one changed file of `size` bytes, inside the batch when it fits.
+    fn run(
+        &mut self,
+        size: i64,
+        index: impl FnOnce(&mut Connection) -> Result<Option<usize>>,
+    ) -> Result<Option<usize>> {
+        let fits = size < BATCH_MAX_FILE;
+        if fits {
+            self.commit_if_due()?;
+        } else {
+            self.commit()?;
+        }
+        // A BEGIN that loses the lock race past the busy timeout just leaves this file to
+        // run unbatched, where upsert_thread takes (and reports failing to take) the lock.
+        if self.open.is_none() && fits && self.conn.execute_batch("BEGIN IMMEDIATE").is_ok() {
+            self.open = Some((Instant::now(), 0));
+        }
+        let Some((_, files)) = self.open.as_mut() else {
+            return index(self.conn);
+        };
+        *files += 1;
+        self.conn.execute_batch("SAVEPOINT claude_file")?;
+        let result = index(self.conn);
+        if self.conn.is_autocommit() {
+            // SQLite rolled the whole transaction back on its own (SQLITE_FULL, an I/O
+            // error): this file and the batch's earlier ones are gone, cursors included.
+            self.open = None;
+            return Err(match result {
+                Err(e) => e,
+                Ok(_) => anyhow::anyhow!("the index batch was rolled back"),
+            });
+        }
+        let end = if result.is_ok() {
+            "RELEASE claude_file"
+        } else {
+            "ROLLBACK TO claude_file; RELEASE claude_file"
+        };
+        self.conn.execute_batch(end)?;
+        result
+    }
+
+    /// Commit the open transaction once it holds [`BATCH_FILES`] files or has been open for
+    /// [`BATCH_WINDOW`]; otherwise leave it open for the next file.
+    fn commit_if_due(&mut self) -> Result<()> {
+        match self.open {
+            Some((since, files)) if files >= BATCH_FILES || since.elapsed() >= BATCH_WINDOW => {
+                self.commit()
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Commit the open transaction, if any. A failed COMMIT is rolled back so the
+    /// connection is usable again; the lost files are redone by the next pass.
+    fn commit(&mut self) -> Result<()> {
+        if self.open.take().is_some() && !self.conn.is_autocommit() {
+            if let Err(e) = self.conn.execute_batch("COMMIT") {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                return Err(e.into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Commit what is left at the end of a scan.
+    fn finish(mut self) -> Result<()> {
+        self.commit()
+    }
+}
+
+impl Drop for Batch<'_> {
+    fn drop(&mut self) {
+        if self.open.take().is_some() && !self.conn.is_autocommit() {
+            let _ = self.conn.execute_batch("ROLLBACK");
+        }
+    }
+}
+
+/// The file's size when it changed since its cursor was written, None when unchanged.
+/// The same check [`index_file`] starts with, without parsing or writing anything.
+fn changed_size(conn: &Connection, path: &Path) -> Result<Option<i64>> {
+    let (mtime, size) = file_stamp(path)?;
+    let unchanged = read_cursor(conn, &path.to_string_lossy())?
+        .is_some_and(|c| c.mtime == mtime && c.size == size);
+    Ok((!unchanged).then_some(size))
 }
 
 /// Index just the given changed paths (the file watcher's fast path): a debounced batch
@@ -236,34 +424,16 @@ pub fn index_paths(conn: &mut Connection, paths: &[PathBuf]) -> Result<IndexRepo
     }
     let sid = source_id(conn, KIND)?;
     for (base, path) in files {
-        tally(&mut report, index_file(conn, sid, &base, &path));
+        report.record(index_file(conn, sid, &base, &path));
     }
     Ok(report)
-}
-
-fn tally(report: &mut IndexReport, res: Result<Option<usize>>) {
-    match res {
-        Ok(Some(n)) => {
-            report.threads_indexed += 1;
-            report.messages_indexed += n;
-        }
-        Ok(None) => report.threads_skipped += 1,
-        Err(_) => report.errors += 1,
-    }
 }
 
 /// Index one thread file. Returns Some(message_count) if indexed, None if unchanged or
 /// deliberately skipped.
 fn index_file(conn: &mut Connection, sid: i64, root: &Path, path: &Path) -> Result<Option<usize>> {
     let path_str = path.to_string_lossy().to_string();
-    let meta = fs::metadata(path)?;
-    let size = meta.len() as i64;
-    let mtime = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+    let (mtime, size) = file_stamp(path)?;
 
     let cursor = read_cursor(conn, &path_str)?;
     if let Some(c) = &cursor {
@@ -476,9 +646,10 @@ fn try_append(
     let Some(mut thread) = load_stored_thread(conn, sid, external_id)? else {
         return Ok(Append::Fallback);
     };
-    // The cursor and the upsert are separate commits. If the last pass stored the new
-    // messages but died (or lost a lock race) before advancing the cursor, re-reading from
-    // the stale offset would append the same lines twice; the count catches that.
+    // Outside a full scan's batch (the watcher path) the cursor and the upsert are separate
+    // commits. If the last pass stored the new messages but died (or lost a lock race)
+    // before advancing the cursor, re-reading from the stale offset would append the same
+    // lines twice; the count catches that.
     if thread.messages.len() != expected_count {
         return Ok(Append::Fallback);
     }
@@ -718,14 +889,7 @@ fn parse_line(line: &[u8]) -> Option<Value> {
 /// Title fallback: first user message, trimmed to a reasonable length.
 fn finish_title(thread: &mut ParsedThread, first_user_text: Option<String>) {
     if thread.title.is_none() {
-        thread.title = first_user_text.map(|t| {
-            let t = t.trim();
-            if t.chars().count() > 80 {
-                format!("{}…", t.chars().take(80).collect::<String>())
-            } else {
-                t.to_string()
-            }
-        });
+        thread.title = first_user_text.as_deref().map(truncate_title);
     }
 }
 
@@ -745,7 +909,7 @@ fn ingest_line(thread: &mut ParsedThread, obj: &Value, first_user_text: &mut Opt
     let ts = obj
         .get("timestamp")
         .and_then(Value::as_str)
-        .and_then(parse_ts);
+        .and_then(parse_rfc3339);
     if let Some(ts) = ts {
         thread.created_at = Some(thread.created_at.map_or(ts, |c| c.min(ts)));
         thread.updated_at = Some(thread.updated_at.map_or(ts, |u| u.max(ts)));
@@ -802,26 +966,15 @@ fn extract_messages(
     content: Option<&Value>,
     ts: Option<i64>,
 ) {
-    let push = |thread: &mut ParsedThread, role: &str, text: String, tool: Option<String>| {
-        let text = text.trim().to_string();
-        if !text.is_empty() {
-            thread.messages.push(ParsedMessage {
-                role: role.to_string(),
-                text,
-                tool_name: tool,
-                ts,
-            });
-        }
-    };
-
+    let out = &mut thread.messages;
     match content {
-        Some(Value::String(s)) => push(thread, role, s.clone(), None),
+        Some(Value::String(s)) => push_message(out, role, s, None, ts),
         Some(Value::Array(blocks)) => {
             for block in blocks {
                 match block.get("type").and_then(Value::as_str) {
                     Some("text") => {
                         if let Some(t) = block.get("text").and_then(Value::as_str) {
-                            push(thread, role, t.to_string(), None);
+                            push_message(out, role, t, None, ts);
                         }
                     }
                     Some("tool_use") => {
@@ -834,11 +987,13 @@ fn extract_messages(
                             .get("input")
                             .map(|v| v.to_string())
                             .unwrap_or_default();
-                        push(thread, "assistant", format!("{name}: {input}"), Some(name));
+                        let text = format!("{name}: {input}");
+                        push_message(out, "assistant", &text, Some(name), ts);
                     }
                     Some("tool_result") => {
-                        let text = stringify_tool_result(block.get("content"));
-                        push(thread, "tool", cap_tool_text(text.trim()), None);
+                        // tool_result content is a plain string or an array of text blocks.
+                        let text = join_text_parts(block.get("content"));
+                        push_message(out, "tool", &cap_tool_text(text.trim()), None, ts);
                     }
                     _ => {} // thinking, image, etc. — skipped for now
                 }
@@ -846,26 +1001,6 @@ fn extract_messages(
         }
         _ => {}
     }
-}
-
-/// tool_result `content` may be a plain string or an array of text blocks.
-fn stringify_tool_result(content: Option<&Value>) -> String {
-    match content {
-        Some(Value::String(s)) => s.clone(),
-        Some(Value::Array(blocks)) => blocks
-            .iter()
-            .filter_map(|b| b.get("text").and_then(Value::as_str))
-            .collect::<Vec<_>>()
-            .join("\n"),
-        _ => String::new(),
-    }
-}
-
-/// ISO-8601 / RFC-3339 timestamp -> epoch seconds.
-fn parse_ts(s: &str) -> Option<i64> {
-    chrono::DateTime::parse_from_rfc3339(s)
-        .ok()
-        .map(|d| d.timestamp())
 }
 
 #[cfg(test)]
@@ -1304,6 +1439,166 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM threads", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 0);
+    }
+
+    // ---- batched full scan ---------------------------------------------------------------
+
+    /// `n` small transcripts under a fresh projects root, plus one over BATCH_MAX_FILE (a
+    /// huge tool result, capped at parse time, so the index stays small).
+    fn scan_fixture(n: usize) -> (PathBuf, Vec<PathBuf>) {
+        let root = temp_path("scanroot");
+        let dir = root.join("-Users-me-proj");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut files: Vec<PathBuf> = (0..n)
+            .map(|i| {
+                let p = dir.join(format!("s{i:02}.jsonl"));
+                std::fs::write(&p, format!("{}\n", user_line(&format!("question {i}")))).unwrap();
+                p
+            })
+            .collect();
+        let big = serde_json::json!({
+            "type": "user",
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "content": "x".repeat(BATCH_MAX_FILE as usize)}
+            ]}
+        });
+        let p = dir.join("big.jsonl");
+        std::fs::write(&p, format!("{}\n{big}\n", user_line("big one"))).unwrap();
+        files.push(p);
+        (root, files)
+    }
+
+    #[test]
+    fn a_full_scan_indexes_every_file_through_batches() {
+        // More files than one batch holds, so at least one mid-scan commit happens.
+        let (root, files) = scan_fixture(BATCH_FILES + 8);
+        // An unreadable file fails alone: its savepoint rolls back, the batch carries on.
+        let bad = root.join("-Users-me-proj").join("unreadable.jsonl");
+        std::fs::write(&bad, format!("{}\n", user_line("locked away"))).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o000)).unwrap();
+        }
+        // Root (some CI containers) reads it anyway; then it is just one more good file.
+        let bad_fails = std::fs::read(&bad).is_err();
+
+        let mut conn = crate::db::open(&temp_path("batch.db")).unwrap();
+        let report = scan_root(&mut conn, &root, &mut || {}).unwrap();
+        assert!(conn.is_autocommit(), "the last batch was committed");
+        assert_eq!(
+            report.threads_indexed,
+            files.len() + usize::from(!bad_fails)
+        );
+        assert_eq!(report.errors, usize::from(bad_fails));
+        for f in &files {
+            let c = read_cursor(&conn, &f.to_string_lossy()).unwrap();
+            assert!(
+                c.is_some_and(|c| c.offset > 0),
+                "cursor for {}",
+                f.display()
+            );
+        }
+        if bad_fails {
+            assert!(read_cursor(&conn, &bad.to_string_lossy())
+                .unwrap()
+                .is_none());
+        }
+        let threads: i64 = conn
+            .query_row("SELECT COUNT(*) FROM threads", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(threads as usize, report.threads_indexed);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o644));
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A re-scan with nothing to do must not take the write lock: the watcher's launch
+    /// catch-up runs one, and it would otherwise stall every other writer.
+    #[test]
+    fn a_no_op_scan_never_takes_the_write_lock() {
+        let (root, files) = scan_fixture(3);
+        let db = temp_path("noop.db");
+        let mut conn = crate::db::open(&db).unwrap();
+        scan_root(&mut conn, &root, &mut || {}).unwrap();
+
+        let other = crate::db::open(&db).unwrap();
+        other.execute_batch("BEGIN IMMEDIATE").unwrap();
+        // Any attempt to take the lock would wait out this timeout.
+        let busy = Duration::from_millis(500);
+        conn.busy_timeout(busy).unwrap();
+        let started = Instant::now();
+        let report = scan_root(&mut conn, &root, &mut || {}).unwrap();
+        assert!(started.elapsed() < busy, "nothing waited on the held lock");
+        assert_eq!(report.errors, 0);
+        assert_eq!(report.threads_skipped, files.len());
+        other.execute_batch("ROLLBACK").unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The window is checked between files even when no further file changes, so a batch
+    /// never holds the lock across a long run of unchanged files.
+    #[test]
+    fn an_open_batch_commits_once_its_window_is_up() {
+        let (root, files) = scan_fixture(1);
+        let mut conn = crate::db::open(&temp_path("window.db")).unwrap();
+        let sid = source_id(&conn, KIND).unwrap();
+        let mut batch = Batch::new(&mut conn);
+        let size = changed_size(batch.conn(), &files[0]).unwrap().unwrap();
+        batch
+            .run(size, |c| index_file(c, sid, &root, &files[0]))
+            .unwrap();
+        assert!(batch.open.is_some(), "a small changed file opens a batch");
+
+        batch.commit_if_due().unwrap();
+        assert!(batch.open.is_some(), "not due yet: still open");
+        assert!(!batch.conn().is_autocommit());
+
+        let opened = Instant::now().checked_sub(BATCH_WINDOW).unwrap();
+        batch.open = Some((opened, 1));
+        batch.commit_if_due().unwrap();
+        assert!(batch.open.is_none());
+        assert!(
+            batch.conn().is_autocommit(),
+            "the window elapsed: committed"
+        );
+        drop(batch);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn data_roots_must_be_existing_absolute_folders_and_are_stored_canonical() {
+        let dir = temp_path("dataroot");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let canonical = super::super::strip_verbatim_prefix(&fs::canonicalize(&dir).unwrap());
+        let want = canonical.to_string_lossy().into_owned();
+        assert_eq!(
+            normalize_data_root(&format!("  {}  ", dir.display())).unwrap(),
+            want
+        );
+        // `..` (and on macOS /var -> /private/var) resolve to one spelling.
+        let dotted = dir.join("sub").join("..");
+        assert_eq!(
+            normalize_data_root(&dotted.to_string_lossy()).unwrap(),
+            want
+        );
+        if let Some(home) = dirs::home_dir() {
+            let home = super::super::strip_verbatim_prefix(&fs::canonicalize(home).unwrap());
+            assert_eq!(normalize_data_root("~").unwrap(), home.to_string_lossy());
+        }
+
+        let err = |raw: &str| normalize_data_root(raw).unwrap_err().to_string();
+        assert!(err("Dropbox/claude").contains("isn't a full path"));
+        assert!(err("$HOME/.claude").contains("environment variable"));
+        assert!(err("%USERPROFILE%\\.claude-work").contains("environment variable"));
+        assert!(err(&dir.join("missing").to_string_lossy()).contains("no folder"));
+        let file = dir.join("file.txt");
+        std::fs::write(&file, "x").unwrap();
+        assert!(err(&file.to_string_lossy()).contains("not a folder"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

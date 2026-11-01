@@ -29,7 +29,7 @@ use error::AppResult;
 use search::{SearchFilters, SearchHit, ThreadDetail, ThreadSummary};
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, WindowEvent};
@@ -39,25 +39,91 @@ use tauri::{AppHandle, Emitter, Manager, WindowEvent};
 /// two COUNT(*) scans on every poll.
 #[derive(Default)]
 struct EmbedJob {
-    running: AtomicBool,
+    running: Arc<JobFlag>,
     done: AtomicI64,
     total: AtomicI64,
 }
 
 impl EmbedJob {
     fn is_running(&self) -> bool {
-        self.running.load(Ordering::Relaxed)
+        self.running.is_set()
     }
 }
 
 /// Guards against more than one background re-index running at a time.
 #[derive(Default)]
-struct IndexJob(AtomicBool);
+struct IndexJob(Arc<JobFlag>);
 
 /// Guards against more than one project-distill running at a time; clearing it mid-run
 /// (via `cancel_distill`) also signals the running job to stop.
 #[derive(Default)]
-struct DistillJob(AtomicBool);
+struct DistillJob(Arc<JobFlag>);
+
+/// Held while Shrink index / Reclaim space rewrites the whole file, so a second rewrite,
+/// a reindex, the watcher catch-up, a semantic build or a distill doesn't start mid-VACUUM.
+#[derive(Default)]
+struct CompactJob(Arc<JobFlag>);
+
+/// One background job's busy flag: the token of the [`JobGuard`] holding it, 0 when free.
+/// Tokens are never reused, so a guard can tell its own claim from a newer job's.
+#[derive(Default)]
+struct JobFlag(AtomicU64);
+
+impl JobFlag {
+    fn is_set(&self) -> bool {
+        self.0.load(Ordering::SeqCst) != 0
+    }
+
+    /// Free the flag whoever holds it (a cancel). The holder sees [`JobGuard::is_current`]
+    /// turn false and stops, and its drop then leaves a newer job's claim alone.
+    fn clear(&self) {
+        self.0.store(0, Ordering::SeqCst);
+    }
+}
+
+/// Source of [`JobGuard`] tokens; starts at 1 because 0 means "free".
+static NEXT_JOB_TOKEN: AtomicU64 = AtomicU64::new(1);
+
+/// A claimed background-job flag (IndexJob / EmbedJob / DistillJob / CompactJob), released
+/// when dropped. The release profile keeps panic=unwind, so a panic in a scan parser or in
+/// ort inference unwinds through this guard instead of skipping a hand-written release. The
+/// flags gate each other, so one stuck flag used to make Reindex, the semantic build and
+/// distill silently do nothing until the app restarted.
+struct JobGuard {
+    flag: Arc<JobFlag>,
+    token: u64,
+}
+
+impl JobGuard {
+    /// Claim `flag`, or None if a job already holds it.
+    fn try_acquire(flag: &Arc<JobFlag>) -> Option<Self> {
+        let token = NEXT_JOB_TOKEN.fetch_add(1, Ordering::Relaxed);
+        flag.0
+            .compare_exchange(0, token, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()?;
+        Some(Self {
+            flag: Arc::clone(flag),
+            token,
+        })
+    }
+
+    /// Whether this guard still owns its flag: false once a cancel freed it, even if
+    /// another job has claimed it since.
+    fn is_current(&self) -> bool {
+        self.flag.0.load(Ordering::SeqCst) == self.token
+    }
+}
+
+impl Drop for JobGuard {
+    fn drop(&mut self) {
+        // Release only our own claim. After cancel_distill a new distill may hold the flag,
+        // and clearing it would make that job read the release as its own cancel.
+        let _ = self
+            .flag
+            .0
+            .compare_exchange(self.token, 0, Ordering::SeqCst, Ordering::SeqCst);
+    }
+}
 
 /// Live mirror of the `window.close_to_tray` preference, so the window-close handler can
 /// decide without touching the DB on every close. Seeded at startup, kept in sync by
@@ -278,19 +344,9 @@ async fn run_tool(
                 .unwrap_or(10)
                 .clamp(1, CHAT_SEARCH_MAX) as u32;
             let pool = app.state::<db::ReadPool>();
-            let json = read_blocking(&pool, move |conn| {
-                let hits = search::search(
-                    conn,
-                    &query,
-                    &SearchFilters {
-                        limit: Some(limit),
-                        ..Default::default()
-                    },
-                )?;
-                Ok(serde_json::to_string(&hits)?)
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            let json = read_blocking(&pool, move |conn| chat_search_json(conn, &query, limit))
+                .await
+                .map_err(error::AppError::into_inner)?;
             let _ = ch.send(result(format!(
                 "{} results",
                 json.matches("\"threadId\"").count()
@@ -305,7 +361,7 @@ async fn run_tool(
                     .unwrap_or_else(|| "thread not found".to_string()))
             })
             .await
-            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            .map_err(error::AppError::into_inner)?;
             let _ = ch.send(result(format!(
                 "loaded thread #{tid} ({} chars)",
                 packed.len()
@@ -341,6 +397,29 @@ async fn run_tool(
     }
 }
 
+/// The chat agent's `search_history` result: keyword hits as JSON for the chat provider.
+/// The index stores transcripts raw, so every string (title, snippet) is redacted here. The
+/// FTS match sentinels come out first: highlights mean nothing to a model, and one landing
+/// inside a key would split it so the redaction pattern no longer sees it.
+fn chat_search_json(
+    conn: &rusqlite::Connection,
+    query: &str,
+    limit: u32,
+) -> anyhow::Result<String> {
+    let mut hits = search::search(
+        conn,
+        query,
+        &SearchFilters {
+            limit: Some(limit),
+            ..Default::default()
+        },
+    )?;
+    for h in &mut hits {
+        h.snippet = h.snippet.replace(['\u{1}', '\u{2}'], "");
+    }
+    Ok(context::to_redacted_json(&hits)?)
+}
+
 /// Lightweight counts for the dashboard / verification.
 #[derive(Debug, Serialize)]
 pub struct DbStats {
@@ -370,15 +449,25 @@ fn read(pool: &db::ReadPool) -> AppResult<db::ReadConn> {
 
 #[tauri::command]
 async fn db_stats(pool: tauri::State<'_, db::ReadPool>) -> AppResult<DbStats> {
-    read_blocking(&pool, |conn| {
-        let count = |sql: &str| -> rusqlite::Result<i64> { conn.query_row(sql, [], |r| r.get(0)) };
-        Ok(DbStats {
-            threads: count("SELECT COUNT(*) FROM threads")?,
-            messages: count("SELECT COUNT(*) FROM messages")?,
-            sources: count("SELECT COUNT(*) FROM sources")?,
-        })
+    read_blocking(&pool, |conn| Ok(db_counts(conn)?)).await
+}
+
+/// The header counts. Messages come from the per-thread `message_count` that upsert_thread
+/// rewrites on every full and incremental write (only whole threads are ever deleted), so
+/// one pass over `threads` answers both: COUNT(*) FROM messages walked a 17 MB index, 0.6 to
+/// 0.8 s on a cold cache, and this query sits on the path to the first window reveal.
+fn db_counts(conn: &rusqlite::Connection) -> rusqlite::Result<DbStats> {
+    let (threads, messages) = conn.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(message_count), 0) FROM threads",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let sources = conn.query_row("SELECT COUNT(*) FROM sources", [], |r| r.get(0))?;
+    Ok(DbStats {
+        threads,
+        messages,
+        sources,
     })
-    .await
 }
 
 /// Rich index analytics for the dashboard: per-source / per-role breakdowns,
@@ -487,12 +576,70 @@ async fn delete_threads(app: AppHandle, ids: Vec<i64>) -> AppResult<usize> {
 /// (multi-second) rewrite, freezing every other command. On its own connection it still
 /// takes SQLite's write lock but never the Rust mutex, so the rest of the UI stays live.
 #[tauri::command]
-async fn vacuum_db() -> AppResult<()> {
-    blocking(|| {
+async fn vacuum_db(app: AppHandle) -> AppResult<()> {
+    let job = claim_rewrite(&app)?;
+    let result = blocking(|| {
         let conn = db::open(&db::default_index_path())?;
         cleanup::vacuum(&conn)
     })
-    .await
+    .await;
+    release_rewrite(&app, job);
+    result
+}
+
+/// Claim [`CompactJob`] for a whole-file rewrite, or say why it can't start. VACUUM holds
+/// the write lock for the whole rewrite, so a reindex or semantic build running alongside
+/// stalls on it, and a second rewrite fails with "database is locked".
+fn claim_rewrite(app: &AppHandle) -> anyhow::Result<JobGuard> {
+    // Claim first, then check: a job that starts after this sees CompactJob and waits.
+    let Some(job) = JobGuard::try_acquire(&app.state::<CompactJob>().0) else {
+        anyhow::bail!("The index is already being rewritten. Try again when that finishes.");
+    };
+    let busy = if app.state::<IndexJob>().0.is_set() {
+        Some("A reindex is running")
+    } else if app.state::<EmbedJob>().is_running() {
+        Some("The semantic index is being built")
+    } else if app.state::<DistillJob>().0.is_set() {
+        Some("Project memory is being distilled")
+    } else {
+        None
+    };
+    if let Some(busy) = busy {
+        anyhow::bail!("{busy}. Try again when it finishes."); // `job` drops: released
+    }
+    Ok(job)
+}
+
+/// Release a [`claim_rewrite`] claim, then pick up the auto-distill drain it held off.
+fn release_rewrite(app: &AppHandle, job: JobGuard) {
+    drop(job);
+    auto_distill_kick(app);
+}
+
+/// Which background jobs hold their flags, so the UI can disable buttons that would collide
+/// with one (Shrink index / Reclaim space refuse while any of the others runs). Field names
+/// match `JobsStatus` in api.ts.
+#[derive(Debug, Serialize)]
+struct JobsStatus {
+    /// A full or single-source reindex, or the watcher's launch catch-up.
+    index: bool,
+    /// A semantic-index build, including its closing vector compaction.
+    embed: bool,
+    /// A project distill or an auto-distill batch.
+    distill: bool,
+    /// Shrink index / Reclaim space.
+    rewrite: bool,
+}
+
+/// Answers from the in-memory flags, so it is cheap to poll while a job runs.
+#[tauri::command]
+fn jobs_status(app: AppHandle) -> JobsStatus {
+    JobsStatus {
+        index: app.state::<IndexJob>().0.is_set(),
+        embed: app.state::<EmbedJob>().is_running(),
+        distill: app.state::<DistillJob>().0.is_set(),
+        rewrite: app.state::<CompactJob>().0.is_set(),
+    }
 }
 
 /// What a `compact_index` pass did, for the Settings confirmation.
@@ -508,14 +655,16 @@ struct CompactSummary {
 /// connection for the same reason as `vacuum_db`. Emits `compact:progress`.
 #[tauri::command]
 async fn compact_index(app: AppHandle) -> AppResult<CompactSummary> {
-    blocking(move || {
+    let job = claim_rewrite(&app)?;
+    let progress = app.clone();
+    let result = blocking(move || {
         let mut conn = db::open(&db::default_index_path())?;
         let mut summary = CompactSummary::default();
         loop {
             let r = cleanup::compact_tool_output(&mut conn, 2_000)?;
             summary.rows += r.rows;
             summary.bytes_saved += r.bytes_saved;
-            let _ = app.emit("compact:progress", &summary);
+            let _ = progress.emit("compact:progress", &summary);
             if r.done {
                 break;
             }
@@ -523,7 +672,9 @@ async fn compact_index(app: AppHandle) -> AppResult<CompactSummary> {
         cleanup::vacuum(&conn)?;
         Ok(summary)
     })
-    .await
+    .await;
+    release_rewrite(&app, job);
+    result
 }
 
 /// Relocated agent data roots, for Settings. A Finder/Dock-launched app never sees the
@@ -542,16 +693,7 @@ struct DataRoots {
 
 fn data_roots(conn: &rusqlite::Connection) -> anyhow::Result<DataRoots> {
     let saved = |key: &str| -> anyhow::Result<String> {
-        Ok(conn
-            .query_row("SELECT value FROM app_config WHERE key = ?1", [key], |r| {
-                r.get::<_, String>(0)
-            })
-            .map(Some)
-            .or_else(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => Ok(None),
-                e => Err(e),
-            })?
-            .unwrap_or_default())
+        Ok(knowledge::app_config::get(conn, key)?.unwrap_or_default())
     };
     let shown = |p: Option<std::path::PathBuf>| p.map(|p| p.to_string_lossy().into_owned());
     Ok(DataRoots {
@@ -568,28 +710,42 @@ async fn get_data_roots(pool: tauri::State<'_, db::ReadPool>) -> AppResult<DataR
 }
 
 /// Save (or clear, with "") the Claude config dir and Codex home overrides. Takes effect
-/// for this process at once; the watcher picks up new roots within a minute.
+/// for this process at once; the watcher picks up new roots within a minute. A path must
+/// name an existing folder and is stored in its canonical form (see
+/// `indexer::claude::normalize_data_root`); anything else is refused with the reason.
 #[tauri::command]
 async fn set_data_roots(
     app: AppHandle,
     claude_config_dir: Option<String>,
     codex_home: Option<String>,
 ) -> AppResult<DataRoots> {
+    // Checked before taking the writer: canonicalize stats the path, which can stall on an
+    // offline network share. None = leave unchanged, "" = clear.
+    let values = blocking(move || {
+        let check = |value: Option<String>| -> anyhow::Result<Option<String>> {
+            value
+                .map(|v| match v.trim() {
+                    "" => Ok(String::new()),
+                    raw => indexer::claude::normalize_data_root(raw),
+                })
+                .transpose()
+        };
+        Ok([
+            (
+                indexer::claude::CONFIG_DIR_SETTING,
+                check(claude_config_dir)?,
+            ),
+            (indexer::codex::CODEX_HOME_SETTING, check(codex_home)?),
+        ])
+    })
+    .await?;
     write_blocking(&app, move |conn| {
-        for (key, value) in [
-            (indexer::claude::CONFIG_DIR_SETTING, claude_config_dir),
-            (indexer::codex::CODEX_HOME_SETTING, codex_home),
-        ] {
+        for (key, value) in values {
             let Some(value) = value else { continue };
-            let value = value.trim();
             if value.is_empty() {
-                conn.execute("DELETE FROM app_config WHERE key = ?1", [key])?;
+                knowledge::app_config::delete(conn, key)?;
             } else {
-                conn.execute(
-                    "INSERT INTO app_config (key, value) VALUES (?1, ?2)
-                     ON CONFLICT(key) DO UPDATE SET value = ?2",
-                    rusqlite::params![key, value],
-                )?;
+                knowledge::app_config::put(conn, key, &value)?;
             }
         }
         indexer::claude::load_config_dir_setting(conn);
@@ -605,13 +761,13 @@ async fn set_data_roots(
 /// already running.
 #[tauri::command]
 fn index_all(app: AppHandle) -> AppResult<()> {
-    if app.state::<EmbedJob>().is_running() {
-        return Ok(()); // a semantic build is writing — don't fight for the lock
+    if app.state::<EmbedJob>().is_running() || app.state::<CompactJob>().0.is_set() {
+        return Ok(()); // a semantic build or a VACUUM is writing: don't fight for the lock
     }
     // Note: a running distill does NOT block reindex — the distill loop yields to us.
-    if app.state::<IndexJob>().0.swap(true, Ordering::SeqCst) {
+    let Some(job) = JobGuard::try_acquire(&app.state::<IndexJob>().0) else {
         return Ok(()); // already running
-    }
+    };
     std::thread::spawn(move || {
         let started = std::time::Instant::now();
         // Dedicated connection (not the shared Mutex<Connection>): the scan never holds
@@ -648,7 +804,9 @@ fn index_all(app: AppHandle) -> AppResult<()> {
             );
             Ok((r, shape))
         });
-        app.state::<IndexJob>().0.store(false, Ordering::SeqCst);
+        // Release here, not at the end of the closure: auto_distill_kick below returns early
+        // while IndexJob is set, so a later release would skip the post-reindex distill.
+        drop(job);
         let report = match report {
             Ok((r, (sources, threads))) => {
                 track(
@@ -684,7 +842,7 @@ fn index_all(app: AppHandle) -> AppResult<()> {
 /// Whether a background re-index is in progress (for the Reindex button state).
 #[tauri::command]
 fn indexing_status(job: tauri::State<'_, IndexJob>) -> bool {
-    job.0.load(Ordering::Relaxed)
+    job.0.is_set()
 }
 
 /// Index a single source by kind ("claude_code" | "codex" | "cursor" | ...). Runs off the
@@ -692,37 +850,27 @@ fn indexing_status(job: tauri::State<'_, IndexJob>) -> bool {
 /// same files into the writer at once.
 #[tauri::command]
 async fn index_source(app: AppHandle, kind: String) -> AppResult<indexer::IndexReport> {
-    if app.state::<IndexJob>().0.swap(true, Ordering::SeqCst) {
+    if app.state::<CompactJob>().0.is_set() {
+        return Err(
+            anyhow::anyhow!("The index is being rewritten. Try again when that finishes.").into(),
+        );
+    }
+    let Some(job) = JobGuard::try_acquire(&app.state::<IndexJob>().0) else {
         return Err(
             anyhow::anyhow!("A re-index is already running. Try again when it finishes.").into(),
         );
-    }
-    let guard_app = app.clone();
+    };
     let result = blocking(move || {
+        // The shared source registry, so a new or renamed source kind can't miss this command.
+        let scan = indexer::scanner_for(&kind)
+            .ok_or_else(|| anyhow::anyhow!("unknown source kind: {kind}"))?;
         let mut conn = db::open(&db::default_index_path())?;
-        let noop = &mut || {};
-        let report = match kind.as_str() {
-            "claude_code" => indexer::claude::scan(&mut conn, noop)?,
-            "codex" => indexer::codex::scan(&mut conn, noop)?,
-            "cursor" => indexer::cursor::scan(&mut conn, noop)?,
-            "gemini" => indexer::gemini::scan(&mut conn, noop)?,
-            "qwen" => indexer::qwen::scan(&mut conn, noop)?,
-            "goose" => indexer::goose::scan(&mut conn, noop)?,
-            "opencode" => indexer::opencode::scan(&mut conn, noop)?,
-            "continue" => indexer::continue_cli::scan(&mut conn, noop)?,
-            "cline" => indexer::cline::scan(&mut conn, noop)?,
-            "roo" => indexer::roo::scan(&mut conn, noop)?,
-            "kilo" => indexer::kilo::scan(&mut conn, noop)?,
-            "copilot" => indexer::copilot::scan(&mut conn, noop)?,
-            other => anyhow::bail!("unknown source kind: {other}"),
-        };
-        Ok(report)
+        scan(&mut conn, &mut || {})
     })
     .await;
-    guard_app
-        .state::<IndexJob>()
-        .0
-        .store(false, Ordering::SeqCst);
+    // Like index_all: a distill drain that yielded to this scan resumes once it is released.
+    drop(job);
+    auto_distill_kick(&app);
     result
 }
 
@@ -814,13 +962,6 @@ async fn embedding_status(
     })
 }
 
-/// True for transient SQLite contention ("database is locked"/"busy") so the
-/// embed job retries rather than aborting when another process holds a write lock.
-fn is_db_locked(e: &anyhow::Error) -> bool {
-    let s = e.to_string().to_lowercase();
-    s.contains("database is locked") || s.contains("database is busy")
-}
-
 /// Run a short DB write, retrying briefly on transient "database is locked" (another
 /// process — the MCP server, a second app instance — momentarily holds the write
 /// lock) instead of failing the user's click. The mutex is released between tries.
@@ -837,7 +978,7 @@ fn write_retry<T>(
         };
         match res {
             Ok(v) => return Ok(v),
-            Err(e) if is_db_locked(&e) => {
+            Err(e) if db::is_busy(&e) => {
                 last = Some(e);
                 std::thread::sleep(std::time::Duration::from_millis(120 * (attempt + 1)));
             }
@@ -877,14 +1018,14 @@ fn embed_facts_if_model_ready(app: &AppHandle, tag: &str) {
 /// `embed:progress`, `embed:error` (model unavailable / systemic failure) and `embed:done`.
 #[tauri::command]
 fn build_embeddings(app: AppHandle) -> AppResult<()> {
-    if app.state::<IndexJob>().0.load(Ordering::Relaxed) {
-        return Ok(()); // a reindex is writing — don't fight it for the write lock
+    if app.state::<IndexJob>().0.is_set() || app.state::<CompactJob>().0.is_set() {
+        return Ok(()); // a reindex or a VACUUM is writing: don't fight it for the lock
     }
     // Note: a running distill does NOT block the embed build — the distill loop yields.
     let job = app.state::<EmbedJob>();
-    if job.running.swap(true, Ordering::SeqCst) {
+    let Some(running) = JobGuard::try_acquire(&job.running) else {
         return Ok(()); // already running
-    }
+    };
     // Fresh counters: embedding_status falls back to a live count until the job's
     // snapshot below lands.
     job.done.store(0, Ordering::Relaxed);
@@ -893,28 +1034,52 @@ fn build_embeddings(app: AppHandle) -> AppResult<()> {
         run_embed_job(&app);
         // The model is loaded now (unless it failed to): embed any facts still waiting.
         embed_facts_if_model_ready(&app, "embed");
-        let job = app.state::<EmbedJob>();
-        job.running.store(false, Ordering::SeqCst);
-        let db = app.state::<db::Db>();
-        if let Ok(conn) = db.0.lock() {
-            // Safety net for #27: owner rows for any vectors written without one.
-            if let Err(e) = cleanup::reconcile_vec_owners(&conn) {
-                app_log!("[embed] owner reconcile: {e}");
-            }
-            // Fold the WAL back after the build's many small writes (PASSIVE never blocks).
-            let _ = conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);");
+        // Still holding `running`: a vector compaction holds the write lock for seconds, and
+        // reindex, the watcher catch-up and distill must keep yielding to it (the status
+        // also keeps reporting a build, so Reindex stays disabled). Dedicated connection, as
+        // in vacuum_db, so UI commands don't queue behind the shared writer mutex meanwhile.
+        match db::open(&db::default_index_path()) {
+            Ok(mut conn) => finish_embed_build(&mut conn),
+            Err(e) => app_log!("[embed] post-build maintenance: {e:#}"),
         }
+        drop(running);
         let _ = app.emit("embed:done", ());
+        // Like index_all: a distill drain that yielded to the build resumes now.
+        auto_distill_kick(&app);
     });
     Ok(())
+}
+
+/// Index maintenance after a semantic build, on its own connection.
+fn finish_embed_build(conn: &mut rusqlite::Connection) {
+    // Safety net for #27: owner rows for any vectors written without one.
+    if let Err(e) = cleanup::reconcile_vec_owners(conn) {
+        app_log!("[embed] owner reconcile: {e}");
+    }
+    // Rebuild vec_chunks once deletes (0029's tool-vector purge) have left it mostly
+    // holes: ~35% faster KNN. Two small COUNTs and a no-op when it is dense.
+    match cleanup::compact_vec_chunks(conn) {
+        Ok(Some(c)) => app_log!(
+            "[embed] compacted {} vectors into {} chunks (was {})",
+            c.vectors,
+            c.chunks_after,
+            c.chunks_before
+        ),
+        Ok(None) => {}
+        Err(e) => app_log!("[embed] vector compaction: {e}"),
+    }
+    // Fold the WAL back after the build's many small writes (PASSIVE never blocks).
+    let _ = conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);");
 }
 
 /// The body of the embedding job (see `build_embeddings`). Returns when the queue is
 /// empty, the model is unavailable, or the build had to stop; the caller does the cleanup.
 fn run_embed_job(app: &AppHandle) {
     // Smaller batches keep each locked write + each inference short, so the UI
-    // (and ambient-recall) stay snappy while the job runs in the background.
-    const BATCH: usize = 64;
+    // (and ambient-recall) stay snappy while the job runs in the background. 128 also
+    // widens embed::infer_bulk's length-sort window: +9-15% chunks/s over 64, for a
+    // locked store_batch write about twice as long.
+    const BATCH: usize = 128;
     let db = app.state::<db::Db>();
     let embedder = app.state::<embed::Embedder>();
     let job = app.state::<EmbedJob>();
@@ -1011,7 +1176,7 @@ fn run_embed_job(app: &AppHandle) {
                     stored = true;
                     break;
                 }
-                Err(e) if is_db_locked(&e) => {
+                Err(e) if db::is_busy(&e) => {
                     std::thread::sleep(std::time::Duration::from_millis(300));
                 }
                 Err(e) => {
@@ -1173,11 +1338,17 @@ async fn auto_distill_budget(pool: tauri::State<'_, db::ReadPool>) -> AppResult<
 /// Set the per-day auto-distill allowance (0 pauses auto-distill without turning it off).
 #[tauri::command]
 async fn set_auto_distill_daily_cap(app: AppHandle, cap: i64) -> AppResult<AutoDistillBudget> {
-    write_blocking(&app, move |conn| {
+    let budget = write_blocking(&app, move |conn| {
         knowledge::set_auto_distill_daily_cap(conn, cap)?;
         auto_distill_budget_now(conn)
     })
-    .await
+    .await?;
+    // Raising the cap (from 0, or past what today already spent) resumes the drain at once,
+    // the way turning auto-distill on does. A no-op when it is off or a job is running.
+    if budget.remaining_today > 0 {
+        auto_distill_kick(&app);
+    }
+    Ok(budget)
 }
 
 /// Enable/disable distillation and pick the engine. Enabling is the user's consent.
@@ -1394,7 +1565,7 @@ async fn detect_conflicts(
     if decisions.len() < 2 {
         return Ok(Vec::new());
     }
-    let texts: Vec<String> = decisions.iter().map(|(_, t)| t.clone()).collect();
+    let texts = conflict_review_texts(&decisions);
     let pairs = agent::find_conflicts(
         &provider,
         &model,
@@ -1426,6 +1597,16 @@ async fn detect_conflicts(
     Ok(out)
 }
 
+/// The decision texts the conflict review sends to the LLM, redacted (facts are stored as
+/// distilled from raw transcripts). The returned conflicts still carry the stored text: they
+/// only go to the app's own UI.
+fn conflict_review_texts(decisions: &[(i64, String)]) -> Vec<String> {
+    decisions
+        .iter()
+        .map(|(_, t)| context::redact_secrets(t).into_owned())
+        .collect()
+}
+
 // ---- project memory ----
 
 /// Distinct projects with distillation coverage, for the Project Memory picker.
@@ -1448,7 +1629,8 @@ async fn project_memory(
     .await
 }
 
-/// Flatten a project's facts into markdown notes for the LLM brief prompt.
+/// Flatten a project's facts into markdown notes for the LLM brief prompt, redacted (the
+/// facts are stored unredacted and this text goes to the provider).
 fn format_memory_notes(m: &knowledge::ProjectMemory) -> String {
     fn section(s: &mut String, title: &str, facts: &[knowledge::MemoryFact]) {
         if facts.is_empty() {
@@ -1456,7 +1638,7 @@ fn format_memory_notes(m: &knowledge::ProjectMemory) -> String {
         }
         s.push_str(&format!("## {title}\n"));
         for f in facts {
-            s.push_str(&format!("- {}\n", f.text.trim()));
+            s.push_str(&format!("- {}\n", context::redact_secrets(f.text.trim())));
         }
         s.push('\n');
     }
@@ -1474,7 +1656,7 @@ async fn project_brief(pool: tauri::State<'_, db::ReadPool>, project: String) ->
     let key_project = project.clone();
     let (provider, model, key, base_url, notes) = read_blocking(&pool, move |conn| {
         let (provider, model, key, base_url) = resolve_distill_engine(conn)?;
-        let mem = knowledge::get_project_memory(conn, &key_project, 80)?;
+        let mem = knowledge::get_project_memory_facts(conn, &key_project, 80)?;
         Ok((provider, model, key, base_url, format_memory_notes(&mem)))
     })
     .await?;
@@ -1557,7 +1739,7 @@ async fn write_agent_memory_file(
 ) -> AppResult<String> {
     read_blocking(&pool, move |conn| {
         let budget = export::MemoryBudget::AGENTS_FILE;
-        let mem = knowledge::get_project_memory(conn, &project, budget.fetch_limit())?;
+        let mem = knowledge::get_project_memory_facts(conn, &project, budget.fetch_limit())?;
         let body = export::agent_memory_md_budgeted(&project, &mem, None, &budget);
         let path = std::path::Path::new(&project).join(&filename);
         export::write_managed_block_file(&path, &body)?;
@@ -1569,13 +1751,13 @@ async fn write_agent_memory_file(
 /// Whether a project distill is in progress (for the Build-memory button state).
 #[tauri::command]
 fn distilling_status(job: tauri::State<'_, DistillJob>) -> bool {
-    job.0.load(Ordering::Relaxed)
+    job.0.is_set()
 }
 
 /// Stop a running project distill at the next thread boundary.
 #[tauri::command]
 fn cancel_distill(job: tauri::State<'_, DistillJob>) {
-    job.0.store(false, Ordering::SeqCst);
+    job.0.clear();
 }
 
 /// Threads per auto-distill round before re-checking the gates (so a reindex/embed can
@@ -1587,44 +1769,53 @@ const AUTO_DISTILL_BATCH: i64 = 25;
 /// Emits distill:progress / distill:done.
 #[tauri::command]
 fn distill_project(app: AppHandle, project: String) -> AppResult<()> {
-    if app.state::<IndexJob>().0.load(Ordering::Relaxed) || app.state::<EmbedJob>().is_running() {
-        return Ok(()); // a reindex / embed build is writing — start later
+    if writer_job_running(&app) {
+        return Ok(()); // a reindex / embed build / VACUUM is writing: start later
     }
-    if app.state::<DistillJob>().0.swap(true, Ordering::SeqCst) {
+    let Some(job) = JobGuard::try_acquire(&app.state::<DistillJob>().0) else {
         return Ok(()); // already running
-    }
+    };
+    // The guard moves into the task: tokio drops a panicked task's future, which clears it.
     tauri::async_runtime::spawn(async move {
         let worklist_app = app.clone();
         let ids = blocking(move || {
             let pool = worklist_app.state::<db::ReadPool>();
-            let conn = read(&pool).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            let conn = read(&pool).map_err(error::AppError::into_inner)?;
             knowledge::project_pending_threads(&conn, &project)
         })
         .await;
         match ids {
             Ok(ids) => {
-                if let Err(e) = run_distill(&app, ids).await {
+                if let Err(e) = run_distill(&app, &job, ids).await {
                     app_log!("[distill] {e}");
                 }
             }
             Err(e) => app_log!("[distill] worklist: {e}"),
         }
-        app.state::<DistillJob>().0.store(false, Ordering::SeqCst);
+        drop(job);
         let _ = app.emit("distill:done", ());
     });
     Ok(())
 }
 
+/// Whether a job that holds the write lock for long stretches is running: a reindex (or the
+/// watcher's catch-up), a semantic build, or a whole-file rewrite. Distill waits for these.
+fn writer_job_running(app: &AppHandle) -> bool {
+    app.state::<IndexJob>().0.is_set()
+        || app.state::<EmbedJob>().is_running()
+        || app.state::<CompactJob>().0.is_set()
+}
+
 /// Distill a worklist of thread ids with the resolved engine. Paced (so a cloud provider
-/// isn't hammered), cancellable (DistillJob cleared), and yields to a user-initiated
-/// reindex / embed build. Shared by the project distill and the background auto-distill.
-/// The DB, keychain and embedding work runs on the blocking pool; only the LLM call is
-/// awaited on the async runtime.
-async fn run_distill(app: &AppHandle, ids: Vec<i64>) -> anyhow::Result<()> {
+/// isn't hammered), cancellable (`job` stops being current once cancel_distill frees the
+/// flag), and yields to a reindex / embed build / VACUUM. Shared by the project distill and
+/// the background auto-distill. The DB, keychain and embedding work runs on the blocking
+/// pool; only the LLM call is awaited on the async runtime.
+async fn run_distill(app: &AppHandle, job: &JobGuard, ids: Vec<i64>) -> anyhow::Result<()> {
     if ids.is_empty() {
         return Ok(());
     }
-    let to_anyhow = |e: error::AppError| anyhow::anyhow!(e.to_string());
+    let to_anyhow = error::AppError::into_inner;
     let pool = app.state::<db::ReadPool>();
     let (provider, model, key, base_url) = read_blocking(&pool, resolve_distill_engine)
         .await
@@ -1633,11 +1824,9 @@ async fn run_distill(app: &AppHandle, ids: Vec<i64>) -> anyhow::Result<()> {
     let mut distilled_count = 0usize;
     let _ = app.emit("distill:progress", DistillProgressEvent { done: 0, total });
     for (i, tid) in ids.into_iter().enumerate() {
-        // Stop if canceled, or yield to a user-initiated reindex / embed build.
-        if !app.state::<DistillJob>().0.load(Ordering::Relaxed)
-            || app.state::<IndexJob>().0.load(Ordering::Relaxed)
-            || app.state::<EmbedJob>().is_running()
-        {
+        // Stop if canceled (even when a newer distill has claimed the flag since), or yield
+        // to a reindex / embed build / VACUUM.
+        if !job.is_current() || writer_job_running(app) {
             break;
         }
         let packed = read_blocking(&pool, move |conn| {
@@ -1708,16 +1897,21 @@ async fn run_distill(app: &AppHandle, ids: Vec<i64>) -> anyhow::Result<()> {
 /// only threads active in the last 30 days, and at most the per-day allowance
 /// (`knowledge::auto_distill_worklist`), so the re-kick chain ends when the day's
 /// budget is spent instead of draining a whole history onto a paid key.
+///
+/// Returning early while a writer job runs loses nothing: every one of them kicks again
+/// once it releases its flag (index_all, index_source, the watcher's launch catch-up, the
+/// semantic build, Shrink index / Reclaim space), so the launch kick, which usually lands
+/// during the catch-up, runs when that pass ends.
 fn auto_distill_kick(app: &AppHandle) {
-    if app.state::<IndexJob>().0.load(Ordering::Relaxed) || app.state::<EmbedJob>().is_running() {
+    if writer_job_running(app) {
         return;
     }
     // Own the distill job BEFORE building the worklist: building it spends today's allowance,
     // so a kick that only then found a distill running (a manual "Build memory", an auto
     // batch in flight) burned up to a batch of the daily cap without distilling anything.
-    if app.state::<DistillJob>().0.swap(true, Ordering::SeqCst) {
+    let Some(job) = JobGuard::try_acquire(&app.state::<DistillJob>().0) else {
         return; // a distill is already running
-    }
+    };
     let ids = (|| {
         let db = app.try_state::<db::Db>()?;
         let conn = db.0.lock().ok()?;
@@ -1731,18 +1925,22 @@ fn auto_distill_kick(app: &AppHandle) {
     })()
     .unwrap_or_default();
     if ids.is_empty() {
-        app.state::<DistillJob>().0.store(false, Ordering::SeqCst);
-        return;
+        return; // `job` drops here, releasing the flag
     }
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
-        if let Err(e) = run_distill(&app, ids).await {
+        if let Err(e) = run_distill(&app, &job, ids).await {
             app_log!("[auto-distill] {e}");
         }
-        app.state::<DistillJob>().0.store(false, Ordering::SeqCst);
+        // A Cancel ends the drain; re-kicking would start the next batch right away.
+        let cancelled = !job.is_current();
+        // Released before the re-kick below, which would otherwise find the flag still held.
+        drop(job);
         let _ = app.emit("distill:done", ());
         // More may remain (and nothing preempted us) — drain the next batch.
-        auto_distill_kick(&app);
+        if !cancelled {
+            auto_distill_kick(&app);
+        }
     });
 }
 
@@ -1784,7 +1982,7 @@ async fn find_prior_work(
             return Ok(Vec::new());
         };
         let pool = app.state::<db::ReadPool>();
-        let conn = read(&pool).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let conn = read(&pool).map_err(error::AppError::into_inner)?;
         knowledge::find_prior_work(&conn, &qv, project.as_deref(), limit.unwrap_or(8) as usize)
     })
     .await
@@ -1805,7 +2003,7 @@ async fn recall_facts(
             return Ok(Vec::new());
         };
         let pool = app.state::<db::ReadPool>();
-        let conn = read(&pool).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let conn = read(&pool).map_err(error::AppError::into_inner)?;
         knowledge::recall(
             &conn,
             &qv,
@@ -1886,10 +2084,12 @@ pub fn prepare_ask(
             focus.get(&h.thread_id).map(Vec::as_slice).unwrap_or(&[]),
         )?
         .unwrap_or_default();
+        // The excerpt is packed (so redacted); the title heading it comes straight from the
+        // index and goes to the provider too.
         context.push_str(&format!(
             "[thread {}] {}\n{excerpt}\n\n",
             h.thread_id,
-            h.title.as_deref().unwrap_or("untitled")
+            context::redact_secrets(h.title.as_deref().unwrap_or("untitled"))
         ));
         sources.push(AskSource {
             thread_id: h.thread_id,
@@ -1929,7 +2129,7 @@ async fn ask_history(app: AppHandle, question: String) -> AppResult<AskAnswer> {
             None
         });
         let pool = app.state::<db::ReadPool>();
-        let conn = read(&pool).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let conn = read(&pool).map_err(error::AppError::into_inner)?;
         prepare_ask(&conn, &prep_q, qv.as_deref())
     })
     .await?;
@@ -2309,7 +2509,7 @@ pub fn resolve_distill_engine(
         anyhow::bail!("distillation is off — enable it in Settings (local Ollama or an API key)");
     }
     let (provider, model) = resolve_synth(cfg.provider.as_deref(), cfg.model.as_deref())
-        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        .map_err(error::AppError::into_inner)?;
     let key = if is_keyless(&provider) {
         None
     } else {
@@ -2335,7 +2535,7 @@ async fn synthesize_export(
     // connection is returned before the network call.
     let (provider, model, detail, packed, base_url, key) = read_blocking(&pool, move |conn| {
         let (provider, model) = resolve_synth(provider.as_deref(), model.as_deref())
-            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            .map_err(error::AppError::into_inner)?;
         let detail = search::thread_detail(conn, thread_id)?
             .ok_or_else(|| anyhow::anyhow!("thread not found"))?;
         let packed = context::pack_thread(conn, thread_id, context::DEFAULT_BUDGET_CHARS)?
@@ -2385,9 +2585,10 @@ async fn open_thread_in_cli(
             .as_deref()
             .filter(|p| !p.is_empty())
             .and_then(|proj| {
-                let key = indexer::canonical_project(proj).unwrap_or_else(|| proj.to_string());
+                let key = knowledge::project_key(proj);
                 let budget = export::MemoryBudget::COMPACT;
-                let m = knowledge::get_project_memory(conn, &key, budget.fetch_limit()).ok()?;
+                let m =
+                    knowledge::get_project_memory_facts(conn, &key, budget.fetch_limit()).ok()?;
                 let pinned_todo = m.open_todos.iter().any(|t| t.pinned);
                 if m.decisions.is_empty() && m.gotchas.is_empty() && !pinned_todo {
                     return None;
@@ -2907,23 +3108,10 @@ fn init_backend(app: &AppHandle) -> anyhow::Result<()> {
     }
     let conn = db::open(&db_path)?; // single WRITER; also runs migrations
 
-    // Post-migration housekeeping. Each step is idempotent and cheap; a failure is logged
-    // and never blocks startup.
-    if let Err(e) = indexer::backfill_project_keys(&conn) {
-        app_log!("[index] project-key backfill: {e}");
-    }
-    // Re-key threads whose project key went stale (home-dir keys, worktree keys).
-    if let Err(e) = knowledge::rekey_project_keys(&conn) {
-        app_log!("[knowledge] re-key projects: {e}");
-    }
-    // Heuristic TODOs extracted from subagent threads by older builds.
-    if let Err(e) = knowledge::purge_subagent_todos(&conn) {
-        app_log!("[knowledge] purge subagent todos: {e}");
-    }
-    // Legacy per-SubagentStop auto snapshots.
-    if let Err(e) = snapshot::purge_legacy_auto_snapshots(&conn) {
-        app_log!("[snapshot] purge legacy auto snapshots: {e}");
-    }
+    // Only what the window needs runs here. The post-migration housekeeping (project-key
+    // backfill / re-key, legacy purges) runs in spawn_background_jobs: cold, it cost about
+    // 0.35 s of splash on every launch and about 1.1 s on the first launch of a re-key.
+
     // Settings overrides for relocated Claude / Codex data roots, for every code path that
     // isn't a scan (scans re-read them on their own).
     indexer::claude::load_config_dir_setting(&conn);
@@ -3058,34 +3246,116 @@ fn spawn_background_jobs(app: &AppHandle) {
 
     let app = app.clone();
     std::thread::spawn(move || {
+        // Housekeeping first, so the distill catch-up below sees re-keyed projects. Own
+        // connection (the watcher's first write waits out a short overlap via BUSY_TIMEOUT).
+        match db::open(&db::default_index_path()) {
+            Ok(conn) => {
+                if startup_housekeeping(&conn) > 0 {
+                    // Open views may be grouping by the old project keys. The null payload
+                    // (no source kind: no scan wrote these rows) is the contract main.tsx
+                    // reads as "housekeeping": it refetches what groups by project at once,
+                    // Project Memory included, instead of only marking it stale the way a
+                    // watcher batch does.
+                    let _ = app.emit("index:updated", ());
+                }
+            }
+            Err(e) => app_log!("[startup] housekeeping: {e:#}"),
+        }
+
         let db = app.state::<db::Db>();
         let embedder = app.state::<embed::Embedder>();
-        // Warm the embedding model off the UI thread so the first hybrid search / recall
-        // (which never downloads) finds it loaded. For an existing semantic index whose old
-        // CWD-relative cache is gone, this is the one-time re-download into the shared
-        // models dir. Users who never built the semantic index download nothing until they
-        // click Build.
-        let has_vectors =
+        let (has_vectors, facts_pending) =
             db.0.lock()
-                .ok()
-                .and_then(|c| {
-                    c.query_row("SELECT EXISTS(SELECT 1 FROM vec_chunk_owner)", [], |r| {
-                        r.get::<_, bool>(0)
-                    })
-                    .ok()
-                })
-                .unwrap_or(false);
-        if has_vectors || embed::model_is_cached() {
+                .map(|c| startup_embed_state(&c))
+                .unwrap_or((false, false));
+        // Load the model at launch only when this session needs it right away. Hybrid search,
+        // recall and Ask load it from the cache on first use (about 150 ms), so a prefetch
+        // for everyone with a semantic index pinned about 400 MB and 45 ORT threads for the
+        // whole session of a close-to-tray app that may never run a semantic query.
+        if should_prefetch_model(has_vectors, facts_pending, embed::model_is_cached()) {
             if let Err(e) = embedder.ensure_loaded() {
                 app_log!("[embed] prefetch: {e}");
             }
-            // Drain any distilled facts that aren't embedded yet (e.g. distilled before
-            // the recall index shipped, or while offline) so cross-thread recall works.
+        }
+        if facts_pending {
+            // Distilled facts not embedded yet (distilled before the recall index shipped,
+            // or while offline): embed them so cross-thread recall finds them.
             embed_facts_if_model_ready(&app, "knowledge");
         }
-        // Then catch up on any auto-distillation owed (no-op unless enabled).
+        // Then catch up on any auto-distillation owed (no-op unless enabled). Usually the
+        // watcher's catch-up still holds IndexJob here; it kicks again when it finishes.
         auto_distill_kick(&app);
     });
+}
+
+/// One idempotent post-migration cleanup step; returns the rows it changed.
+type HousekeepingStep = fn(&rusqlite::Connection) -> anyhow::Result<usize>;
+
+/// Post-migration housekeeping, run once per launch off the splash path. Each step is
+/// idempotent; a failure is logged and skipped. Returns how many rows changed in total.
+fn startup_housekeeping(conn: &rusqlite::Connection) -> usize {
+    let steps: [(&str, HousekeepingStep); 5] = [
+        (
+            "[index] project-key backfill",
+            indexer::backfill_project_keys,
+        ),
+        // Threads whose project key went stale (home-dir keys, worktree keys).
+        ("[knowledge] re-key projects", knowledge::rekey_project_keys),
+        // Heuristic TODOs extracted from subagent threads by older builds.
+        (
+            "[knowledge] purge subagent todos",
+            knowledge::purge_subagent_todos,
+        ),
+        // Legacy per-SubagentStop auto snapshots.
+        (
+            "[snapshot] purge legacy auto snapshots",
+            snapshot::purge_legacy_auto_snapshots,
+        ),
+        // Owner rows for vectors an older build wrote without one (an old app that kept
+        // embedding after a newer sidecar migrated the index). Until they exist, scoped
+        // semantic search post-filters. Two b-tree counts when nothing is missing.
+        (
+            "[embed] reconcile vector owners",
+            cleanup::reconcile_vec_owners,
+        ),
+    ];
+    steps
+        .into_iter()
+        .map(|(what, step)| {
+            step(conn).unwrap_or_else(|e| {
+                app_log!("{what}: {e}");
+                0
+            })
+        })
+        .sum()
+}
+
+/// Recall facts still waiting for vectors. An index search, never a scan of `facts`: the
+/// planner takes idx_facts_kind (or the partial idx_facts_pending_embed) and `EXISTS` stops
+/// at the first hit, so a launch with nothing pending reads a few thousand index entries.
+const FACTS_PENDING_EMBED_SQL: &str = "SELECT EXISTS(SELECT 1 FROM facts \
+     WHERE embedded = 0 AND kind IN ('decision', 'gotcha'))";
+
+/// (the semantic index has vectors, recall facts are waiting to be embedded).
+fn startup_embed_state(conn: &rusqlite::Connection) -> (bool, bool) {
+    let exists = |sql: &str| {
+        conn.query_row(sql, [], |r| r.get::<_, bool>(0))
+            .unwrap_or(false)
+    };
+    (
+        exists("SELECT EXISTS(SELECT 1 FROM vec_chunk_owner)"),
+        exists(FACTS_PENDING_EMBED_SQL),
+    )
+}
+
+/// Whether launch should load the embedding model now, off the UI thread:
+/// - an existing semantic index whose old CWD-relative model cache is gone: the one-time
+///   re-download into the shared models dir (users who never built the semantic index
+///   download nothing until they click Build);
+/// - recall facts waiting for vectors, when the model is already on disk (a background fact
+///   embed never starts the download; see `embed_facts_if_model_ready`).
+fn should_prefetch_model(has_vectors: bool, facts_pending: bool, model_cached: bool) -> bool {
+    (has_vectors && !model_cached) || (facts_pending && model_cached)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -3117,6 +3387,7 @@ pub fn run() {
             app.manage(EmbedJob::default());
             app.manage(IndexJob::default());
             app.manage(DistillJob::default());
+            app.manage(CompactJob::default());
             app.manage(SetupState::default());
             app.manage(ChatGeneration::default());
             app.manage(PendingApprovals::default());
@@ -3151,6 +3422,7 @@ pub fn run() {
             delete_threads,
             vacuum_db,
             compact_index,
+            jobs_status,
             get_data_roots,
             set_data_roots,
             index_all,
@@ -3331,6 +3603,367 @@ mod startup_tests {
         assert!(
             !paras.iter().any(|p| p.contains("/x/index.db")),
             "{paras:?}"
+        );
+    }
+
+    fn thread(ext: &str, project: Option<&str>, msgs: usize) -> indexer::ParsedThread {
+        indexer::ParsedThread {
+            external_id: ext.into(),
+            title: Some(ext.into()),
+            project_path: project.map(Into::into),
+            updated_at: Some(1_000),
+            created_at: Some(1_000),
+            messages: (0..msgs)
+                .map(|i| indexer::ParsedMessage {
+                    role: if i % 2 == 0 { "user" } else { "assistant" }.into(),
+                    text: format!("message {i}"),
+                    tool_name: None,
+                    ts: Some(1_000),
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn job_guard_releases_its_flag_on_drop_and_on_panic() {
+        let flag = Arc::new(JobFlag::default());
+        let guard = JobGuard::try_acquire(&flag).expect("a free flag can be claimed");
+        assert!(flag.is_set());
+        assert!(JobGuard::try_acquire(&flag).is_none(), "claimed twice");
+        drop(guard);
+        assert!(!flag.is_set());
+
+        // A job that panics (a scan parser, ort) must not leave the flag stuck.
+        let guard = JobGuard::try_acquire(&flag).unwrap();
+        let joined = std::thread::spawn(move || {
+            let _guard = guard;
+            panic!("job panicked (expected by this test)");
+        })
+        .join();
+        assert!(joined.is_err());
+        assert!(!flag.is_set(), "a panicked job kept its flag");
+        assert!(JobGuard::try_acquire(&flag).is_some());
+    }
+
+    /// Cancel, then start a new job while the old one is still finishing its last step: the
+    /// old job must see that it was cancelled, and its drop must not release the new claim.
+    #[test]
+    fn a_cancelled_guard_cannot_release_a_newer_jobs_flag() {
+        let flag = Arc::new(JobFlag::default());
+        let old = JobGuard::try_acquire(&flag).unwrap();
+        assert!(old.is_current());
+        flag.clear(); // cancel_distill
+        assert!(
+            !old.is_current(),
+            "the cancelled job stops at its next check"
+        );
+
+        let new = JobGuard::try_acquire(&flag).expect("a cancel frees the flag");
+        assert!(!old.is_current(), "a newer claim isn't the old job's");
+        drop(old);
+        assert!(
+            flag.is_set(),
+            "the stale guard left the new job's claim alone"
+        );
+        assert!(new.is_current());
+        drop(new);
+        assert!(!flag.is_set());
+    }
+
+    #[test]
+    fn launch_loads_the_model_only_when_the_session_needs_it() {
+        // (has_vectors, facts_pending, model_cached) -> prefetch
+        let cases = [
+            ((true, false, true), false), // semantic index, model on disk: load on first use
+            ((true, false, false), true), // semantic index, cache gone: one-time re-download
+            ((false, true, true), true),  // recall facts waiting, model on disk
+            ((false, true, false), false), // never downloads just for facts
+            ((true, true, true), true),
+            ((false, false, true), false),
+            ((false, false, false), false),
+        ];
+        for ((vectors, pending, cached), want) in cases {
+            assert_eq!(
+                should_prefetch_model(vectors, pending, cached),
+                want,
+                "has_vectors={vectors} facts_pending={pending} cached={cached}"
+            );
+        }
+    }
+
+    #[test]
+    fn pending_facts_check_searches_an_index() {
+        let p = temp_db("facts_plan");
+        let conn = db::open(&p).unwrap();
+        let plan: Vec<String> = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {FACTS_PENDING_EMBED_SQL}"))
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(
+            plan.iter().any(|d| d.starts_with("SEARCH facts USING")),
+            "{plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|d| d.starts_with("SCAN facts")),
+            "{plan:?}"
+        );
+        assert_eq!(startup_embed_state(&conn), (false, false));
+    }
+
+    #[test]
+    fn db_counts_match_the_live_row_counts() {
+        let p = temp_db("db_counts");
+        let mut conn = db::open(&p).unwrap();
+        let sid = indexer::source_id(&conn, "codex").unwrap();
+        indexer::upsert_thread(&mut conn, sid, &thread("a", None, 3)).unwrap();
+        indexer::upsert_thread(&mut conn, sid, &thread("b", None, 5)).unwrap();
+        // A re-index that rewrites a thread with more messages keeps the sum exact.
+        indexer::upsert_thread(&mut conn, sid, &thread("a", None, 4)).unwrap();
+        let live = |sql: &str| conn.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap();
+        let stats = db_counts(&conn).unwrap();
+        assert_eq!(stats.threads, 2);
+        assert_eq!(stats.messages, live("SELECT COUNT(*) FROM messages"));
+        assert_eq!(stats.messages, 9);
+        assert_eq!(stats.sources, live("SELECT COUNT(*) FROM sources"));
+    }
+
+    #[test]
+    fn housekeeping_reports_changes_once_then_nothing() {
+        let p = temp_db("housekeeping");
+        let mut conn = db::open(&p).unwrap();
+        let project = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let sid = indexer::source_id(&conn, "codex").unwrap();
+        indexer::upsert_thread(&mut conn, sid, &thread("t", project.to_str(), 2)).unwrap();
+        // A thread from before project keys existed (what the backfill is for).
+        conn.execute("UPDATE threads SET project_key = NULL", [])
+            .unwrap();
+        assert!(startup_housekeeping(&conn) > 0);
+        let key: Option<String> = conn
+            .query_row("SELECT project_key FROM threads", [], |r| r.get(0))
+            .unwrap();
+        assert!(key.is_some());
+        // Steady state: nothing to change, so launch sends no `index:updated`.
+        assert_eq!(startup_housekeeping(&conn), 0);
+    }
+}
+
+/// Text built from index rows for a model provider is redacted on the way out, while the
+/// index itself keeps the raw text.
+#[cfg(test)]
+mod redaction_tests {
+    use super::*;
+
+    const KEY: &str = "sk-ant-api03-AbCdEfGhIjKlMnOpQrStUv0123456789";
+
+    fn assert_scrubbed(out: &str) {
+        assert!(out.contains("[REDACTED]"), "{out}");
+        assert!(!out.contains("sk-ant-api03"), "{out}");
+    }
+
+    fn memory_db() -> rusqlite::Connection {
+        db::open(std::path::Path::new(":memory:")).unwrap()
+    }
+
+    #[test]
+    fn chat_search_and_ask_context_redact_a_planted_key() {
+        let mut conn = memory_db();
+        let sid = indexer::source_id(&conn, "codex").unwrap();
+        let t = indexer::ParsedThread {
+            external_id: "leaky".into(),
+            title: Some(format!("wire the gateway with {KEY}")),
+            project_path: Some("/proj/app".into()),
+            messages: vec![indexer::ParsedMessage {
+                role: "user".into(),
+                text: format!("the gateway rejects {KEY}"),
+                tool_name: None,
+                ts: Some(1_000),
+            }],
+            ..Default::default()
+        };
+        indexer::upsert_thread(&mut conn, sid, &t).unwrap();
+
+        // The chat agent's search_history tool: title and snippet.
+        let json = chat_search_json(&conn, "gateway", 10).unwrap();
+        assert_scrubbed(&json);
+        assert!(json.contains("wire the gateway with [REDACTED]"), "{json}");
+        assert!(
+            !json.contains("\\u0001"),
+            "match sentinels are stripped: {json}"
+        );
+
+        // Ask: the title heading each excerpt. A keyless engine, so no keychain read.
+        knowledge::set_config(&conn, true, Some("ollama"), Some("llama3")).unwrap();
+        let prep = prepare_ask(&conn, "gateway", None)
+            .unwrap()
+            .expect("the seeded thread is relevant");
+        assert_scrubbed(&prep.context);
+        assert!(
+            prep.context
+                .contains("] wire the gateway with [REDACTED]\n"),
+            "{}",
+            prep.context
+        );
+
+        // Redaction happens on read: the index still holds the raw title.
+        let stored: String = conn
+            .query_row("SELECT title FROM threads", [], |r| r.get(0))
+            .unwrap();
+        assert!(stored.contains(KEY));
+    }
+
+    #[test]
+    fn memory_notes_and_conflict_review_redact_a_planted_key() {
+        let conn = memory_db();
+        let project = "/proj/app";
+        let leaky = format!("call the billing API with {KEY}");
+        knowledge::record_fact(&conn, project, "decision", &leaky, None, 1_000).unwrap();
+        knowledge::record_fact(&conn, project, "decision", "keep sqlite", None, 1_001).unwrap();
+
+        // Project brief prompt (project_brief, write_project_memory_file).
+        let mem = knowledge::get_project_memory_facts(&conn, project, 10).unwrap();
+        let notes = format_memory_notes(&mem);
+        assert_scrubbed(&notes);
+        assert!(
+            notes.contains("- call the billing API with [REDACTED]\n"),
+            "{notes}"
+        );
+
+        // Conflict review prompt.
+        let decisions = knowledge::project_decisions(&conn, project).unwrap();
+        assert_eq!(decisions.len(), 2);
+        let texts = conflict_review_texts(&decisions);
+        assert_scrubbed(&texts.join("\n"));
+        assert!(texts
+            .iter()
+            .any(|t| t == "call the billing API with [REDACTED]"));
+        assert!(texts.iter().any(|t| t == "keep sqlite"));
+    }
+}
+
+/// The Tauri command surface and the typed frontend API must list the same commands.
+#[cfg(test)]
+mod command_surface_tests {
+    use std::collections::BTreeSet;
+
+    /// The names in `run()`'s handler list. The needle is assembled so this test's own
+    /// source never matches it.
+    fn registered_commands() -> BTreeSet<&'static str> {
+        let src = include_str!("lib.rs");
+        let needle = concat!("tauri::generate_", "handler![");
+        assert_eq!(src.matches(needle).count(), 1, "one handler list in lib.rs");
+        let start = src.find(needle).unwrap() + needle.len();
+        let end = start + src[start..].find(']').expect("the handler list closes");
+        src[start..end]
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or_default())
+            .flat_map(|line| line.split(','))
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            // `module::command` registers under its last segment, the name `invoke` uses.
+            .map(|path| path.rsplit("::").next().unwrap_or(path))
+            .collect()
+    }
+
+    /// Command names passed as a string literal to `invoke(...)` or `invoke<T>(...)`.
+    fn invoked_commands(src: &str) -> Vec<&str> {
+        let mut names = Vec::new();
+        for (at, word) in src.match_indices("invoke") {
+            let prev = src[..at].chars().next_back();
+            if prev.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '$') {
+                continue;
+            }
+            let mut rest = &src[at + word.len()..];
+            if rest.starts_with('<') {
+                // Skip the type argument: `invoke<Record<string, T>>(` ends at the first `>(`.
+                let Some(close) = rest.find(">(") else {
+                    continue;
+                };
+                rest = &rest[close + 1..];
+            }
+            let Some(args) = rest.strip_prefix('(') else {
+                continue; // `import { invoke }`, or `invoke` in a comment
+            };
+            let args = args.trim_start();
+            let Some(quote) = args
+                .chars()
+                .next()
+                .filter(|c| matches!(c, '"' | '\'' | '`'))
+            else {
+                continue;
+            };
+            if let Some(end) = args[1..].find(quote) {
+                names.push(&args[1..1 + end]);
+            }
+        }
+        names
+    }
+
+    #[test]
+    fn invoke_parser_reads_every_call_shape() {
+        let src = r#"
+            import { invoke, Channel } from "@tauri-apps/api/core";
+            // Keep all `invoke` calls here.
+            a: () => invoke<DbStats>("db_stats"),
+            b: () => invoke<[string, number][]>("list_tags"),
+            c: () => invoke<Record<string, Foo<Bar>>>('nested'),
+            d: (x) =>
+              invoke<ThreadDetail | null>(
+                "get_thread",
+                { x },
+              ),
+            e: () => invoke("track_event", { name }),
+            f: () => reinvoke("not_a_command"),
+        "#;
+        assert_eq!(
+            invoked_commands(src),
+            [
+                "db_stats",
+                "list_tags",
+                "nested",
+                "get_thread",
+                "track_event"
+            ]
+        );
+    }
+
+    /// Every command in generate_handler! has a typed wrapper (api.ts, or telemetry.ts, which
+    /// api.ts re-exports), and every wrapper names a registered command. bce5702 registered six
+    /// commands with no wrapper, so the Settings overrides its changeset announced had no UI.
+    #[test]
+    fn every_command_has_a_frontend_wrapper_and_every_wrapper_a_command() {
+        // Invoked directly, not through a wrapper: the splash handshake in main.tsx and
+        // ErrorBoundary.tsx, which must work even when the app's own modules fail to load.
+        const INVOKED_OUTSIDE_WRAPPERS: &[&str] = &["set_complete"];
+        let wrapper_sources = [
+            include_str!("../../src/lib/api.ts"),
+            include_str!("../../src/lib/telemetry.ts"),
+        ];
+        let wrapped: BTreeSet<&str> = wrapper_sources
+            .iter()
+            .flat_map(|src| invoked_commands(src))
+            .chain(INVOKED_OUTSIDE_WRAPPERS.iter().copied())
+            .collect();
+        let registered = registered_commands();
+        assert!(
+            registered.contains("db_stats") && registered.len() > 50,
+            "{registered:?}"
+        );
+
+        let missing: Vec<_> = registered.difference(&wrapped).collect();
+        assert!(
+            missing.is_empty(),
+            "registered in generate_handler! but no wrapper in apps/desktop/src/lib/api.ts \
+             invokes them: {missing:?}. Add a typed wrapper (and a caller), or unregister them."
+        );
+        let unknown: Vec<_> = wrapped.difference(&registered).collect();
+        assert!(
+            unknown.is_empty(),
+            "the frontend invokes commands that generate_handler! doesn't register \
+             (they fail at runtime): {unknown:?}"
         );
     }
 }

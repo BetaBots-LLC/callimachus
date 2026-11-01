@@ -33,56 +33,22 @@ fn home() -> Result<PathBuf> {
     dirs::home_dir().ok_or_else(|| anyhow!("could not resolve home directory"))
 }
 
-/// Expand a leading `~` in a directory taken from an env var (a quoted assignment or a GUI
-/// launch can leave it unexpanded).
-fn expand_tilde(raw: &OsString, home: &Path) -> PathBuf {
-    let s = raw.to_string_lossy();
-    if s == "~" {
-        return home.to_path_buf();
-    }
-    match s.strip_prefix("~/").or_else(|| s.strip_prefix("~\\")) {
-        Some(rest) => home.join(rest),
-        None => PathBuf::from(raw),
-    }
-}
-
-/// A directory from an env-var override (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`), else `home/default`.
-fn dir_override(env: Option<OsString>, home: &Path, default: &str) -> PathBuf {
-    match env.filter(|v| !v.is_empty()) {
-        Some(v) => expand_tilde(&v, home),
-        None => home.join(default),
-    }
-}
-
 /// Claude Code's config dir: `$CLAUDE_CONFIG_DIR` when set (multi-account setups relocate it),
 /// else `~/.claude`. Holds `settings.json` (hooks), `skills/` and `projects/` (transcripts).
 ///
 /// A GUI app launched from Finder or the Dock doesn't inherit shell-exported variables, so a
-/// Settings override (`paths.claude_config_dir`, applied at startup) wins when set, exactly as
-/// for the indexer; otherwise the variable applies when it reaches this process (terminal
-/// launches, hooks, the MCP server).
+/// Settings override (`paths.claude_config_dir`, applied at startup) wins when set; otherwise
+/// the variable applies when it reaches this process (terminal launches, hooks, the MCP
+/// server). This is the indexer's resolver, so the hooks and skill land in the dir whose
+/// transcripts get indexed.
 pub fn claude_config_dir() -> Result<PathBuf> {
-    if let Some(dir) = crate::indexer::claude::config_dir_override() {
-        return Ok(dir);
-    }
-    Ok(dir_override(
-        std::env::var_os("CLAUDE_CONFIG_DIR"),
-        &home()?,
-        ".claude",
-    ))
+    crate::indexer::claude::config_dir().ok_or_else(|| anyhow!("could not resolve home directory"))
 }
 
 /// Codex's home: the Settings override (`paths.codex_home`), else `$CODEX_HOME`, else
-/// `~/.codex`.
+/// `~/.codex`. The indexer's resolver, so the MCP entry goes where the indexed Codex lives.
 pub fn codex_home() -> Result<PathBuf> {
-    if let Some(dir) = crate::indexer::codex::codex_home_override() {
-        return Ok(dir);
-    }
-    Ok(dir_override(
-        std::env::var_os("CODEX_HOME"),
-        &home()?,
-        ".codex",
-    ))
+    crate::indexer::codex::codex_root().ok_or_else(|| anyhow!("could not resolve home directory"))
 }
 
 /// `<claude config dir>/skills/recall/SKILL.md`
@@ -111,7 +77,8 @@ fn claude_config_path() -> Result<PathBuf> {
 /// reads, so register there instead of in a file it never opens.
 fn claude_config_path_from(config_dir_env: Option<OsString>, home: &Path) -> PathBuf {
     if let Some(dir) = config_dir_env.filter(|v| !v.is_empty()) {
-        let relocated = expand_tilde(&dir, home).join(".claude.json");
+        let relocated =
+            crate::indexer::claude::expand_tilde(PathBuf::from(dir)).join(".claude.json");
         if relocated.is_file() {
             return relocated;
         }
@@ -2865,23 +2832,13 @@ mod tests {
     #[cfg(unix)] // Unix path semantics
     #[test]
     fn config_dir_overrides() {
-        let home = Path::new("/home/me");
-        assert_eq!(
-            dir_override(None, home, ".claude"),
-            PathBuf::from("/home/me/.claude")
-        );
-        assert_eq!(
-            dir_override(Some("".into()), home, ".claude"),
-            PathBuf::from("/home/me/.claude")
-        );
-        assert_eq!(
-            dir_override(Some("/work/claude".into()), home, ".claude"),
-            PathBuf::from("/work/claude")
-        );
-        assert_eq!(
-            dir_override(Some("~/.claude-work".into()), home, ".claude"),
-            PathBuf::from("/home/me/.claude-work")
-        );
+        // The env-var and Settings dirs share the indexer's `~` expansion.
+        let home = dirs::home_dir().expect("home dir");
+        let expand = |s: &str| crate::indexer::claude::expand_tilde(PathBuf::from(s));
+        assert_eq!(expand("/work/claude"), PathBuf::from("/work/claude"));
+        assert_eq!(expand("~/.claude-work"), home.join(".claude-work"));
+        assert_eq!(expand("~"), home);
+        assert_eq!(expand("~nope/x"), PathBuf::from("~nope/x"));
 
         // .claude.json stays in $HOME unless the relocated dir already has its own.
         let tmp = TempDir::new("claude_json");

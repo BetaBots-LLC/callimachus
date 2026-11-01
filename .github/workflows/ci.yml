@@ -148,8 +148,9 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       # Same check as `pnpm check` (CONTRIBUTING.md), with PR annotations.
-      # TODO: drop continue-on-error once the existing Biome errors in apps/desktop,
-      # apps/vscode and scripts are fixed, so new lint regressions fail the PR.
+      # TODO: drop continue-on-error once the existing Biome errors in apps/desktop
+      # (mostly the shadcn files in src/components/ui/) and apps/vscode/src/webview are
+      # fixed, so new lint regressions fail the PR.
       - name: Biome lint + format check
         continue-on-error: true
         run: pnpm exec biome ci --reporter=github .

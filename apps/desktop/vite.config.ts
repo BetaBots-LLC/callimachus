@@ -20,8 +20,9 @@ export default defineConfig(async () => ({
     rolldownOptions: {
       output: {
         // Syntax highlighting (highlight.js grammars via lowlight) is the largest single
-        // dependency. Keep it in its own chunk so the entry chunk stays small and the
-        // highlighter is parsed and cached separately from app code.
+        // dependency. It gets its own chunk, which only the lazily loaded markdown stack
+        // imports (startup-path components go through components/LazyMarkdown), so it is
+        // neither modulepreloaded nor parsed behind the splash.
         codeSplitting: {
           groups: [
             {

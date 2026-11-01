@@ -10,6 +10,7 @@
 //! size-budgeted markdown the SessionStart hook injects.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -489,10 +490,8 @@ impl Callimachus {
         // "*"/"all" searches every project.
         let project: Option<String> = match args.project.as_deref().map(str::trim) {
             Some("*") | Some("all") => None,
-            Some(p) if !p.is_empty() => {
-                Some(crate::indexer::canonical_project(p).unwrap_or_else(|| p.to_string()))
-            }
-            _ => current_project_root().map(|r| crate::indexer::canonical_project(&r).unwrap_or(r)),
+            Some(p) if !p.is_empty() => Some(crate::knowledge::project_key(p)),
+            _ => cwd_project_key(),
         };
         let conn = self.lock()?;
         let clusters = crate::issues::recurring_issues(&conn, project.as_deref(), since, limit)
@@ -535,7 +534,10 @@ impl Callimachus {
         if let Some(notice) = self.empty_index_notice()? {
             return Ok(notice);
         }
-        let project = current_project_root().ok_or_else(|| {
+        // The same key the indexer stores (worktrees resolved to the main repo, the walk
+        // stopping at $HOME). A raw walk-up root missed every thread of a linked worktree and
+        // let a dotfiles ~/.git scope the search to all of home.
+        let project = cwd_project_key().ok_or_else(|| {
             ErrorData::invalid_params("could not determine current project dir", None)
         })?;
         let limit = clamp_limit(args.limit, SEARCH_DEFAULT, SEARCH_MAX);
@@ -715,11 +717,7 @@ impl Callimachus {
         let kinds = MemoryKinds::parse(&args.kinds)?;
         let limit = args.limit.map(|n| n.clamp(1, MEMORY_PER_KIND_MAX) as usize);
 
-        let raw = args
-            .project
-            .or_else(current_project_root)
-            .unwrap_or_default();
-        let project = crate::indexer::canonical_project(&raw).unwrap_or(raw);
+        let project = project_key_or_cwd(args.project);
 
         // Markdown fetches the full per-kind cap and lets the budget pick what fits, so its
         // "+N more" footer counts what was actually left out. JSON returns exactly `limit`.
@@ -924,11 +922,7 @@ impl Callimachus {
         // Writes still go through on an empty index (the note persists and shows up once the
         // app indexes), but the agent should learn that recall has nothing to search yet.
         let empty_notice = self.empty_index_notice()?.is_some();
-        let raw = args
-            .project
-            .or_else(current_project_root)
-            .unwrap_or_default();
-        let project = crate::indexer::canonical_project(&raw).unwrap_or(raw);
+        let project = project_key_or_cwd(args.project);
         let now = chrono::Utc::now().timestamp();
         let mut conn = self.lock()?;
         let rationale = args
@@ -979,7 +973,9 @@ impl Callimachus {
 // ---------------------------------------------------------------------------
 
 fn internal<E: std::fmt::Display>(e: E) -> ErrorData {
-    ErrorData::internal_error(e.to_string(), None)
+    // `{:#}` prints an anyhow error's whole context chain ("what failed: why"), where
+    // to_string() keeps only the outermost layer. Other error types ignore the flag.
+    ErrorData::internal_error(format!("{e:#}"), None)
 }
 
 /// What a write tool says when the index lock outlasts the sidecar's busy wait.
@@ -1015,15 +1011,25 @@ fn no_query_vector() -> CallToolResult {
     }
 }
 
-fn text_result(text: String) -> CallToolResult {
+/// A plain-text tool result, scrubbed of credential-shaped text.
+///
+/// Every tool answers through here or [`json_result`], and both redact on the way out: the
+/// index stores transcripts raw, so titles, snippets, fact text and error signatures would
+/// otherwise reach the calling agent verbatim. Text that was already packed (and redacted)
+/// passes through unchanged.
+fn text_result(mut text: String) -> CallToolResult {
+    if let std::borrow::Cow::Owned(r) = context::redact_secrets(&text) {
+        text = r;
+    }
     CallToolResult::success(vec![Content::text(text)])
 }
 
-/// Compact JSON tool result. Never pretty-printed: indentation was 15-20% of every response
-/// and models read minified JSON just as well.
+/// Compact JSON tool result with every string redacted ([`context::to_redacted_json`]).
+/// Never pretty-printed: indentation was 15-20% of every response and models read minified
+/// JSON just as well.
 fn json_result<T: Serialize>(value: &T) -> Result<CallToolResult, ErrorData> {
-    let json = serde_json::to_string(value).map_err(internal)?;
-    Ok(text_result(json))
+    let json = context::to_redacted_json(value).map_err(internal)?;
+    Ok(CallToolResult::success(vec![Content::text(json)]))
 }
 
 /// A caller's `limit`, or `default`, kept within 1..=max.
@@ -1279,19 +1285,18 @@ fn char_suffix(s: &str, max: usize) -> &str {
     &s[start..]
 }
 
-/// The git repo root for the process's cwd, walking up for a `.git`; falls back
-/// to the cwd itself. Used to scope `search_current_project`.
-fn current_project_root() -> Option<String> {
-    let cwd = std::env::current_dir().ok()?;
-    let mut dir = cwd.as_path();
-    loop {
-        if dir.join(".git").exists() {
-            return Some(dir.to_string_lossy().to_string());
-        }
-        match dir.parent() {
-            Some(p) => dir = p,
-            None => return Some(cwd.to_string_lossy().to_string()), // no repo — scope to cwd
-        }
+/// The project key for the server's cwd (`knowledge::cwd_project_key`, the resolver `cal`
+/// and its hooks use), the one the tools scope to by default. None only when the cwd can't
+/// be read.
+fn cwd_project_key() -> Option<String> {
+    crate::knowledge::cwd_project_key()
+}
+
+/// The project key for a tool's `project` argument, else (unset or blank) for the cwd.
+fn project_key_or_cwd(project: Option<String>) -> String {
+    match project.filter(|p| !p.trim().is_empty()) {
+        Some(p) => crate::knowledge::project_key(&p),
+        None => cwd_project_key().unwrap_or_default(),
     }
 }
 
@@ -1313,14 +1318,73 @@ impl ServerHandler for Callimachus {
     }
 }
 
-/// Serve the MCP protocol over stdio against `conn`, blocking until the client
-/// disconnects. Both the `callimachus-mcp` binary and the app's `--mcp` mode call this.
-pub async fn serve(conn: Connection) -> anyhow::Result<()> {
+/// Serve the MCP protocol over stdio against `conn`, until the client disconnects. Only
+/// [`serve_stdio`] calls it, after opening the index and building the runtime.
+async fn serve(conn: Connection) -> anyhow::Result<()> {
     let service = Callimachus::new(conn)
         .serve((tokio::io::stdin(), tokio::io::stdout()))
         .await?;
     service.waiting().await?;
     Ok(())
+}
+
+/// The whole stdio MCP server process, shared by both entry points (the `callimachus-mcp`
+/// binary and the app's `--mcp` mode) so they can't drift: say so when there is no index
+/// yet, open `index_path` as a sidecar, serve until the client disconnects, and return the
+/// process exit code. `prog` prefixes the stderr lines, which MCP clients show in their
+/// server log.
+pub fn serve_stdio(prog: &str, index_path: &Path) -> i32 {
+    if let Some(notice) = no_index_notice(prog, index_path) {
+        eprintln!("{notice}");
+    }
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("{prog}: starting the async runtime: {e}");
+            return 1;
+        }
+    };
+    let result = rt.block_on(async {
+        // Writable: the server has write tools (complete_todo, record_*). WAL + busy_timeout
+        // let it coexist with the desktop app's writer; the sidecar open also waits out an
+        // index upgrade another process is running.
+        let conn = crate::db::open_sidecar(index_path)?;
+        serve(conn).await
+    });
+    // Don't wait on tokio's stdin reader: it is a blocking read that can't be cancelled, so a
+    // plain drop could hang an exit that didn't come from stdin EOF. The process ends next.
+    rt.shutdown_background();
+    match result {
+        Ok(()) => 0,
+        // A lock held past the sidecar wait is almost always an upgrade in progress: say that
+        // instead of SQLite's raw "database is locked".
+        Err(e) if crate::db::is_busy(&e) => {
+            eprintln!("{prog}: the index is busy (an upgrade may be running); try again shortly");
+            1
+        }
+        Err(e) => {
+            eprintln!("{prog}: {e:#}");
+            1
+        }
+    }
+}
+
+/// The server-log line for a missing index, or None when `index_path` exists. Only the
+/// desktop app indexes, so without it (an npx / MCP-registry install, or CALLIMACHUS_DB
+/// pointing somewhere new) the server starts on an empty index; the tools also answer with
+/// [`EMPTY_INDEX_NOTICE`] until threads show up. Worded for both entry points: the app's own
+/// `--mcp` mode can hit this too, when it was never opened or CALLIMACHUS_DB moved the index.
+fn no_index_notice(prog: &str, index_path: &Path) -> Option<String> {
+    if index_path.exists() {
+        return None;
+    }
+    Some(format!(
+        "{prog}: no index at {}; starting with an empty one. The Callimachus desktop app builds \
+         the index: open it to index your agent history (install it from \
+         https://github.com/BetaBots-LLC/callimachus/releases/latest), or set CALLIMACHUS_DB to \
+         an existing index.db.",
+        index_path.display()
+    ))
 }
 
 #[cfg(test)]
@@ -1396,6 +1460,61 @@ mod tests {
         let res = write_error(anyhow::Error::from(busy).context("saving")).expect("soft result");
         assert_eq!(text_of(&res), INDEX_BUSY_NOTICE);
         assert!(write_error(anyhow::anyhow!("no such table: facts")).is_err());
+    }
+
+    /// A fresh scratch dir under the temp dir (not under $HOME, so the home stop stays out of
+    /// the way), canonicalized so keys compare equal on macOS's /var -> /private/var.
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "calli_mcp_{tag}_{}_{}",
+            std::process::id(),
+            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::canonicalize(&dir).unwrap()
+    }
+
+    #[test]
+    fn project_keys_match_the_indexer_inside_a_worktree() {
+        // A linked worktree's threads are indexed under its main repo. The old walk-up
+        // stopped at the worktree's own `.git` file, so search_current_project matched none.
+        let base = scratch_dir("wt");
+        let main = base.join("repo");
+        let wt_git = main.join(".git/worktrees/feature");
+        std::fs::create_dir_all(&wt_git).unwrap();
+        std::fs::write(wt_git.join("commondir"), "../..\n").unwrap();
+        let wt = base.join("repo-feature");
+        std::fs::create_dir_all(wt.join("src")).unwrap();
+        std::fs::write(wt.join(".git"), format!("gitdir: {}\n", wt_git.display())).unwrap();
+
+        let k_main = crate::indexer::canonical_project(main.to_str().unwrap()).unwrap();
+        assert_eq!(
+            crate::knowledge::project_key(&wt.join("src").to_string_lossy()),
+            k_main
+        );
+        assert_eq!(
+            project_key_or_cwd(Some(wt.to_string_lossy().into_owned())),
+            k_main
+        );
+        // An unset or blank argument falls back to the cwd's key, not to an empty project.
+        let cwd_key = cwd_project_key().expect("cwd");
+        assert_eq!(project_key_or_cwd(None), cwd_key);
+        assert_eq!(project_key_or_cwd(Some("  ".into())), cwd_key);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn no_index_notice_only_when_the_index_is_missing() {
+        let dir = scratch_dir("noindex");
+        let path = dir.join("index.db");
+        let notice = no_index_notice("callimachus --mcp", &path).expect("missing index");
+        assert!(notice.starts_with("callimachus --mcp: no index at "));
+        assert!(notice.contains(&path.display().to_string()));
+        assert!(notice.contains("CALLIMACHUS_DB"));
+        std::fs::write(&path, b"").unwrap();
+        assert_eq!(no_index_notice("callimachus-mcp", &path), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -1671,6 +1790,66 @@ mod tests {
                 }))
                 .await;
             assert!(res.is_err(), "invalid format/kinds must error");
+        }
+    }
+
+    #[tokio::test]
+    async fn issue_recent_and_search_tools_redact_a_planted_key() {
+        // The index stores transcripts raw, so the key must be scrubbed on the way out: in the
+        // error signature recurring_issues returns and the title recent_threads lists.
+        let key = "sk-ant-api03-AbCdEfGhIjKlMnOpQrStUv0123456789";
+        let now = chrono::Utc::now().timestamp();
+        let err = format!("Error: invalid x-api-key {key}");
+        let mut conn = empty_db();
+        seed(
+            &mut conn,
+            "leaky",
+            &format!("debug auth with {key}"),
+            vec![msg("tool", &err, now - 60), msg("tool", &err, now)],
+        );
+        let srv = Callimachus::new(conn);
+
+        let issues = srv
+            .recurring_issues(Parameters(RecurringIssuesArgs {
+                project: Some("*".into()),
+                since_days: None,
+                limit: None,
+            }))
+            .await
+            .unwrap();
+        let issues = text_of(&issues);
+        assert!(issues.contains("invalid x-api-key [REDACTED]"), "{issues}");
+
+        let recent = srv
+            .recent_threads(Parameters(RecentArgs {
+                sources: vec![],
+                project: None,
+                starred: None,
+                tags: vec![],
+                limit: None,
+            }))
+            .await
+            .unwrap();
+        let recent = text_of(&recent);
+        assert!(recent.contains("debug auth with [REDACTED]"), "{recent}");
+
+        // Search results share the exit, titles included (snippets were already scrubbed).
+        let found = srv
+            .search_threads(Parameters(SearchArgs {
+                query: "invalid".into(),
+                sources: vec![],
+                hybrid: false,
+                include_subagents: false,
+                limit: None,
+            }))
+            .await
+            .unwrap();
+        let found = text_of(&found);
+        assert!(found.contains("debug auth with [REDACTED]"), "{found}");
+
+        for body in [&issues, &recent, &found] {
+            assert!(!body.contains("sk-ant-api03"), "{body}");
+            serde_json::from_str::<serde_json::Value>(body).expect("still valid JSON");
         }
     }
 

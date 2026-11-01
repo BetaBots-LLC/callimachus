@@ -3,9 +3,10 @@ import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import path from "node:path";
 
-// Builds the React webview UI into `media/` as a single, unhashed
-// `webview.js` + `webview.css` pair that the extension host loads via
-// `webview.asWebviewUri`. The host itself stays on `tsc` (see tsconfig.json).
+// Builds the React webview UI into `media/` as an unhashed `webview.js` +
+// `webview.css` pair that the extension host loads via `webview.asWebviewUri`, plus
+// the thread panel's lazy chunks in `media/assets/`. The host itself stays on `tsc`
+// (see tsconfig.json).
 //
 // We reuse the desktop app's Tauri-free primitives (`ui/*`, Markdown) and its
 // Tailwind v4 theme for visual parity — hence the `@desktop` alias and the
@@ -39,7 +40,9 @@ export default defineConfig({
       output: {
         format: "es",
         entryFileNames: "webview.js",
-        chunkFileNames: "webview-[name].js",
+        // Lazy chunks (the thread panel and its markdown stack) go under assets/, which
+        // .gitignore and the `clean` script already cover. Unhashed like the entry.
+        chunkFileNames: "assets/webview-[name].js",
         assetFileNames: (asset) =>
           asset.names?.[0]?.endsWith(".css") ? "webview.css" : "assets/[name][extname]",
       },

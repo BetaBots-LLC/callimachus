@@ -7,7 +7,11 @@
 //!
 //! Schema verified against continuedev/continue `extensions/cli/src/session.ts`.
 
-use super::{set_file_state, source_id, upsert_thread, IndexReport, ParsedMessage, ParsedThread};
+use super::common::{join_text_parts, truncate_title};
+use super::{
+    file_change_state, set_file_state, source_id, upsert_thread, IndexReport, ParsedMessage,
+    ParsedThread,
+};
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use serde_json::Value;
@@ -40,32 +44,16 @@ pub fn scan(conn: &mut Connection, tick: &mut dyn FnMut()) -> Result<IndexReport
             continue;
         }
         tick();
-        match index_file(conn, sid, &path) {
-            Ok(Some(n)) => {
-                report.threads_indexed += 1;
-                report.messages_indexed += n;
-            }
-            Ok(None) => report.threads_skipped += 1,
-            Err(_) => report.errors += 1,
-        }
+        report.record(index_file(conn, sid, &path));
     }
     Ok(report)
 }
 
 fn index_file(conn: &mut Connection, sid: i64, path: &Path) -> Result<Option<usize>> {
     let path_str = path.to_string_lossy().to_string();
-    let meta = fs::metadata(path)?;
-    let size = meta.len() as i64;
-    let mtime = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    if let Some((prev_mtime, prev_size)) = super::file_state(conn, &path_str)? {
-        if prev_mtime == mtime && prev_size == size {
-            return Ok(None);
-        }
+    let (unchanged, mtime, size) = file_change_state(conn, path)?;
+    if unchanged {
+        return Ok(None);
     }
 
     let fallback_id = path
@@ -105,7 +93,8 @@ pub fn parse_file(path: &Path, fallback_id: &str, mtime: i64) -> Result<Option<P
                 Some("tool") => "tool",
                 _ => continue, // system already filtered by Continue
             };
-            let text = content_text(msg.get("content"));
+            // `content` is a plain string or an array of `{type:"text", text}` parts.
+            let text = join_text_parts(msg.get("content"));
             let text = text.trim();
             // Same head + tail cap as the Claude indexer for tool output.
             let text = if role == "tool" {
@@ -136,7 +125,7 @@ pub fn parse_file(path: &Path, fallback_id: &str, mtime: i64) -> Result<Option<P
         .and_then(Value::as_str)
         .filter(|t| !t.trim().is_empty())
         .map(str::to_string)
-        .or_else(|| first_user.map(truncate_title));
+        .or_else(|| first_user.as_deref().map(truncate_title));
     let project_path = root
         .get("workspaceDirectory")
         .and_then(Value::as_str)
@@ -154,28 +143,6 @@ pub fn parse_file(path: &Path, fallback_id: &str, mtime: i64) -> Result<Option<P
         usage: Vec::new(),
         messages,
     }))
-}
-
-/// `content` is a plain string or an array of `{type:"text", text}` parts.
-fn content_text(content: Option<&Value>) -> String {
-    match content {
-        Some(Value::String(s)) => s.clone(),
-        Some(Value::Array(parts)) => parts
-            .iter()
-            .filter_map(|p| p.get("text").and_then(Value::as_str))
-            .collect::<Vec<_>>()
-            .join("\n"),
-        _ => String::new(),
-    }
-}
-
-fn truncate_title(s: String) -> String {
-    let s = s.trim();
-    if s.chars().count() > 80 {
-        format!("{}…", s.chars().take(80).collect::<String>())
-    } else {
-        s.to_string()
-    }
 }
 
 #[cfg(test)]

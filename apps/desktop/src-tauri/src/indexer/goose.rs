@@ -8,6 +8,7 @@
 //!
 //! Schema verified against block/goose `session_manager.rs`.
 
+use super::common::truncate_title;
 use super::{
     file_change_state, set_file_state, source_id, upsert_thread, IndexReport, ParsedMessage,
     ParsedThread,
@@ -115,7 +116,7 @@ fn scan_path(conn: &mut Connection, db: &Path, tick: &mut dyn FnMut()) -> Result
             .name
             .filter(|n| !n.trim().is_empty())
             .or_else(|| s.description.filter(|d| !d.trim().is_empty()))
-            .or_else(|| first_user.map(truncate_title));
+            .or_else(|| first_user.as_deref().map(truncate_title));
         let thread = ParsedThread {
             external_id: s.id,
             title,
@@ -203,15 +204,6 @@ fn collect_text(v: &Value, out: &mut Vec<String>) {
             }
         }
         _ => {}
-    }
-}
-
-fn truncate_title(s: String) -> String {
-    let s = s.trim();
-    if s.chars().count() > 80 {
-        format!("{}…", s.chars().take(80).collect::<String>())
-    } else {
-        s.to_string()
     }
 }
 

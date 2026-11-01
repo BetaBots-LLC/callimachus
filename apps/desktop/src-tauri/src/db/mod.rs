@@ -5,6 +5,7 @@ pub mod migrations;
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, ErrorCode, OpenFlags, TransactionBehavior};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, Once};
 use std::time::Duration;
@@ -20,9 +21,26 @@ pub const BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 pub const SIDECAR_BUSY_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// How long the app waits, when its schema is out of date, for another process that is
-/// already upgrading the same index. One release's migrations (0025-0030: two index
-/// builds over the whole messages table) took ~30s on a multi-GB index.
+/// already upgrading the same index. One release's migrations (0025-0031: four index
+/// builds over the whole messages table) take ~17 s on a 4.7 GB index from a cold cache
+/// with the pre-read (see `preread_for_migration`), ~48 s where it is skipped.
 const UPGRADE_WAIT: Duration = Duration::from_secs(120);
+
+/// mmap window for every connection: the bundled SQLite's cap (asking for more returns
+/// this). KNN reads every vec0 chunk blob, and on a large index those pages sit up to ~1 GB
+/// into the file; with the old 256 MiB window three quarters of them went through pread
+/// into a small page cache on every semantic query (20-25% slower). The mapping is clean,
+/// file-backed pages, so it costs address space, not memory footprint.
+#[cfg(not(windows))]
+const MMAP_SIZE: i64 = 2_147_418_112;
+
+/// Windows keeps the old 256 MiB window. NTFS refuses to truncate a file below the size of
+/// a section another handle still has mapped, and SQLite's winTruncate ignores that error
+/// and reports success. Every connection (the writer, the read pool, the watcher, MCP and
+/// `cal` sidecars) holds its own view, so with a 2 GiB window a VACUUM / Shrink index on any
+/// index under 2 GiB would quietly leave the file at its old size.
+#[cfg(windows)]
+const MMAP_SIZE: i64 = 256 << 20;
 
 /// Managed Tauri state wrapper around the app's SQLite connection.
 pub struct Db(pub Mutex<Connection>);
@@ -90,22 +108,69 @@ pub fn open_with_busy_timeout(path: &Path, busy: Duration) -> Result<Connection>
     open_with(path, busy, busy)
 }
 
-/// True when `e` (anywhere in its chain, including inside a migration error) is SQLite
-/// giving up on a lock: SQLITE_BUSY or SQLITE_LOCKED.
+/// True when `e` is SQLite giving up on a lock, SQLITE_BUSY or SQLITE_LOCKED (any extended
+/// code), anywhere in its chain: under `.context()`, inside a migration error, behind an
+/// `AppError`, or flattened to text by `anyhow!(e.to_string())`. The one lock check for
+/// every retry loop and "try again later" message, so adding context to a write path can
+/// never turn a retryable lock into a hard failure.
 pub fn is_busy(e: &anyhow::Error) -> bool {
-    e.chain().any(|cause| {
-        let err = cause
-            .downcast_ref::<rusqlite::Error>()
-            .or_else(|| match cause.downcast_ref::<rusqlite_migration::Error>() {
-                Some(rusqlite_migration::Error::RusqliteError { err, .. }) => Some(err),
-                _ => None,
-            });
-        matches!(
-            err,
-            Some(rusqlite::Error::SqliteFailure(f, _))
-                if matches!(f.code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
-        )
-    })
+    e.chain().any(is_busy_cause)
+}
+
+/// [`is_busy`] for a bare rusqlite error.
+pub fn is_busy_sqlite(e: &rusqlite::Error) -> bool {
+    matches!(
+        e.sqlite_error_code(),
+        Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+    )
+}
+
+fn is_busy_cause(cause: &(dyn std::error::Error + 'static)) -> bool {
+    if let Some(e) = cause.downcast_ref::<rusqlite::Error>() {
+        return is_busy_sqlite(e);
+    }
+    if let Some(rusqlite_migration::Error::RusqliteError { err, .. }) = cause.downcast_ref() {
+        return is_busy_sqlite(err);
+    }
+    // A transparent wrapper (AppError) forwards source() to the inner error's source, so
+    // the rusqlite::Error itself is skipped but its ffi::Error cause still shows up.
+    if let Some(e) = cause.downcast_ref::<rusqlite::ffi::Error>() {
+        return matches!(e.code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked);
+    }
+    if let Some(crate::error::AppError::Other(inner)) = cause.downcast_ref() {
+        return is_busy(inner);
+    }
+    // Only the text survived (a chain flattened with to_string): SQLite's own messages for
+    // SQLITE_BUSY and the SQLITE_LOCKED family.
+    let msg = cause.to_string();
+    [
+        "database is locked",
+        "database table is locked",
+        "database schema is locked",
+    ]
+    .iter()
+    .any(|m| msg.contains(m))
+}
+
+/// Whether this connection's schema has the index `name`. For a query that names an index
+/// with INDEXED BY, which is an error (not just a slower plan) when the index is missing:
+/// read-only sidecars and pooled readers never migrate, so a newer binary can be reading an
+/// index an older app built. Asked per query on a cached statement (the schema table is
+/// tiny and always cached), so it also stays right when an upgrade lands under a
+/// long-lived connection.
+pub fn has_index(conn: &Connection, name: &str) -> bool {
+    conn.prepare_cached("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1")
+        .and_then(|mut stmt| stmt.exists([name]))
+        .unwrap_or(false)
+}
+
+/// Whether this connection's schema has the table `name`, for a query that reads a table a
+/// later migration added. Same reason and cost as [`has_index`]: a read-only connection
+/// can be reading an index an older app built, and an upgrade can land under it.
+pub fn has_table(conn: &Connection, name: &str) -> bool {
+    conn.prepare_cached("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1")
+        .and_then(|mut stmt| stmt.exists([name]))
+        .unwrap_or(false)
 }
 
 fn open_with(path: &Path, busy: Duration, upgrade_wait: Duration) -> Result<Connection> {
@@ -133,7 +198,7 @@ fn open_with(path: &Path, busy: Duration, upgrade_wait: Duration) -> Result<Conn
     // sorts/CTEs in RAM; the WAL caps keep the -wal file from growing unbounded and
     // checkpoints small. See db-perf audit.
     conn.pragma_update(None, "cache_size", -65536_i64)?; // 64 MiB
-    conn.pragma_update(None, "mmap_size", 268_435_456_i64)?; // 256 MiB
+    conn.pragma_update(None, "mmap_size", MMAP_SIZE)?;
     conn.pragma_update(None, "temp_store", "MEMORY")?;
     conn.pragma_update(None, "wal_autocheckpoint", 2000_i64)?; // ~8 MiB
     conn.pragma_update(None, "journal_size_limit", 67_108_864_i64)?; // cap -wal at 64 MiB
@@ -163,6 +228,9 @@ fn migrate(conn: &mut Connection, busy: Duration, upgrade_wait: Duration) -> Res
         // A newer build's schema: to_latest reports DatabaseTooFarAhead without locking.
         return m.to_latest(conn).context("running migrations");
     }
+    if let Some(path) = conn.path().filter(|p| !p.is_empty()) {
+        preread_for_migration(Path::new(path));
+    }
     conn.busy_timeout(upgrade_wait)?;
     conn.set_transaction_behavior(TransactionBehavior::Immediate);
     let result = conn
@@ -178,6 +246,129 @@ fn migrate(conn: &mut Connection, busy: Duration, upgrade_wait: Duration) -> Res
         Err(_) if m.pending_migrations(conn).ok() == Some(0) => Ok(()),
         Err(e) => Err(e.context("running migrations")),
     }
+}
+
+/// Below this size a cold upgrade is quick anyway; a pre-read would only add I/O.
+const PREREAD_MIN_BYTES: u64 = 256 << 20;
+/// Never pre-read more than this, whatever the RAM.
+const PREREAD_MAX_BYTES: u64 = 8 << 30;
+
+/// Read the database file once, front to back, before running pending migrations. Their
+/// index builds scan `messages` in b-tree order, and reaching a column stored after `text`
+/// walks each long row's overflow chain: about 3 GB of random 4 KB reads on a 4.7 GB index.
+/// Measured there from a cold cache: 0031's two index builds took 20.6 s, and 5.1 s after
+/// the sequential read (itself ~1.2 s); the whole 24 -> 31 upgrade took 17 s, where 24 -> 30
+/// alone took 27.7 s without it. Runs once per release, in whichever process (app, MCP
+/// server, hook) opens the index first. Best effort: any error skips it. The file lands in
+/// reclaimable page cache, not RSS, and it is skipped when the file is small or would crowd
+/// RAM.
+fn preread_for_migration(path: &Path) {
+    let Ok(len) = std::fs::metadata(path).map(|m| m.len()) else {
+        return;
+    };
+    if !should_preread(len, physical_memory()) {
+        return;
+    }
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return;
+    };
+    let mut buf = vec![0u8; 8 << 20];
+    while matches!(file.read(&mut buf), Ok(n) if n > 0) {}
+}
+
+/// Pre-read only a file big enough to matter and small enough to stay cached until the
+/// migration's scans reach it: at most half of RAM (when known) and [`PREREAD_MAX_BYTES`].
+fn should_preread(len: u64, ram: Option<u64>) -> bool {
+    let cap = ram.map_or(PREREAD_MAX_BYTES, |r| (r / 2).min(PREREAD_MAX_BYTES));
+    len > PREREAD_MIN_BYTES && len <= cap
+}
+
+/// RAM this process can use, in bytes, where it is cheap to ask.
+#[cfg(target_os = "macos")]
+fn physical_memory() -> Option<u64> {
+    let out = std::process::Command::new("/usr/sbin/sysctl")
+        .args(["-n", "hw.memsize"])
+        .output()
+        .ok()?;
+    String::from_utf8(out.stdout).ok()?.trim().parse().ok()
+}
+
+/// The smaller of installed RAM and the cgroup memory limit. Inside a container (the MCP
+/// server image) /proc/meminfo reports the host's RAM, while the page cache that would
+/// hold the pre-read is charged to, and evicted within, the container's limit. The
+/// container's own cgroup is the root of its /sys/fs/cgroup.
+#[cfg(target_os = "linux")]
+fn physical_memory() -> Option<u64> {
+    let read = |path: &str| std::fs::read_to_string(path).ok();
+    let total = read("/proc/meminfo")
+        .as_deref()
+        .and_then(parse_meminfo_total);
+    let limit = read("/sys/fs/cgroup/memory.max") // cgroup v2
+        .or_else(|| read("/sys/fs/cgroup/memory/memory.limit_in_bytes")) // cgroup v1
+        .as_deref()
+        .and_then(parse_cgroup_limit);
+    match (total, limit) {
+        (Some(t), Some(l)) => Some(t.min(l)),
+        (t, l) => t.or(l),
+    }
+}
+
+/// `MemTotal` from /proc/meminfo, in bytes.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_meminfo_total(info: &str) -> Option<u64> {
+    let kb = info.lines().find_map(|l| l.strip_prefix("MemTotal:"))?;
+    let kb: u64 = kb.trim().trim_end_matches("kB").trim().parse().ok()?;
+    Some(kb * 1024)
+}
+
+/// A cgroup memory limit file: bytes, or v2's `max` for none. (v1's "no limit" is a huge
+/// number, which the `min` with MemTotal discards.)
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_cgroup_limit(text: &str) -> Option<u64> {
+    text.trim().parse().ok()
+}
+
+/// Installed physical RAM from GlobalMemoryStatusEx (kernel32, always linked).
+#[cfg(windows)]
+fn physical_memory() -> Option<u64> {
+    /// MEMORYSTATUSEX from <sysinfoapi.h>.
+    #[repr(C)]
+    struct MemoryStatusEx {
+        length: u32,
+        memory_load: u32,
+        total_phys: u64,
+        avail_phys: u64,
+        total_page_file: u64,
+        avail_page_file: u64,
+        total_virtual: u64,
+        avail_virtual: u64,
+        avail_extended_virtual: u64,
+    }
+    const _: () = assert!(std::mem::size_of::<MemoryStatusEx>() == 64);
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GlobalMemoryStatusEx(buffer: *mut MemoryStatusEx) -> i32;
+    }
+    let mut status = MemoryStatusEx {
+        length: std::mem::size_of::<MemoryStatusEx>() as u32,
+        memory_load: 0,
+        total_phys: 0,
+        avail_phys: 0,
+        total_page_file: 0,
+        avail_page_file: 0,
+        total_virtual: 0,
+        avail_virtual: 0,
+        avail_extended_virtual: 0,
+    };
+    // SAFETY: `status` is a live, correctly sized MEMORYSTATUSEX with `length` set, which is
+    // all the call requires; it only writes into that struct.
+    let ok = unsafe { GlobalMemoryStatusEx(&mut status) } != 0;
+    (ok && status.total_phys > 0).then_some(status.total_phys)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+fn physical_memory() -> Option<u64> {
+    None
 }
 
 /// Open the index **read-only**, for the sidecar processes (MCP server, `cal`).
@@ -204,7 +395,7 @@ pub fn open_readonly(path: &Path) -> Result<Connection> {
     // Reader pragmas: readers benefit most from mmap; smaller cache since these are
     // short-lived (sidecars) or pooled (the in-process read pool). query_only is a
     // belt-and-suspenders guard. NO autocheckpoint — readers must not checkpoint.
-    conn.pragma_update(None, "mmap_size", 268_435_456_i64)?; // 256 MiB
+    conn.pragma_update(None, "mmap_size", MMAP_SIZE)?;
     conn.pragma_update(None, "temp_store", "MEMORY")?;
     conn.pragma_update(None, "cache_size", -16384_i64)?; // 16 MiB
     conn.pragma_update(None, "query_only", "ON")?;
@@ -231,7 +422,7 @@ impl r2d2::ManageConnection for ReadManager {
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
         )?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        conn.pragma_update(None, "mmap_size", 268_435_456_i64)?;
+        conn.pragma_update(None, "mmap_size", MMAP_SIZE)?;
         conn.pragma_update(None, "temp_store", "MEMORY")?;
         conn.pragma_update(None, "cache_size", -16384_i64)?;
         conn.pragma_update(None, "query_only", "ON")?;
@@ -394,6 +585,99 @@ mod tests {
         assert!(is_busy(&err), "{err:#}");
         assert!(!is_busy(&anyhow::anyhow!("unrelated")));
         holder.execute_batch("ROLLBACK").unwrap();
+    }
+
+    /// Every shape a lock error reaches a retry loop in: SQLITE_LOCKED as well as BUSY, under
+    /// context, behind the app's transparent AppError, and flattened to text.
+    #[test]
+    fn busy_detection_sees_through_wrappers() {
+        let sqlite = |code: i32, msg: &str| {
+            rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), Some(msg.into()))
+        };
+        let locked = sqlite(rusqlite::ffi::SQLITE_LOCKED, "database table is locked");
+        assert!(is_busy_sqlite(&locked));
+        assert!(is_busy(&anyhow::Error::from(locked).context("saving tags")));
+
+        let busy = sqlite(rusqlite::ffi::SQLITE_BUSY, "database is locked");
+        let app = crate::error::AppError::from(anyhow::Error::from(busy));
+        assert!(is_busy(&anyhow::Error::from(app).context("command")));
+
+        let flattened =
+            anyhow::anyhow!(sqlite(rusqlite::ffi::SQLITE_BUSY, "database is locked").to_string());
+        assert!(is_busy(&flattened));
+
+        let constraint = sqlite(rusqlite::ffi::SQLITE_CONSTRAINT, "UNIQUE constraint failed");
+        assert!(!is_busy_sqlite(&constraint));
+        assert!(!is_busy(&anyhow::Error::from(constraint).context("insert")));
+    }
+
+    #[test]
+    fn preread_only_for_big_files_that_fit_in_ram() {
+        const GIB: u64 = 1 << 30;
+        assert!(
+            !should_preread(100 << 20, Some(16 * GIB)),
+            "small index: skip"
+        );
+        assert!(should_preread(5 * GIB, Some(16 * GIB)));
+        assert!(
+            !should_preread(5 * GIB, Some(8 * GIB)),
+            "over half of RAM: skip"
+        );
+        assert!(
+            !should_preread(9 * GIB, Some(64 * GIB)),
+            "over the fixed cap: skip"
+        );
+        assert!(
+            should_preread(5 * GIB, None),
+            "unknown RAM falls back to the fixed cap"
+        );
+    }
+
+    #[test]
+    fn ram_probe_parses_meminfo_and_cgroup_limits() {
+        let meminfo = "MemTotal:       16318412 kB\nMemFree:         1234 kB\n";
+        assert_eq!(parse_meminfo_total(meminfo), Some(16_318_412 * 1024));
+        assert_eq!(parse_meminfo_total("MemFree: 1 kB\n"), None);
+        assert_eq!(parse_cgroup_limit("1073741824\n"), Some(1 << 30));
+        assert_eq!(parse_cgroup_limit("max\n"), None, "cgroup v2: no limit");
+        assert_eq!(
+            parse_cgroup_limit("9223372036854771712\n"),
+            Some(9_223_372_036_854_771_712),
+            "cgroup v1's no-limit value parses; the min with MemTotal drops it"
+        );
+    }
+
+    /// The probe answers on every platform that ships (macOS, Linux, Windows); `None` there
+    /// would silently fall back to the 8 GiB cap whatever the machine has.
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    fn ram_probe_answers() {
+        let ram = physical_memory().expect("RAM is known on this platform");
+        assert!(ram >= 256 << 20, "{ram}");
+    }
+
+    #[test]
+    fn has_table_reflects_the_schema() {
+        let conn = temp_db();
+        assert!(has_table(&conn, "vec_chunk_owner"));
+        assert!(
+            !has_table(&conn, "idx_vec_chunk_owner_message"),
+            "an index, not a table"
+        );
+        conn.execute_batch("DROP TABLE vec_chunk_owner").unwrap();
+        assert!(!has_table(&conn, "vec_chunk_owner"), "re-read, not cached");
+    }
+
+    #[test]
+    fn has_index_reflects_the_schema() {
+        let conn = temp_db();
+        assert!(has_index(&conn, "idx_messages_cover"));
+        assert!(!has_index(&conn, "idx_messages_pending_embed"));
+        conn.execute_batch("DROP INDEX idx_messages_cover").unwrap();
+        assert!(
+            !has_index(&conn, "idx_messages_cover"),
+            "re-read, not cached"
+        );
     }
 
     #[test]

@@ -9,7 +9,13 @@ import {
   type SourceKind,
 } from "../lib/api";
 import { useUi } from "../store/ui";
-import { EMBED_ERROR_KEY, useEmbedError, useEmbedStatus, useIndexError } from "../lib/queries";
+import {
+  EMBED_ERROR_KEY,
+  useEmbedError,
+  useEmbedStatus,
+  useIndexError,
+  useIndexRewriting,
+} from "../lib/queries";
 import {
   InputGroup,
   InputGroupAddon,
@@ -87,6 +93,8 @@ export function SearchBar() {
   const embedError = useEmbedError();
   // A failed full reindex otherwise ends with no visible change after clicking Reindex.
   const indexError = useIndexError();
+  // Reindex and Build return without doing anything while Shrink index / Reclaim space runs.
+  const rewriting = useIndexRewriting();
   const buildIndex = useMutation({
     mutationFn: api.buildEmbeddings,
     // A retry starts clean; a new failure arrives as a fresh embed:error.
@@ -172,7 +180,7 @@ export function SearchBar() {
         <Button
           variant="secondary"
           onClick={() => reindex.mutate()}
-          disabled={indexing.data || reindex.isPending || embed.data?.running}
+          disabled={indexing.data || reindex.isPending || embed.data?.running || rewriting}
         >
           {indexing.data ? (
             <>
@@ -273,7 +281,7 @@ export function SearchBar() {
               size="xs"
               variant="outline"
               onClick={() => buildIndex.mutate()}
-              disabled={indexing.data || buildIndex.isPending}
+              disabled={indexing.data || buildIndex.isPending || rewriting}
               title={`${embed.data.done}/${embed.data.total} messages embedded`}
             >
               Build semantic index ({embedPct}%)

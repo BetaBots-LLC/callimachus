@@ -8,44 +8,27 @@
 //! source re-runs its (fingerprint-skipping) scan. Roots that don't exist at launch are
 //! picked up later by a periodic re-check, so an agent installed while the app sits in
 //! the tray still gets live indexing.
+//!
+//! Watch events only cover changes from the moment the watch starts, so once the roots
+//! are registered the watcher also runs one catch-up pass over every source, picking up
+//! the sessions agents wrote while the app was closed.
 
+use super::scanner_for;
 use crate::db;
-use notify::RecursiveMode;
-use notify_debouncer_full::{new_debouncer, DebounceEventResult};
+use notify::{RecommendedWatcher, RecursiveMode};
+use notify_debouncer_full::{new_debouncer_opt, DebounceEventResult, NoCache};
 use rusqlite::Connection;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::RecvTimeoutError;
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Emitter};
-
-/// A full-source scan, as registered in `indexer::scan_all_with_progress`.
-type Scan = fn(&mut Connection, &mut dyn FnMut()) -> anyhow::Result<super::IndexReport>;
+use tauri::{AppHandle, Emitter, Manager};
 
 /// How often to look for roots that didn't exist when the watcher started.
 const ROOT_RECHECK: Duration = Duration::from_secs(60);
 
-/// The full scan for a source kind. Every kind `watch_targets` can produce must be here
-/// (enforced by a test), or that source's events are silently dropped, which is how
-/// Copilot ended up watched but never live-indexed.
-fn scanner_for(kind: &str) -> Option<Scan> {
-    let scan: Scan = match kind {
-        k if k == super::claude::KIND => super::claude::scan,
-        k if k == super::codex::KIND => super::codex::scan,
-        k if k == super::cursor::KIND => super::cursor::scan,
-        k if k == super::gemini::KIND => super::gemini::scan,
-        k if k == super::qwen::KIND => super::qwen::scan,
-        k if k == super::goose::KIND => super::goose::scan,
-        k if k == super::opencode::KIND => super::opencode::scan,
-        k if k == super::continue_cli::KIND => super::continue_cli::scan,
-        k if k == super::cline::KIND => super::cline::scan,
-        k if k == super::roo::KIND => super::roo::scan,
-        k if k == super::kilo::KIND => super::kilo::scan,
-        k if k == super::copilot::KIND => super::copilot::scan,
-        _ => return None,
-    };
-    Some(scan)
-}
+/// How long to wait before retrying a catch-up deferred by a running reindex or embed build.
+const CATCH_UP_RETRY: Duration = Duration::from_secs(30);
 
 /// Minimum time between two scans of the same source. Cursor's state.vscdb takes writes
 /// for all editor state, not just chat, so its WAL changes constantly while Cursor is in
@@ -253,7 +236,17 @@ struct Pending {
 
 fn run(app: AppHandle) -> anyhow::Result<()> {
     let (tx, rx) = std::sync::mpsc::channel::<DebounceEventResult>();
-    let mut debouncer = new_debouncer(Duration::from_millis(800), None, tx)?;
+    // NoCache instead of the default file-id cache (FileIdMap on macOS and Windows): that
+    // cache walks and stats every file under each root on every watch() and rescan, only
+    // to stitch renames into one event. Routing here reads plain event paths, and an
+    // unstitched rename still reports both the old and the new path.
+    let mut debouncer = new_debouncer_opt::<_, RecommendedWatcher, NoCache>(
+        Duration::from_millis(800),
+        None,
+        tx,
+        NoCache,
+        notify::Config::default(),
+    )?;
 
     // Index on a DEDICATED connection, separate from the app's shared Mutex<Connection>.
     // Holding the shared lock across a re-scan was freezing every UI query ("stuck
@@ -269,12 +262,25 @@ fn run(app: AppHandle) -> anyhow::Result<()> {
     let mut pending: HashMap<&'static str, Pending> = HashMap::new();
     let mut last_run: HashMap<&'static str, Instant> = HashMap::new();
 
+    // Not on a first run: until something is indexed, indexing waits for the user to start
+    // it from onboarding. Roots are already watched, so a write during the pass is queued.
+    let mut catch_up_at = has_threads(&conn).then(Instant::now);
+
     loop {
-        // Sleep until the next deferred scan is due or the next root re-check.
+        if catch_up_at.is_some_and(|at| at <= Instant::now()) {
+            catch_up_at = if catch_up(&app, &mut conn, &mut last_run) {
+                None
+            } else {
+                Some(Instant::now() + CATCH_UP_RETRY)
+            };
+        }
+
+        // Sleep until the next deferred scan, catch-up retry or root re-check is due.
         let now = Instant::now();
         let next_due = pending
             .keys()
             .map(|k| due_at(k, &last_run))
+            .chain(catch_up_at)
             .min()
             .map(|d| d.saturating_duration_since(now));
         let until_root_check = ROOT_RECHECK.saturating_sub(last_root_check.elapsed());
@@ -324,6 +330,47 @@ fn run(app: AppHandle) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Whether anything has been indexed yet.
+fn has_threads(conn: &Connection) -> bool {
+    conn.query_row("SELECT EXISTS(SELECT 1 FROM threads)", [], |r| r.get(0))
+        .unwrap_or(false)
+}
+
+/// Re-scan every source once, on the watcher's own connection, to pick up what changed
+/// while the app was closed. Unchanged files cost a stat and one lookup each, so this is
+/// fast when there is nothing to do. Holds the reindex flag meanwhile, so a Reindex click
+/// doesn't start a second scan of the same files, then kicks auto-distill the way index_all
+/// does. Returns false, having done nothing, when a reindex, an embedding build or a
+/// whole-file rewrite already holds the writer.
+fn catch_up(
+    app: &AppHandle,
+    conn: &mut Connection,
+    last_run: &mut HashMap<&'static str, Instant>,
+) -> bool {
+    // Same rule as index_all: never fight a semantic build or a VACUUM for the write lock.
+    if app.state::<crate::EmbedJob>().is_running() || app.state::<crate::CompactJob>().0.is_set() {
+        return false;
+    }
+    // Cleared on drop, including when a scan panics, so Reindex is never left disabled.
+    let Some(job) = crate::JobGuard::try_acquire(&app.state::<crate::IndexJob>().0) else {
+        return false; // a reindex is running
+    };
+    for source in super::SOURCES {
+        let full = Pending {
+            paths: Vec::new(),
+            full: true,
+        };
+        reindex(app, conn, source.kind, full);
+        last_run.insert(source.kind, Instant::now());
+    }
+    // Released first: auto_distill_kick returns early while IndexJob is set. The launch kick
+    // usually lands during this pass and bails, and a drain running when it started yielded
+    // to it, so this kick is what distills the sessions written while the app was closed.
+    drop(job);
+    crate::auto_distill_kick(app);
+    true
 }
 
 fn due_at(kind: &str, last_run: &HashMap<&'static str, Instant>) -> Instant {
@@ -384,7 +431,7 @@ fn reindex(app: &AppHandle, conn: &mut Connection, kind: &'static str, work: Pen
     let mut report = run(conn);
     for _ in 0..2 {
         match &report {
-            Err(e) if is_db_locked(e) => {
+            Err(e) if db::is_busy(e) => {
                 std::thread::sleep(Duration::from_millis(500));
                 report = run(conn);
             }
@@ -402,35 +449,15 @@ fn reindex(app: &AppHandle, conn: &mut Connection, kind: &'static str, work: Pen
     }
 }
 
-/// Whether an error is SQLite's transient "database is locked" (busy) race.
-fn is_db_locked(e: &anyhow::Error) -> bool {
-    let s = e.to_string().to_ascii_lowercase();
-    s.contains("database is locked") || s.contains("database table is locked")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Every source kind the indexer knows must have a watcher scan arm.
+    /// Every kind the watcher can route must have a registered scan, or that source's
+    /// events are silently dropped (how Copilot once ended up watched but never
+    /// live-indexed).
     #[test]
-    fn every_source_kind_has_a_scanner() {
-        for kind in [
-            super::super::claude::KIND,
-            super::super::codex::KIND,
-            super::super::cursor::KIND,
-            super::super::gemini::KIND,
-            super::super::qwen::KIND,
-            super::super::goose::KIND,
-            super::super::opencode::KIND,
-            super::super::continue_cli::KIND,
-            super::super::cline::KIND,
-            super::super::roo::KIND,
-            super::super::kilo::KIND,
-            super::super::copilot::KIND,
-        ] {
-            assert!(scanner_for(kind).is_some(), "no watcher scan for {kind}");
-        }
+    fn every_watched_kind_has_a_scanner() {
         for t in watch_targets() {
             assert!(
                 scanner_for(t.kind).is_some(),

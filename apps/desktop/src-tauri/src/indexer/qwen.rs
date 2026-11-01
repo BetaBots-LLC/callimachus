@@ -7,11 +7,12 @@
 //! Schema verified against QwenLM/qwen-code `chatRecordingService.ts`. Recording
 //! can be disabled in Qwen, so an absent dir is not an error.
 
-use super::{set_file_state, source_id, upsert_thread, IndexReport, ParsedMessage, ParsedThread};
-use anyhow::{Context, Result};
+use super::common::parse_rfc3339;
+use super::gemini::{ingest_parts, parse_chat_jsonl, scan_chats};
+use super::{IndexReport, ParsedThread};
+use anyhow::Result;
 use rusqlite::Connection;
 use serde_json::Value;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 pub const KIND: &str = "qwen";
@@ -21,116 +22,19 @@ pub fn tmp_root() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".qwen").join("tmp"))
 }
 
-/// Recursively collect chat `.jsonl` files (inside a `chats/` segment).
-fn collect_chat_jsonl(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_chat_jsonl(&path, out);
-        } else if path.extension().and_then(|e| e.to_str()) == Some("jsonl")
-            && path.to_string_lossy().contains("/chats/")
-        {
-            out.push(path);
-        }
-    }
-}
-
-/// Walk every project tmp dir, (re)indexing chat files whose mtime/size changed.
+/// Walk every project tmp dir, (re)indexing chat files whose mtime/size changed. The
+/// walk, change detection and external ids (the path below the tmp root, '/'-joined) are
+/// Gemini's: Qwen Code keeps the Gemini CLI's layout.
 pub fn scan(conn: &mut Connection, tick: &mut dyn FnMut()) -> Result<IndexReport> {
-    let mut report = IndexReport::default();
-    let Some(root) = tmp_root() else {
-        return Ok(report);
-    };
-    if !root.is_dir() {
-        return Ok(report);
+    match tmp_root() {
+        Some(root) => scan_chats(conn, KIND, &root, parse_file, tick),
+        None => Ok(IndexReport::default()),
     }
-    let sid = source_id(conn, KIND)?;
-
-    let mut files = Vec::new();
-    collect_chat_jsonl(&root, &mut files);
-
-    for path in files {
-        tick();
-        match index_file(conn, sid, &root, &path) {
-            Ok(Some(n)) => {
-                report.threads_indexed += 1;
-                report.messages_indexed += n;
-            }
-            Ok(None) => report.threads_skipped += 1,
-            Err(_) => report.errors += 1,
-        }
-    }
-    Ok(report)
-}
-
-fn index_file(conn: &mut Connection, sid: i64, root: &Path, path: &Path) -> Result<Option<usize>> {
-    let path_str = path.to_string_lossy().to_string();
-    let meta = fs::metadata(path)?;
-    let size = meta.len() as i64;
-    let mtime = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-
-    if let Some((prev_mtime, prev_size)) = super::file_state(conn, &path_str)? {
-        if prev_mtime == mtime && prev_size == size {
-            return Ok(None);
-        }
-    }
-
-    let rel = path
-        .strip_prefix(root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .to_string();
-    let thread = parse_file(path, &rel).with_context(|| format!("parsing {path_str}"))?;
-    let n = if let Some(t) = thread {
-        upsert_thread(conn, sid, &t)?
-    } else {
-        0
-    };
-    set_file_state(conn, &path_str, KIND, mtime, size)?;
-    Ok(Some(n))
 }
 
 /// Parse a Qwen chat `.jsonl` file. Returns None if it has no messages.
 pub fn parse_file(path: &Path, external_id: &str) -> Result<Option<ParsedThread>> {
-    let content = fs::read_to_string(path)?;
-    let mut thread = ParsedThread {
-        external_id: external_id.to_string(),
-        ..Default::default()
-    };
-    let mut first_user_text: Option<String> = None;
-
-    for line in content.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let Ok(obj) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        ingest_line(&mut thread, &obj, &mut first_user_text);
-    }
-
-    if thread.messages.is_empty() {
-        return Ok(None);
-    }
-    if thread.title.is_none() {
-        thread.title = first_user_text.map(|t| {
-            let t = t.trim();
-            if t.chars().count() > 80 {
-                format!("{}…", t.chars().take(80).collect::<String>())
-            } else {
-                t.to_string()
-            }
-        });
-    }
-    Ok(Some(thread))
+    parse_chat_jsonl(path, external_id, ingest_line)
 }
 
 fn ingest_line(thread: &mut ParsedThread, obj: &Value, first_user_text: &mut Option<String>) {
@@ -147,7 +51,7 @@ fn ingest_line(thread: &mut ParsedThread, obj: &Value, first_user_text: &mut Opt
     let ts = obj
         .get("timestamp")
         .and_then(Value::as_str)
-        .and_then(parse_ts);
+        .and_then(parse_rfc3339);
     if let Some(ts) = ts {
         thread.created_at = Some(thread.created_at.map_or(ts, |c| c.min(ts)));
         thread.updated_at = Some(thread.updated_at.map_or(ts, |u| u.max(ts)));
@@ -159,77 +63,15 @@ fn ingest_line(thread: &mut ParsedThread, obj: &Value, first_user_text: &mut Opt
         Some("tool_result") => "tool",
         _ => return, // system / unknown — skipped
     };
-
     // Content lives in the nested Gemini `message` object: { role, parts: [...] }.
     let parts = obj.get("message").and_then(|m| m.get("parts"));
-    let before = thread.messages.len();
-    extract_parts(thread, role, parts, ts);
-    if role == "user" && first_user_text.is_none() {
-        if let Some(m) = thread.messages.get(before) {
-            if m.role == "user" {
-                *first_user_text = Some(m.text.clone());
-            }
-        }
-    }
-}
-
-/// Flatten a Gemini `parts` array into messages.
-fn extract_parts(thread: &mut ParsedThread, role: &str, parts: Option<&Value>, ts: Option<i64>) {
-    let push = |thread: &mut ParsedThread, role: &str, text: String, tool: Option<String>| {
-        let text = text.trim().to_string();
-        if !text.is_empty() {
-            thread.messages.push(ParsedMessage {
-                role: role.to_string(),
-                text,
-                tool_name: tool,
-                ts,
-            });
-        }
-    };
-
-    match parts {
-        Some(Value::String(s)) => push(thread, role, s.clone(), None),
-        Some(Value::Array(parts)) => {
-            for part in parts {
-                if let Some(t) = part.get("text").and_then(Value::as_str) {
-                    push(thread, role, t.to_string(), None);
-                } else if let Some(call) = part.get("functionCall") {
-                    let name = call
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .unwrap_or("tool")
-                        .to_string();
-                    let args = call.get("args").map(|v| v.to_string()).unwrap_or_default();
-                    push(thread, "assistant", format!("{name}: {args}"), Some(name));
-                } else if let Some(resp) = part.get("functionResponse") {
-                    let text = resp
-                        .get("response")
-                        .map(|v| v.to_string())
-                        .unwrap_or_else(|| resp.to_string());
-                    // Same head + tail cap as the Claude indexer (tool output is never
-                    // embedded or distilled, and dominated the index size).
-                    push(
-                        thread,
-                        "tool",
-                        super::claude::cap_tool_text(text.trim()),
-                        None,
-                    );
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
-fn parse_ts(s: &str) -> Option<i64> {
-    chrono::DateTime::parse_from_rfc3339(s)
-        .ok()
-        .map(|d| d.timestamp())
+    ingest_parts(thread, role, parts, ts, first_user_text);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::indexer::{source_id, upsert_thread};
     use std::io::Write;
 
     fn temp_path(name: &str) -> PathBuf {

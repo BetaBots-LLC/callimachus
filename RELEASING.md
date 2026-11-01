@@ -53,7 +53,10 @@ platform uploads into that draft, and `finalize` publishes it only after all
 three legs succeeded, all six standalone binaries are attached and `latest.json`
 covers every platform. So the updater (`releases/latest/download/latest.json`)
 never sees a half-uploaded release, and a failed leg leaves a draft to fix and
-re-run instead of a broken "Latest".
+re-run instead of a broken "Latest". The extension is the exception:
+`publish-extension.yml` doesn't wait for `build.yml`, so it reaches the VS Code
+Marketplace and Open VSX as soon as the tag is pushed, even if a desktop leg
+fails later.
 
 ## One-time setup
 
@@ -153,7 +156,9 @@ automatically.
      Marketplace + Open VSX, then waits for the draft and attaches the `.vsix` to
      **that same Release**.
 
-If a platform leg fails, the release stays a draft and nothing downstream runs.
+If a platform leg fails, the release stays a draft, and `finalize` and
+`publish-mcp` don't run (the extension is already on the marketplaces; only its
+`.vsix` waits in the draft).
 Fix the cause and use **Re-run failed jobs**: the legs upload into the same draft
 (assets are replaced), and `finalize` publishes once everything is there.
 
@@ -191,8 +196,12 @@ keeps `server.json` (the registry manifest) on the same version.
 - Per release, `build.yml`'s `publish-mcp` job (after `finalize` published the
   release) runs `npm publish` with trusted publishing, then a pinned,
   checksum-verified `mcp-publisher publish`, authenticating to the registry with
-  GitHub OIDC (`id-token: write`, no secret). Re-runs are safe: an
-  already-published npm version is skipped. Skipped on `-rc` / `-beta` tags.
+  GitHub OIDC (`id-token: write`, no secret). Re-runs skip an npm version that
+  is already published, but the registry step has no such check: the registry
+  needs a new version string for every publish, so on a re-run after a
+  successful publish, `mcp-publisher publish` fails. That failure is harmless
+  (the entry is already current); only a run that never reached the registry
+  needs it to succeed. Skipped on `-rc` / `-beta` tags.
 - **One-time, before the first publish**, claim the namespace and verify the npm
   package by hand from a clean checkout of the tagged commit:
 
@@ -254,8 +263,9 @@ Re-running `build.yml` for a tag reuses its existing release. While it is still 
 draft, the platform legs rebuild and replace its assets. Once it is published, a
 re-run never rebuilds or re-uploads anything: the build legs are skipped,
 `finalize` only checks that `SHA256SUMS` and `latest.json` are attached and leaves
-the release and its "Latest" flag alone, and only `publish-mcp` runs again (an npm
-version that is already published is skipped). Codesigned builds are not
+the release and its "Latest" flag alone, and only `publish-mcp` runs again (npm skips
+a version that is already published; the registry step fails if that version is
+already listed, which is harmless). Codesigned builds are not
 byte-reproducible, so fresh binaries would stop matching the `SHA256SUMS` bundled
 in the published `callimachus-mcp` package, and every `npx` download of that
 version would fail its checksum. To ship a fixed build, cut a new patch version
@@ -285,7 +295,20 @@ git tag v0.5.0 && git push origin v0.5.0    # → build.yml + publish-extension.
   The `mcp-publisher` and `trusted-signing-cli` downloads in `build.yml` are
   pinned by version and SHA-256; bump those by hand.
 - **Docker image.** `docker.yml` builds the `Dockerfile` (used by MCP registries
-  such as Glama to verify the server) and checks it answers `tools/list`.
+  such as Glama to verify the server) and checks it answers `tools/list`. It
+  builds in `rust:1-trixie` and copies only the binary (plus its entrypoint
+  script) into `debian:trixie-slim`
+  (glibc must stay >= 2.38 for ONNX Runtime). If the server starts linking a new
+  shared library, the runtime stage's `ldd` check fails the build: add the
+  library's package to that stage's `apt-get install` line.
+- **Windows uninstaller.** `bundle.windows.nsis.installerHooks` runs
+  `windows/hooks.nsh`: before an uninstall it runs
+  `callimachus.exe --uninstall-integration` (removing the `/recall` skill, MCP
+  entries, Claude Code hooks and `cal.exe`). In-app updates, which run the
+  uninstaller with `/UPDATE`, skip it. The `.msi` has no equivalent step (Tauri
+  takes installer hooks only for NSIS), so uninstalling an MSI install leaves the
+  hooks pointing at the deleted exe. Test both installers on Windows after
+  touching either.
 
 ## Adding an RC auto-update channel (later)
 

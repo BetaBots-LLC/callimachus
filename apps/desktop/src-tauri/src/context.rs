@@ -82,6 +82,75 @@ pub fn redact_secrets(text: &str) -> Cow<'_, str> {
     }
 }
 
+/// Serialize `value` as compact JSON with every string in it run through
+/// [`redact_secrets`]: the shared exit for JSON payloads built from index rows (titles,
+/// snippets, fact text, error signatures) that go to a model provider or another agent.
+///
+/// Each string is scrubbed while it is written, not the finished document, so a match can
+/// never run into a closing quote or an escape and the output stays valid JSON. Numbers and
+/// key order come out exactly as `serde_json::to_string` prints them (a round trip through
+/// `serde_json::Value` would widen every f32 score to its f64 digits).
+pub fn to_redacted_json<T: serde::Serialize + ?Sized>(value: &T) -> serde_json::Result<String> {
+    use serde::ser::Error as _;
+    let mut out = Vec::with_capacity(256);
+    let mut ser = serde_json::Serializer::with_formatter(&mut out, RedactingFormatter::default());
+    value.serialize(&mut ser)?;
+    String::from_utf8(out).map_err(serde_json::Error::custom)
+}
+
+/// The compact formatter, except that a string's text is collected between `begin_string`
+/// and `end_string` and written out redacted. Integer map keys, which serde_json writes
+/// straight to the output between the two quotes, pass through untouched.
+#[derive(Default)]
+struct RedactingFormatter {
+    /// The current string's text, unescaped.
+    buf: String,
+}
+
+impl serde_json::ser::Formatter for RedactingFormatter {
+    fn write_string_fragment<W>(&mut self, _: &mut W, fragment: &str) -> std::io::Result<()>
+    where
+        W: ?Sized + std::io::Write,
+    {
+        self.buf.push_str(fragment);
+        Ok(())
+    }
+
+    fn write_char_escape<W>(
+        &mut self,
+        _: &mut W,
+        escape: serde_json::ser::CharEscape,
+    ) -> std::io::Result<()>
+    where
+        W: ?Sized + std::io::Write,
+    {
+        use serde_json::ser::CharEscape::*;
+        self.buf.push(match escape {
+            Quote => '"',
+            ReverseSolidus => '\\',
+            Solidus => '/',
+            Backspace => '\u{8}',
+            FormFeed => '\u{c}',
+            LineFeed => '\n',
+            CarriageReturn => '\r',
+            Tab => '\t',
+            AsciiControl(b) => char::from(b),
+        });
+        Ok(())
+    }
+
+    fn end_string<W>(&mut self, writer: &mut W) -> std::io::Result<()>
+    where
+        W: ?Sized + std::io::Write,
+    {
+        let text = std::mem::take(&mut self.buf);
+        let quoted =
+            serde_json::to_string(&*redact_secrets(&text)).map_err(std::io::Error::other)?;
+        // `quoted` carries both quotes; the default `begin_string` already wrote the opening one.
+        writer.write_all(&quoted.as_bytes()[1..])
+    }
+}
+
 /// The byte range to replace if a secret starts at `i`.
 fn secret_at(b: &[u8], i: usize) -> Option<(usize, usize)> {
     let boundary = i == 0 || !b[i - 1].is_ascii_alphanumeric();
@@ -815,6 +884,47 @@ mod tests {
             .unwrap();
         assert!(!out.contains("sk-ant-api03"), "{out}");
         assert!(out.contains("here is my key [REDACTED] thanks"));
+    }
+
+    #[test]
+    fn redacted_json_scrubs_every_string_and_keeps_the_rest_byte_identical() {
+        #[derive(serde::Serialize)]
+        struct Row {
+            title: Option<String>,
+            score: f32,
+            by_id: std::collections::BTreeMap<i64, String>,
+            tags: Vec<String>,
+        }
+        let key = "sk-ant-api03-AbCdEfGhIjKlMnOpQrStUv0123456789";
+        let row = Row {
+            title: Some(format!("\"quoted\"\tpath C:\\x {key}\nnext")),
+            score: 0.85,
+            by_id: [(7, format!("token={key}"))].into(),
+            tags: vec![format!("[{key}]"), "plain".into()],
+        };
+        let out = to_redacted_json(&row).unwrap();
+        assert!(!out.contains("sk-ant-api03"), "{out}");
+        let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+        assert_eq!(
+            v["title"], "\"quoted\"\tpath C:\\x [REDACTED]\nnext",
+            "escapes survive the scrub"
+        );
+        assert_eq!(v["by_id"]["7"], "token=[REDACTED]");
+        assert_eq!(v["tags"][0], "[[REDACTED]]");
+        // f32 digits and integer map keys print exactly as plain serde_json does.
+        assert!(out.contains("\"score\":0.85,"), "{out}");
+        assert!(out.contains("\"by_id\":{\"7\":"), "{out}");
+        // Clean input comes out byte-identical to serde_json::to_string.
+        let clean = Row {
+            title: Some("a \"b\" \\ c\n\u{1}d".into()),
+            score: 0.1,
+            by_id: [(1, "x".into())].into(),
+            tags: vec![],
+        };
+        assert_eq!(
+            to_redacted_json(&clean).unwrap(),
+            serde_json::to_string(&clean).unwrap()
+        );
     }
 
     #[test]

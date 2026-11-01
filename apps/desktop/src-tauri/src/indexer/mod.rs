@@ -6,6 +6,7 @@
 pub mod claude;
 pub mod cline;
 pub mod codex;
+pub mod common;
 pub mod continue_cli;
 pub mod copilot;
 pub mod cursor;
@@ -66,6 +67,126 @@ pub struct IndexReport {
     pub errors: usize,
 }
 
+impl IndexReport {
+    /// Count one file or thread a scan processed: `Some(n)` was indexed with `n` messages,
+    /// `None` was unchanged or skipped on purpose, and an error is counted, not raised, so
+    /// one bad file never aborts the rest of the pass.
+    pub fn record(&mut self, result: Result<Option<usize>>) {
+        match result {
+            Ok(Some(n)) => {
+                self.threads_indexed += 1;
+                self.messages_indexed += n;
+            }
+            Ok(None) => self.threads_skipped += 1,
+            Err(_) => self.errors += 1,
+        }
+    }
+
+    /// Fold another pass's tally into this one.
+    fn add(&mut self, other: &IndexReport) {
+        self.threads_indexed += other.threads_indexed;
+        self.threads_skipped += other.threads_skipped;
+        self.messages_indexed += other.messages_indexed;
+        self.errors += other.errors;
+    }
+}
+
+/// A full scan of one source. `tick` is called once per thread (or file) processed, so a
+/// caller can drive a progress bar.
+pub type Scan = fn(&mut Connection, &mut dyn FnMut()) -> Result<IndexReport>;
+
+/// One indexed source.
+pub struct Source {
+    /// The `sources.kind` row (seeded by migration) and the frontend's `SourceKind`.
+    pub kind: &'static str,
+    pub scan: Scan,
+    /// The indexer stores tool results through `claude::cap_tool_text`. Only these sources'
+    /// tool rows may be compacted by cleanup: compacting any other source's rows would just
+    /// be undone by its next re-index, which sees a mismatch and stores the full text again.
+    pub caps_tool_output: bool,
+}
+
+/// Every source, in full-scan order. This is the one list to extend when adding a source:
+/// the full reindex, the per-source reindex command, the watcher and tool-output cleanup all
+/// read it, and tests check it against the `sources` table and the telemetry allowlist.
+pub const SOURCES: &[Source] = &[
+    Source {
+        kind: claude::KIND,
+        scan: claude::scan,
+        caps_tool_output: true,
+    },
+    Source {
+        kind: codex::KIND,
+        scan: codex::scan,
+        caps_tool_output: true,
+    },
+    Source {
+        kind: cursor::KIND,
+        scan: cursor::scan,
+        caps_tool_output: false,
+    },
+    Source {
+        kind: gemini::KIND,
+        scan: gemini::scan,
+        caps_tool_output: true,
+    },
+    Source {
+        kind: qwen::KIND,
+        scan: qwen::scan,
+        caps_tool_output: true,
+    },
+    Source {
+        kind: goose::KIND,
+        scan: goose::scan,
+        caps_tool_output: false,
+    },
+    Source {
+        kind: opencode::KIND,
+        scan: opencode::scan,
+        caps_tool_output: false,
+    },
+    Source {
+        kind: continue_cli::KIND,
+        scan: continue_cli::scan,
+        caps_tool_output: true,
+    },
+    Source {
+        kind: cline::KIND,
+        scan: cline::scan,
+        caps_tool_output: true,
+    },
+    Source {
+        kind: roo::KIND,
+        scan: roo::scan,
+        caps_tool_output: true,
+    },
+    Source {
+        kind: kilo::KIND,
+        scan: kilo::scan,
+        caps_tool_output: true,
+    },
+    Source {
+        kind: copilot::KIND,
+        scan: copilot::scan,
+        caps_tool_output: false,
+    },
+];
+
+/// The full scan for a source kind, or None for a kind no indexer handles (`in_app`, a
+/// typo). Callers that take a kind from outside (a command argument, a watch route) use
+/// this instead of matching kinds by hand, so a new source can't be missed.
+pub fn scanner_for(kind: &str) -> Option<Scan> {
+    SOURCES.iter().find(|s| s.kind == kind).map(|s| s.scan)
+}
+
+/// Kinds whose tool rows are stored capped (see [`Source::caps_tool_output`]).
+pub fn capped_tool_sources() -> impl Iterator<Item = &'static str> {
+    SOURCES
+        .iter()
+        .filter(|s| s.caps_tool_output)
+        .map(|s| s.kind)
+}
+
 /// Index every source, one at a time, summing the reports. Calls `on_progress(threads_seen,
 /// current_source)` thread-granularly (throttled) so a background reindex can drive a live
 /// progress bar even while one big source churns. Pass `|_, _| {}` to ignore progress.
@@ -73,46 +194,27 @@ pub fn scan_all_with_progress(
     conn: &mut Connection,
     mut on_progress: impl FnMut(usize, &str),
 ) -> Result<IndexReport> {
-    type Scan = fn(&mut Connection, &mut dyn FnMut()) -> Result<IndexReport>;
-    let sources: [(&str, Scan); 12] = [
-        ("claude_code", claude::scan),
-        ("codex", codex::scan),
-        ("cursor", cursor::scan),
-        ("gemini", gemini::scan),
-        ("qwen", qwen::scan),
-        ("goose", goose::scan),
-        ("opencode", opencode::scan),
-        ("continue", continue_cli::scan),
-        ("cline", cline::scan),
-        ("roo", roo::scan),
-        ("kilo", kilo::scan),
-        ("copilot", copilot::scan),
-    ];
     // Progress is THREAD-granular, not source-granular: each source ticks once per thread
     // it processes (indexed OR skipped), so the bar keeps moving even while one big source
     // (usually Claude Code) churns through thousands of files. `seen` is the running count
     // across all sources; the total isn't known up front, so the UI renders it indeterminate.
     let mut total = IndexReport::default();
     let mut seen = 0usize;
-    for (name, scan) in sources.into_iter() {
+    for source in SOURCES {
+        let name = source.kind;
         on_progress(seen, name);
         // Isolate per-source failures: a single source erroring (a missing/locked
         // agent DB, an OS-specific quirk, a malformed store) must NOT abort the whole
         // index and zero out every other source. Log it, count it, keep going — the
         // same resilience each scan already applies per-file.
-        match scan(conn, &mut || {
+        match (source.scan)(conn, &mut || {
             seen += 1;
             // Emit the first 50 per-thread (so movement is obviously live), then every 10.
             if seen <= 50 || seen.is_multiple_of(10) {
                 on_progress(seen, name);
             }
         }) {
-            Ok(r) => {
-                total.threads_indexed += r.threads_indexed;
-                total.threads_skipped += r.threads_skipped;
-                total.messages_indexed += r.messages_indexed;
-                total.errors += r.errors;
-            }
+            Ok(r) => total.add(&r),
             Err(e) => {
                 eprintln!("[index] source '{name}' failed: {e:#}");
                 total.errors += 1;
@@ -321,12 +423,59 @@ pub fn upsert_thread(
         .iter()
         .filter(|m| m.role == "user" || m.role == "assistant")
         .count() as i64;
-    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    // Re-check under the write lock: the watcher indexes on its own connection, so a delete
-    // that committed after the check above would otherwise be undone by the INSERT below
-    // (the thread comes back next to its own tombstone). Dropping `tx` rolls back.
-    if crate::cleanup::is_tombstoned(&tx, source_id, &thread.external_id)? {
+    // On its own, the write is one IMMEDIATE transaction: it takes the write lock up front,
+    // so the busy handler waits for another writer instead of failing a read-to-write
+    // upgrade. Inside a caller's open transaction (claude::scan batches a full scan into a
+    // few commits) it is a savepoint, so a failing thread rolls back only its own rows.
+    // Either way, dropping the scope without committing rolls it back.
+    let written = if conn.is_autocommit() {
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let written = write_thread(&tx, source_id, thread, now, bytes, distillable)?;
+        if written {
+            tx.commit()?;
+        }
+        written
+    } else {
+        let sp = conn.savepoint()?;
+        let written = write_thread(&sp, source_id, thread, now, bytes, distillable)?;
+        if written {
+            sp.commit()?;
+        }
+        written
+    };
+    if !written {
         return Ok(0);
+    }
+    // A re-index does a full message replace; on a huge changed thread (FTS re-tokenizes
+    // everything) that can take seconds. Log the slow ones so a stall is visible/explained
+    // in the terminal rather than looking like a hang.
+    let elapsed = t0.elapsed();
+    if elapsed.as_millis() > 1500 {
+        eprintln!(
+            "[index] slow thread: {} messages, {} KB took {:.1}s",
+            thread.messages.len(),
+            bytes / 1024,
+            elapsed.as_secs_f64(),
+        );
+    }
+    Ok(thread.messages.len())
+}
+
+/// The body of [`upsert_thread`], run under the write lock `tx` holds. Returns false (and
+/// writes nothing) when the thread was tombstoned.
+fn write_thread(
+    tx: &Connection,
+    source_id: i64,
+    thread: &ParsedThread,
+    now: i64,
+    bytes: i64,
+    distillable: i64,
+) -> Result<bool> {
+    // Re-check under the write lock: the watcher indexes on its own connection, so a delete
+    // that committed after the early check would otherwise be undone by the INSERT below
+    // (the thread comes back next to its own tombstone).
+    if crate::cleanup::is_tombstoned(tx, source_id, &thread.external_id)? {
+        return Ok(false);
     }
 
     let project_key = thread.project_path.as_deref().and_then(canonical_project);
@@ -479,7 +628,7 @@ pub fn upsert_thread(
     // The LLM-distilled facts (extractor='llm') are left untouched here. Gated on the
     // opt-in: when knowledge is off we don't write todo facts at all. Subagent threads are
     // skipped: their "TODO"s are the parent agent's task list echoed back, not the user's.
-    if crate::knowledge::get_config(&tx)?.enabled && !thread.is_subagent {
+    if crate::knowledge::get_config(tx)?.enabled && !thread.is_subagent {
         const MAX_TODOS_PER_THREAD: usize = 25;
         // Keep CURATED todos (done / dismissed / pinned) so closing one survives re-index;
         // re-derive only the open, untouched ones.
@@ -617,20 +766,7 @@ pub fn upsert_thread(
         }
     }
 
-    tx.commit()?;
-    // A re-index does a full message replace; on a huge changed thread (FTS re-tokenizes
-    // everything) that can take seconds. Log the slow ones so a stall is visible/explained
-    // in the terminal rather than looking like a hang.
-    let elapsed = t0.elapsed();
-    if elapsed.as_millis() > 1500 {
-        eprintln!(
-            "[index] slow thread: {} messages, {} KB took {:.1}s",
-            thread.messages.len(),
-            bytes / 1024,
-            elapsed.as_secs_f64(),
-        );
-    }
-    Ok(thread.messages.len())
+    Ok(true)
 }
 
 /// True when `stored` is a tool row indexed before the index-time tool-output cap and `new`
@@ -756,17 +892,22 @@ pub fn open_external_readonly(path: &Path) -> Result<Connection> {
 /// succeed. Writing it here (before the work) would let the watcher's retry skip threads
 /// that failed mid-pass on a transient write-lock, silently dropping them.
 pub fn file_change_state(conn: &Connection, path: &Path) -> Result<(bool, i64, i64)> {
+    let (mtime, size) = file_stamp(path)?;
+    let path_str = path.to_string_lossy().to_string();
+    let unchanged = matches!(file_state(conn, &path_str)?, Some((m, s)) if m == mtime && s == size);
+    Ok((unchanged, mtime, size))
+}
+
+/// A file's `(mtime in epoch seconds, size in bytes)`: the change key every indexer stores
+/// in `index_state`. An mtime the platform can't report reads as 0.
+pub fn file_stamp(path: &Path) -> std::io::Result<(i64, i64)> {
     let meta = std::fs::metadata(path)?;
-    let size = meta.len() as i64;
     let mtime = meta
         .modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    let path_str = path.to_string_lossy().to_string();
-    let unchanged = matches!(file_state(conn, &path_str)?, Some((m, s)) if m == mtime && s == size);
-    Ok((unchanged, mtime, size))
+        .map_or(0, |d| d.as_secs() as i64);
+    Ok((mtime, meta.len() as i64))
 }
 
 #[cfg(test)]
@@ -1114,6 +1255,95 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&p);
+    }
+
+    /// Inside a caller's open transaction (claude::scan's batches) upsert_thread uses a
+    /// savepoint: it doesn't fail on "transaction within a transaction", and a thread it
+    /// skips (tombstoned) leaves the rest of the batch intact.
+    #[test]
+    fn upsert_inside_an_open_transaction_uses_a_savepoint() {
+        let mut conn = temp_db("sp");
+        let sid = source_id(&conn, "claude_code").unwrap();
+        conn.execute(
+            "INSERT INTO deleted_threads (source_id, external_id, deleted_at) VALUES (?1, 'gone', 0)",
+            [sid],
+        )
+        .unwrap();
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        assert_eq!(
+            upsert_thread(&mut conn, sid, &thread_with(&["a", "b"])).unwrap(),
+            2
+        );
+        let mut gone = thread_with(&["c"]);
+        gone.external_id = "gone".into();
+        assert_eq!(upsert_thread(&mut conn, sid, &gone).unwrap(), 0);
+        assert!(!conn.is_autocommit(), "the outer transaction is still open");
+        conn.execute_batch("COMMIT").unwrap();
+        let ids: Vec<String> = conn
+            .prepare("SELECT external_id FROM threads")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(ids, vec!["t1"]);
+    }
+
+    /// Every registered kind has its `sources` row (else every scan of it fails with
+    /// "unknown source kind") and is on the telemetry allowlist (else its events report
+    /// "other"), and no kind is registered twice.
+    #[test]
+    fn the_source_registry_matches_the_schema_and_telemetry() {
+        let conn = temp_db("registry");
+        let mut kinds = std::collections::HashSet::new();
+        for s in super::SOURCES {
+            assert!(kinds.insert(s.kind), "{} registered twice", s.kind);
+            assert!(
+                source_id(&conn, s.kind).is_ok(),
+                "no sources row for {}",
+                s.kind
+            );
+            assert!(
+                crate::telemetry::SOURCES.contains(&s.kind),
+                "{} missing from telemetry::SOURCES",
+                s.kind
+            );
+            assert!(super::scanner_for(s.kind).is_some());
+        }
+        assert!(super::scanner_for("in_app").is_none());
+    }
+
+    /// `caps_tool_output` must match what each indexer does: cleanup compacts exactly the
+    /// flagged sources' tool rows, and compacting a source that stores full tool output
+    /// would be undone (and the thread rewritten) on its next re-index.
+    #[test]
+    fn caps_tool_output_matches_the_indexers() {
+        use super::{claude, cline, codex, continue_cli, copilot, cursor, gemini, goose};
+        use super::{kilo, opencode, qwen, roo};
+        for s in super::SOURCES {
+            let code = match s.kind {
+                claude::KIND => include_str!("claude.rs"),
+                codex::KIND => include_str!("codex.rs"),
+                cursor::KIND => include_str!("cursor.rs"),
+                // Qwen parses through Gemini's shared parts flattener.
+                gemini::KIND | qwen::KIND => include_str!("gemini.rs"),
+                goose::KIND => include_str!("goose.rs"),
+                opencode::KIND => include_str!("opencode.rs"),
+                continue_cli::KIND => include_str!("continue_cli.rs"),
+                // Roo and Kilo run Cline's engine.
+                cline::KIND | roo::KIND | kilo::KIND => include_str!("cline.rs"),
+                copilot::KIND => include_str!("copilot.rs"),
+                other => panic!("add {other}'s indexer source here"),
+            };
+            assert_eq!(
+                code.contains("cap_tool_text("),
+                s.caps_tool_output,
+                "{}: caps_tool_output disagrees with its indexer",
+                s.kind
+            );
+        }
+        let capped: Vec<&str> = super::capped_tool_sources().collect();
+        assert!(capped.contains(&claude::KIND) && !capped.contains(&cursor::KIND));
     }
 
     #[test]

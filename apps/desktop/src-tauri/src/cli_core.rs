@@ -11,6 +11,9 @@ use crate::{
     agent, context, cost, db, embed, export, gitlink, issues, knowledge, search, secrets, snapshot,
 };
 use rusqlite::Connection;
+use std::borrow::Cow;
+use std::fmt::Write as _;
+use std::mem::ManuallyDrop;
 
 /// Subcommands that identify a `cal` invocation when the app is launched directly.
 pub const COMMANDS: &[&str] = &[
@@ -121,9 +124,7 @@ USAGE:
   cal help
 
 OPTIONS:
-  -s, --source SOURCE   filter by source kind (claude_code, codex, cursor,
-                        gemini, qwen, goose, opencode, continue, cline, roo,
-                        kilo, in_app)
+  -s, --source SOURCE   filter by source kind ({SOURCE_KINDS})
   -p, --project PATH    substring-match the project path
       --starred         only starred threads (recent/related/search)
   -t, --tag TAG         only threads with this tag (repeatable)
@@ -137,7 +138,53 @@ OPTIONS:
   -o, --out FILE        write `export` output to FILE instead of a vault/stdout
   -S, --synthesize      prepend an LLM summary / decisions / gotchas / TODOs
                         to `export` (uses the first stored provider key)
-      --json            machine-readable JSON output";
+      --json            machine-readable JSON output
+      --raw             show stored text unredacted (query commands redact
+                        secrets by default; cat, export and hooks always do)";
+
+/// Where [`usage`] puts the `-s` source kinds.
+const SOURCE_KINDS_SLOT: &str = "{SOURCE_KINDS}";
+/// The OPTIONS description column, and the width the source kinds wrap to, matching the
+/// hand-wrapped lines around them.
+const OPTION_DESC_COL: usize = 24;
+const USAGE_WIDTH: usize = 76;
+
+/// `cal help`: [`USAGE`] with the `-s` source kinds filled in from `indexer::SOURCES` (plus
+/// `in_app`, the app's own chats, which no indexer scans). The registry is the one list to
+/// extend when adding a source, so a hand-written copy here would drift (it once lacked
+/// copilot).
+fn usage() -> String {
+    let kinds: Vec<&str> = crate::indexer::SOURCES
+        .iter()
+        .map(|s| s.kind)
+        .chain(["in_app"])
+        .collect();
+    let at = USAGE
+        .find(SOURCE_KINDS_SLOT)
+        .expect("USAGE has the source kinds slot");
+    let mut col = at - USAGE[..at].rfind('\n').map_or(0, |nl| nl + 1);
+    let mut list = String::new();
+    for (i, kind) in kinds.iter().enumerate() {
+        // Each kind carries its trailing "," or, for the last one, the closing ")".
+        let width = kind.len() + 1;
+        if i > 0 {
+            if col + 1 + width > USAGE_WIDTH {
+                list.push('\n');
+                list.push_str(&" ".repeat(OPTION_DESC_COL));
+                col = OPTION_DESC_COL;
+            } else {
+                list.push(' ');
+                col += 1;
+            }
+        }
+        list.push_str(kind);
+        if i + 1 < kinds.len() {
+            list.push(',');
+        }
+        col += width;
+    }
+    USAGE.replacen(SOURCE_KINDS_SLOT, &list, 1)
+}
 
 /// Hook targets Claude Code runs inside the agent loop (SessionStart, PreCompact,
 /// UserPromptSubmit). They must never fail visibly: Claude Code shows a non-zero exit plus
@@ -181,7 +228,7 @@ fn run_hook_silently(args: &[String]) -> i32 {
 
 pub fn run(args: &[String]) -> anyhow::Result<()> {
     let Some((cmd, rest)) = args.split_first() else {
-        println!("{USAGE}");
+        println!("{}", usage());
         return Ok(());
     };
     match cmd.as_str() {
@@ -224,7 +271,7 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
             Ok(())
         }
         "help" | "-h" | "--help" => {
-            println!("{USAGE}");
+            println!("{}", usage());
             Ok(())
         }
         other => anyhow::bail!("unknown command '{other}'. Run `cal help`."),
@@ -250,7 +297,39 @@ struct Opts {
     because: Option<String>,
     /// `hook`: max chars to print.
     budget: Option<usize>,
+    /// `--raw`: print stored text as is instead of redacting secrets (see [`Opts::shown`]).
+    raw: bool,
     positional: Vec<String>,
+}
+
+/// The output boundary for stored history. Query commands print titles, snippets, facts and
+/// error text straight from the index, which keeps transcripts unredacted, and agents run
+/// them too: the /recall skill falls back to `cal` when MCP isn't wired, and the VS Code
+/// extension reads `--json`. So everything printed goes through these two helpers, redacted
+/// unless the user passed `--raw` for their own terminal. `cat`, `export` and the hooks
+/// redact on their own (packed transcripts, `export::fact_line`) and never honor `--raw`.
+impl Opts {
+    /// Stored text for human output: secrets redacted unless `--raw`.
+    fn shown<'a>(&self, text: &'a str) -> Cow<'a, str> {
+        if self.raw {
+            Cow::Borrowed(text)
+        } else {
+            context::redact_secrets(text)
+        }
+    }
+
+    /// A `--json` payload, pretty-printed, with every string redacted unless `--raw`.
+    fn json<T: serde::Serialize + ?Sized>(&self, value: &T) -> anyhow::Result<String> {
+        if self.raw {
+            return Ok(serde_json::to_string_pretty(value)?);
+        }
+        // `to_redacted_json` writes compact JSON; re-indent it so `--json` prints exactly as
+        // before. Lossless: serde_json keeps key order (preserve_order), and every number
+        // parses back to the value whose shortest form it was printed as.
+        let compact = context::to_redacted_json(value)?;
+        let v: serde_json::Value = serde_json::from_str(&compact)?;
+        Ok(serde_json::to_string_pretty(&v)?)
+    }
 }
 
 fn parse(args: &[String]) -> anyhow::Result<Opts> {
@@ -285,6 +364,7 @@ fn parse(args: &[String]) -> anyhow::Result<Opts> {
             "--starred" => o.starred = true,
             "--off" => o.off = true,
             "--json" => o.json = true,
+            "--raw" => o.raw = true,
             s if s.starts_with('-') && s.len() > 1 => anyhow::bail!("unknown flag '{s}'"),
             _ => o.positional.push(a.clone()),
         }
@@ -339,14 +419,23 @@ fn filters(o: &Opts) -> search::SearchFilters {
 /// working directory, and a 128 MB model download must not start from there. Without the
 /// model the app downloaded, semantic features fall back to keyword results or come back
 /// empty, and this says so once on stderr (stdout stays clean for `--json`).
-fn cli_embedder() -> embed::Embedder {
+fn cli_embedder() -> ManuallyDrop<embed::Embedder> {
     if !embed::model_is_cached() {
         eprintln!(
             "note: semantic search is unavailable until the embedding model is downloaded \
              (open Callimachus and build the semantic index); using keyword matches only"
         );
     }
-    embed::Embedder::cached_only()
+    one_shot_embedder()
+}
+
+/// A cached-only embedder that is never dropped. Every `cal` command is a one-shot process
+/// that exits right after it prints, and tearing down a loaded model (the ONNX session and
+/// its thread pool) only spends ~3 ms freeing memory the OS reclaims at exit anyway. That
+/// adds up on `recall-now`, which runs on every prompt, hit or not. Only for `cal`: the app
+/// and the MCP server are long-lived and must drop theirs.
+fn one_shot_embedder() -> ManuallyDrop<embed::Embedder> {
+    ManuallyDrop::new(embed::Embedder::cached_only())
 }
 
 fn cmd_search(args: &[String]) -> anyhow::Result<()> {
@@ -354,30 +443,47 @@ fn cmd_search(args: &[String]) -> anyhow::Result<()> {
     if o.positional.is_empty() {
         anyhow::bail!("search needs a query. e.g. `cal search \"vector index\"`");
     }
-    let query = o.positional.join(" ");
     let conn = open_db()?;
-    let f = filters(&o);
-    let hits = if o.hybrid {
+    print!("{}", search_output(&conn, &o)?);
+    Ok(())
+}
+
+/// `cal search`'s stdout (the no-matches note goes to stderr).
+fn search_output(conn: &Connection, o: &Opts) -> anyhow::Result<String> {
+    let query = o.positional.join(" ");
+    let f = filters(o);
+    let mut hits = if o.hybrid {
         let embedder = cli_embedder();
-        search::hybrid(&conn, &embedder, &query, &f)?
+        search::hybrid(conn, &embedder, &query, &f)?
     } else {
-        search::search(&conn, &query, &f)?
+        search::search(conn, &query, &f)?
     };
 
     if o.json {
-        println!("{}", serde_json::to_string_pretty(&hits)?);
-        return Ok(());
+        if !o.raw {
+            // JSON keeps the FTS match sentinels (the VS Code sidebar highlights with them),
+            // but one landing inside a key splits it so the redaction pattern no longer sees
+            // it. A snippet hiding a secret that way goes out plain, without highlights.
+            for h in &mut hits {
+                if let Cow::Owned(clean) = context::redact_secrets(&strip_marks(&h.snippet)) {
+                    h.snippet = clean;
+                }
+            }
+        }
+        return Ok(format!("{}\n", o.json(&hits)?));
     }
     if hits.is_empty() {
         eprintln!("no matches for {query:?}");
-        return Ok(());
+        return Ok(String::new());
     }
+    let mut out = String::new();
     for h in &hits {
         let title = h.title.as_deref().unwrap_or("(untitled)");
-        println!("[{}] {:<11} {}", h.thread_id, h.source, title);
-        println!("    {}", strip_marks(&h.snippet));
+        writeln!(out, "[{}] {:<11} {}", h.thread_id, h.source, o.shown(title))?;
+        // Marks out first, so one inside a key can't hide it from the redaction.
+        writeln!(out, "    {}", o.shown(&strip_marks(&h.snippet)))?;
     }
-    Ok(())
+    Ok(out)
 }
 
 fn cmd_related(args: &[String]) -> anyhow::Result<()> {
@@ -404,7 +510,7 @@ fn cmd_related(args: &[String]) -> anyhow::Result<()> {
     let rows = search::related(&conn, &embedder, &text, &filters(&o))?;
 
     if o.json {
-        println!("{}", serde_json::to_string_pretty(&rows)?);
+        println!("{}", o.json(&rows)?);
         return Ok(());
     }
     if rows.is_empty() {
@@ -415,7 +521,10 @@ fn cmd_related(args: &[String]) -> anyhow::Result<()> {
         let title = t.title.as_deref().unwrap_or("(untitled)");
         println!(
             "[{}] {:<11} {}  ({} msgs)",
-            t.id, t.source, title, t.message_count
+            t.id,
+            t.source,
+            o.shown(title),
+            t.message_count
         );
     }
     Ok(())
@@ -424,28 +533,35 @@ fn cmd_related(args: &[String]) -> anyhow::Result<()> {
 fn cmd_recent(args: &[String]) -> anyhow::Result<()> {
     let o = parse(args)?;
     let conn = open_db()?;
-    let rows = search::recent_threads(&conn, &filters(&o))?;
+    print!("{}", recent_output(&conn, &o)?);
+    Ok(())
+}
+
+/// `cal recent`'s stdout (the empty-index note goes to stderr).
+fn recent_output(conn: &Connection, o: &Opts) -> anyhow::Result<String> {
+    let rows = search::recent_threads(conn, &filters(o))?;
 
     if o.json {
-        println!("{}", serde_json::to_string_pretty(&rows)?);
-        return Ok(());
+        return Ok(format!("{}\n", o.json(&rows)?));
     }
     if rows.is_empty() {
         eprintln!("no threads indexed yet");
-        return Ok(());
+        return Ok(String::new());
     }
+    let mut out = String::new();
     for t in &rows {
         let title = t.title.as_deref().unwrap_or("(untitled)");
-        println!(
+        writeln!(
+            out,
             "[{}] {:<11} {}  ({} msgs · {})",
             t.id,
             t.source,
-            title,
+            o.shown(title),
             t.message_count,
             fmt_time(t.updated_at)
-        );
+        )?;
     }
-    Ok(())
+    Ok(out)
 }
 
 fn thread_id_arg(o: &Opts, cmd: &str) -> anyhow::Result<i64> {
@@ -490,7 +606,7 @@ fn cmd_tags(args: &[String]) -> anyhow::Result<()> {
     let conn = open_db()?;
     let tags = search::list_tags(&conn)?;
     if o.json {
-        println!("{}", serde_json::to_string_pretty(&tags)?);
+        println!("{}", o.json(&tags)?);
         return Ok(());
     }
     if tags.is_empty() {
@@ -516,7 +632,7 @@ fn cmd_todos(args: &[String]) -> anyhow::Result<()> {
         o.limit.unwrap_or(50) as i64,
     )?;
     if o.json {
-        println!("{}", serde_json::to_string_pretty(&todos)?);
+        println!("{}", o.json(&todos)?);
         return Ok(());
     }
     if todos.is_empty() {
@@ -525,34 +641,39 @@ fn cmd_todos(args: &[String]) -> anyhow::Result<()> {
     }
     for t in &todos {
         let title = t.title.as_deref().unwrap_or("untitled");
-        println!("• {}", t.text);
-        println!("    {} · {} · thread {}", t.source, title, t.thread_id);
+        println!("• {}", o.shown(&t.text));
+        println!(
+            "    {} · {} · thread {}",
+            t.source,
+            o.shown(title),
+            t.thread_id
+        );
     }
     Ok(())
 }
 
-fn print_knowledge(k: &knowledge::ThreadKnowledge) {
+fn print_knowledge(k: &knowledge::ThreadKnowledge, o: &Opts) {
     if let Some(s) = &k.summary {
-        println!("Summary: {s}\n");
+        println!("Summary: {}\n", o.shown(s));
     }
     if !k.decisions.is_empty() {
         println!("Decisions:");
         for f in &k.decisions {
-            println!("  • {}", f.text);
+            println!("  • {}", o.shown(&f.text));
         }
         println!();
     }
     if !k.gotchas.is_empty() {
         println!("Gotchas:");
         for f in &k.gotchas {
-            println!("  • {}", f.text);
+            println!("  • {}", o.shown(&f.text));
         }
         println!();
     }
     if !k.todos.is_empty() {
         println!("TODOs:");
         for f in &k.todos {
-            println!("  • {}", f.text);
+            println!("  • {}", o.shown(&f.text));
         }
     }
     if k.stale {
@@ -566,14 +687,14 @@ fn cmd_knowledge(args: &[String]) -> anyhow::Result<()> {
     let conn = open_db()?;
     let k = knowledge::get_thread_knowledge(&conn, id)?;
     if o.json {
-        println!("{}", serde_json::to_string_pretty(&k)?);
+        println!("{}", o.json(&k)?);
         return Ok(());
     }
     if !k.extracted && k.todos.is_empty() {
         eprintln!("no knowledge for thread {id} yet — run `cal distill {id}`");
         return Ok(());
     }
-    print_knowledge(&k);
+    print_knowledge(&k, &o);
     Ok(())
 }
 
@@ -595,17 +716,15 @@ fn cmd_distill(args: &[String]) -> anyhow::Result<()> {
     ))?;
     let now = chrono::Utc::now().timestamp();
     knowledge::store_distilled(&mut conn, id, &distilled, now)?;
-    print_knowledge(&knowledge::get_thread_knowledge(&conn, id)?);
+    print_knowledge(&knowledge::get_thread_knowledge(&conn, id)?, &o);
     Ok(())
 }
 
-/// The project key for the cwd: its git root, with worktrees resolved to their main repo
-/// and the walk stopping at $HOME (`indexer::canonical_project`, the same normalization the
-/// indexer stores), else the cwd itself. For memory lookups and write-backs.
+/// The project key for the cwd (`knowledge::cwd_project_key`, shared with the MCP server):
+/// its git root with worktrees resolved to their main repo and the walk stopping at $HOME,
+/// else the cwd itself. For memory lookups and write-backs.
 fn cwd_project_root() -> String {
-    let cwd = std::env::current_dir().unwrap_or_default();
-    let raw = cwd.to_string_lossy().into_owned();
-    crate::indexer::canonical_project(&raw).unwrap_or(raw)
+    knowledge::cwd_project_key().unwrap_or_default()
 }
 
 /// The git WORKING directory containing `dir` (the nearest `.git` dir or worktree file),
@@ -639,17 +758,11 @@ fn cwd_git_root() -> String {
 
 fn cmd_memory(args: &[String]) -> anyhow::Result<()> {
     let o = parse(args)?;
-    let raw = if o.positional.is_empty() {
-        cwd_project_root()
-    } else {
-        o.positional.join(" ")
-    };
-    // Normalize to the canonical project key so we match however the threads were indexed.
-    let project = crate::indexer::canonical_project(&raw).unwrap_or(raw);
+    let project = project_arg(&o);
     let conn = open_db()?;
     let mem = knowledge::get_project_memory(&conn, &project, o.limit.unwrap_or(40) as usize)?;
     if o.json {
-        println!("{}", serde_json::to_string_pretty(&mem)?);
+        println!("{}", o.json(&mem)?);
         return Ok(());
     }
     println!(
@@ -662,7 +775,7 @@ fn cmd_memory(args: &[String]) -> anyhow::Result<()> {
         }
         println!("\n{title}:");
         for f in facts {
-            println!("  - {}", f.text.trim());
+            println!("  - {}", o.shown(f.text.trim()));
         }
     };
     section("Decisions", &mem.decisions);
@@ -683,14 +796,14 @@ fn cmd_done(args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Resolve the project arg (positional or cwd) to its canonical key.
+/// Resolve the project arg (positional or cwd) to its canonical key, so it matches however
+/// the threads were indexed.
 fn project_arg(o: &Opts) -> String {
-    let raw = if o.positional.is_empty() {
+    if o.positional.is_empty() {
         cwd_project_root()
     } else {
-        o.positional.join(" ")
-    };
-    crate::indexer::canonical_project(&raw).unwrap_or(raw)
+        knowledge::project_key(&o.positional.join(" "))
+    }
 }
 
 /// `cal hook`: the SessionStart hook target. Prints the repo's memory, size-capped, for
@@ -729,11 +842,9 @@ fn cmd_hook(args: &[String]) -> anyhow::Result<()> {
 
     let cwd = hook_cwd(payload.as_ref());
     let project = if o.positional.is_empty() {
-        let raw = cwd.to_string_lossy().into_owned();
-        crate::indexer::canonical_project(&raw).unwrap_or(raw)
+        knowledge::project_key(&cwd.to_string_lossy())
     } else {
-        let raw = o.positional.join(" ");
-        crate::indexer::canonical_project(&raw).unwrap_or(raw)
+        knowledge::project_key(&o.positional.join(" "))
     };
     if claude_md_has_managed_block(&claude_md_dirs(&cwd)) {
         return Ok(());
@@ -747,7 +858,8 @@ fn cmd_hook(args: &[String]) -> anyhow::Result<()> {
         .fetch_limit()
         .max(budget.max_decisions)
         .max(budget.max_gotchas);
-    let mem = knowledge::get_project_memory(&conn, &project, per_kind)?;
+    // Facts only: the budgeted renderer never prints the N/M-distilled coverage counts.
+    let mem = knowledge::get_project_memory_facts(&conn, &project, per_kind)?;
     let pinned_todo = mem.open_todos.iter().any(|t| t.pinned);
     if mem.decisions.is_empty() && mem.gotchas.is_empty() && !pinned_todo {
         return Ok(());
@@ -924,8 +1036,10 @@ fn cmd_remember(args: &[String]) -> anyhow::Result<()> {
     }
     let kind = o.positional[0].to_ascii_lowercase();
     let text = o.positional[1..].join(" ");
-    let raw = o.project.clone().unwrap_or_else(cwd_project_root);
-    let project = crate::indexer::canonical_project(&raw).unwrap_or(raw);
+    let project = o
+        .project
+        .as_deref()
+        .map_or_else(cwd_project_root, knowledge::project_key);
     let mut conn = open_db_write()?;
     let now = chrono::Utc::now().timestamp();
     let rationale = o
@@ -940,7 +1054,7 @@ fn cmd_remember(args: &[String]) -> anyhow::Result<()> {
     // background job embeds it otherwise. The fact is saved either way, so an embedding
     // failure is not reported as a failed command (which would invite a duplicate retry).
     if embed::model_is_cached() {
-        let embedder = embed::Embedder::cached_only();
+        let embedder = one_shot_embedder();
         if let Err(e) = embed::embed_pending_facts_conn(&mut conn, &embedder) {
             eprintln!("(saved; embedding deferred to the app: {e})");
         }
@@ -964,7 +1078,7 @@ fn cmd_check(args: &[String]) -> anyhow::Result<()> {
     let conn = open_db()?;
     let hits = knowledge::check_contradiction(&conn, &qv, o.project.as_deref(), 8)?;
     if o.json {
-        println!("{}", serde_json::to_string_pretty(&hits)?);
+        println!("{}", o.json(&hits)?);
         return Ok(());
     }
     if hits.is_empty() {
@@ -975,14 +1089,14 @@ fn cmd_check(args: &[String]) -> anyhow::Result<()> {
     for h in &hits {
         println!(
             "\n  • {}  ({:.0}% match)",
-            h.text.trim(),
+            o.shown(h.text.trim()),
             h.similarity * 100.0
         );
         if let Some(why) = h.rationale.as_deref().filter(|w| !w.is_empty()) {
-            println!("    because: {}", why.trim());
+            println!("    because: {}", o.shown(why.trim()));
         }
         if let Some(title) = h.title.as_deref() {
-            println!("    from: {title}");
+            println!("    from: {}", o.shown(title));
         }
     }
     Ok(())
@@ -1016,6 +1130,7 @@ fn cmd_audit_pr(args: &[String]) -> anyhow::Result<()> {
     let mut files: Vec<String> = Vec::new();
     let mut shas: Vec<String> = Vec::new();
     let mut cap: i64 = 5; // per-file / per-sha thread cap
+    let mut raw = false;
     let split = |v: &str| -> Vec<String> {
         v.split(',')
             .map(|s| s.trim().to_string())
@@ -1042,13 +1157,14 @@ fn cmd_audit_pr(args: &[String]) -> anyhow::Result<()> {
                 cap = args.get(i).and_then(|v| v.parse().ok()).unwrap_or(cap);
             }
             "--json" => {} // JSON is this command's only output
+            "--raw" => raw = true,
             s if !s.starts_with('-') && repo.is_none() => repo = Some(s.to_string()),
             _ => {}
         }
         i += 1;
     }
     let repo = repo.unwrap_or_else(cwd_git_root);
-    let key = crate::indexer::canonical_project(&repo).unwrap_or_else(|| repo.clone());
+    let key = knowledge::project_key(&repo);
 
     let conn = open_db_write()?;
     // Refresh thread↔commit links for the branch first; provenance is empty without this.
@@ -1134,7 +1250,12 @@ fn cmd_audit_pr(args: &[String]) -> anyhow::Result<()> {
             "threadKnowledgeAvailable": distill_on,
         },
     });
-    println!("{}", serde_json::to_string_pretty(&bundle)?);
+    // Titles, distilled reasoning, error signatures and memory, all for another agent.
+    let out = Opts {
+        raw,
+        ..Opts::default()
+    };
+    println!("{}", out.json(&bundle)?);
     Ok(())
 }
 
@@ -1145,12 +1266,12 @@ fn cmd_commits(args: &[String]) -> anyhow::Result<()> {
     } else {
         o.positional.join(" ")
     };
-    let key = crate::indexer::canonical_project(&repo).unwrap_or_else(|| repo.clone());
+    let key = knowledge::project_key(&repo);
     let conn = open_db_write()?;
     let n = gitlink::link_project(&conn, &repo)?;
     let rows = gitlink::commit_timeline(&conn, &key, o.limit.unwrap_or(40) as usize)?;
     if o.json {
-        println!("{}", serde_json::to_string_pretty(&rows)?);
+        println!("{}", o.json(&rows)?);
         return Ok(());
     }
     if rows.is_empty() {
@@ -1173,7 +1294,7 @@ fn cmd_commits(args: &[String]) -> anyhow::Result<()> {
             threads,
             r.best_overlap,
             if r.best_overlap == 1 { "" } else { "s" },
-            r.subject.as_deref().unwrap_or("")
+            o.shown(r.subject.as_deref().unwrap_or(""))
         );
     }
     Ok(())
@@ -1188,7 +1309,7 @@ fn cmd_files(args: &[String]) -> anyhow::Result<()> {
     let conn = open_db()?;
     let threads = search::threads_with_file(&conn, &path, o.limit.unwrap_or(40) as i64)?;
     if o.json {
-        println!("{}", serde_json::to_string_pretty(&threads)?);
+        println!("{}", o.json(&threads)?);
         return Ok(());
     }
     if threads.is_empty() {
@@ -1196,7 +1317,11 @@ fn cmd_files(args: &[String]) -> anyhow::Result<()> {
         return Ok(());
     }
     for t in &threads {
-        println!("{:>6}  {}", t.id, t.title.as_deref().unwrap_or("untitled"));
+        println!(
+            "{:>6}  {}",
+            t.id,
+            o.shown(t.title.as_deref().unwrap_or("untitled"))
+        );
     }
     Ok(())
 }
@@ -1224,13 +1349,15 @@ fn cmd_ask(args: &[String]) -> anyhow::Result<()> {
         &question,
         &prep.context,
     ))?;
-    println!("{answer}\n");
+    // The context the model saw was redacted, but it can still echo a secret from the
+    // question, and the source titles come straight from the index.
+    println!("{}\n", o.shown(&answer));
     println!("Sources:");
     for s in &prep.sources {
         println!(
             "  [thread {}] {}",
             s.thread_id,
-            s.title.as_deref().unwrap_or("untitled")
+            o.shown(s.title.as_deref().unwrap_or("untitled"))
         );
     }
     Ok(())
@@ -1255,7 +1382,7 @@ fn cmd_recall(args: &[String], kind: &str) -> anyhow::Result<()> {
     let limit = o.limit.unwrap_or(20) as usize;
     let hits = knowledge::recall(&conn, &qv, kind, o.project.as_deref(), limit)?;
     if o.json {
-        println!("{}", serde_json::to_string_pretty(&hits)?);
+        println!("{}", o.json(&hits)?);
         return Ok(());
     }
     if hits.is_empty() {
@@ -1263,10 +1390,10 @@ fn cmd_recall(args: &[String], kind: &str) -> anyhow::Result<()> {
         return Ok(());
     }
     for h in &hits {
-        println!("• {}", h.text);
+        println!("• {}", o.shown(&h.text));
         println!(
             "    {} · thread {} · {:.0}% match",
-            h.title.as_deref().unwrap_or("untitled"),
+            o.shown(h.title.as_deref().unwrap_or("untitled")),
             h.thread_id,
             h.similarity * 100.0
         );
@@ -1290,7 +1417,7 @@ fn cmd_similar(args: &[String]) -> anyhow::Result<()> {
     let limit = o.limit.unwrap_or(8) as usize;
     let hits = knowledge::find_prior_work(&conn, &qv, o.project.as_deref(), limit)?;
     if o.json {
-        println!("{}", serde_json::to_string_pretty(&hits)?);
+        println!("{}", o.json(&hits)?);
         return Ok(());
     }
     if hits.is_empty() {
@@ -1300,11 +1427,11 @@ fn cmd_similar(args: &[String]) -> anyhow::Result<()> {
     for h in &hits {
         println!(
             "• {} · thread {} · {:.0}% match",
-            h.title.as_deref().unwrap_or("untitled"),
+            o.shown(h.title.as_deref().unwrap_or("untitled")),
             h.thread_id,
             h.similarity * 100.0
         );
-        println!("    {}: {}", h.kind, h.snippet);
+        println!("    {}: {}", h.kind, o.shown(&h.snippet));
     }
     Ok(())
 }
@@ -1330,7 +1457,7 @@ fn cmd_stats(args: &[String]) -> anyhow::Result<()> {
     let s = search::stats(&conn)?;
 
     if o.json {
-        println!("{}", serde_json::to_string_pretty(&s)?);
+        println!("{}", o.json(&s)?);
         return Ok(());
     }
 
@@ -1443,12 +1570,15 @@ fn cmd_snapshot(args: &[String]) -> anyhow::Result<()> {
     let conn = open_db_write()?;
     let snap = snapshot::create(&conn, id, o.label.as_deref())?;
     if o.json {
-        println!("{}", serde_json::to_string_pretty(&snap)?);
+        println!("{}", o.json(&snap)?);
         return Ok(());
     }
     println!(
         "Saved snapshot #{} \"{}\" (~{} tokens). Resume with: cal resume {}",
-        snap.id, snap.label, snap.token_estimate, snap.id
+        snap.id,
+        o.shown(&snap.label),
+        snap.token_estimate,
+        snap.id
     );
     Ok(())
 }
@@ -1464,7 +1594,7 @@ fn cmd_snapshots(args: &[String]) -> anyhow::Result<()> {
     let conn = open_db()?;
     let snaps = snapshot::list(&conn, project.as_deref(), o.limit.unwrap_or(40) as usize)?;
     if o.json {
-        println!("{}", serde_json::to_string_pretty(&snaps)?);
+        println!("{}", o.json(&snaps)?);
         return Ok(());
     }
     if snaps.is_empty() {
@@ -1477,7 +1607,7 @@ fn cmd_snapshots(args: &[String]) -> anyhow::Result<()> {
             s.id,
             fmt_time(Some(s.created_at)),
             s.source_kind.as_deref().unwrap_or("?"),
-            s.label
+            o.shown(&s.label)
         );
     }
     Ok(())
@@ -1607,7 +1737,18 @@ fn cmd_snapshot_hook(_args: &[String]) -> anyhow::Result<()> {
 /// matching their thread on Windows and for relocated configs.
 fn claude_external_id(transcript_path: &str) -> Option<String> {
     let root = crate::indexer::claude::projects_root()?;
-    external_id_under(transcript_path, &root)
+    external_id_resolving(transcript_path, &root)
+}
+
+/// [`external_id_under`], retried with symlinks resolved on both sides.
+fn external_id_resolving(transcript_path: &str, root: &std::path::Path) -> Option<String> {
+    external_id_under(transcript_path, root).or_else(|| {
+        // The Settings override is stored canonical (symlinks resolved), but Claude Code
+        // reports transcripts under the spelling it was configured with.
+        let real = std::fs::canonicalize(transcript_path).ok()?;
+        let real_root = std::fs::canonicalize(root).ok()?;
+        external_id_under(&real.to_string_lossy(), &real_root)
+    })
 }
 
 /// The id of `transcript_path` relative to `base`, as the indexer writes it, or None when
@@ -1670,7 +1811,7 @@ fn cmd_recall_now(_args: &[String]) -> anyhow::Result<()> {
     // bge-small reads ~512 tokens; embedding more of a long prompt only costs time.
     let query: String = prompt.chars().take(1500).collect();
     // Cached-only: even if the model vanished since the check above, never download here.
-    let embedder = embed::Embedder::cached_only();
+    let embedder = one_shot_embedder();
     let Some(qv) = embed::embed_query_cached_only(&embedder, &query)? else {
         return Ok(());
     };
@@ -1799,7 +1940,7 @@ fn cmd_issues(args: &[String]) -> anyhow::Result<()> {
         o.limit.unwrap_or(20) as usize,
     )?;
     if o.json {
-        println!("{}", serde_json::to_string_pretty(&found)?);
+        println!("{}", o.json(&found)?);
         return Ok(());
     }
     if found.is_empty() {
@@ -1819,7 +1960,7 @@ fn cmd_issues(args: &[String]) -> anyhow::Result<()> {
             threads,
             fmt_time(Some(i.last_seen))
         );
-        println!("    {}", i.example.trim());
+        println!("    {}", o.shown(i.example.trim()));
     }
     Ok(())
 }
@@ -1836,7 +1977,7 @@ fn cmd_cost(args: &[String]) -> anyhow::Result<()> {
     // All-time by default (cost is a lifetime figure); `since = 0`.
     let s = cost::spend(&conn, 0, project.as_deref(), o.limit.unwrap_or(8) as usize)?;
     if o.json {
-        println!("{}", serde_json::to_string_pretty(&s)?);
+        println!("{}", o.json(&s)?);
         return Ok(());
     }
     if s.tracked_calls == 0 && s.untracked_calls == 0 {
@@ -1869,7 +2010,7 @@ fn cmd_cost(args: &[String]) -> anyhow::Result<()> {
             "  ${:>9.2}   #{}  {}",
             t.cost,
             t.thread_id,
-            t.title.as_deref().unwrap_or("")
+            o.shown(t.title.as_deref().unwrap_or(""))
         );
     }
     println!("\n(estimate from list prices; not a billing record)");
@@ -1919,6 +2060,102 @@ mod tests {
         assert_eq!(o.budget, Some(4000));
         assert_eq!(o.limit, Some(5));
         assert!(parse(&argv(&["--budget", "lots"])).is_err());
+    }
+
+    #[test]
+    fn parse_reads_raw() {
+        assert!(parse(&argv(&["--raw", "q"])).unwrap().raw);
+        assert!(!parse(&argv(&["q"])).unwrap().raw);
+    }
+
+    /// Query commands print stored history, which agents read too (the /recall skill's CLI
+    /// fallback, the VS Code extension's `--json`). A planted key comes out redacted in human
+    /// and JSON output alike, `--raw` prints it as stored, and the JSON is otherwise
+    /// byte-identical to what `--json` printed before.
+    #[test]
+    fn query_output_redacts_secrets_unless_raw() {
+        const KEY: &str = "sk-ant-api03-AbCdEfGhIjKlMnOpQrStUv0123456789";
+        const KEY_TAIL: &str = "AbCdEfGhIjKlMnOpQrStUv0123456789";
+        let mut conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let sid = crate::indexer::source_id(&conn, "claude_code").unwrap();
+        let threads = [
+            (
+                "leaky",
+                format!("wire the gateway with {KEY}"),
+                format!("the gateway rejects {KEY} on staging"),
+            ),
+            (
+                "clean",
+                "gateway timeouts".to_string(),
+                "the gateway times out under load".to_string(),
+            ),
+        ];
+        for (external_id, title, text) in threads {
+            let t = crate::indexer::ParsedThread {
+                external_id: external_id.into(),
+                title: Some(title),
+                project_path: Some("/proj/app".into()),
+                messages: vec![crate::indexer::ParsedMessage {
+                    role: "user".into(),
+                    text,
+                    tool_name: None,
+                    ts: Some(1_000),
+                }],
+                ..Default::default()
+            };
+            crate::indexer::upsert_thread(&mut conn, sid, &t).unwrap();
+        }
+        type Cmd = fn(&Connection, &Opts) -> anyhow::Result<String>;
+        let run = |cmd: Cmd, args: &[&str]| cmd(&conn, &parse(&argv(args)).unwrap()).unwrap();
+        let assert_scrubbed = |out: &str| {
+            assert!(out.contains("[REDACTED]"), "{out}");
+            assert!(!out.contains(KEY_TAIL), "{out}");
+        };
+
+        let json = run(search_output, &["gateway", "--json"]);
+        assert_scrubbed(&json);
+        let hits: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
+        let leaky = hits
+            .iter()
+            .find(|h| h["title"] == "wire the gateway with [REDACTED]");
+        assert_eq!(
+            leaky.expect("the leaky thread matches")["snippet"],
+            "the gateway rejects [REDACTED] on staging"
+        );
+        assert!(
+            hits.iter()
+                .any(|h| h["snippet"].as_str().unwrap().contains('\u{1}')),
+            "a clean snippet keeps its highlights: {json}"
+        );
+        // A match inside the key splits it with sentinels; the JSON still never carries it.
+        assert_scrubbed(&run(search_output, &["api03", "--json"]));
+
+        let text = run(search_output, &["gateway"]);
+        assert_scrubbed(&text);
+        assert!(text.contains("wire the gateway with [REDACTED]"), "{text}");
+        assert!(
+            text.contains("    the gateway rejects [REDACTED] on staging"),
+            "{text}"
+        );
+
+        let recent = run(recent_output, &[]);
+        assert_scrubbed(&recent);
+        assert!(
+            recent.contains("wire the gateway with [REDACTED]"),
+            "{recent}"
+        );
+
+        // --raw prints the history as stored, and the redacted JSON differs from it only
+        // where the key was.
+        assert!(run(search_output, &["gateway", "--json", "--raw"]).contains(KEY));
+        assert!(run(search_output, &["gateway", "--raw"]).contains(KEY));
+        assert!(run(recent_output, &["--raw"]).contains(KEY));
+        let raw_json = run(recent_output, &["--json", "--raw"]);
+        assert!(raw_json.contains(KEY), "{raw_json}");
+        assert_eq!(
+            run(recent_output, &["--json"]),
+            raw_json.replace(KEY, "[REDACTED]")
+        );
     }
 
     #[test]
@@ -2110,6 +2347,26 @@ mod tests {
         assert!(external_id_under("/tmp/elsewhere/x.jsonl", base).is_none());
     }
 
+    /// A canonical stored root still matches a transcript reported through a symlink.
+    #[cfg(unix)]
+    #[test]
+    fn external_id_matches_through_a_symlinked_config_dir() {
+        let dir = temp_dir("extid_symlink");
+        let real = dir.join("real");
+        std::fs::create_dir_all(real.join("projects/-proj")).unwrap();
+        std::fs::write(real.join("projects/-proj/abc.jsonl"), "{}\n").unwrap();
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let root = std::fs::canonicalize(real.join("projects")).unwrap();
+        let reported = link.join("projects/-proj/abc.jsonl");
+        assert!(external_id_under(reported.to_str().unwrap(), &root).is_none());
+        assert_eq!(
+            external_id_resolving(reported.to_str().unwrap(), &root).as_deref(),
+            Some("-proj/abc.jsonl")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // ---- docs-in-sync guards: keep `cal help` + the README/website from drifting ----
 
     /// Flags added for `hook` must stay documented in `cal help`.
@@ -2117,6 +2374,44 @@ mod tests {
     fn usage_documents_hook_flags() {
         assert!(USAGE.contains("--budget"));
         assert!(USAGE.contains("cal hook [<project>] [-n PER_KIND] [--budget CHARS]"));
+    }
+
+    /// The global `--raw` opt-out stays documented, with the commands that ignore it.
+    #[test]
+    fn usage_documents_raw_flag() {
+        assert!(USAGE.contains("      --raw "), "{USAGE}");
+        assert!(USAGE.contains("hooks always do"), "{USAGE}");
+    }
+
+    /// `cal help` lists exactly the registered source kinds (plus `in_app`) for `-s`, so a
+    /// new source is documented the moment it is registered, wrapped like the lines around it.
+    #[test]
+    fn usage_lists_every_source_kind() {
+        let help = usage();
+        assert!(!help.contains(SOURCE_KINDS_SLOT), "{help}");
+        let lead = "-s, --source SOURCE   filter by source kind (";
+        let start = help.find(lead).unwrap();
+        let end = start + help[start..].find(')').unwrap() + 1;
+        let block = &help[start..end];
+        let listed: Vec<&str> = block[lead.len()..block.len() - 1]
+            .split([',', ' ', '\n'])
+            .filter(|k| !k.is_empty())
+            .collect();
+        let registered: Vec<&str> = crate::indexer::SOURCES
+            .iter()
+            .map(|s| s.kind)
+            .chain(["in_app"])
+            .collect();
+        assert_eq!(listed, registered);
+        assert!(listed.contains(&"copilot"));
+        let line_start = help[..start].rfind('\n').unwrap() + 1;
+        for (i, line) in help[line_start..end].lines().enumerate() {
+            assert!(line.len() <= USAGE_WIDTH, "too wide: {line:?}");
+            if i > 0 {
+                assert!(line.starts_with(&" ".repeat(OPTION_DESC_COL)), "{line:?}");
+                assert!(!line[OPTION_DESC_COL..].starts_with(' '), "{line:?}");
+            }
+        }
     }
 
     /// `cal help` (USAGE) must document every real command, so a new subcommand can't ship

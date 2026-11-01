@@ -158,8 +158,9 @@ function Home() {
               title="Always current, never in the way"
               className="lg:col-span-5"
             >
-              A background watcher catalogues new sessions as you work. Reindex any source on
-              demand; forget it's running the rest of the time.
+              A background watcher catalogues new sessions as you work, and each launch catches up
+              on the ones your agents wrote while the app was closed. Reindex any source on demand;
+              forget it's running the rest of the time.
             </FeaturePanel>
             <FeaturePanel
               icon={Share2}
@@ -178,8 +179,9 @@ function Home() {
               className="lg:col-span-7"
             >
               Free heuristic TODO extraction, plus opt-in LLM distillation of decisions, gotchas,
-              and summaries — with cross-thread semantic recall of past decisions and gotchas. Needs
-              local Ollama (keyless) or a cloud API key.
+              and summaries — with cross-thread semantic recall of past decisions and gotchas. Runs
+              on local Ollama (keyless), your logged-in Claude Code or Codex CLI, or a cloud API
+              key.
             </FeaturePanel>
             <FeaturePanel
               icon={MessageCircleQuestion}
@@ -211,7 +213,8 @@ function Home() {
             >
               Durable checkpoints of a thread — packed transcript plus carry-forward project memory
               — so work survives a context-window compaction or a jump to another tool.
-              Auto-captured via Claude Code hooks, or snapshot and resume by hand.
+              Auto-captured by a Claude Code hook right before a context compaction, or snapshot and
+              resume by hand.
             </FeaturePanel>
             <FeaturePanel
               icon={Scale}

@@ -72,6 +72,11 @@ pub static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
         M::up(include_str!(
             "../../migrations/0030_gemini_forward_slash_ids.sql"
         )),
+        // 0031: covering indexes for the FTS join, Coach heatmap and commit linker; drops
+        // the redundant (thread_id) index and 0008's unused partial index.
+        M::up(include_str!(
+            "../../migrations/0031_messages_cover_indexes.sql"
+        )),
     ])
 });
 
@@ -374,6 +379,78 @@ mod tests {
         // tool rows pile up.
         assert!(p.contains("SEARCH"), "{p}");
         assert!(!p.contains("SCAN m"), "{p}");
+        // ...through 0026's covering index, which is what let 0031 drop 0008's partial one.
+        assert!(p.contains("idx_messages_embed_counts"), "{p}");
+    }
+
+    // ---- 0031: messages index swap ----------------------------------------------------
+
+    fn index_names(conn: &Connection) -> Vec<String> {
+        conn.prepare(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'messages'",
+        )
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+    }
+
+    #[test]
+    fn upgrade_swaps_the_message_indexes() {
+        let mut conn = db_at_version(30);
+        let (tid, _) = thread_with_messages(&conn, &[false, true, false]);
+        let before = index_names(&conn);
+        assert!(before.iter().any(|n| n == "idx_messages_thread"));
+        assert!(before.iter().any(|n| n == "idx_messages_pending_embed"));
+
+        MIGRATIONS.to_latest(&mut conn).unwrap();
+
+        let after = index_names(&conn);
+        for gone in ["idx_messages_thread", "idx_messages_pending_embed"] {
+            assert!(
+                !after.iter().any(|n| n == gone),
+                "{gone} still there: {after:?}"
+            );
+        }
+        for new in ["idx_messages_thread_ts", "idx_messages_cover"] {
+            assert!(after.iter().any(|n| n == new), "{new} missing: {after:?}");
+        }
+        let integrity: String = conn
+            .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+        // The thread's rows are still found by thread, the way the viewer and the FK
+        // cascade look them up.
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM messages WHERE thread_id = ?1",
+                [tid],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            3
+        );
+    }
+
+    /// Dropping the (thread_id) index leaves every per-thread lookup on an index: the
+    /// viewer's ordered read on the UNIQUE (thread_id, seq) autoindex, and a thread delete's
+    /// cascade still a SEARCH, never a scan of the messages table.
+    #[test]
+    fn per_thread_reads_keep_an_index_without_idx_messages_thread() {
+        let conn = fresh_db();
+        let detail = plan(
+            &conn,
+            "SELECT id, role, text, tool_name, ts, model FROM messages
+             WHERE thread_id = 1 ORDER BY seq",
+        );
+        assert!(
+            detail.contains("USING INDEX sqlite_autoindex_messages_1 (thread_id=?)"),
+            "{detail}"
+        );
+        assert!(!detail.contains("TEMP B-TREE"), "{detail}");
+        let delete = plan(&conn, "DELETE FROM messages WHERE thread_id = 1");
+        assert!(delete.contains("SEARCH messages USING"), "{delete}");
     }
 
     // ---- 0029: prose-only vectors + repair -----------------------------------------------
