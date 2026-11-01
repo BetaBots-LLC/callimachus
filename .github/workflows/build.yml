@@ -1,17 +1,36 @@
 name: Build & Release
 
-# Triggered by the vX.Y.Z (or -rc.N) tag pushed by version.yml — or run manually.
+# Triggered by the vX.Y.Z (or -rc.N) tag pushed by version.yml, or run manually.
 # Builds the desktop app for macOS (Apple Silicon), Windows (x64) and Linux (x64),
-# signs the updater artifacts, and publishes them to one GitHub Release. RC/beta
-# tags are marked prereleases. v[0-9]* matches desktop tags, not the vscode-v* tag.
+# signs the installers and updater artifacts, and publishes them to one GitHub
+# Release. RC/beta tags are marked prereleases.
+#
+# Release ordering: create-release opens a DRAFT release first, every platform
+# uploads into that draft, and finalize publishes it only after every leg
+# succeeded and latest.json covers every platform. Until then nothing is public,
+# so the auto-updater (releases/latest/download/latest.json) never sees a
+# half-uploaded release, and a failed leg leaves a draft instead of a broken
+# "Latest". publish-extension.yml attaches the .vsix to the same draft.
+#
+# Re-running a tag whose release is already PUBLISHED never rebuilds or
+# re-uploads anything: codesigned builds are not byte-reproducible, so fresh
+# binaries would stop matching the SHA256SUMS already bundled into the
+# published callimachus-mcp npm package (every `npx` download would then fail
+# its checksum), and tauri-action would swap live installers out from under
+# latest.json. Such a re-run skips the build legs, leaves the release alone and
+# only retries publish-mcp (npm publish is skipped when the version exists).
 #
 # macOS is Apple Silicon only: `ort` (fastembed's ONNX backend, currently pinned
 # via fastembed to ort 2.0.0-rc.12) publishes NO x86_64-apple-darwin prebuilt at
-# all — not even on a native Intel runner — and fastembed force-enables
+# all (not even on a native Intel runner), and fastembed force-enables
 # `download-binaries`, so there's no config knob to point it elsewhere. Supporting
 # Intel would require a system/dynamic ONNX Runtime + bundling its dylib; not worth
 # it for the shrinking Intel-Mac base. Linux runs on 24.04 because the ONNX prebuilt
-# needs glibc >= 2.38 (22.04 ships 2.35 -> undefined __isoc23_* link errors).
+# needs glibc >= 2.38 (22.04 ships 2.35 -> undefined __isoc23_* link errors), so the
+# Linux binaries need glibc 2.38+ at run time too.
+#
+# Third-party actions are pinned to commit SHAs (Dependabot keeps them current):
+# these jobs hold the updater signing key and the Apple/Azure signing credentials.
 
 on:
   push:
@@ -25,62 +44,158 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
+  # Keep RUST_TOOLCHAIN and CARGO_INCREMENTAL identical to release-cache.yml: both
+  # feed rust-cache's key, and that workflow is what warms the cache restored here.
+  RUST_TOOLCHAIN: "1.96.0"
+  CARGO_INCREMENTAL: 0
+
 jobs:
+  create-release:
+    name: Create draft release
+    runs-on: ubuntu-latest
+    outputs:
+      release_id: ${{ steps.release.outputs.id }}
+      # "true" when the tag's release is already public (a re-run): the build
+      # legs are skipped and finalize only verifies (see the header).
+      published: ${{ steps.release.outputs.published }}
+      changelog: ${{ steps.notes.outputs.changelog }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: ${{ env.TAG }}
+
+      # The release body is this version's section of the desktop CHANGELOG plus an
+      # install footer. latest.json's `notes` (what an update prompt can show) gets
+      # the changelog section alone.
+      - name: Release notes from the changelog
+        id: notes
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          NOTES="$(awk -v heading="## $VERSION" '
+            $0 == heading { found = 1; next }
+            found && /^## / { exit }
+            found { print }
+          ' apps/desktop/CHANGELOG.md | sed '/./,$!d')"
+          if [ -z "$NOTES" ]; then
+            NOTES="See the assets below to download and install this version."
+          fi
+          {
+            echo "changelog<<__CALLIMACHUS_NOTES__"
+            printf '%s\n' "$NOTES"
+            echo "__CALLIMACHUS_NOTES__"
+          } >> "$GITHUB_OUTPUT"
+          # shellcheck disable=SC2016 # literal Markdown backticks, not expansions
+          FOOTER='**Install:** macOS `.dmg` (Apple Silicon), Windows `.msi` or `-setup.exe`, Linux `.AppImage`, `.deb` or `.rpm` (glibc 2.38+). Installed apps update themselves. The standalone `cal-<target>` and `callimachus-mcp-<target>` binaries are for CLI/MCP-only use; their SHA-256 sums are in `SHA256SUMS`.'
+          printf '%s\n\n---\n%s\n' "$NOTES" "$FOOTER" > "$RUNNER_TEMP/notes.md"
+
+      - name: Create (or reuse) the draft release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRERELEASE: ${{ contains(env.TAG, '-rc') || contains(env.TAG, '-beta') }}
+        run: |
+          set -euo pipefail
+          # Drafts are invisible to `releases/tags/<tag>`, so look the tag up in the
+          # full list. Reusing an existing draft makes re-running a failed leg safe.
+          # Prints "<id> <draft>", e.g. "123 true".
+          find_release() {
+            gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" --paginate \
+              --jq ".[] | select(.tag_name == \"$TAG\") | \"\\(.id) \\(.draft)\"" | head -n 1
+          }
+          REL="$(find_release)"
+          read -r ID DRAFT <<< "$REL"
+          if [ -z "$ID" ]; then
+            FLAGS=(--draft --verify-tag --title "Callimachus $TAG" --notes-file "$RUNNER_TEMP/notes.md")
+            if [ "$PRERELEASE" = "true" ]; then FLAGS+=(--prerelease); fi
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" "${FLAGS[@]}"
+            REL="$(find_release)"
+            read -r ID DRAFT <<< "$REL"
+          fi
+          if [ -z "$ID" ]; then
+            echo "::error::Could not find or create a release for $TAG"
+            exit 1
+          fi
+          PUBLISHED=false
+          if [ "$DRAFT" != "true" ]; then
+            PUBLISHED=true
+            echo "::notice::$TAG is already published: skipping the build legs, nothing on the release is replaced"
+          fi
+          echo "Release $TAG has id $ID (published: $PUBLISHED)"
+          {
+            echo "id=$ID"
+            echo "published=$PUBLISHED"
+          } >> "$GITHUB_OUTPUT"
+
   release:
+    needs: create-release
+    # Never build into a published release (see the header): skipped legs leave
+    # its installers, standalone bins and SHA256SUMS untouched.
+    if: needs.create-release.outputs.published != 'true'
     strategy:
       fail-fast: false
       matrix:
         include:
-          - platform: macos-latest      # Apple Silicon (native arm64)
+          - platform: macos-latest # Apple Silicon (native arm64)
             args: "--target aarch64-apple-darwin"
             rust_target: aarch64-apple-darwin
-          - platform: ubuntu-24.04      # Linux x64 (glibc 2.39 for the ONNX prebuilt)
+          - platform: ubuntu-24.04 # Linux x64 (glibc 2.39 for the ONNX prebuilt)
             args: ""
             rust_target: ""
-          - platform: windows-latest    # Windows x64
+          - platform: windows-latest # Windows x64
             args: ""
             rust_target: ""
     runs-on: ${{ matrix.platform }}
     env:
-      # AppImage GPG signing (Linux). Empty until you add the secret → AppImage is
-      # built unsigned, no failure. Gates the import step + the SIGN env below.
-      LINUX_GPG_PRIVATE_KEY: ${{ secrets.LINUX_GPG_PRIVATE_KEY }}
-      # Windows Authenticode via Azure Trusted Signing. Empty until you add the
-      # AZURE_CLIENT_ID secret → gates the trusted-signing-cli install. The
-      # signCommand (tauri.conf.json) only runs on the Windows leg.
-      AZURE_SIGN: ${{ secrets.AZURE_CLIENT_ID }}
-      # Apple notarization via App Store Connect API key. Empty until you add the
-      # secret → the mac app is signed but not notarized (no failure). Gates the
-      # .p8 write step below.
-      APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+      # Booleans only: the secrets themselves are passed to the individual steps
+      # that need them, never job-wide, so dependency install scripts (pnpm install
+      # runs third-party lifecycle scripts) can't read signing material. The
+      # tauri-action step does run third-party build code (the tauri CLI, vite and
+      # its plugins, every crate's build.rs), so it gets only THIS leg's platform
+      # credentials, gated on runner.os, plus the updater key every leg needs.
+      # AppImage GPG signing (Linux). Unset -> AppImage built unsigned, no failure.
+      HAS_LINUX_GPG: ${{ secrets.LINUX_GPG_PRIVATE_KEY != '' }}
+      # Windows Authenticode via Azure Trusted Signing. Unset -> unsigned .exe/.msi.
+      HAS_AZURE: ${{ secrets.AZURE_CLIENT_ID != '' }}
+      # Apple Developer ID certificate. Unset -> the mac app and bins build unsigned.
+      HAS_APPLE_CERT: ${{ secrets.APPLE_CERTIFICATE != '' }}
+      # App Store Connect API key for notarization. Unset -> signed, not notarized.
+      HAS_APPLE_API_KEY: ${{ secrets.APPLE_API_KEY != '' }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
-          ref: ${{ inputs.tag || github.ref_name }}
+          ref: ${{ env.TAG }}
 
       - name: Install Linux build deps
-        if: startsWith(matrix.platform, 'ubuntu')
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf \
             build-essential pkg-config libssl-dev
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
 
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
-          node-version: 20
+          node-version: 22
           cache: pnpm
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: ${{ matrix.rust_target }}
 
       # macOS: rustc links `-lclang_rt.osx` but searches a clang-version subdir the runner's
       # Xcode lacks; the lib is present under a different clang/<ver> dir. Add it to the search
       # path so the link resolves on macos-latest (see ci.yml for the full note).
       - name: Locate compiler-rt for the linker (macOS)
-        if: startsWith(matrix.platform, 'macos')
+        if: runner.os == 'macOS'
         run: |
           LIB=$(find "$(xcode-select -p)" -name 'libclang_rt.osx.a' 2>/dev/null | head -1)
           if [ -n "$LIB" ]; then
@@ -90,100 +205,125 @@ jobs:
             echo "::warning::libclang_rt.osx.a not found under $(xcode-select -p)"
           fi
 
-      - uses: swatinem/rust-cache@v2
+      # Caches saved on a tag are scoped to that tag, so no later tag could ever
+      # restore one: release runs only RESTORE, from the cache release-cache.yml
+      # saves on main with the same shared key.
+      - uses: swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: ./apps/desktop/src-tauri -> target
-          key: ${{ matrix.platform }}
+          shared-key: release-${{ matrix.platform }}
+          save-if: false
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
       - name: Import AppImage signing key (Linux)
-        if: startsWith(matrix.platform, 'ubuntu') && env.LINUX_GPG_PRIVATE_KEY != ''
+        if: runner.os == 'Linux' && env.HAS_LINUX_GPG == 'true'
+        env:
+          LINUX_GPG_PRIVATE_KEY: ${{ secrets.LINUX_GPG_PRIVATE_KEY }}
         run: echo "$LINUX_GPG_PRIVATE_KEY" | gpg --batch --import
 
+      # Prebuilt, checksum-pinned trusted-signing-cli (compiling it from source cost
+      # ~4 min per Windows release). 0.10.0 is the last release that ships the
+      # `trusted-signing-cli.exe` name the signCommand calls; the crate's 0.11.0 only
+      # adds a deprecation notice. Upstream is now artifact-signing-cli.
       - name: Install Trusted Signing CLI (Windows)
-        if: matrix.platform == 'windows-latest' && env.AZURE_SIGN != ''
-        run: cargo install trusted-signing-cli --locked
+        if: runner.os == 'Windows' && env.HAS_AZURE == 'true'
+        shell: bash
+        env:
+          TSC_VERSION: "0.10.0"
+          TSC_SHA256: 8c9d750ca582891a7433925dcf302d5d3761fbed757b46c4bf5b417562dccb0e
+        run: |
+          set -euo pipefail
+          DIR="$(cygpath -u "$RUNNER_TEMP")/trusted-signing-cli"
+          mkdir -p "$DIR"
+          curl -fsSL --retry 3 -o "$DIR/trusted-signing-cli.exe" \
+            "https://github.com/Levminer/artifact-signing-cli/releases/download/$TSC_VERSION/trusted-signing-cli.exe"
+          echo "$TSC_SHA256  $DIR/trusted-signing-cli.exe" | sha256sum -c -
+          cygpath -w "$DIR" >> "$GITHUB_PATH"
 
       # Decode the App Store Connect API key (.p8) used for notarization. The base64
       # secret avoids storing a file; the path is handed to the Tauri bundler below
-      # via APPLE_API_KEY_PATH. macOS leg only, and only when the secret is set.
+      # via APPLE_API_KEY_PATH, and reused to notarize the standalone binaries.
       - name: Write App Store Connect API key (macOS)
-        if: startsWith(matrix.platform, 'macos') && env.APPLE_API_KEY != ''
+        if: runner.os == 'macOS' && env.HAS_APPLE_API_KEY == 'true'
         env:
           APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
         run: echo "$APPLE_API_KEY_BASE64" | base64 --decode > "$RUNNER_TEMP/apple_api_key.p8"
 
-      - name: Build, sign & release
-        uses: tauri-apps/tauri-action@v0
+      - name: Build, sign & upload to the draft release
+        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0.6.2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          # AppImage GPG signing — Linux only, and only when the key secret exists
-          # (otherwise SIGN is empty → unsigned AppImage, no failure).
-          SIGN: ${{ startsWith(matrix.platform, 'ubuntu') && env.LINUX_GPG_PRIVATE_KEY != '' && '1' || '' }}
-          SIGN_KEY: ${{ secrets.LINUX_GPG_KEY_ID }}
-          APPIMAGETOOL_SIGN_PASSPHRASE: ${{ secrets.LINUX_GPG_PASSPHRASE }}
-          APPIMAGETOOL_FORCE_SIGN: ${{ startsWith(matrix.platform, 'ubuntu') && env.LINUX_GPG_PRIVATE_KEY != '' && '1' || '' }}
-          # Azure Trusted Signing creds — read by trusted-signing-cli (the Windows
-          # signCommand in tauri.conf.json). Unused/harmless on macOS & Linux legs.
-          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
-          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
-          # Apple Developer ID signing + notarization — macOS leg only. Empty until
-          # you add the secrets → the mac app builds unsigned (no failure), same as
-          # the Azure/GPG legs. The Tauri bundler decodes APPLE_CERTIFICATE into a
-          # temporary keychain itself, so no manual `security` step is needed. The
+          # Opt-in desktop telemetry: baked in at compile time via option_env!, so only
+          # official release builds can send anything (forks and local builds have no
+          # token). Repo *variables*, not secrets: a PostHog project token is a
+          # write-only ingestion key. Deliberately step-scoped: the standalone
+          # cal/callimachus-mcp build below does not see it, and those never send
+          # analytics.
+          CALLIMACHUS_POSTHOG_TOKEN: ${{ vars.POSTHOG_PROJECT_TOKEN }}
+          CALLIMACHUS_POSTHOG_HOST: ${{ vars.POSTHOG_HOST }}
+          # Every platform credential below is gated on runner.os, so a compromised
+          # build dependency on one leg can't read another platform's signing
+          # material (`cond && secret || ''` yields an empty string elsewhere).
+          #
+          # AppImage GPG signing: Linux only, and only when the key secret exists
+          # (otherwise SIGN is empty -> unsigned AppImage, no failure).
+          SIGN: ${{ runner.os == 'Linux' && env.HAS_LINUX_GPG == 'true' && '1' || '' }}
+          SIGN_KEY: ${{ runner.os == 'Linux' && secrets.LINUX_GPG_KEY_ID || '' }}
+          APPIMAGETOOL_SIGN_PASSPHRASE: ${{ runner.os == 'Linux' && secrets.LINUX_GPG_PASSPHRASE || '' }}
+          APPIMAGETOOL_FORCE_SIGN: ${{ runner.os == 'Linux' && env.HAS_LINUX_GPG == 'true' && '1' || '' }}
+          # Azure Trusted Signing creds, read by trusted-signing-cli (the Windows
+          # signCommand in src-tauri/tauri.windows-sign.conf.json). Windows only.
+          AZURE_TENANT_ID: ${{ runner.os == 'Windows' && secrets.AZURE_TENANT_ID || '' }}
+          AZURE_CLIENT_ID: ${{ runner.os == 'Windows' && secrets.AZURE_CLIENT_ID || '' }}
+          AZURE_CLIENT_SECRET: ${{ runner.os == 'Windows' && secrets.AZURE_CLIENT_SECRET || '' }}
+          # Apple Developer ID signing + notarization (macOS leg only). The Tauri
+          # bundler decodes APPLE_CERTIFICATE into a temporary keychain itself. The
           # ONNX runtime is statically linked (ort download-binaries), so there's no
           # nested third-party dylib and no entitlements file is required. Hardened
           # runtime is on by default; with no App Sandbox it does not block the git/
           # osascript/CLI subprocesses the app spawns. Notarization + stapling run
-          # via the App Store Connect API key (APPLE_API_KEY/ISSUER/KEY_PATH) — far
+          # via the App Store Connect API key (APPLE_API_KEY/ISSUER/KEY_PATH), far
           # more robust than an Apple ID + app-specific password, which locks the
-          # account after repeated failed CI auths. Harmless on Windows & Linux legs.
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
-          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          # account after repeated failed CI auths.
+          APPLE_CERTIFICATE: ${{ runner.os == 'macOS' && secrets.APPLE_CERTIFICATE || '' }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ runner.os == 'macOS' && secrets.APPLE_CERTIFICATE_PASSWORD || '' }}
+          APPLE_SIGNING_IDENTITY: ${{ runner.os == 'macOS' && secrets.APPLE_SIGNING_IDENTITY || '' }}
+          APPLE_API_ISSUER: ${{ runner.os == 'macOS' && secrets.APPLE_API_ISSUER || '' }}
+          APPLE_API_KEY: ${{ runner.os == 'macOS' && secrets.APPLE_API_KEY || '' }}
           APPLE_API_KEY_PATH: ${{ runner.temp }}/apple_api_key.p8
         with:
           projectPath: apps/desktop
-          tagName: ${{ inputs.tag || github.ref_name }}
-          releaseName: "Callimachus ${{ inputs.tag || github.ref_name }}"
-          releaseDraft: false
-          prerelease: ${{ contains(inputs.tag || github.ref_name, '-rc') || contains(inputs.tag || github.ref_name, '-beta') }}
+          # Upload into the draft opened by create-release. tagName is still needed:
+          # it rewrites the draft's "untagged-..." download URLs in latest.json to
+          # the real /download/<tag>/ URLs that work once the release is published.
+          releaseId: ${{ needs.create-release.outputs.release_id }}
+          tagName: ${{ env.TAG }}
+          releaseBody: ${{ needs.create-release.outputs.changelog }}
           # Each job appends its platform/arch entry to the release's latest.json.
           includeUpdaterJson: true
-          args: ${{ matrix.args }}
+          # The Windows signCommand lives in a CI-only overlay so local and fork
+          # builds without trusted-signing-cli don't fail at bundle time.
+          args: ${{ matrix.args }}${{ runner.os == 'Windows' && env.HAS_AZURE == 'true' && ' --config src-tauri/tauri.windows-sign.conf.json' || '' }}
 
       # Standalone `cal` + `callimachus-mcp` binaries for CLI/MCP-only users (no GUI
-      # app). Reuses the rust-cache from the app build, so it's a near-incremental
-      # compile. Each job uploads its own arch-suffixed names → no collisions; the
-      # tauri-action above already created/updated the release we attach to.
-      - name: Build & upload standalone cal + callimachus-mcp
+      # app). Reuses the target dir from the app build, so it's a near-incremental
+      # compile. Each job uploads its own arch-suffixed names, so no collisions.
+      - name: Build standalone cal + callimachus-mcp
         shell: bash
         working-directory: apps/desktop/src-tauri
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ inputs.tag || github.ref_name }}
-          # Azure Trusted Signing creds — same as the tauri-action leg. Used to
-          # Authenticode-sign the standalone Windows .exe bins below, which bypass
-          # the Tauri bundler's signCommand. Empty/unused on macOS & Linux.
-          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
-          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
         run: |
           set -euo pipefail
           TARGET="${{ matrix.rust_target }}"
           if [ -n "$TARGET" ]; then
-            cargo build --release --target "$TARGET" --bin cal --bin callimachus-mcp
+            cargo build --release --locked --target "$TARGET" --bin cal --bin callimachus-mcp
             OUT="target/$TARGET/release"
             TRIPLE="$TARGET"
           else
-            cargo build --release --bin cal --bin callimachus-mcp
+            cargo build --release --locked --bin cal --bin callimachus-mcp
             OUT="target/release"
             TRIPLE="$(rustc -vV | sed -n 's/host: //p')"
           fi
@@ -193,67 +333,265 @@ jobs:
           mkdir -p "$STAGE"
           cp "$OUT/cal$EXT"             "$STAGE/cal-$TRIPLE$EXT"
           cp "$OUT/callimachus-mcp$EXT" "$STAGE/callimachus-mcp-$TRIPLE$EXT"
-          # Authenticode-sign the staged Windows bins (matches the app's signCommand)
-          # so they don't trip SmartScreen "Unknown publisher". Gated on the Azure
-          # secret, so it's a no-op until Trusted Signing is configured. The CLI is
-          # already installed by the "Install Trusted Signing CLI (Windows)" step.
-          if [ "${{ runner.os }}" = "Windows" ] && [ -n "${AZURE_CLIENT_ID:-}" ]; then
-            for f in "$STAGE/cal-$TRIPLE$EXT" "$STAGE/callimachus-mcp-$TRIPLE$EXT"; do
-              trusted-signing-cli -e https://eus.codesigning.azure.net -a betabots -c callimachus -d Callimachus "$f"
-            done
-          fi
-          gh release upload "$TAG" \
-            "$STAGE/cal-$TRIPLE$EXT" \
-            "$STAGE/callimachus-mcp-$TRIPLE$EXT" \
-            --clobber
+          {
+            echo "STAGE=$STAGE"
+            echo "TRIPLE=$TRIPLE"
+            echo "EXT=$EXT"
+          } >> "$GITHUB_ENV"
 
-  # Once every platform's binaries are attached to the Release, publish the
-  # `callimachus-mcp` npm wrapper (it downloads those binaries at runtime) and
-  # refresh the entry on the official MCP registry. Runs once, after the matrix.
-  # Skipped on prereleases and when NPM_TOKEN isn't set, so it's inert until you
-  # add that secret. Registry auth is GitHub OIDC (no secret) and needs
-  # `id-token: write`; the namespace `io.github.betabots-llc/*` is verified
-  # against this repo's owning org.
+      # Authenticode-sign the staged Windows bins (matches the app's signCommand)
+      # so they don't trip SmartScreen "Unknown publisher".
+      - name: Sign standalone bins (Windows)
+        if: runner.os == 'Windows' && env.HAS_AZURE == 'true'
+        shell: bash
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+        run: |
+          set -euo pipefail
+          for f in "$STAGE/cal-$TRIPLE$EXT" "$STAGE/callimachus-mcp-$TRIPLE$EXT"; do
+            trusted-signing-cli -e https://eus.codesigning.azure.net -a betabots -c callimachus -d Callimachus "$f"
+          done
+
+      # Developer ID-sign (hardened runtime + secure timestamp) and notarize the
+      # bare Mach-O bins. Without this they carry only the linker's ad-hoc
+      # signature and Gatekeeper rejects a browser-downloaded copy. Bare binaries
+      # can't be stapled, so Gatekeeper checks the notarization ticket online.
+      - name: Sign + notarize standalone bins (macOS)
+        if: runner.os == 'macOS' && env.HAS_APPLE_CERT == 'true'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_PATH: ${{ runner.temp }}/apple_api_key.p8
+        run: |
+          set -euo pipefail
+          KEYCHAIN="$RUNNER_TEMP/cli-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 32)"
+          CERT="$RUNNER_TEMP/cli-signing.p12"
+          cleanup() {
+            security delete-keychain "$KEYCHAIN" >/dev/null 2>&1 || true
+            rm -f "$CERT"
+          }
+          trap cleanup EXIT
+
+          # Import the Developer ID cert into a throwaway keychain (the Tauri bundler
+          # deletes its own keychain when it finishes).
+          printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$CERT"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$CERT" -k "$KEYCHAIN" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+          # Prepend to the search list (keeping the defaults) so codesign can build the chain.
+          # shellcheck disable=SC2046 # intentionally split into one argument per keychain
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+
+          for bin in cal callimachus-mcp; do
+            f="$STAGE/$bin-$TRIPLE"
+            codesign --force --options runtime --timestamp --keychain "$KEYCHAIN" \
+              --sign "$APPLE_SIGNING_IDENTITY" --identifier "dev.shaller.callimachus.$bin" "$f"
+            codesign --verify --strict --verbose=2 "$f"
+          done
+
+          if [ "$HAS_APPLE_API_KEY" != "true" ]; then
+            echo "::warning::APPLE_API_KEY is not set: the standalone macOS binaries are signed but not notarized"
+            exit 0
+          fi
+          NOTARIZE_DIR="$RUNNER_TEMP/notarize"
+          ZIP="$RUNNER_TEMP/cli-bins-notarize.zip"
+          mkdir -p "$NOTARIZE_DIR"
+          cp "$STAGE/cal-$TRIPLE" "$STAGE/callimachus-mcp-$TRIPLE" "$NOTARIZE_DIR/"
+          ditto -c -k --keepParent "$NOTARIZE_DIR" "$ZIP"
+          RESULT="$(xcrun notarytool submit "$ZIP" --key "$APPLE_API_KEY_PATH" --key-id "$APPLE_API_KEY" \
+            --issuer "$APPLE_API_ISSUER" --wait --timeout 30m --output-format json)"
+          echo "$RESULT"
+          if [ "$(echo "$RESULT" | jq -r '.status')" != "Accepted" ]; then
+            ID="$(echo "$RESULT" | jq -r '.id // empty')"
+            [ -n "$ID" ] && xcrun notarytool log "$ID" --key "$APPLE_API_KEY_PATH" \
+              --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER" || true
+            echo "::error::Notarization of the standalone macOS binaries was not accepted"
+            exit 1
+          fi
+
+      - name: Upload standalone bins
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber \
+            "$STAGE/cal-$TRIPLE$EXT" \
+            "$STAGE/callimachus-mcp-$TRIPLE$EXT"
+
+  # Runs only when every platform leg succeeded. Verifies the draft is complete,
+  # adds SHA256SUMS for the standalone binaries (the npm wrapper verifies downloads
+  # against it), then publishes the release. A failed leg leaves the draft
+  # unpublished: fix and re-run, nothing half-done is ever public.
+  #
+  # On a re-run of an already-published tag the legs were skipped on purpose, so
+  # this job still runs (the explicit `if:`), but only checks that SHA256SUMS and
+  # latest.json are there: it never rewrites them or touches "Latest".
+  finalize:
+    name: Verify + publish release
+    needs: [create-release, release]
+    if: >-
+      !cancelled() && needs.create-release.result == 'success' &&
+      (needs.release.result == 'success' ||
+       (needs.release.result == 'skipped' && needs.create-release.outputs.published == 'true'))
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PRERELEASE: ${{ contains(inputs.tag || github.ref_name, '-rc') || contains(inputs.tag || github.ref_name, '-beta') }}
+      PUBLISHED: ${{ needs.create-release.outputs.published }}
+    steps:
+      - name: Already published? Check SHA256SUMS is attached, change nothing
+        if: env.PUBLISHED == 'true'
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --clobber -p SHA256SUMS
+          [ -s SHA256SUMS ] || { echo "::error::Published release $TAG has no SHA256SUMS"; exit 1; }
+          echo "$TAG is already published; leaving its assets and SHA256SUMS as they are"
+
+      - name: Check standalone binaries + write SHA256SUMS
+        if: env.PUBLISHED != 'true'
+        run: |
+          set -euo pipefail
+          EXPECTED=(
+            cal-aarch64-apple-darwin
+            callimachus-mcp-aarch64-apple-darwin
+            cal-x86_64-unknown-linux-gnu
+            callimachus-mcp-x86_64-unknown-linux-gnu
+            cal-x86_64-pc-windows-msvc.exe
+            callimachus-mcp-x86_64-pc-windows-msvc.exe
+          )
+          DIR="$RUNNER_TEMP/release-bins"
+          mkdir -p "$DIR"
+          cd "$DIR"
+          PATTERNS=()
+          for f in "${EXPECTED[@]}"; do PATTERNS+=(-p "$f"); done
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --clobber "${PATTERNS[@]}"
+          for f in "${EXPECTED[@]}"; do
+            if [ ! -s "$f" ]; then
+              echo "::error::Release $TAG is missing $f"
+              exit 1
+            fi
+          done
+          # Hash the bytes actually attached to the release, not the build outputs.
+          sha256sum "${EXPECTED[@]}" > SHA256SUMS
+          cat SHA256SUMS
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber SHA256SUMS
+
+      - name: Check the updater manifest covers every platform
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --clobber -p latest.json
+          jq -e '.platforms | has("darwin-aarch64") and has("linux-x86_64") and has("windows-x86_64")' latest.json \
+            || { echo "::error::latest.json is missing a platform"; jq '.platforms | keys' latest.json; exit 1; }
+
+      - name: Publish the release
+        if: env.PUBLISHED != 'true'
+        run: |
+          set -euo pipefail
+          IS_DRAFT="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft')"
+          if [ "$IS_DRAFT" != "true" ]; then
+            # Published between create-release and now (create-release saw a
+            # draft): don't touch "Latest", or an old tag would point the updater
+            # back at it.
+            echo "$TAG is already published; leaving it as is"
+            exit 0
+          fi
+          if [ "$PRERELEASE" = "true" ]; then
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --prerelease --latest=false
+          else
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+          fi
+          echo "Published $TAG"
+
+  # Once the release is public, publish the `callimachus-mcp` npm wrapper (it
+  # downloads the release binaries at runtime and verifies them against the
+  # SHA256SUMS bundled into the package here) and refresh the entry on the
+  # official MCP registry. Skipped on prereleases.
+  #
+  # Auth is GitHub OIDC for both: npm trusted publishing (configure it once on
+  # npmjs.com for this repo + build.yml, see RELEASING.md) and the MCP registry.
+  # No long-lived NPM_TOKEN. Trusted publishing needs npm >= 11.5.1 / Node 22.14+.
   publish-mcp:
     name: Publish npm wrapper + MCP registry
-    needs: release
-    if: ${{ !contains(inputs.tag || github.ref_name, '-rc') && !contains(inputs.tag || github.ref_name, '-beta') }}
+    needs: finalize
+    # The explicit result check (not the implicit success()) keeps this job running
+    # on a re-run of a published tag, where the release legs upstream were skipped.
+    if: >-
+      !cancelled() && needs.finalize.result == 'success' &&
+      !contains(inputs.tag || github.ref_name, '-rc') && !contains(inputs.tag || github.ref_name, '-beta')
     runs-on: ubuntu-latest
     permissions:
       contents: read
       id-token: write
     env:
-      HAS_NPM: ${{ secrets.NPM_TOKEN != '' }}
+      MCP_PUBLISHER_VERSION: v1.8.6
+      MCP_PUBLISHER_SHA256: 1fbe93fc0783c2394d8012c8d6e50a59e98cb2cc2d216264cc69f405d0e21340
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
-          ref: ${{ inputs.tag || github.ref_name }}
+          ref: ${{ env.TAG }}
 
-      - uses: pnpm/action-setup@v4
-
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
-          node-version: 20
+          node-version: 24
           registry-url: "https://registry.npmjs.org"
-          cache: pnpm
+          # Never restore a dependency cache into a publishing job.
+          package-manager-cache: false
 
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
-
-      - name: Publish wrapper to npm
-        if: env.HAS_NPM == 'true'
-        working-directory: packages/callimachus-mcp
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish --access public
-
-      - name: Install mcp-publisher
-        if: env.HAS_NPM == 'true'
+      - name: Ensure npm supports trusted publishing
         run: |
-          curl -L "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" | tar xz mcp-publisher
+          npm install -g "npm@^11.5.1"
+          npm --version
+
+      - name: Bundle the checksum manifest into the package
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          PKG_VERSION="$(node -p "require('./packages/callimachus-mcp/package.json').version")"
+          if [ "v$PKG_VERSION" != "$TAG" ]; then
+            echo "::error::packages/callimachus-mcp is $PKG_VERSION but the tag is $TAG"
+            exit 1
+          fi
+          SUMS=packages/callimachus-mcp/lib/SHA256SUMS
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" -p SHA256SUMS -O "$SUMS" --clobber
+          for t in aarch64-apple-darwin x86_64-unknown-linux-gnu x86_64-pc-windows-msvc.exe; do
+            grep -Eq "^[0-9a-f]{64}  callimachus-mcp-$t\$" "$SUMS" \
+              || { echo "::error::SHA256SUMS has no entry for callimachus-mcp-$t"; exit 1; }
+          done
+          cat "$SUMS"
+
+      - name: Publish wrapper to npm (trusted publishing)
+        working-directory: packages/callimachus-mcp
+        run: |
+          set -euo pipefail
+          VERSION="$(node -p "require('./package.json').version")"
+          # Re-runs are safe: npm refuses to republish a version, so skip it.
+          if [ -n "$(npm view "callimachus-mcp@$VERSION" version 2>/dev/null)" ]; then
+            echo "callimachus-mcp@$VERSION is already on npm; skipping"
+          else
+            npm publish --access public
+          fi
+
+      - name: Install mcp-publisher (pinned, checksum-verified)
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 -o mcp-publisher.tar.gz \
+            "https://github.com/modelcontextprotocol/registry/releases/download/$MCP_PUBLISHER_VERSION/mcp-publisher_linux_amd64.tar.gz"
+          echo "$MCP_PUBLISHER_SHA256  mcp-publisher.tar.gz" | sha256sum -c -
+          tar xzf mcp-publisher.tar.gz mcp-publisher
 
       - name: Publish to MCP registry (GitHub OIDC)
-        if: env.HAS_NPM == 'true'
         run: |
           ./mcp-publisher login github-oidc
           ./mcp-publisher publish

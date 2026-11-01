@@ -49,7 +49,12 @@ export function CommandPalette() {
     mutationFn: api.indexAll,
     onSuccess: () => qc.invalidateQueries({ queryKey: ["index_status"] }),
   });
-  const buildIndex = useMutation({ mutationFn: api.buildEmbeddings });
+  const buildIndex = useMutation({
+    mutationFn: api.buildEmbeddings,
+    // embed_status never refetches on its own while idle (lib/queries.ts); pick up
+    // running:true now so the progress bar appears.
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["embed_status"] }),
+  });
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {

@@ -2,9 +2,24 @@
 // recall related threads against — the layered signal: the selection, else the
 // symbol around the cursor, else the nearest error. Debounced; never sends whole
 // files. Pure VS Code APIs; the actual `cal related` call happens in the provider.
+//
+// Each new context costs a `cal related` process that loads the embedding model, and
+// deriving it costs an LSP symbol request, so the watcher does nothing at all while
+// ambient recall can't be shown (sidebar hidden, or the feature off).
 
 import * as vscode from "vscode";
 import { config } from "./cal";
+
+/** Settle time before recalling. Must match the `callimachus.ambientRecallThrottle`
+ *  default in package.json, which is what the Settings UI shows; this is only the
+ *  fallback if the contribution is missing. 1.5 s because each recall spawns a process
+ *  that loads the embedding model. */
+const DEFAULT_THROTTLE_MS = 1500;
+const MIN_THROTTLE_MS = 150;
+
+function throttleMs(): number {
+  return Math.max(MIN_THROTTLE_MS, config<number>("ambientRecallThrottle", DEFAULT_THROTTLE_MS));
+}
 
 export interface EditorContext {
   /** Text to embed/recall against (already capped). */
@@ -20,7 +35,11 @@ export class EditorContextWatcher implements vscode.Disposable {
   private lastText = "";
   private readonly subs: vscode.Disposable[] = [];
 
-  constructor(private readonly onContext: (ctx: EditorContext | null) => void) {
+  constructor(
+    private readonly onContext: (ctx: EditorContext | null) => void,
+    /** Whether a result could be shown right now (sidebar visible + feature on). */
+    private readonly isActive: () => boolean,
+  ) {
     this.subs.push(
       vscode.window.onDidChangeActiveTextEditor(() => this.schedule()),
       vscode.window.onDidChangeTextEditorSelection(() => this.schedule()),
@@ -36,11 +55,15 @@ export class EditorContextWatcher implements vscode.Disposable {
 
   private schedule(): void {
     if (this.timer) clearTimeout(this.timer);
-    const ms = Math.max(150, config<number>("ambientRecallThrottle", 500));
-    this.timer = setTimeout(() => void this.fire(), ms);
+    this.timer = undefined;
+    // Hidden or disabled: skip even the symbol lookup. refresh() re-arms on show.
+    if (!this.isActive()) return;
+    this.timer = setTimeout(() => void this.fire(), throttleMs());
   }
 
   private async fire(): Promise<void> {
+    this.timer = undefined;
+    if (!this.isActive()) return;
     const ctx = await this.extract();
     // Dedupe: identical context shouldn't re-query.
     if (ctx && ctx.text === this.lastText) return;

@@ -128,35 +128,136 @@ pub fn scan_all_with_progress(
 /// root. When the path exists on disk we resolve it and walk up to the nearest git root;
 /// otherwise we apply a light string normalization. Returns None for an empty path. The
 /// result is what Project Memory / recall scoping group on (column `threads.project_key`).
+///
+/// - A git worktree (where `.git` is a file pointing into `<repo>/.git/worktrees/<name>`)
+///   keys on its MAIN repo, so worktree sessions share the repo's memory instead of each
+///   getting an empty project under a path that is later deleted.
+/// - The walk stops at the home directory: a `~/.git` (dotfiles kept as a plain repo) is
+///   only the project when the path IS the home dir, so a non-repo directory under home
+///   keys on itself rather than on the whole home directory.
+/// - Windows `\\?\` verbatim prefixes from `canonicalize` are stripped, so keys match
+///   paths that were normalized without resolving.
 pub fn canonical_project(path: &str) -> Option<String> {
+    // Resolved once per process: indexing calls this for every thread.
+    static HOME: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    let home = HOME.get_or_init(|| {
+        dirs::home_dir().map(|h| strip_verbatim_prefix(&std::fs::canonicalize(&h).unwrap_or(h)))
+    });
+    canonical_project_with_home(path, home.as_deref())
+}
+
+/// `canonical_project` with the home directory passed in (tests use a fake one).
+fn canonical_project_with_home(path: &str, home: Option<&Path>) -> Option<String> {
     use std::path::PathBuf;
     let p = path.trim();
     if p.is_empty() {
         return None;
     }
     // Expand a leading `~`.
-    let expanded: PathBuf = match p.strip_prefix("~/") {
-        Some(rest) => dirs::home_dir()
-            .map(|h| h.join(rest))
-            .unwrap_or_else(|| PathBuf::from(p)),
-        None => PathBuf::from(p),
+    let expanded: PathBuf = if p == "~" {
+        dirs::home_dir().unwrap_or_else(|| PathBuf::from(p))
+    } else {
+        match p.strip_prefix("~/") {
+            Some(rest) => dirs::home_dir()
+                .map(|h| h.join(rest))
+                .unwrap_or_else(|| PathBuf::from(p)),
+            None => PathBuf::from(p),
+        }
     };
     // If it exists: resolve symlinks + absolutize, then walk up to the git root.
     if let Ok(abs) = std::fs::canonicalize(&expanded) {
-        let mut dir = abs.as_path();
-        loop {
-            if dir.join(".git").exists() {
-                return Some(dir.to_string_lossy().trim_end_matches('/').to_string());
-            }
-            match dir.parent() {
-                Some(par) => dir = par,
-                None => break,
-            }
-        }
-        return Some(abs.to_string_lossy().trim_end_matches('/').to_string());
+        let abs = strip_verbatim_prefix(&abs);
+        let root = git_root(&abs, home).unwrap_or(abs);
+        return Some(path_key(&root));
     }
     // Doesn't exist on this machine: light normalization only.
-    Some(expanded.to_string_lossy().trim_end_matches('/').to_string())
+    Some(path_key(&expanded))
+}
+
+/// The repository root for `start` (walking up), resolving worktrees to their main repo.
+/// Never walks above `home` unless `start` is `home` itself.
+fn git_root(start: &Path, home: Option<&Path>) -> Option<std::path::PathBuf> {
+    let mut dir = start;
+    loop {
+        if home == Some(dir) && dir != start {
+            return None; // reached home from below: home's own repo doesn't count
+        }
+        let dot_git = dir.join(".git");
+        if dot_git.is_dir() {
+            return Some(dir.to_path_buf());
+        }
+        if dot_git.is_file() {
+            return Some(worktree_main_repo(dir, &dot_git).unwrap_or_else(|| dir.to_path_buf()));
+        }
+        dir = dir.parent()?;
+    }
+}
+
+/// For a linked worktree (`.git` file with `gitdir: <common>/worktrees/<name>`), the main
+/// repo's working directory. None for anything else, e.g. a submodule (`gitdir:
+/// ../.git/modules/x`), which is its own project.
+fn worktree_main_repo(dir: &Path, dot_git_file: &Path) -> Option<std::path::PathBuf> {
+    let content = std::fs::read_to_string(dot_git_file).ok()?;
+    let gitdir = content
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("gitdir:"))?
+        .trim();
+    let gitdir = if Path::new(gitdir).is_absolute() {
+        std::path::PathBuf::from(gitdir)
+    } else {
+        dir.join(gitdir)
+    };
+    // `<common>/worktrees/<name>`; `commondir` (when present) names <common> explicitly.
+    let common = match std::fs::read_to_string(gitdir.join("commondir")) {
+        Ok(c) => {
+            let c = c.trim();
+            if Path::new(c).is_absolute() {
+                std::path::PathBuf::from(c)
+            } else {
+                gitdir.join(c)
+            }
+        }
+        Err(_) => {
+            let parent = gitdir.parent()?;
+            if parent.file_name()? != "worktrees" {
+                return None;
+            }
+            parent.parent()?.to_path_buf()
+        }
+    };
+    let common = std::fs::canonicalize(&common).ok()?;
+    let common = strip_verbatim_prefix(&common);
+    if common.file_name()? == ".git" {
+        // The usual layout: the main working tree is the parent of its .git dir.
+        common.parent().map(Path::to_path_buf)
+    } else {
+        // A bare repo (`repo.git`) has no main working tree; key on the repo dir.
+        Some(common)
+    }
+}
+
+/// Strip a Windows verbatim prefix: `\\?\C:\x` -> `C:\x`, `\\?\UNC\srv\share` ->
+/// `\\srv\share`. A no-op for every other path (and on Unix in practice).
+fn strip_verbatim_prefix(p: &Path) -> std::path::PathBuf {
+    let s = p.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        return std::path::PathBuf::from(format!(r"\\{rest}"));
+    }
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        return std::path::PathBuf::from(rest);
+    }
+    p.to_path_buf()
+}
+
+/// A path as a key string: trailing separators trimmed, but a root (`/`, `C:\`) kept whole.
+fn path_key(p: &Path) -> String {
+    let s = p.to_string_lossy();
+    let trimmed = s.trim_end_matches(['/', '\\']);
+    if trimmed.is_empty() || trimmed.ends_with(':') {
+        s.into_owned()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 /// Compute `project_key` for threads that don't have one yet (post-0016 backfill). Groups
@@ -201,6 +302,13 @@ pub fn upsert_thread(
     if thread.messages.is_empty() {
         return Ok(0);
     }
+    // The user deleted this thread (cleanup::delete_threads tombstones it): don't re-import
+    // it. Claude, Codex, Cursor and Copilot also check before parsing; this covers every
+    // other indexer. A fast path only: the authoritative check is repeated inside the
+    // write transaction below.
+    if crate::cleanup::is_tombstoned(conn, source_id, &thread.external_id)? {
+        return Ok(0);
+    }
     let t0 = std::time::Instant::now();
     let now = chrono::Utc::now().timestamp();
     // UTF-8 byte size of all message text (String::len is byte length) — stored so the
@@ -214,6 +322,12 @@ pub fn upsert_thread(
         .filter(|m| m.role == "user" || m.role == "assistant")
         .count() as i64;
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    // Re-check under the write lock: the watcher indexes on its own connection, so a delete
+    // that committed after the check above would otherwise be undone by the INSERT below
+    // (the thread comes back next to its own tombstone). Dropping `tx` rolls back.
+    if crate::cleanup::is_tombstoned(&tx, source_id, &thread.external_id)? {
+        return Ok(0);
+    }
 
     let project_key = thread.project_path.as_deref().and_then(canonical_project);
     tx.execute(
@@ -270,6 +384,9 @@ pub fn upsert_thread(
         |r| r.get(0),
     )?;
     let n = thread.messages.len() as i64;
+    // Stored tool rows that differ from the new parse only by the index-time tool-output
+    // cap (see `recapped`), rewritten in place on an append.
+    let mut recapped: Vec<i64> = Vec::new();
     let incremental = existing_count > 0 && n >= existing_count && {
         let mut stmt =
             tx.prepare("SELECT seq, text FROM messages WHERE thread_id = ?1 ORDER BY seq")?;
@@ -280,19 +397,36 @@ pub fn upsert_thread(
         })?;
         for row in rows {
             let (seq, text) = row?;
-            if seq < 0
-                || seq as usize >= thread.messages.len()
-                || thread.messages[seq as usize].text != text
-            {
+            let Some(new) = usize::try_from(seq)
+                .ok()
+                .and_then(|i| thread.messages.get(i))
+            else {
                 ok = false;
                 break;
+            };
+            if new.text != text {
+                if !is_recapped(new, &text) {
+                    ok = false;
+                    break;
+                }
+                recapped.push(seq);
             }
             matched += 1;
         }
         ok && matched == existing_count
     };
 
-    if !incremental {
+    if incremental {
+        // Tool output indexed before the cap existed: store the capped text a fresh index
+        // would, without the full replace below (which churns every message id, re-queues
+        // the thread's prose for embedding and drops fact provenance). FTS follows through
+        // the update trigger.
+        let mut upd =
+            tx.prepare("UPDATE messages SET text = ?3 WHERE thread_id = ?1 AND seq = ?2")?;
+        for seq in &recapped {
+            upd.execute(params![thread_id, seq, thread.messages[*seq as usize].text])?;
+        }
+    } else {
         // Full replace: clear existing messages (FTS triggers keep the index in sync).
         tx.execute("DELETE FROM messages WHERE thread_id = ?1", [thread_id])?;
     }
@@ -304,7 +438,8 @@ pub fn upsert_thread(
         0
     };
 
-    let mut inserted: Vec<(i64, &str, &str)> =
+    // (message id, role, text, message timestamp) for each newly inserted row.
+    let mut inserted: Vec<(i64, &str, &str, Option<i64>)> =
         Vec::with_capacity(thread.messages.len().saturating_sub(start_seq));
     {
         let usage_by_idx: std::collections::HashMap<usize, &MsgUsage> =
@@ -330,15 +465,21 @@ pub fn upsert_thread(
                 u.map(|u| u.cache_write),
                 u.map(|u| u.cache_read),
             ])?;
-            inserted.push((tx.last_insert_rowid(), m.role.as_str(), m.text.as_str()));
+            inserted.push((
+                tx.last_insert_rowid(),
+                m.role.as_str(),
+                m.text.as_str(),
+                m.ts,
+            ));
         }
     }
 
     // Free heuristic knowledge tier: re-derive this thread's TODO facts every index
     // (delete + rescan) so they never go stale. Only user/assistant text is scanned.
     // The LLM-distilled facts (extractor='llm') are left untouched here. Gated on the
-    // opt-in: when knowledge is off we don't write todo facts at all.
-    if crate::knowledge::get_config(&tx)?.enabled {
+    // opt-in: when knowledge is off we don't write todo facts at all. Subagent threads are
+    // skipped: their "TODO"s are the parent agent's task list echoed back, not the user's.
+    if crate::knowledge::get_config(&tx)?.enabled && !thread.is_subagent {
         const MAX_TODOS_PER_THREAD: usize = 25;
         // Keep CURATED todos (done / dismissed / pinned) so closing one survives re-index;
         // re-derive only the open, untouched ones.
@@ -380,7 +521,7 @@ pub fn upsert_thread(
         } else {
             0
         };
-        'outer: for (mid, role, text) in &inserted {
+        'outer: for (mid, role, text, ts) in &inserted {
             if *role != "user" && *role != "assistant" {
                 continue;
             }
@@ -389,7 +530,14 @@ pub fn upsert_thread(
                     break 'outer;
                 }
                 if seen.insert(todo.to_ascii_lowercase()) {
-                    fstmt.execute(params![thread_id, todo, mid, now])?;
+                    // Stamped with the source message's time, not index time, so a
+                    // re-index of old history doesn't make old TODOs look new.
+                    fstmt.execute(params![
+                        thread_id,
+                        todo,
+                        mid,
+                        crate::knowledge::todo_created_at(*ts, now)
+                    ])?;
                     count += 1;
                 }
             }
@@ -422,7 +570,7 @@ pub fn upsert_thread(
                 seen.insert(p.to_ascii_lowercase());
             }
         }
-        'paths: for (_mid, role, text) in &inserted {
+        'paths: for (_mid, role, text, _ts) in &inserted {
             if *role != "user" && *role != "assistant" {
                 continue;
             }
@@ -483,6 +631,17 @@ pub fn upsert_thread(
         );
     }
     Ok(thread.messages.len())
+}
+
+/// True when `stored` is a tool row indexed before the index-time tool-output cap and `new`
+/// is the same output freshly parsed, i.e. capped by `claude::cap_tool_text`. Every indexer
+/// that caps (Claude, Codex, Gemini, Qwen, Cline and forks, Continue) caps exactly the
+/// `tool` rows, so an upgrade must not read the shorter text as a rewritten transcript.
+fn is_recapped(new: &ParsedMessage, stored: &str) -> bool {
+    new.role == "tool"
+        && stored.len() > new.text.len()
+        && stored.len() > claude::TOOL_TEXT_CAP_CHARS
+        && claude::cap_tool_text(stored) == new.text
 }
 
 /// Extensions that mark a bare filename (no slash) as a real file reference.
@@ -736,6 +895,146 @@ mod tests {
         let _ = std::fs::remove_file(&p);
     }
 
+    fn temp_db(tag: &str) -> rusqlite::Connection {
+        let p = std::env::temp_dir().join(format!("calli_{tag}_{}.db", std::process::id()));
+        for ext in ["db", "db-wal", "db-shm"] {
+            let _ = std::fs::remove_file(p.with_extension(ext));
+        }
+        crate::db::open(&p).unwrap()
+    }
+
+    /// A tool row stored by a build before the index-time cap must not turn the first
+    /// re-parse after an upgrade into a full replace: it is rewritten in place and the
+    /// rest of the thread (ids, embedding state) is untouched.
+    #[test]
+    fn uncapped_legacy_tool_rows_are_recapped_in_place() {
+        use super::claude::cap_tool_text;
+        let mut conn = temp_db("recap");
+        let sid = source_id(&conn, "claude_code").unwrap();
+        let raw = format!("HEADMARK {} tailmarkword", "line of output\n".repeat(3_000));
+        let mut legacy = thread_with(&["run the tests", "here you go"]);
+        legacy.messages.insert(
+            1,
+            ParsedMessage {
+                role: "tool".into(),
+                text: raw.clone(),
+                tool_name: None,
+                ts: Some(1),
+            },
+        );
+        upsert_thread(&mut conn, sid, &legacy).unwrap();
+        let tid: i64 = conn
+            .query_row("SELECT id FROM threads WHERE external_id = 't1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        conn.execute("UPDATE messages SET embedded = 1 WHERE role <> 'tool'", [])
+            .unwrap();
+        let before = message_rowids(&conn, tid);
+
+        // Today's parse of the same transcript caps the tool output, plus one new message.
+        let mut fresh = thread_with(&["run the tests", "here you go", "thanks"]);
+        fresh.messages.insert(
+            1,
+            ParsedMessage {
+                role: "tool".into(),
+                text: cap_tool_text(&raw),
+                tool_name: None,
+                ts: Some(1),
+            },
+        );
+        upsert_thread(&mut conn, sid, &fresh).unwrap();
+
+        let after = message_rowids(&conn, tid);
+        assert_eq!(&after[..3], &before[..], "no full replace");
+        assert_eq!(after.len(), 4);
+        let stored: String = conn
+            .query_row(
+                "SELECT text FROM messages WHERE thread_id = ?1 AND seq = 1",
+                [tid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, cap_tool_text(&raw));
+        let embedded: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE thread_id = ?1 AND embedded = 1",
+                [tid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(embedded, 2, "the prose keeps its embedding state");
+        let fts = |q: &str| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH ?1",
+                [q],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(fts("tailmarkword"), 1, "FTS follows the rewrite");
+
+        // Any other difference in a stored row is still a rewritten transcript.
+        let mut edited = thread_with(&["run the tests", "here you go", "thanks"]);
+        edited.messages.insert(
+            1,
+            ParsedMessage {
+                role: "tool".into(),
+                text: "different output".into(),
+                tool_name: None,
+                ts: Some(1),
+            },
+        );
+        upsert_thread(&mut conn, sid, &edited).unwrap();
+        let stored: String = conn
+            .query_row(
+                "SELECT text FROM messages WHERE thread_id = ?1 AND seq = 1",
+                [tid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, "different output");
+    }
+
+    /// The tombstone is checked again under the write lock: an indexer that passed the early
+    /// check just before the user's delete committed must not re-insert the thread.
+    #[test]
+    fn a_delete_that_lands_after_the_early_check_still_wins() {
+        let p = std::env::temp_dir().join(format!("calli_tomb_tx_{}.db", std::process::id()));
+        for ext in ["db", "db-wal", "db-shm"] {
+            let _ = std::fs::remove_file(p.with_extension(ext));
+        }
+        let mut ui = crate::db::open(&p).unwrap();
+        let sid = source_id(&ui, "claude_code").unwrap();
+        upsert_thread(&mut ui, sid, &thread_with(&["hi"])).unwrap();
+
+        // The user's delete holds the write lock (uncommitted) while the watcher re-indexes.
+        let tx = ui
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        tx.execute(
+            "INSERT INTO deleted_threads (source_id, external_id, deleted_at) VALUES (?1, 't1', 0)",
+            [sid],
+        )
+        .unwrap();
+        tx.execute("DELETE FROM threads WHERE external_id = 't1'", [])
+            .unwrap();
+        let path = p.clone();
+        let watcher = std::thread::spawn(move || {
+            let mut conn = crate::db::open(&path).unwrap();
+            // Passes the early check (the delete isn't committed), then waits for the lock.
+            upsert_thread(&mut conn, sid, &thread_with(&["hi", "more"])).unwrap()
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        tx.commit().unwrap();
+
+        assert_eq!(watcher.join().unwrap(), 0, "the upsert backs off");
+        let n: i64 = ui
+            .query_row("SELECT COUNT(*) FROM threads", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0, "the deleted thread stays deleted");
+    }
+
     #[test]
     fn distillable_count_excludes_tool_rows_and_gates_invalidation() {
         let p = std::env::temp_dir().join(format!("calli_dc_{}.db", std::process::id()));
@@ -844,6 +1143,95 @@ mod tests {
         assert!(k_root.is_some());
         assert_eq!(k_root, k_deep, "subdir groups with the repo root");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "cp_{tag}_{}_{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::canonicalize(&dir).unwrap()
+    }
+
+    #[test]
+    fn canonical_project_resolves_worktrees_to_the_main_repo() {
+        let base = scratch("wt");
+        let main = base.join("repo");
+        let wt_git = main.join(".git/worktrees/feature");
+        std::fs::create_dir_all(&wt_git).unwrap();
+        std::fs::write(wt_git.join("commondir"), "../..\n").unwrap();
+        let wt = base.join("repo-feature");
+        std::fs::create_dir_all(wt.join("src")).unwrap();
+        std::fs::write(wt.join(".git"), format!("gitdir: {}\n", wt_git.display())).unwrap();
+
+        let k_main = canonical_project(main.to_str().unwrap());
+        assert_eq!(canonical_project(wt.to_str().unwrap()), k_main);
+        assert_eq!(canonical_project(wt.join("src").to_str().unwrap()), k_main);
+
+        // A submodule (.git file into .git/modules) stays its own project.
+        let sub = main.join("vendor/lib");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::create_dir_all(main.join(".git/modules/lib")).unwrap();
+        std::fs::write(sub.join(".git"), "gitdir: ../../.git/modules/lib\n").unwrap();
+        assert_eq!(
+            canonical_project(sub.to_str().unwrap()),
+            Some(sub.to_string_lossy().into_owned())
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn canonical_project_stops_at_home() {
+        let home = scratch("home");
+        std::fs::create_dir_all(home.join(".git")).unwrap(); // dotfiles repo in ~
+        let scratch_dir = home.join("scratch/notes");
+        std::fs::create_dir_all(&scratch_dir).unwrap();
+        let repo = home.join("code/app");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        let key = |p: &std::path::Path| {
+            super::canonical_project_with_home(p.to_str().unwrap(), Some(&home))
+        };
+
+        assert_eq!(
+            key(&scratch_dir),
+            Some(scratch_dir.to_string_lossy().into_owned()),
+            "a non-repo dir under home keys on itself, not on ~"
+        );
+        assert_eq!(
+            key(&repo.join("src")),
+            Some(repo.to_string_lossy().into_owned())
+        );
+        assert_eq!(
+            key(&home),
+            Some(home.to_string_lossy().into_owned()),
+            "home itself is still its own project"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn strips_windows_verbatim_prefixes() {
+        use std::path::Path;
+        assert_eq!(
+            super::strip_verbatim_prefix(Path::new(r"\\?\C:\Users\me\repo")),
+            Path::new(r"C:\Users\me\repo")
+        );
+        assert_eq!(
+            super::strip_verbatim_prefix(Path::new(r"\\?\UNC\srv\share\repo")),
+            Path::new(r"\\srv\share\repo")
+        );
+        assert_eq!(
+            super::strip_verbatim_prefix(Path::new("/home/me/repo")),
+            Path::new("/home/me/repo")
+        );
+        assert_eq!(super::path_key(Path::new("/")), "/");
+        assert_eq!(super::path_key(Path::new("/a/b/")), "/a/b");
     }
 
     #[test]

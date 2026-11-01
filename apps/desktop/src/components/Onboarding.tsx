@@ -1,5 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, type IndexProgress, SOURCE_LABELS, type SourceKind } from "../lib/api";
+import { useIndexError } from "../lib/queries";
 import { Button } from "@/components/ui/button";
 import { Progress, ProgressLabel } from "@/components/ui/progress";
 
@@ -34,10 +35,15 @@ export function Onboarding() {
     staleTime: Number.POSITIVE_INFINITY,
   });
 
+  // Set by the index:error listener in main.tsx. A failed scan also ends with an empty
+  // index:done, so this is checked first: "no threads found" would be the wrong story.
+  const indexError = useIndexError();
+
   const busy = !!indexing.data || reindex.isPending;
+  const failed = !!indexError && !busy;
   // A reindex finished but the store is still empty → say so, instead of silently
   // re-offering the same "Index my history" button (which read as "nothing happened").
-  const emptyAfterRun = !!ran.data && !busy && (stats.data?.threads ?? 0) === 0;
+  const emptyAfterRun = !failed && !!ran.data && !busy && (stats.data?.threads ?? 0) === 0;
   const ip = progress.data;
   const source = ip?.current ? (SOURCE_LABELS[ip.current as SourceKind] ?? ip.current) : "…";
   // Determinate % when we have an estimated total (re-index); indeterminate on first run.
@@ -47,13 +53,27 @@ export function Onboarding() {
     <div className="mx-auto flex h-full w-full max-w-lg flex-col items-center justify-center gap-6 p-8 text-center">
       <div className="space-y-2">
         <h1 className="text-2xl font-semibold tracking-tight">
-          {emptyAfterRun ? "No threads found" : "Welcome to Callimachus"}
+          {failed
+            ? "Couldn't index your history"
+            : emptyAfterRun
+              ? "No threads found"
+              : "Welcome to Callimachus"}
         </h1>
         <p className="text-sm text-muted-foreground">
-          {emptyAfterRun
-            ? "Callimachus scanned this machine for Claude Code, Codex, Cursor, and 8 more agents but found no history to index. If you just used one, reindex to pick it up."
-            : "One local, searchable index of every AI coding-agent conversation you've had. Let's build it from your history on this machine."}
+          {failed
+            ? "The scan stopped before it could index anything, so your history may well be there. Your agents' files were only read, never changed. Try again, and if it keeps failing, the reason below says what to fix."
+            : emptyAfterRun
+              ? "Callimachus scanned this machine for Claude Code, Codex, Cursor, and 8 more agents but found no history to index. If you just used one, reindex to pick it up."
+              : "One local, searchable index of every AI coding-agent conversation you've had. Let's build it from your history on this machine."}
         </p>
+        {failed && (
+          <p
+            role="alert"
+            className="break-words rounded-md bg-destructive/10 px-3 py-2 text-left font-mono text-xs text-destructive"
+          >
+            {indexError}
+          </p>
+        )}
       </div>
 
       {busy ? (
@@ -72,13 +92,13 @@ export function Onboarding() {
         </div>
       ) : (
         <Button size="lg" onClick={() => reindex.mutate()}>
-          {emptyAfterRun ? "Reindex" : "Index my history"}
+          {failed ? "Try again" : emptyAfterRun ? "Reindex" : "Index my history"}
         </Button>
       )}
 
       <p className="text-xs text-muted-foreground">
-        Nothing leaves your machine. After indexing, add semantic search from the header and the
-        Knowledge layer in Settings.
+        Your history stays on your machine. After indexing, add semantic search from the header and
+        the Knowledge layer in Settings.
       </p>
     </div>
   );

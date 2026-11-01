@@ -1,9 +1,16 @@
-import { useRef } from "react";
+import { useEffect, useRef } from "react";
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { api, SOURCE_LABELS, type SearchHit, type ThreadSummary } from "../lib/api";
+import {
+  api,
+  SOURCE_LABELS,
+  type SearchHit,
+  type ThreadDetail,
+  type ThreadSummary,
+} from "../lib/api";
 import { useUi } from "../store/ui";
 import { formatTime, renderSnippet, shortPath } from "../lib/format";
+import { commitSearch, noteSearch } from "../lib/telemetry";
 import { Badge } from "@/components/ui/badge";
 import { Star } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -33,7 +40,7 @@ export function ResultsList() {
   const fileFilter = query.startsWith("file:") ? query.slice(5).trim() : null;
   const searching = query.length > 0 && fileFilter === null;
 
-  const { data, isLoading, isFetching, error } = useQuery<ResultItem[]>({
+  const { data, isLoading, isFetching, isPlaceholderData, error } = useQuery<ResultItem[]>({
     queryKey: ["results", query, sources, includeSubagents, hybrid, starredOnly, selectedTags],
     queryFn: async () => {
       if (fileFilter) return await api.searchByFile(fileFilter);
@@ -42,6 +49,33 @@ export function ResultsList() {
     // Keep the current results visible while the next search loads (no empty flash).
     placeholderData: keepPreviousData,
   });
+
+  // Analytics: one search_performed per query that settles (unchanged for 1.5 s, or a
+  // result gets opened), never one per debounced keystroke and never from the queryFn.
+  // The key is an in-memory de-duplication id only; the query text is never sent.
+  // Placeholder data is the previous query's results, so it is skipped.
+  useEffect(() => {
+    if (!searching || !data || isPlaceholderData) return;
+    noteSearch(
+      JSON.stringify([query, sources, includeSubagents, hybrid, starredOnly, selectedTags]),
+      {
+        hybrid,
+        has_filters:
+          sources.length > 0 || starredOnly || selectedTags.length > 0 || includeSubagents,
+        results: data.length,
+      },
+    );
+  }, [
+    data,
+    isPlaceholderData,
+    searching,
+    query,
+    sources,
+    includeSubagents,
+    hybrid,
+    starredOnly,
+    selectedTags,
+  ]);
 
   const parentRef = useRef<HTMLDivElement>(null);
   const items = data ?? [];
@@ -85,7 +119,11 @@ export function ResultsList() {
                 style={{ transform: `translateY(${vrow.start}px)` }}
               >
                 <button
-                  onClick={() => selectThread(threadId, messageId)}
+                  type="button"
+                  onClick={() => {
+                    commitSearch(); // opening a result means the search was "performed"
+                    selectThread(threadId, messageId);
+                  }}
                   className={cn(
                     "block w-full cursor-pointer border-b px-4 py-2.5 pr-9 text-left hover:bg-muted/50",
                     active && "bg-muted shadow-[inset_3px_0_0_var(--primary)]",
@@ -105,6 +143,7 @@ export function ResultsList() {
                   {"snippet" in item ? (
                     <div
                       className="mt-1 line-clamp-2 text-[0.82rem] text-muted-foreground [&_mark]:rounded-sm [&_mark]:bg-primary/25 [&_mark]:text-foreground"
+                      // biome-ignore lint/security/noDangerouslySetInnerHtml: renderSnippet escapes &, < and > first and only adds <mark> tags
                       dangerouslySetInnerHTML={{ __html: renderSnippet(item.snippet) }}
                     />
                   ) : (
@@ -133,7 +172,10 @@ function StarButton({ threadId, starred }: { threadId: number; starred: boolean 
     mutationFn: () => api.setStar(threadId, !starred),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["results"] });
-      queryClient.invalidateQueries({ queryKey: ["thread", threadId] });
+      // Patch the open thread (if cached) rather than refetching its whole transcript.
+      queryClient.setQueryData<ThreadDetail | null>(["thread", threadId], (d) =>
+        d ? { ...d, starred: !starred } : d,
+      );
     },
   });
   return (

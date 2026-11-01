@@ -1,11 +1,14 @@
 import { memo, useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { api, OPEN_TARGETS, SOURCE_LABELS, type MessageRow } from "../lib/api";
+import { api, OPEN_TARGETS, SOURCE_LABELS, type MessageRow, type ThreadDetail } from "../lib/api";
 import { useUi } from "../store/ui";
-import { useChat } from "../store/chat";
+import { MAX_CONTEXT_CHARS, MAX_CONTEXTS, useChat } from "../store/chat";
 import { useSettings } from "../store/settings";
 import { formatTime } from "../lib/format";
+import { track, trackError } from "../lib/telemetry";
+import { copyAsyncText } from "../lib/clipboard";
+import { CAN_LAUNCH_CLI_FALLBACK } from "../lib/platform";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import {
@@ -21,6 +24,13 @@ import { KnowledgeButton } from "./KnowledgeSection";
 import { Loading } from "./Loading";
 import { Markdown, asCodeBlock } from "./Markdown";
 
+/** An inline notice tied to the thread it is about. */
+type Notice = { threadId: number; text: string };
+
+// Module-level, not a ref: this view remounts on every tab switch, and coming back to the
+// Search tab with the same thread selected is not a new "thread opened".
+let lastReportedThread: number | null = null;
+
 export function ThreadView() {
   const threadId = useUi((s) => s.selectedThreadId);
   const setView = useUi((s) => s.setView);
@@ -28,7 +38,10 @@ export function ThreadView() {
   const vaultDir = useSettings((s) => s.vaultDir);
   const synthProvider = useSettings((s) => s.synthProvider);
   const synthModel = useSettings((s) => s.synthModel);
-  const [copied, setCopied] = useState(false);
+  const [copyState, setCopyState] = useState<"idle" | "copying" | "copied">("idle");
+  // Notices remember which thread they are about, so opening another thread hides them.
+  const [copyError, setCopyError] = useState<Notice | null>(null);
+  const [contextNotice, setContextNotice] = useState<Notice | null>(null);
   const [exported, setExported] = useState(false);
 
   const { data, isLoading } = useQuery({
@@ -37,27 +50,71 @@ export function ThreadView() {
     enabled: threadId != null,
   });
 
-  const canResume = data?.source === "claude_code" || data?.source === "codex";
+  // Once per opened thread, not per refetch (live updates refetch open threads).
+  useEffect(() => {
+    if (data && data.id === threadId && lastReportedThread !== threadId) {
+      lastReportedThread = threadId;
+      track("thread_opened", { source: data.source });
+    }
+  }, [data, threadId]);
+
+  // The backend says whether it can open a terminal here (a Linux box with no terminal
+  // emulator can't), so Resume / Open-in-CLI are hidden instead of failing on click. The
+  // answer can't change mid-session; the OS guess covers the moment before it arrives.
+  const cliLaunch = useQuery({
+    queryKey: ["cli_launch_supported"],
+    queryFn: api.cliLaunchSupported,
+    staleTime: Infinity,
+  });
+  const canLaunchCli = cliLaunch.data ?? CAN_LAUNCH_CLI_FALLBACK;
+  const canResume = canLaunchCli && (data?.source === "claude_code" || data?.source === "codex");
   const resume = useMutation({ mutationFn: () => api.resumeThread(threadId as number) });
   const addToChat = useMutation({
-    mutationFn: () => api.threadContext(threadId as number),
-    onSuccess: (ctx) => {
-      addContext(ctx);
-      setView("chat");
-    },
-  });
-  const copyContext = useMutation({
-    mutationFn: () => api.threadContext(threadId as number),
-    onSuccess: async (ctx) => {
-      try {
-        await navigator.clipboard.writeText(ctx);
-        setCopied(true);
-        setTimeout(() => setCopied(false), 1500);
-      } catch {
-        /* clipboard unavailable */
+    // Chat context is re-sent every turn, so ask for a compact pack (see store/chat.ts).
+    // The thread is passed in (not read from render scope) so a reply that lands after
+    // the user opened another thread is still attributed to the right one.
+    mutationFn: (t: { id: number; title: string | null }) =>
+      api.threadContext(t.id, MAX_CONTEXT_CHARS),
+    onMutate: () => setContextNotice(null),
+    onSuccess: (ctx, { id, title }) => {
+      const result = addContext(ctx, { threadId: id, title });
+      if (result === "limit") {
+        setContextNotice({
+          threadId: id,
+          text: `Chat already has ${MAX_CONTEXTS} attached threads. Remove one in Chat, or start a new chat, to add this one.`,
+        });
+      } else if (result === "busy") {
+        setContextNotice({
+          threadId: id,
+          text: "Chat is still replying. Add this thread once the reply finishes.",
+        });
+      } else {
+        setView("chat"); // "added", or "duplicate" (already attached): show the chat
       }
     },
   });
+
+  // Copy runs straight from the click (no await first): WebKit only allows clipboard
+  // writes during the user gesture, so the IPC result is handed to the clipboard as a
+  // promise (see lib/clipboard).
+  const copyContext = () => {
+    if (threadId == null || copyState === "copying") return;
+    setCopyError(null);
+    setCopyState("copying");
+    copyAsyncText(() => api.threadContext(threadId)).then(
+      () => {
+        setCopyState("copied");
+        setTimeout(() => setCopyState("idle"), 1500);
+      },
+      (e) => {
+        setCopyState("idle");
+        setCopyError({
+          threadId,
+          text: `Couldn't copy the context: ${e instanceof Error ? e.message : e}`,
+        });
+      },
+    );
+  };
   const openInCli = useMutation({
     mutationFn: (program: string) => api.openThreadInCli(threadId as number, program),
   });
@@ -69,17 +126,29 @@ export function ThreadView() {
   const exportNote = useMutation({
     mutationFn: () => api.exportThread(threadId as number, vaultDir),
     onSuccess: markExported,
+    // A plain export is a file write, so its errors (permission denied, missing folder)
+    // must not be read as provider errors by the keyword classifier.
+    onError: () => track("error_shown", { kind: "export_failed" }),
   });
   const synthExport = useMutation({
     mutationFn: () => api.synthesizeExport(threadId as number, vaultDir, synthProvider, synthModel),
     onSuccess: markExported,
+    // Synthesis calls an LLM first, so a provider error keeps its class.
+    onError: (e) => trackError(e, "export_failed"),
   });
 
   const queryClient = useQueryClient();
   const toggleStar = useMutation({
-    mutationFn: () => api.setStar(threadId as number, !data?.starred),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["thread", threadId] });
+    // The id travels as a variable: a pending mutation picks up the newest render's
+    // callbacks, so reading `threadId` in onSuccess would patch whichever thread is open
+    // when setStar returns (it can queue behind a reindex write), not the one starred.
+    mutationFn: ({ id, starred }: { id: number; starred: boolean }) => api.setStar(id, starred),
+    onSuccess: (_, { id, starred }) => {
+      // Patch the cached thread instead of refetching it: a big thread is megabytes over
+      // IPC, and only the flag changed. Results still refetch (they filter by star).
+      queryClient.setQueryData<ThreadDetail | null>(["thread", id], (d) =>
+        d ? { ...d, starred } : d,
+      );
       queryClient.invalidateQueries({ queryKey: ["results"] });
     },
   });
@@ -110,7 +179,7 @@ export function ThreadView() {
             <Button
               size="icon-sm"
               variant="outline"
-              onClick={() => toggleStar.mutate()}
+              onClick={() => toggleStar.mutate({ id: data.id, starred: !data.starred })}
               disabled={toggleStar.isPending}
               title={data.starred ? "Unstar" : "Star"}
             >
@@ -133,14 +202,14 @@ export function ThreadView() {
                 <MoreHorizontal className="size-4" />
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end">
-                <DropdownMenuItem onClick={() => addToChat.mutate()} disabled={addToChat.isPending}>
+                <DropdownMenuItem
+                  onClick={() => addToChat.mutate({ id: data.id, title: data.title })}
+                  disabled={addToChat.isPending}
+                >
                   Add to chat
                 </DropdownMenuItem>
-                <DropdownMenuItem
-                  onClick={() => copyContext.mutate()}
-                  disabled={copyContext.isPending}
-                >
-                  {copied ? "Copied ✓" : "Copy context"}
+                <DropdownMenuItem onClick={copyContext} disabled={copyState === "copying"}>
+                  {copyState === "copied" ? "Copied ✓" : "Copy context"}
                 </DropdownMenuItem>
 
                 <div className="-mx-1 my-1 h-px bg-border" />
@@ -157,14 +226,18 @@ export function ThreadView() {
                   Synthesize &amp; export{canSynth.data === false ? " (add API key)" : ""}
                 </DropdownMenuItem>
 
-                <div className="-mx-1 my-1 h-px bg-border" />
-                <div className="px-2 py-1 text-xs text-muted-foreground">Open thread in…</div>
-                {OPEN_TARGETS.map((t) => (
-                  <DropdownMenuItem key={t.program} onClick={() => openInCli.mutate(t.program)}>
-                    <ExternalLink />
-                    {t.label}
-                  </DropdownMenuItem>
-                ))}
+                {canLaunchCli && (
+                  <>
+                    <div className="-mx-1 my-1 h-px bg-border" />
+                    <div className="px-2 py-1 text-xs text-muted-foreground">Open thread in…</div>
+                    {OPEN_TARGETS.map((t) => (
+                      <DropdownMenuItem key={t.program} onClick={() => openInCli.mutate(t.program)}>
+                        <ExternalLink />
+                        {t.label}
+                      </DropdownMenuItem>
+                    ))}
+                  </>
+                )}
               </DropdownMenuContent>
             </DropdownMenu>
           </div>
@@ -175,7 +248,21 @@ export function ThreadView() {
           {data.gitBranch && <span> · {data.gitBranch}</span>}
           <span> · {formatTime(data.updatedAt)}</span>
         </div>
-        <TagsEditor threadId={data.id} tags={data.tags} />
+        {/* Keyed per thread so a half-typed tag doesn't carry over to the next thread. */}
+        <TagsEditor key={data.id} threadId={data.id} tags={data.tags} />
+        {addToChat.isError && (
+          <div className="mt-1 text-xs text-destructive">{String(addToChat.error)}</div>
+        )}
+        {contextNotice?.threadId === data.id && (
+          <div className="mt-1 text-xs text-destructive">{contextNotice.text}</div>
+        )}
+        {copyError?.threadId === data.id && (
+          <div className="mt-1 text-xs text-destructive">{copyError.text}</div>
+        )}
+        {copyState === "copied" && (
+          // The menu closes on click, so confirm here where it stays visible.
+          <div className="mt-1 text-xs text-muted-foreground">Copied the thread context.</div>
+        )}
         {resume.isError && (
           <div className="mt-1 text-xs text-destructive">{String(resume.error)}</div>
         )}
@@ -321,24 +408,40 @@ function toolBody(text: string, toolName: string | null): string {
       // Not valid JSON (e.g. a line-numbered file read) — fall through.
     }
   }
-  return asCodeBlock(body);
+  // Label non-JSON output as plain text: unlabeled fences trigger highlight.js language
+  // auto-detection across every grammar, ~30x the cost of plain rendering per row.
+  return asCodeBlock(body, "text");
+}
+
+/** A collapsed tool call/result. The body is parsed and rendered only once the row is
+ *  first opened: most tool rows are never expanded, and a large thread has thousands. */
+function ToolMessage({ m, ring }: { m: MessageRow; ring: string }) {
+  const [opened, setOpened] = useState(false);
+  return (
+    <details
+      className={cn("rounded-lg border bg-muted/40 px-3 py-2 text-sm", ring)}
+      onToggle={(e) => {
+        if (e.currentTarget.open) setOpened(true);
+      }}
+    >
+      <summary className="cursor-pointer text-muted-foreground">
+        <span className="text-[0.68rem] uppercase tracking-wide">
+          {m.toolName ? `tool · ${m.toolName}` : "result"}
+        </span>
+      </summary>
+      {opened && (
+        <div className="mt-2 max-h-80 overflow-auto text-[0.8rem]">
+          <Markdown>{toolBody(m.text, m.toolName)}</Markdown>
+        </div>
+      )}
+    </details>
+  );
 }
 
 const Message = memo(function Message({ m, highlight }: { m: MessageRow; highlight?: boolean }) {
   const ring = highlight ? "ring-2 ring-primary/60" : "";
   if (m.toolName || m.role === "tool") {
-    return (
-      <details className={cn("rounded-lg border bg-muted/40 px-3 py-2 text-sm", ring)}>
-        <summary className="cursor-pointer text-muted-foreground">
-          <span className="text-[0.68rem] uppercase tracking-wide">
-            {m.toolName ? `tool · ${m.toolName}` : "result"}
-          </span>
-        </summary>
-        <div className="mt-2 max-h-80 overflow-auto text-[0.8rem]">
-          <Markdown>{toolBody(m.text, m.toolName)}</Markdown>
-        </div>
-      </details>
-    );
+    return <ToolMessage m={m} ring={ring} />;
   }
   return (
     <div

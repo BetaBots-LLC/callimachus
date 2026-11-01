@@ -14,8 +14,42 @@ use std::path::{Path, PathBuf};
 
 pub const KIND: &str = "codex";
 
-/// `~/.codex`, or None if HOME is unset.
+static CODEX_HOME_OVERRIDE: std::sync::RwLock<Option<PathBuf>> = std::sync::RwLock::new(None);
+
+/// Point the indexer at a relocated Codex home (a Settings value). A GUI app launched from
+/// Finder/Dock never sees the shell's `CODEX_HOME`, so the app needs a way to set it
+/// explicitly. `None` (or an empty path) restores the default lookup.
+pub fn set_codex_home_override(dir: Option<PathBuf>) {
+    if let Ok(mut slot) = CODEX_HOME_OVERRIDE.write() {
+        *slot = dir
+            .filter(|d| !d.as_os_str().is_empty())
+            .map(super::claude::expand_tilde);
+    }
+}
+
+/// `app_config` key holding a user-chosen Codex home (a Settings value).
+pub const CODEX_HOME_SETTING: &str = "paths.codex_home";
+
+/// Apply the [`CODEX_HOME_SETTING`] override from the index (cleared when unset). Called at
+/// the start of every scan, so a changed setting takes effect on the next pass.
+pub fn load_codex_home_setting(conn: &Connection) {
+    set_codex_home_override(super::claude::read_path_setting(conn, CODEX_HOME_SETTING));
+}
+
+/// The Settings override set by [`set_codex_home_override`], if any (no env fallback).
+pub fn codex_home_override() -> Option<PathBuf> {
+    CODEX_HOME_OVERRIDE.read().ok().and_then(|g| g.clone())
+}
+
+/// Codex's home: the override, else `$CODEX_HOME`, else `~/.codex`. The CLI, the Desktop
+/// app and the IDE extension all honor `CODEX_HOME`, so the index must too.
 pub fn codex_root() -> Option<PathBuf> {
+    if let Some(dir) = CODEX_HOME_OVERRIDE.read().ok().and_then(|g| g.clone()) {
+        return Some(dir);
+    }
+    if let Some(dir) = std::env::var_os("CODEX_HOME").filter(|v| !v.is_empty()) {
+        return Some(super::claude::expand_tilde(PathBuf::from(dir)));
+    }
     dirs::home_dir().map(|h| h.join(".codex"))
 }
 
@@ -41,6 +75,7 @@ struct ThreadMeta {
 /// `session_meta` header, so it can be indexed without the DB. Dedup is by session
 /// id, so a session present in both passes is indexed once (pass 1 wins).
 pub fn scan(conn: &mut Connection, tick: &mut dyn FnMut()) -> Result<IndexReport> {
+    load_codex_home_setting(conn);
     let Some(root) = codex_root() else {
         return Ok(IndexReport::default());
     };
@@ -135,8 +170,25 @@ fn index_rollout(conn: &mut Connection, sid: i64, meta: &ThreadMeta) -> Result<O
             return Ok(None);
         }
     }
+    // The user deleted this thread: don't bring it back (and don't pay to parse it).
+    if crate::cleanup::is_tombstoned(conn, sid, &meta.id)? {
+        set_file_state(conn, &meta.rollout_path, KIND, mtime, size)?;
+        return Ok(None);
+    }
 
     let messages = parse_rollout(path)?;
+    // `codex exec` runs the app's own distill / Ask calls (codex-cli engine) and always
+    // writes a rollout; those are not the user's history.
+    let cwd = (!meta.cwd.is_empty()).then_some(meta.cwd.as_str());
+    let user_texts = messages
+        .iter()
+        .filter(|m| m.role == "user")
+        .take(3)
+        .map(|m| m.text.as_str());
+    if crate::agent::is_app_cli_session(cwd, user_texts) {
+        set_file_state(conn, &meta.rollout_path, KIND, mtime, size)?;
+        return Ok(None);
+    }
     let title = if !meta.title.trim().is_empty() {
         Some(meta.title.clone())
     } else if !meta.first_user_message.trim().is_empty() {
@@ -283,6 +335,8 @@ fn ingest_payload(out: &mut Vec<ParsedMessage>, payload: &Value, ts: Option<i64>
         }
         Some("function_call_output") => {
             let output = payload.get("output").map(value_to_text).unwrap_or_default();
+            // Same index-time cap as Claude tool results (see `claude::cap_tool_text`).
+            let output = super::claude::cap_tool_text(output.trim());
             push(out, "tool", output, None, ts);
         }
         _ => {} // reasoning, etc. — skipped
@@ -418,6 +472,54 @@ mod tests {
         // Re-scan is a no-op (rollout fingerprint unchanged).
         let again = scan_in(&mut conn, &root, &mut || {}).unwrap();
         assert_eq!(again.threads_indexed, 0);
+    }
+
+    #[test]
+    fn caps_tool_output_and_skips_the_apps_own_sessions() {
+        let root = std::env::temp_dir().join(format!("calli_codex_cap_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let day = root.join("sessions/2026/05/01");
+        std::fs::create_dir_all(&day).unwrap();
+        let big = "x".repeat(40_000);
+        let user_session = serde_json::json!([
+            {"type":"session_meta","payload":{"id":"user-1","cwd":"/Users/me/proj"}},
+            {"type":"response_item","payload":{"type":"message","role":"user",
+                "content":[{"type":"input_text","text":"run the tests"}]}},
+            {"type":"response_item","payload":{"type":"function_call_output","output": big}}
+        ]);
+        let app_cwd = crate::agent::cli_work_dir_path();
+        let app_session = serde_json::json!([
+            {"type":"session_meta","payload":{"id":"app-1","cwd": app_cwd.to_string_lossy()}},
+            {"type":"response_item","payload":{"type":"message","role":"user",
+                "content":[{"type":"input_text","text":"distill this"}]}}
+        ]);
+        for (name, lines) in [
+            ("rollout-a.jsonl", user_session),
+            ("rollout-b.jsonl", app_session),
+        ] {
+            let body: String = lines
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|l| format!("{l}\n"))
+                .collect();
+            std::fs::write(day.join(name), body).unwrap();
+        }
+
+        let dbp = std::env::temp_dir().join(format!("calli_codex_cap_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&dbp);
+        let mut conn = crate::db::open(&dbp).unwrap();
+        let report = scan_in(&mut conn, &root, &mut || {}).unwrap();
+        assert_eq!(
+            report.threads_indexed, 1,
+            "only the user's session is indexed"
+        );
+        let tool: String = conn
+            .query_row("SELECT text FROM messages WHERE role = 'tool'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(tool.chars().count() <= super::super::claude::TOOL_TEXT_CAP_CHARS);
     }
 
     /// Real-data smoke test. Run with `cargo test -- --ignored real_codex_index --nocapture`.

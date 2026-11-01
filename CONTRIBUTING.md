@@ -4,9 +4,20 @@ Thanks for your interest. Issues, feature ideas, and PRs are all welcome.
 
 ## Prerequisites
 
-- **macOS** (the app is macOS-first today — keychain + "Open in CLI" are macOS-specific)
-- **Node 20+** and **pnpm** (`corepack enable` or `npm i -g pnpm`)
-- **Rust** (stable, via [rustup](https://rustup.rs))
+- **macOS, Windows or Linux.** Everything builds and runs on all three; only the
+  "Open in CLI" / "Resume" launchers are macOS-only today (they drive Terminal via
+  AppleScript). On Linux, install the WebKitGTK build deps first
+  ([Tauri's prerequisites](https://v2.tauri.app/start/prerequisites/#linux)), e.g.
+  on Ubuntu 24.04+ / Debian 13+:
+  ```bash
+  sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev \
+    build-essential pkg-config libssl-dev
+  ```
+  The ONNX Runtime prebuilt needs glibc 2.38 or newer, so older distros (Ubuntu
+  22.04, Debian 12) can't build or run it.
+- **Node 22+** and **pnpm** (`corepack enable` or `npm i -g pnpm`)
+- **Rust** via [rustup](https://rustup.rs). CI pins a specific stable release
+  (`RUST_TOOLCHAIN` in `.github/workflows/ci.yml`); use that or newer.
 
 ## Setup
 
@@ -24,11 +35,12 @@ sources, then **Build semantic index** for hybrid search.
 This is a [Turborepo](https://turborepo.com) + pnpm workspace.
 
 ```
-apps/desktop/    Tauri 2 app + the `cal` CLI and `callimachus-mcp` server (src-tauri)
-apps/vscode/     VS Code extension (shells out to `cal`)
-apps/web/        marketing + download site (TanStack Start)
-scripts/         version-sync, release tagging
-.changeset/      versioning + changelog
+apps/desktop/              Tauri 2 app + the `cal` CLI and `callimachus-mcp` server (src-tauri)
+apps/vscode/               VS Code extension (shells out to `cal`)
+apps/web/                  marketing + download site (TanStack Start)
+packages/callimachus-mcp/  npm launcher for the MCP server (`npx -y callimachus-mcp`)
+scripts/                   version-sync, release tagging
+.changeset/                versioning + changelog
 ```
 
 ## Checks before a PR
@@ -37,8 +49,14 @@ scripts/         version-sync, release tagging
 pnpm check                             # Biome lint + format check
 pnpm typecheck                         # all apps (tsc)
 pnpm build                             # all apps
+node --test packages/callimachus-mcp/test/*.test.mjs   # npm launcher tests
 cd apps/desktop/src-tauri && cargo test   # Rust unit tests
 ```
+
+CI runs the same checks, plus `cargo clippy -D warnings` on macOS and
+`cargo check --all-targets` on Linux and Windows. Rust builds use `--locked`, so
+commit `Cargo.lock` with any dependency change. The Biome step is advisory for
+now (there are existing errors to clear), but please don't add new ones.
 
 `cargo test -- --ignored` runs real-data smoke tests against your own history
 (read-only) and downloads the embedding model on first run.
@@ -53,8 +71,12 @@ at [`apps/desktop/src-tauri/src/indexer/README.md`](apps/desktop/src-tauri/src/i
 
 - **Commits:** [Conventional Commits](https://www.conventionalcommits.org)
   (`feat:`, `fix:`, `chore:`, `docs:`, `refactor:`, `test:`).
-- **Changesets:** if your change is user-facing, run `pnpm changeset` and commit
-  the generated file so it lands in the changelog / version bump.
+- **Changesets:** if your change is user-facing, run `pnpm changeset` (patch by
+  default) and commit the generated file so it lands in the changelog / version
+  bump.
+- **Privacy:** if a change adds network traffic or changes what analytics send,
+  update the privacy policy (`apps/web/src/content/legal.ts`, bump
+  `LEGAL_UPDATED`) and `SECURITY.md` in the same PR, and say so in the changeset.
 - **Style:** functional and concise; validate at system boundaries; don't add
   comments or type annotations to unchanged code. Run `pnpm check` (Biome lint +
   format, or `pnpm check:fix` to apply) before opening a PR.

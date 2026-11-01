@@ -1,6 +1,7 @@
 import { useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { api } from "../lib/api";
+import { api, type ThreadDetail } from "../lib/api";
+import { isImeComposing } from "../lib/keyboard";
 import {
   Combobox,
   ComboboxChip,
@@ -30,10 +31,27 @@ export function TagsEditor({ threadId, tags }: { threadId: number; tags: string[
     staleTime: 60_000,
   });
 
+  // Patch the cached thread optimistically instead of refetching it: get_thread ships the
+  // whole transcript (megabytes for big threads) and only the tag list changed. Results
+  // and the tag vocabulary still refresh, since they filter and count by tag.
+  const threadKey = ["thread", threadId];
   const save = useMutation({
     mutationFn: (next: string[]) => api.setThreadTags(threadId, next),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["thread", threadId] });
+    onMutate: async (next: string[]) => {
+      await queryClient.cancelQueries({ queryKey: threadKey });
+      const prev = queryClient.getQueryData<ThreadDetail | null>(threadKey);
+      queryClient.setQueryData<ThreadDetail | null>(threadKey, (d) =>
+        d ? { ...d, tags: next } : d,
+      );
+      // Carry the key with the snapshot: a pending mutation runs the newest render's
+      // onError, so `threadKey` there may already name another thread, and restoring this
+      // thread's snapshot into it would show the wrong transcript.
+      return { prev, key: threadKey };
+    },
+    onError: (_e, _next, ctx) => {
+      if (ctx && ctx.prev !== undefined) queryClient.setQueryData(ctx.key, ctx.prev);
+    },
+    onSettled: () => {
       queryClient.invalidateQueries({ queryKey: ["results"] });
       queryClient.invalidateQueries({ queryKey: ["list_tags"] });
     },
@@ -75,7 +93,7 @@ export function TagsEditor({ threadId, tags }: { threadId: number; tags: string[
         <ComboboxInput
           placeholder={tags.length ? "" : "add tags…"}
           onKeyDown={(e) => {
-            if (e.key !== "Enter" || highlighted.current) return;
+            if (e.key !== "Enter" || highlighted.current || isImeComposing(e)) return;
             const t = query.trim();
             if (!t) return;
             e.preventDefault();

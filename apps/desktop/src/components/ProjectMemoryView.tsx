@@ -4,6 +4,8 @@ import { Pencil, Pin, Trash2 } from "lucide-react";
 import { api, type MemoryFact, type ProjectMemory } from "../lib/api";
 import { useUi } from "../store/ui";
 import { shortPath } from "../lib/format";
+import { useEmbedStatus } from "../lib/queries";
+import { AGGREGATE_STALE_MS } from "../lib/queryClient";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Progress, ProgressLabel, ProgressValue } from "@/components/ui/progress";
@@ -31,7 +33,12 @@ export function ProjectMemoryView() {
   const selectedProject = useUi((s) => s.selectedProject);
   const openProject = useUi((s) => s.openProject);
 
-  const projects = useQuery({ queryKey: ["projects"], queryFn: api.listProjects });
+  // Refreshed by index:done / distill:done (main.tsx), so revisits reuse the cache.
+  const projects = useQuery({
+    queryKey: ["projects"],
+    queryFn: api.listProjects,
+    staleTime: AGGREGATE_STALE_MS,
+  });
   const project = selectedProject ?? projects.data?.[0]?.project ?? null;
 
   const memory = useQuery({
@@ -47,11 +54,7 @@ export function ProjectMemoryView() {
   });
   // Distill is mutually exclusive with the embedding build + reindex (they share the
   // write lock). Track them so the Build-memory button disables instead of no-op'ing.
-  const embed = useQuery({
-    queryKey: ["embed_status"],
-    queryFn: api.embeddingStatus,
-    refetchInterval: (q) => (q.state.data?.running ? 3000 : false),
-  });
+  const embed = useEmbedStatus(); // event-driven; never polls while idle (lib/queries.ts)
   const indexing = useQuery({
     queryKey: ["index_status"],
     queryFn: api.indexingStatus,

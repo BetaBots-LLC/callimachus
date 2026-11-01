@@ -1,11 +1,11 @@
 export const FAQ: { q: string; a: string }[] = [
   {
     q: "Does my data leave my machine?",
-    a: "No. Callimachus reads the conversation logs your agents already write locally and builds a SQLite index on disk. Search, embeddings, and the index all stay on your computer. There is no account, no cloud sync, and no telemetry. The only time anything leaves is if you explicitly use the in-app chat with your own provider key.",
+    a: "Your history doesn't. Callimachus reads the conversation logs your agents already write locally and builds a SQLite index on disk. Search, embeddings, and the index all stay on your computer, and there is no account and no cloud sync. Conversation content leaves only when you use the in-app chat, distillation, or Ask with a cloud AI provider you choose (local Ollama keeps even that on your machine). Beyond that, the app checks GitHub for updates, downloads its embedding model once, and sends anonymous usage analytics (event names, the app version and platform, and a few properties from fixed lists such as rounded counts; never your content) only if you choose to allow them.",
   },
   {
     q: "Which AI coding agents does it index?",
-    a: "Eleven today: Claude Code, Codex, Cursor, Gemini CLI, Qwen Code, Goose, OpenCode, Continue, Cline, Roo Code, and Kilo Code — plus the in-app chat. A background watcher keeps the index current as you work, and you can reindex any source on demand.",
+    a: "Twelve today: Claude Code, Codex, Cursor, Gemini CLI, Qwen Code, Goose, OpenCode, Continue, Cline, Roo Code, Kilo Code, and Copilot Chat in VS Code-family editors, plus the in-app chat. A background watcher keeps the index current as you work, and you can reindex any source on demand.",
   },
   {
     q: "How is the search better than grep?",
@@ -13,7 +13,7 @@ export const FAQ: { q: string; a: string }[] = [
   },
   {
     q: "What do I actually need to run it?",
-    a: "The desktop app on macOS, Windows, or Linux — that's it; it bundles the index and the cal CLI. The editor extension and MCP server both read the same local index, so run the app once and everything else just works.",
+    a: "The desktop app on macOS (Apple Silicon), Windows, or Linux (glibc 2.38 or newer, such as Ubuntu 24.04+ or Debian 13+). That's it: it builds the index and can install the cal CLI. The editor extension and MCP server both read the same local index, so run the app once and everything else just works.",
   },
   {
     q: "Can it summarize decisions or answer questions about my history?",

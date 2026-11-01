@@ -1,16 +1,20 @@
 #!/usr/bin/env node
-// Multi-artifact release tagger. Wired as the Changesets Action `publish` step,
-// so it runs right after a "Version Packages" PR merges (no changesets left).
+// Release tagger. Wired as the Changesets Action `publish` step, so it runs
+// right after a "Version Packages" PR merges (no changesets left).
 //
-// For each publishable package whose new version isn't tagged yet, it creates +
-// pushes that tag — which triggers the matching workflow:
+// Every shippable package (desktop app, VS Code extension, `callimachus-mcp`
+// npm wrapper) is in one Changesets `fixed` group, so they always share a
+// version and one tag drives every release workflow:
 //
-//   v<version>         -> build.yml             (desktop: .dmg + signed updater)
-//   vscode-v<version>  -> publish-extension.yml (VS Code Marketplace + Open VSX + .vsix)
+//   v<version>  -> build.yml             (desktop installers, standalone cal +
+//                                         callimachus-mcp binaries, updater
+//                                         manifest, npm wrapper, MCP registry)
+//               -> publish-extension.yml (VS Code Marketplace + Open VSX, and
+//                                         the .vsix attached to the same Release)
 //
-// Independent versions: a release that only bumps the extension pushes only the
-// vscode tag (and vice versa). Tags are pushed via the checkout token (use a PAT
-// as RELEASE_TOKEN so the pushed tag is allowed to trigger the artifact workflows).
+// If the tag already exists it does nothing. Tags are pushed via the checkout
+// token: use a PAT as RELEASE_TOKEN so the pushed tag is allowed to trigger the
+// release workflows (the default GITHUB_TOKEN cannot trigger other workflows).
 
 import { execSync } from "node:child_process";
 import { readFileSync } from "node:fs";
@@ -20,12 +24,8 @@ import { dirname, join } from "node:path";
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const versionOf = (pkg) => JSON.parse(readFileSync(join(root, pkg), "utf8")).version;
 
-// One tag drives everything: build.yml (desktop installers) AND
-// publish-extension.yml (extension) both run on v<version>. The extension version
-// is kept in lockstep with the desktop via the Changesets `fixed` group.
-const ARTIFACTS = [
-  { pkg: "apps/desktop/package.json", prefix: "v" },
-];
+// The desktop package.json carries the shared version (see the header).
+const ARTIFACTS = [{ pkg: "apps/desktop/package.json", prefix: "v" }];
 
 const existing = new Set(
   execSync("git tag --list", { encoding: "utf8" })

@@ -1,6 +1,7 @@
 // Thread actions shared by the webview RPC and the palette commands. Each takes a
 // plain thread id so both callers hit the same core.
 
+import * as path from "node:path";
 import * as vscode from "vscode";
 import { calBinPath, catThread, config, runCal } from "./cal";
 
@@ -37,12 +38,49 @@ export async function exportThreadById(id: number): Promise<void> {
   await vscode.window.showTextDocument(doc, { preview: false });
 }
 
+type ShellSyntax = "posix" | "powershell";
+
+/**
+ * Which command-line syntax the new terminal will speak, and the shell to force when the
+ * default can't do command substitution. On Windows, cmd.exe has no `$()` at all and
+ * wsl.exe can't run the Windows `cal.exe` path, so those (and anything unrecognized) get
+ * a Windows PowerShell terminal, which every Windows install has.
+ */
+function terminalShell(): { syntax: ShellSyntax; shellPath?: string } {
+  const name = path
+    .basename(vscode.env.shell || "")
+    .toLowerCase()
+    .replace(/\.exe$/, "");
+  if (name === "pwsh" || name === "powershell") return { syntax: "powershell" };
+  if (process.platform !== "win32") return { syntax: "posix" };
+  // Git Bash, MSYS2, Cygwin.
+  if (["bash", "zsh", "sh", "fish"].includes(name)) return { syntax: "posix" };
+  return { syntax: "powershell", shellPath: "powershell.exe" };
+}
+
+/** The line that runs `program` with `cal cat <id>` spliced in as its one argument. The
+ *  subshell keeps the (large) context off the visible command line. The binary path is
+ *  quoted because install dirs can contain spaces ("Program Files"). */
+function cliCommandLine(program: string, bin: string, id: number, syntax: ShellSyntax): string {
+  if (syntax === "powershell") {
+    // `&` is required: PowerShell parses a quoted path followed by arguments as an
+    // expression ("Unexpected token 'cat'"). Out-String keeps the transcript's line
+    // breaks; a bare subexpression would join its output lines with spaces.
+    const quoted = `'${bin.replace(/'/g, "''")}'`;
+    return `${program} "$(& ${quoted} cat ${id} | Out-String)"`;
+  }
+  return `${program} "$("${bin}" cat ${id})"`;
+}
+
 /** Seed a CLI agent (default `claude`) with the thread's context in a terminal. */
 export async function openInCli(id: number): Promise<void> {
   const program = config<string>("openCommand", "claude").trim() || "claude";
-  const bin = calBinPath();
-  const term = vscode.window.createTerminal(`Callimachus ▸ thread ${id}`);
+  const bin = await calBinPath(); // throws CalSetupError (setup prompt) when cal is missing
+  const shell = terminalShell();
+  const term = vscode.window.createTerminal({
+    name: `Callimachus ▸ thread ${id}`,
+    shellPath: shell.shellPath,
+  });
   term.show();
-  // Subshell keeps the (large) context off the visible command line / argv limits.
-  term.sendText(`${program} "$(${bin} cat ${id})"`);
+  term.sendText(cliCommandLine(program, bin, id, shell.syntax));
 }

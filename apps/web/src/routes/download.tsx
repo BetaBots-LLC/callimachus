@@ -45,7 +45,12 @@ function DownloadPage() {
           Pick your platform; it auto-updates from there.
         </p>
         <div className="mt-8">
-          <DownloadButton release={release} primaryOs={primaryOs} showAll={false} />
+          <DownloadButton
+            release={release}
+            primaryOs={primaryOs}
+            placement="download_page"
+            showAll={false}
+          />
         </div>
       </div>
 
@@ -82,8 +87,9 @@ function DownloadPage() {
           <div className="mt-2 rounded-md border border-border p-4">
             <p className="cat-label mb-2">Requires</p>
             <p className="text-sm leading-relaxed text-muted-foreground">
-              macOS 12+, Windows 10+, or a modern Linux desktop. The first run downloads a small
-              embedding model for semantic search; everything else is offline.
+              macOS 12+ (Apple Silicon), Windows 10+, or Linux with glibc 2.38+ (Ubuntu 24.04+,
+              Debian 13+, Fedora 39+). The app downloads a small embedding model once for semantic
+              search and checks GitHub for updates; indexing and search run offline.
             </p>
           </div>
         </aside>

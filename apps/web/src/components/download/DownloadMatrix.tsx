@@ -2,6 +2,8 @@ import { Apple, Download, Monitor, Terminal } from "lucide-react";
 import type { ComponentType } from "react";
 import { RELEASES_URL } from "@/lib/site";
 import type { Release } from "@/server/releases";
+import type { OsKey } from "@/lib/os-detect";
+import { useTrack } from "@/lib/analytics";
 import { buttonVariants } from "@/components/ui/button";
 import {
   Item,
@@ -19,7 +21,8 @@ interface Row {
   os: string;
   format: string;
   note: string;
-  href: (r: Release) => string;
+  /** Which release asset this row downloads (also the download_clicked `os`). */
+  key: OsKey;
   icon: ComponentType<{ className?: string }>;
 }
 
@@ -29,7 +32,7 @@ const ROWS: Row[] = [
     os: "macOS",
     format: ".dmg",
     note: "Apple Silicon (M-series)",
-    href: (r) => r.assets.mac_arm,
+    key: "mac_arm",
     icon: Apple,
   },
   {
@@ -37,7 +40,7 @@ const ROWS: Row[] = [
     os: "Windows",
     format: "Installer .exe",
     note: "x64",
-    href: (r) => r.assets.win,
+    key: "win",
     icon: Monitor,
   },
   {
@@ -45,7 +48,7 @@ const ROWS: Row[] = [
     os: "Linux",
     format: "AppImage",
     note: "x64 · portable",
-    href: (r) => r.assets.linux_appimage,
+    key: "linux_appimage",
     icon: Terminal,
   },
   {
@@ -53,12 +56,13 @@ const ROWS: Row[] = [
     os: "Linux",
     format: "Debian .deb",
     note: "x64 · apt-based",
-    href: (r) => r.assets.linux_deb,
+    key: "linux_deb",
     icon: Terminal,
   },
 ];
 
 export function DownloadMatrix({ release }: { release: Release }) {
+  const track = useTrack();
   return (
     <div>
       {/* A catalogue ledger: hairline-ruled rows in a drawer, framed top and bottom. */}
@@ -90,7 +94,10 @@ export function DownloadMatrix({ release }: { release: Release }) {
                 </ItemContent>
                 <ItemActions className="self-center">
                   <a
-                    href={row.href(release)}
+                    href={release.assets[row.key]}
+                    onClick={() =>
+                      track("download_clicked", { os: row.key, placement: "download_matrix" })
+                    }
                     className={cn(
                       buttonVariants({ variant: "outline", size: "sm" }),
                       "group/btn transition-colors group-hover/item:border-link/50 group-hover/item:text-link",

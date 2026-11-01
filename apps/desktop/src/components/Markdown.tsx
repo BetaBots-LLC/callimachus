@@ -6,10 +6,25 @@ import { unified } from "unified";
 import remarkParse from "remark-parse";
 import remarkRehype from "remark-rehype";
 import rehypeStringify from "rehype-stringify";
+// Relative import on purpose: the VS Code webview reuses this file, and its build maps
+// "@/" to its own sources (only "@/lib/utils" is redirected back here).
+import { rehypeSafeLinks } from "../lib/safeLinks";
 
-// Syntax-highlight fenced code; detect the language when unlabeled, ignore unknown.
+// Syntax-highlight fenced code: detect the language when unlabeled (assistant prose often
+// omits it), ignore unknown ones, and skip fences explicitly labeled as plain text. Tool
+// output is labeled `text` (see ThreadView's toolBody), which avoids auto-detection, the
+// costliest step: it tries every registered grammar.
+const HIGHLIGHT = {
+  detect: true,
+  ignoreMissing: true,
+  plainText: ["text", "txt", "plain", "plaintext"],
+};
+
+// Every rendering path also runs rehypeSafeLinks: transcripts are untrusted, so links
+// may only open in the system browser and images never auto-load (see lib/safeLinks).
 const REHYPE: ComponentProps<typeof ReactMarkdown>["rehypePlugins"] = [
-  [rehypeHighlight, { detect: true, ignoreMissing: true }],
+  [rehypeHighlight, HIGHLIGHT],
+  rehypeSafeLinks,
 ];
 
 // A single sanitizing markdown→HTML pipeline (no allowDangerousHtml, so raw HTML in a
@@ -21,7 +36,8 @@ const processor = unified()
   .use(remarkParse)
   .use(remarkGfm)
   .use(remarkRehype)
-  .use(rehypeHighlight, { detect: true, ignoreMissing: true })
+  .use(rehypeSafeLinks)
+  .use(rehypeHighlight, HIGHLIGHT)
   .use(rehypeStringify);
 
 const htmlCache = new Map<string, string>();
@@ -86,9 +102,10 @@ export const InlineMarkdown = memo(function InlineMarkdown({ children }: { child
         components={{
           // Unwrap blocks and links: distilled facts are one-liners, and any embedded
           // link (often a scraped relative file path) is dead in the webview — show its
-          // text, not a broken anchor.
+          // text, not a broken anchor. Images show their alt text and never load.
           p: ({ children }) => <>{children}</>,
           a: ({ children }) => <>{children}</>,
+          img: ({ alt }) => <>{alt ?? ""}</>,
         }}
       >
         {children}

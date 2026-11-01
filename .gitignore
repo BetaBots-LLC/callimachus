@@ -54,3 +54,10 @@ dist/
 *.pfx
 *.key
 !*public*.asc
+
+# Callimachus project memory written by the app when it is run against
+# sub-packages of this repo (absolute local paths, regenerated on demand).
+apps/**/.callimachus/
+
+# Written into the npm wrapper by build.yml right before `npm publish`.
+packages/callimachus-mcp/lib/SHA256SUMS

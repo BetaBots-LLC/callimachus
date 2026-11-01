@@ -179,14 +179,37 @@ pub fn correlate(threads: &[ThreadWindow], commits: &[Commit]) -> Vec<Link> {
     out
 }
 
+/// `git` with no console window on Windows (a GUI app spawning a console program would
+/// otherwise flash one for every link pass).
+fn git_command() -> std::process::Command {
+    #[allow(unused_mut)]
+    let mut cmd = std::process::Command::new("git");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
+/// Drop Windows' verbatim `\\?\` prefix (what `std::fs::canonicalize` returns there), which
+/// git and most tools don't accept as a working directory. Unchanged elsewhere.
+fn plain_path(p: &str) -> String {
+    if let Some(rest) = p.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{rest}");
+    }
+    p.strip_prefix(r"\\?\").unwrap_or(p).to_string()
+}
+
 /// Run `git log` over `repo` since `since` (epoch secs), returning raw output for `parse_git_log`.
 fn run_git_log(repo: &str, since: i64) -> Result<String> {
     let since_iso = chrono::DateTime::from_timestamp(since.max(0), 0)
         .map(|d| d.to_rfc3339())
         .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
-    let out = std::process::Command::new("git")
+    let out = git_command()
         .arg("-C")
-        .arg(repo)
+        .arg(plain_path(repo))
         .arg("log")
         .arg("--no-merges")
         .arg(format!("--since={since_iso}"))
@@ -528,6 +551,13 @@ mod tests {
         assert!(commits_by_sha(&conn, &["".into(), "   ".into()])
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn plain_path_strips_windows_verbatim_prefixes() {
+        assert_eq!(plain_path(r"\\?\C:\Users\me\proj"), r"C:\Users\me\proj");
+        assert_eq!(plain_path(r"\\?\UNC\server\share\x"), r"\\server\share\x");
+        assert_eq!(plain_path("/Users/me/proj"), "/Users/me/proj");
     }
 
     #[test]

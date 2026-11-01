@@ -106,7 +106,13 @@ pub fn parse_file(path: &Path, fallback_id: &str, mtime: i64) -> Result<Option<P
                 _ => continue, // system already filtered by Continue
             };
             let text = content_text(msg.get("content"));
-            let text = text.trim().to_string();
+            let text = text.trim();
+            // Same head + tail cap as the Claude indexer for tool output.
+            let text = if role == "tool" {
+                super::claude::cap_tool_text(text)
+            } else {
+                text.to_string()
+            };
             if text.is_empty() {
                 continue;
             }

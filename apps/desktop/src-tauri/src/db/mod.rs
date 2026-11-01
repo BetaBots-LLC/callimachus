@@ -4,9 +4,25 @@
 pub mod migrations;
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, ErrorCode, OpenFlags, TransactionBehavior};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, Once};
+use std::time::Duration;
+
+/// How long a write on an app connection waits for another connection's write lock before
+/// failing with "database is locked". The app, `cal`, the MCP server and hooks share the
+/// file, and in-process the indexer and file watcher each hold their own write connection.
+pub const BUSY_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// The wait for sidecar processes (the MCP server, hooks, `cal` write commands). Their
+/// writes are tiny and they keep no UI responsive, so outlasting a long app write (a big
+/// cleanup, a one-time index upgrade) beats failing inside the user's agent session.
+pub const SIDECAR_BUSY_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How long the app waits, when its schema is out of date, for another process that is
+/// already upgrading the same index. One release's migrations (0025-0030: two index
+/// builds over the whole messages table) took ~30s on a multi-GB index.
+const UPGRADE_WAIT: Duration = Duration::from_secs(120);
 
 /// Managed Tauri state wrapper around the app's SQLite connection.
 pub struct Db(pub Mutex<Connection>);
@@ -53,8 +69,46 @@ pub fn default_index_path() -> PathBuf {
         .join("index.db")
 }
 
-/// Open (or create) the database at `path`, apply pragmas, and migrate to latest.
+/// Open (or create) the database at `path`, apply pragmas, and migrate to latest. For the
+/// desktop app's own connections; sidecar processes use [`open_sidecar`].
 pub fn open(path: &Path) -> Result<Connection> {
+    open_with(path, BUSY_TIMEOUT, UPGRADE_WAIT)
+}
+
+/// [`open`] for the sidecar processes (MCP server, hooks, `cal` write commands): writes wait
+/// up to [`SIDECAR_BUSY_TIMEOUT`] for the lock, and so does waiting out an index upgrade
+/// another process is running. Callers should treat an error that [`is_busy`] recognizes
+/// as "try again later", not as a failure to report inside an agent session.
+pub fn open_sidecar(path: &Path) -> Result<Connection> {
+    open_with_busy_timeout(path, SIDECAR_BUSY_TIMEOUT)
+}
+
+/// [`open`] with one custom wait for both writes and a concurrent index upgrade, for a
+/// caller with its own deadline (a hook that the agent kills after a few seconds should
+/// give up, and exit quietly on [`is_busy`], before that).
+pub fn open_with_busy_timeout(path: &Path, busy: Duration) -> Result<Connection> {
+    open_with(path, busy, busy)
+}
+
+/// True when `e` (anywhere in its chain, including inside a migration error) is SQLite
+/// giving up on a lock: SQLITE_BUSY or SQLITE_LOCKED.
+pub fn is_busy(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        let err = cause
+            .downcast_ref::<rusqlite::Error>()
+            .or_else(|| match cause.downcast_ref::<rusqlite_migration::Error>() {
+                Some(rusqlite_migration::Error::RusqliteError { err, .. }) => Some(err),
+                _ => None,
+            });
+        matches!(
+            err,
+            Some(rusqlite::Error::SqliteFailure(f, _))
+                if matches!(f.code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+        )
+    })
+}
+
+fn open_with(path: &Path, busy: Duration, upgrade_wait: Duration) -> Result<Connection> {
     register_vec();
     // Create the parent dir so a first run (e.g. the MCP server in a fresh
     // container, or CALLIMACHUS_DB pointing somewhere new) can create the file —
@@ -70,12 +124,10 @@ pub fn open(path: &Path) -> Result<Connection> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
-    // Wait (don't fail) for a write lock — the app, `cal`, and the MCP server open
-    // the same file from separate processes, AND in-process the indexer + file watcher
-    // each hold their own write connection. Combined with BEGIN IMMEDIATE on every write
-    // txn (so the busy handler actually engages instead of an instant upgrade-conflict),
-    // a generous timeout lets concurrent writers queue rather than error "database locked".
-    conn.busy_timeout(std::time::Duration::from_secs(15))?;
+    // Wait (don't fail) for a write lock. Combined with BEGIN IMMEDIATE on every write txn
+    // (so the busy handler actually engages instead of an instant upgrade-conflict), a
+    // generous timeout lets concurrent writers queue rather than error "database locked".
+    conn.busy_timeout(busy)?;
     // Performance pragmas (defaults are tiny). cache_size is the biggest single win:
     // -65536 = 64 MiB page cache. mmap maps the file for read; temp_store keeps
     // sorts/CTEs in RAM; the WAL caps keep the -wal file from growing unbounded and
@@ -86,11 +138,46 @@ pub fn open(path: &Path) -> Result<Connection> {
     conn.pragma_update(None, "wal_autocheckpoint", 2000_i64)?; // ~8 MiB
     conn.pragma_update(None, "journal_size_limit", 67_108_864_i64)?; // cap -wal at 64 MiB
 
-    migrations::MIGRATIONS
-        .to_latest(&mut conn)
-        .context("running migrations")?;
-
+    migrate(&mut conn, busy, upgrade_wait)?;
     Ok(conn)
+}
+
+/// Bring the schema up to date, safely against other processes doing the same.
+///
+/// After an update, whichever process opens the index first (the app, the MCP server, a
+/// hook) runs the new migrations, which can hold the write lock for tens of seconds.
+/// rusqlite_migration reads `user_version` before it takes that lock, so a second process
+/// would fail after its normal busy timeout, or get the lock afterwards and replay
+/// migrations that were just applied. So when anything is pending: wait for the write lock
+/// first (an upgrade in flight finishes, and to_latest then re-reads the version and
+/// finds nothing to do), and migrate in IMMEDIATE transactions with the same long wait.
+fn migrate(conn: &mut Connection, busy: Duration, upgrade_wait: Duration) -> Result<()> {
+    let m = &*migrations::MIGRATIONS;
+    let pending = m
+        .pending_migrations(conn)
+        .context("reading the schema version")?;
+    if pending == 0 {
+        return Ok(());
+    }
+    if pending < 0 {
+        // A newer build's schema: to_latest reports DatabaseTooFarAhead without locking.
+        return m.to_latest(conn).context("running migrations");
+    }
+    conn.busy_timeout(upgrade_wait)?;
+    conn.set_transaction_behavior(TransactionBehavior::Immediate);
+    let result = conn
+        .execute_batch("BEGIN IMMEDIATE; ROLLBACK;")
+        .map_err(anyhow::Error::from)
+        .and_then(|()| m.to_latest(conn).map_err(anyhow::Error::from));
+    conn.set_transaction_behavior(TransactionBehavior::Deferred);
+    conn.busy_timeout(busy)?;
+    match result {
+        Ok(()) => Ok(()),
+        // Another process took the lock in the instant between our wait and our migration
+        // and finished the upgrade first; our replay failed and rolled back. Nothing to do.
+        Err(_) if m.pending_migrations(conn).ok() == Some(0) => Ok(()),
+        Err(e) => Err(e.context("running migrations")),
+    }
 }
 
 /// Open the index **read-only**, for the sidecar processes (MCP server, `cal`).
@@ -241,6 +328,72 @@ mod tests {
         let _: i64 = c2
             .query_row("SELECT COUNT(*) FROM threads", [], |r| r.get(0))
             .unwrap();
+    }
+
+    fn fresh_path(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let p = std::env::temp_dir().join(format!("calli_{tag}_{}_{n}.db", std::process::id()));
+        for ext in ["db", "db-wal", "db-shm"] {
+            let _ = std::fs::remove_file(p.with_extension(ext));
+        }
+        p
+    }
+
+    /// A process that finds the schema out of date while another one is upgrading it waits
+    /// for that upgrade (well past its normal busy timeout) instead of failing with
+    /// "database is locked", then finds nothing left to do.
+    #[test]
+    fn open_waits_out_another_process_upgrade() {
+        let p = fresh_path("upgrade_wait");
+        drop(open(&p).unwrap());
+
+        // "Another process": rewinds the version, then holds the write lock mid-upgrade.
+        let other = Connection::open(&p).unwrap();
+        let version: i64 = other
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        other
+            .pragma_update(None, "user_version", version - 1)
+            .unwrap();
+        other.execute_batch("BEGIN IMMEDIATE").unwrap();
+        other.pragma_update(None, "user_version", version).unwrap();
+
+        let path = p.clone();
+        let opener = std::thread::spawn(move || {
+            open_with(&path, Duration::from_millis(50), Duration::from_secs(10))
+        });
+        std::thread::sleep(Duration::from_millis(400)); // far past the 50 ms busy timeout
+        other.execute_batch("COMMIT").unwrap();
+
+        let conn = opener.join().unwrap().expect("waited for the upgrade");
+        let busy_ms: i64 = conn
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(busy_ms, 50, "the normal busy timeout is restored");
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, version);
+    }
+
+    #[test]
+    fn busy_errors_are_recognized() {
+        let p = fresh_path("busy");
+        let holder = open(&p).unwrap();
+        holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let other = open(&p).unwrap();
+        other.busy_timeout(Duration::from_millis(10)).unwrap();
+        let err = anyhow::Error::from(
+            other
+                .execute("INSERT INTO app_config (key, value) VALUES ('k', 'v')", [])
+                .unwrap_err(),
+        )
+        .context("writing");
+        assert!(is_busy(&err), "{err:#}");
+        assert!(!is_busy(&anyhow::anyhow!("unrelated")));
+        holder.execute_batch("ROLLBACK").unwrap();
     }
 
     #[test]

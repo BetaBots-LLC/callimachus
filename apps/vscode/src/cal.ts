@@ -9,7 +9,7 @@
 
 import * as vscode from "vscode";
 import { execFile } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { promisify } from "node:util";
@@ -34,7 +34,17 @@ export class CalSetupError extends Error {
   }
 }
 
-/** Known locations the desktop app drops `cal`, checked before falling back to PATH. */
+const MISSING_MESSAGE =
+  "The `cal` CLI wasn't found. Install the Callimachus desktop app (it provides `cal`), or set callimachus.calPath.";
+
+/**
+ * Known locations of the Callimachus CLI, checked before PATH. The desktop app's
+ * "Install integration" step symlinks `~/.local/bin/cal` to the app binary; the app
+ * binary itself also serves `cal` subcommands, so the bundle path works without it.
+ *
+ * Bare `/usr/bin/cal` is deliberately absent: on macOS and most Linux distros it is the
+ * system *calendar*, which answers every call with a usage message.
+ */
 function calCandidates(): string[] {
   const home = os.homedir();
   const exe = process.platform === "win32" ? "cal.exe" : "cal";
@@ -43,59 +53,141 @@ function calCandidates(): string[] {
     c.push(
       "/usr/local/bin/cal",
       "/opt/homebrew/bin/cal",
-      "/Applications/Callimachus.app/Contents/Resources/cal",
-      "/Applications/Callimachus.app/Contents/MacOS/cal",
+      "/Applications/Callimachus.app/Contents/MacOS/callimachus",
+      path.join(home, "Applications", "Callimachus.app", "Contents", "MacOS", "callimachus"),
     );
   } else if (process.platform === "win32") {
+    // Each install dir: the `cal.exe` the app drops next to itself, then the app binary.
+    // A per-machine (MSI / Program Files) install can't write `cal.exe`, but the app runs
+    // `search`, `recent` and every other cal subcommand itself, so it works as `cal` too.
+    // Its path contains "callimachus", so isCallimachusCal accepts it without launching it.
+    // NTFS is case-insensitive, so one spelling covers callimachus.exe / Callimachus.exe.
+    const dirs: string[] = [];
     const la = process.env.LOCALAPPDATA;
     const pf = process.env.ProgramFiles;
-    if (la) c.push(path.join(la, "Programs", "Callimachus", exe));
-    if (pf) c.push(path.join(pf, "Callimachus", exe));
+    if (la) dirs.push(path.join(la, "Programs", "Callimachus"), path.join(la, "Callimachus"));
+    if (pf) dirs.push(path.join(pf, "Callimachus"));
+    for (const dir of dirs) c.push(path.join(dir, exe), path.join(dir, "callimachus.exe"));
   } else {
-    c.push("/usr/local/bin/cal", "/usr/bin/cal");
+    c.push("/usr/local/bin/cal");
   }
   return c;
 }
 
-let cachedBin: string | undefined;
+/** Every `cal` on PATH, in PATH order (the system calendar is filtered out later). */
+function pathCandidates(): string[] {
+  const exe = process.platform === "win32" ? "cal.exe" : "cal";
+  return (process.env.PATH ?? "")
+    .split(path.delimiter)
+    .filter(Boolean)
+    .map((dir) => path.join(dir, exe));
+}
 
-/** Resolve the `cal` binary: an explicit `calPath` setting wins; otherwise probe
- *  known install locations; otherwise fall back to PATH (`cal`). */
-function resolveCalBin(): string {
-  const configured = config<string>("calPath", "cal");
+// `cal help` from Callimachus prints its usage banner ("cal — search your indexed AI
+// coding-agent history"); the BSD / util-linux calendar rejects `help` and exits non-zero.
+const CAL_SIGNATURE = /coding-agent history|callimachus/i;
+const PROBE_TIMEOUT_MS = 5_000;
+
+/** Whether `bin` is the Callimachus CLI rather than the system calendar. */
+async function isCallimachusCal(bin: string): Promise<boolean> {
+  // 1. By install path: the installer's symlink resolves into the app bundle / install
+  //    dir, and the app binary itself is named callimachus. No process needed.
+  try {
+    if (/callimachus/i.test(realpathSync(bin))) return true;
+  } catch {
+    return false; // dangling symlink or unreadable
+  }
+  // 2. By output. Only files named `cal` are probed: the app runs in CLI mode when
+  //    invoked as `cal`, whereas the app binary under another name with an unknown
+  //    argument would launch the GUI.
+  const stem = path.basename(bin, path.extname(bin)).toLowerCase();
+  if (stem !== "cal") return false;
+  try {
+    const { stdout, stderr } = await exec(bin, ["help"], {
+      timeout: PROBE_TIMEOUT_MS,
+      windowsHide: true,
+    });
+    return CAL_SIGNATURE.test(`${stdout}\n${stderr}`);
+  } catch {
+    return false;
+  }
+}
+
+async function findCallimachusCal(): Promise<string | undefined> {
+  const seen = new Set<string>();
+  for (const cand of [...calCandidates(), ...pathCandidates()]) {
+    if (seen.has(cand)) continue;
+    seen.add(cand);
+    if (existsSync(cand) && (await isCallimachusCal(cand))) return cand;
+  }
+  return undefined;
+}
+
+let cachedBin: string | undefined;
+let resolving: Promise<string | undefined> | undefined;
+// After a failed discovery, don't re-probe on every call (the sidebar fires several
+// RPCs at once), but do retry soon so a fresh desktop-app install is picked up.
+let lastMiss = 0;
+const REDISCOVER_AFTER_MS = 30_000;
+
+/** Resolve the `cal` binary: an explicit `calPath` setting wins; otherwise the first
+ *  known install location or PATH entry that is really the Callimachus CLI. Throws
+ *  CalSetupError("missing") when there is none. */
+async function resolveCalBin(): Promise<string> {
+  const configured = config<string>("calPath", "cal").trim();
   if (configured && configured !== "cal") return configured; // user override
   if (cachedBin) return cachedBin;
-  for (const cand of calCandidates()) {
-    if (existsSync(cand)) {
-      cachedBin = cand;
-      return cand;
-    }
+  if (Date.now() - lastMiss < REDISCOVER_AFTER_MS) {
+    throw new CalSetupError("missing", MISSING_MESSAGE);
   }
-  return "cal"; // not cached — a later app install should be discovered on next call
+  resolving ??= findCallimachusCal().finally(() => {
+    resolving = undefined;
+  });
+  const found = await resolving;
+  if (!found) {
+    lastMiss = Date.now();
+    throw new CalSetupError("missing", MISSING_MESSAGE);
+  }
+  cachedBin = found;
+  return found;
 }
 
-/** The resolved `cal` binary path/name — for callers that build their own command
- *  line (e.g. the "Open in CLI" terminal action). */
-export function calBinPath(): string {
+/** The resolved `cal` binary path — for callers that build their own command line
+ *  (e.g. the "Open in CLI" terminal action). */
+export function calBinPath(): Promise<string> {
   return resolveCalBin();
 }
+
+// The system calendar's reply to arguments it doesn't understand (BSD exits 64).
+const SYSTEM_CAL_USAGE = /^usage: cal\b/im;
 
 /** Run `cal` with args, returning stdout. Throws CalSetupError when `cal` is
  *  missing or the index hasn't been built yet. */
 export async function runCal(args: string[]): Promise<string> {
-  const bin = resolveCalBin();
+  const bin = await resolveCalBin();
   try {
-    const { stdout } = await exec(bin, args, { maxBuffer: 64 * 1024 * 1024 });
+    const { stdout } = await exec(bin, args, { maxBuffer: 64 * 1024 * 1024, windowsHide: true });
     return stdout;
   } catch (err: unknown) {
-    const e = err as { stderr?: Buffer | string; code?: string; message?: string };
+    const e = err as {
+      stderr?: Buffer | string;
+      stdout?: Buffer | string;
+      code?: string | number;
+      message?: string;
+    };
     if (e.code === "ENOENT") {
-      throw new CalSetupError(
-        "missing",
-        "Callimachus needs the desktop app, which provides the `cal` CLI and builds your searchable history.",
-      );
+      cachedBin = undefined; // uninstalled or moved: rediscover next time
+      throw new CalSetupError("missing", MISSING_MESSAGE);
     }
     const stderr = e.stderr?.toString().trim();
+    // A user-set calPath (or a stale PATH entry) pointing at the system calendar.
+    if (e.code === 64 || SYSTEM_CAL_USAGE.test(`${stderr ?? ""}\n${e.stdout?.toString() ?? ""}`)) {
+      cachedBin = undefined;
+      throw new CalSetupError(
+        "missing",
+        `\`${bin}\` is the system calendar, not the Callimachus CLI. Install the desktop app or fix callimachus.calPath.`,
+      );
+    }
     if (stderr && /no index found/i.test(stderr)) {
       throw new CalSetupError(
         "no-index",
@@ -166,14 +258,41 @@ export async function stats(): Promise<Stats> {
   return parseJson<Stats>(await runCal(["stats", "--json"]), "stats");
 }
 
+// Ambient recall re-asks for the same few contexts as the cursor moves back and forth
+// between symbols, and each `cal related` is a fresh process that loads the embedding
+// model. Keep the last few answers in memory (briefly, since the index keeps growing).
+const RELATED_CACHE_MAX = 20;
+const RELATED_CACHE_TTL_MS = 10 * 60_000;
+const relatedCache = new Map<string, { at: number; results: ThreadSummary[] }>();
+
 /** Threads semantically related to arbitrary editor context — powers ambient
  *  recall. Matches across all projects (no `-p`); returns thread summaries. */
 export async function relatedThreads(contextText: string): Promise<ThreadSummary[]> {
   const limit = String(config<number>("ambientRecallLimit", 5));
-  return parseJson<ThreadSummary[]>(
+  const key = `${limit}\u0000${contextText}`;
+  const hit = relatedCache.get(key);
+  if (hit && Date.now() - hit.at < RELATED_CACHE_TTL_MS) {
+    relatedCache.delete(key); // refresh its LRU position
+    relatedCache.set(key, hit);
+    return hit.results;
+  }
+  const results = parseJson<ThreadSummary[]>(
     await runCal(["related", contextText, "--json", "-n", limit]),
     "related",
   );
+  relatedCache.delete(key);
+  relatedCache.set(key, { at: Date.now(), results });
+  while (relatedCache.size > RELATED_CACHE_MAX) {
+    const oldest = relatedCache.keys().next().value;
+    if (oldest === undefined) break;
+    relatedCache.delete(oldest);
+  }
+  return results;
+}
+
+/** Forget cached ambient-recall answers (e.g. on an explicit refresh). */
+export function clearRelatedCache(): void {
+  relatedCache.clear();
 }
 
 /** The packed markdown transcript for a thread. */

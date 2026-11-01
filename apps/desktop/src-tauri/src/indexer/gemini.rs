@@ -86,12 +86,9 @@ fn index_file(conn: &mut Connection, sid: i64, root: &Path, path: &Path) -> Resu
         }
     }
 
-    // external_id = path relative to the tmp root: stable and unique per file.
-    let rel = path
-        .strip_prefix(root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .to_string();
+    // external_id = path relative to the tmp root: stable and unique per file, joined with
+    // '/' on every OS (the `chats/` segment check below splits on '/').
+    let rel = super::claude::external_id_for(root, path);
 
     let mut thread = parse_file(path, &rel).with_context(|| format!("parsing {path_str}"))?;
     if let Some(t) = thread.as_mut() {
@@ -233,7 +230,14 @@ fn extract_content(
                         .get("response")
                         .map(|v| v.to_string())
                         .unwrap_or_else(|| resp.to_string());
-                    push(thread, "tool", text, None);
+                    // Same head + tail cap as the Claude indexer (tool output is never
+                    // embedded or distilled, and dominated the index size).
+                    push(
+                        thread,
+                        "tool",
+                        super::claude::cap_tool_text(text.trim()),
+                        None,
+                    );
                 }
             }
         }

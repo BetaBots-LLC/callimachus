@@ -4,8 +4,9 @@
 //! ($ per million tokens) and are clearly an estimate, not a billing record.
 
 use anyhow::Result;
-use rusqlite::{Connection, ToSql};
+use rusqlite::{Connection, OptionalExtension, ToSql};
 use serde::Serialize;
+use std::collections::HashMap;
 
 /// Published list price for a model, in USD per million tokens.
 #[derive(Debug, Clone, Copy)]
@@ -84,7 +85,7 @@ pub fn cost_of(input: i64, output: i64, cache_write: i64, cache_read: i64, p: &M
 }
 
 /// Spend for one model.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelSpend {
     pub model: String,
@@ -98,7 +99,7 @@ pub struct ModelSpend {
 }
 
 /// One of the most expensive threads.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadCost {
     pub thread_id: i64,
@@ -108,7 +109,7 @@ pub struct ThreadCost {
 }
 
 /// The cost x-ray: total spend, a per-model breakdown, and the priciest threads.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Spend {
     pub total_cost: f64,
@@ -118,140 +119,175 @@ pub struct Spend {
     pub top_threads: Vec<ThreadCost>,
 }
 
-fn project_clause(project: Option<&str>, args: &mut Vec<Box<dyn ToSql>>) -> String {
-    match project.filter(|p| !p.is_empty()) {
-        Some(p) => {
-            args.push(Box::new(format!("%{p}%")));
-            format!(
-                " AND COALESCE(t.project_key, t.project_path) LIKE ?{}",
-                args.len()
-            )
-        }
-        None => String::new(),
-    }
+/// Cache key: (since, project filter, top_n).
+type SpendKey = (i64, Option<String>, usize);
+
+static SPEND_CACHE: std::sync::LazyLock<crate::search::cache::AggCache<SpendKey, Spend>> =
+    std::sync::LazyLock::new(crate::search::cache::AggCache::new);
+
+/// [`spend`], reused for up to 10 minutes while the thread set is unchanged (see
+/// `search::cache`). For the app's Stats view; `cal spend` and tests read live.
+pub fn spend_cached(
+    conn: &Connection,
+    since: i64,
+    project: Option<&str>,
+    top_n: usize,
+) -> Result<Spend> {
+    let key = (
+        since,
+        project.filter(|p| !p.is_empty()).map(str::to_string),
+        top_n,
+    );
+    SPEND_CACHE.get_or_try(crate::search::cache::index_version(conn)?, key, || {
+        spend(conn, since, project, top_n)
+    })
 }
 
-/// Compute spend across messages with captured usage since `since` (epoch secs), optionally
-/// scoped to a project-path substring.
-pub fn spend(conn: &Connection, since: i64, project: Option<&str>, top_n: usize) -> Result<Spend> {
-    // Per-model token totals.
-    let mut args: Vec<Box<dyn ToSql>> = vec![Box::new(since)];
-    let proj = project_clause(project, &mut args);
-    let sql = format!(
-        "SELECT m.model, SUM(m.input_tokens), SUM(m.output_tokens),
-                SUM(m.cache_write_tokens), SUM(m.cache_read_tokens), COUNT(*)
-         FROM messages m JOIN threads t ON t.id = m.thread_id
-         WHERE m.model IS NOT NULL AND m.ts >= ?1{proj}
-         GROUP BY m.model"
-    );
-    let arg_refs: Vec<&dyn ToSql> = args.iter().map(|b| b.as_ref()).collect();
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(arg_refs.as_slice(), |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, i64>(1).unwrap_or(0),
-            r.get::<_, i64>(2).unwrap_or(0),
-            r.get::<_, i64>(3).unwrap_or(0),
-            r.get::<_, i64>(4).unwrap_or(0),
-            r.get::<_, i64>(5)?,
-        ))
-    })?;
+/// Token totals for one (thread, model) pair.
+struct Usage {
+    thread_id: i64,
+    model: String,
+    input: i64,
+    output: i64,
+    cache_write: i64,
+    cache_read: i64,
+    calls: i64,
+}
 
-    let mut by_model = Vec::new();
+/// Compute spend across messages with captured usage since `since` (epoch secs; 0 = all
+/// time), optionally scoped to a project-path substring.
+///
+/// One aggregate pass per (thread, model), served by the covering usage index (migration
+/// 0026), then rolled up per model and per thread in Rust. This used to be two separate
+/// GROUP BY scans that each read every message's trailing usage columns.
+pub fn spend(conn: &Connection, since: i64, project: Option<&str>, top_n: usize) -> Result<Spend> {
+    let rows = usage_by_thread_model(conn, since, project)?;
+
+    let mut per_model: HashMap<String, ModelSpend> = HashMap::new();
+    let mut per_thread: HashMap<i64, f64> = HashMap::new();
     let mut total_cost = 0.0;
     let mut tracked_calls = 0;
     let mut untracked_calls = 0;
-    for row in rows {
-        let (model, input, output, cw, cr, calls) = row?;
-        match price_for(&model) {
-            Some(p) => {
-                let cost = cost_of(input, output, cw, cr, &p);
-                total_cost += cost;
-                tracked_calls += calls;
-                by_model.push(ModelSpend {
-                    model,
-                    cost,
-                    input,
-                    output,
-                    cache_read: cr,
-                    calls,
-                    priced: true,
-                });
-            }
-            None => {
-                untracked_calls += calls;
-                by_model.push(ModelSpend {
-                    model,
-                    cost: 0.0,
-                    input,
-                    output,
-                    cache_read: cr,
-                    calls,
-                    priced: false,
-                });
-            }
+    for u in rows {
+        let price = price_for(&u.model);
+        let cost = price.map_or(0.0, |p| {
+            cost_of(u.input, u.output, u.cache_write, u.cache_read, &p)
+        });
+        if price.is_some() {
+            total_cost += cost;
+            tracked_calls += u.calls;
+            *per_thread.entry(u.thread_id).or_insert(0.0) += cost;
+        } else {
+            untracked_calls += u.calls;
         }
+        let m = per_model
+            .entry(u.model.clone())
+            .or_insert_with(|| ModelSpend {
+                model: u.model.clone(),
+                cost: 0.0,
+                input: 0,
+                output: 0,
+                cache_read: 0,
+                calls: 0,
+                priced: price.is_some(),
+            });
+        m.cost += cost;
+        m.input += u.input;
+        m.output += u.output;
+        m.cache_read += u.cache_read;
+        m.calls += u.calls;
     }
-    by_model.sort_by(|a, b| b.cost.total_cmp(&a.cost));
+    let mut by_model: Vec<ModelSpend> = per_model.into_values().collect();
+    by_model.sort_by(|a, b| {
+        b.cost
+            .total_cmp(&a.cost)
+            .then_with(|| a.model.cmp(&b.model))
+    });
 
     Ok(Spend {
         total_cost,
         tracked_calls,
         untracked_calls,
         by_model,
-        top_threads: top_threads(conn, since, project, top_n)?,
+        top_threads: top_threads(conn, per_thread, top_n)?,
     })
 }
 
-/// The priciest threads (summing each thread's per-model costs).
-fn top_threads(
+/// SUM the usage columns per (thread, model). The `ts` filter is only added for a real
+/// window: `ts >= 0` would steer the planner onto the timestamp index and away from the
+/// covering usage index.
+fn usage_by_thread_model(
     conn: &Connection,
     since: i64,
     project: Option<&str>,
-    top_n: usize,
-) -> Result<Vec<ThreadCost>> {
-    let mut args: Vec<Box<dyn ToSql>> = vec![Box::new(since)];
-    let proj = project_clause(project, &mut args);
+) -> Result<Vec<Usage>> {
+    let mut args: Vec<Box<dyn ToSql>> = Vec::new();
+    let mut filters = String::new();
+    if since > 0 {
+        args.push(Box::new(since));
+        filters.push_str(&format!(" AND m.ts >= ?{}", args.len()));
+    }
+    let join = match project.filter(|p| !p.is_empty()) {
+        Some(p) => {
+            args.push(Box::new(format!("%{p}%")));
+            filters.push_str(&format!(
+                " AND COALESCE(t.project_key, t.project_path) LIKE ?{}",
+                args.len()
+            ));
+            " JOIN threads t ON t.id = m.thread_id"
+        }
+        None => "",
+    };
     let sql = format!(
-        "SELECT m.thread_id, t.title, COALESCE(t.project_key, t.project_path), m.model,
-                SUM(m.input_tokens), SUM(m.output_tokens),
-                SUM(m.cache_write_tokens), SUM(m.cache_read_tokens)
-         FROM messages m JOIN threads t ON t.id = m.thread_id
-         WHERE m.model IS NOT NULL AND m.ts >= ?1{proj}
+        "SELECT m.thread_id, m.model, SUM(m.input_tokens), SUM(m.output_tokens),
+                SUM(m.cache_write_tokens), SUM(m.cache_read_tokens), COUNT(*)
+         FROM messages m{join}
+         WHERE m.model IS NOT NULL{filters}
          GROUP BY m.thread_id, m.model"
     );
     let arg_refs: Vec<&dyn ToSql> = args.iter().map(|b| b.as_ref()).collect();
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(arg_refs.as_slice(), |r| {
-        Ok((
-            r.get::<_, i64>(0)?,
-            r.get::<_, Option<String>>(1)?,
-            r.get::<_, Option<String>>(2)?,
-            r.get::<_, String>(3)?,
-            r.get::<_, i64>(4).unwrap_or(0),
-            r.get::<_, i64>(5).unwrap_or(0),
-            r.get::<_, i64>(6).unwrap_or(0),
-            r.get::<_, i64>(7).unwrap_or(0),
-        ))
-    })?;
+    let rows = stmt
+        .query_map(arg_refs.as_slice(), |r| {
+            Ok(Usage {
+                thread_id: r.get(0)?,
+                model: r.get(1)?,
+                input: r.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                output: r.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                cache_write: r.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                cache_read: r.get::<_, Option<i64>>(5)?.unwrap_or(0),
+                calls: r.get(6)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
 
-    use std::collections::HashMap;
-    let mut by_thread: HashMap<i64, ThreadCost> = HashMap::new();
-    for row in rows {
-        let (tid, title, project, model, input, output, cw, cr) = row?;
-        let Some(p) = price_for(&model) else { continue };
-        let cost = cost_of(input, output, cw, cr, &p);
-        let e = by_thread.entry(tid).or_insert_with(|| ThreadCost {
-            thread_id: tid,
+/// The priciest threads, from the per-thread totals; titles are looked up only for the
+/// threads actually shown.
+fn top_threads(
+    conn: &Connection,
+    per_thread: HashMap<i64, f64>,
+    top_n: usize,
+) -> Result<Vec<ThreadCost>> {
+    let mut ranked: Vec<(i64, f64)> = per_thread.into_iter().filter(|(_, c)| *c > 0.0).collect();
+    ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    ranked.truncate(top_n);
+    let mut stmt = conn
+        .prepare("SELECT title, COALESCE(project_key, project_path) FROM threads WHERE id = ?1")?;
+    let mut out = Vec::with_capacity(ranked.len());
+    for (thread_id, cost) in ranked {
+        let (title, project) = stmt
+            .query_row([thread_id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?
+            .unwrap_or((None, None));
+        out.push(ThreadCost {
+            thread_id,
             title,
             project,
-            cost: 0.0,
+            cost,
         });
-        e.cost += cost;
     }
-    let mut out: Vec<ThreadCost> = by_thread.into_values().filter(|t| t.cost > 0.0).collect();
-    out.sort_by(|a, b| b.cost.total_cmp(&a.cost));
-    out.truncate(top_n);
     Ok(out)
 }
 
@@ -331,5 +367,32 @@ mod tests {
         assert_eq!(s.untracked_calls, 1);
         assert_eq!(s.top_threads.len(), 1);
         assert_eq!(s.top_threads[0].thread_id, tid);
+        assert_eq!(s.top_threads[0].title.as_deref(), Some("pricey thread"));
+
+        // Project scoping and a time window give the same totals here (all rows match).
+        let scoped = spend(&conn, 50, Some("/p"), 5).unwrap();
+        assert!((scoped.total_cost - 30.0).abs() < 1e-6);
+        assert!(spend(&conn, 0, Some("/elsewhere"), 5)
+            .unwrap()
+            .by_model
+            .is_empty());
+        let cached = spend_cached(&conn, 0, None, 5).unwrap();
+        assert!((cached.total_cost - s.total_cost).abs() < 1e-9);
+
+        // The all-time aggregate reads only the covering usage index.
+        let plan: String = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT m.thread_id, m.model, SUM(m.input_tokens),
+                        SUM(m.output_tokens), SUM(m.cache_write_tokens), SUM(m.cache_read_tokens),
+                        COUNT(*)
+                 FROM messages m WHERE m.model IS NOT NULL GROUP BY m.thread_id, m.model",
+            )
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(plan.contains("COVERING INDEX idx_messages_usage"), "{plan}");
     }
 }

@@ -1,6 +1,8 @@
 //! Full-text search over indexed messages (SQLite FTS5 + BM25) plus the read
 //! queries the UI needs: recent threads and a single thread's messages.
 
+pub(crate) mod cache;
+
 use crate::embed::{self, Embedder};
 use anyhow::Result;
 use rusqlite::{Connection, ToSql};
@@ -537,7 +539,7 @@ fn thread_summary(conn: &Connection, id: i64) -> Result<Option<ThreadSummary>> {
 }
 
 /// Aggregate stats over the whole index, for the dashboard / `cal stats`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Stats {
     pub threads: i64,
@@ -551,7 +553,7 @@ pub struct Stats {
     pub top_projects: Vec<ProjectStat>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SourceStat {
     pub kind: String,
@@ -559,41 +561,42 @@ pub struct SourceStat {
     pub messages: i64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RoleStat {
     pub role: String,
     pub messages: i64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectStat {
     pub project: String,
     pub threads: i64,
 }
 
-/// Compute index-wide aggregate stats in one pass of small queries.
+/// Compute index-wide aggregate stats in one pass of small queries. Every query here is
+/// served by an index or the (small) threads table; none reads message bodies.
 pub fn stats(conn: &Connection) -> Result<Stats> {
     let one = |sql: &str| -> Result<i64> { Ok(conn.query_row(sql, [], |r| r.get(0))?) };
 
     let threads = one("SELECT COUNT(*) FROM threads")?;
     let messages = one("SELECT COUNT(*) FROM messages")?;
-    let embedded = one("SELECT COUNT(DISTINCT message_id) FROM vec_chunks")?;
-    let embeddable = one("SELECT COUNT(*) FROM messages WHERE role IN ('user','assistant')")?;
+    // Same numbers (and predicate) as the embedding progress bar, from the covering count
+    // index, instead of a COUNT(DISTINCT) full scan of the vec0 table.
+    let (embedded, embeddable) = embed::embed_progress(conn)?;
     let (earliest, latest): (Option<i64>, Option<i64>) = conn.query_row(
         "SELECT MIN(created_at), MAX(updated_at) FROM threads",
         [],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
 
-    // Per-source thread + message counts (skip sources with no threads).
+    // Per-source thread + message counts (skip sources with no threads). message_count is
+    // maintained per thread by upsert_thread, so this never touches the messages table.
     let mut src_stmt = conn.prepare(
-        "SELECT s.kind,
-                (SELECT COUNT(*) FROM threads t WHERE t.source_id = s.id),
-                (SELECT COUNT(*) FROM messages m JOIN threads t ON m.thread_id = t.id
-                 WHERE t.source_id = s.id)
-         FROM sources s",
+        "SELECT s.kind, COUNT(t.id), COALESCE(SUM(t.message_count), 0)
+         FROM sources s LEFT JOIN threads t ON t.source_id = s.id
+         GROUP BY s.id",
     )?;
     let mut per_source: Vec<SourceStat> = src_stmt
         .query_map([], |r| {
@@ -646,7 +649,7 @@ pub fn stats(conn: &Connection) -> Result<Stats> {
 }
 
 /// One day's message activity, for the Coach coding heatmap.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DayActivity {
     pub day: i64, // unix seconds at UTC midnight
@@ -654,7 +657,7 @@ pub struct DayActivity {
 }
 
 /// A distilled decision or gotcha surfaced in the Coach "this week" digest.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CoachFact {
     pub id: i64,
@@ -667,7 +670,7 @@ pub struct CoachFact {
 
 /// Proactive dashboard data: a daily-activity heatmap plus the decisions and gotchas
 /// captured in the last week (so the memory layer surfaces insight, not just answers).
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CoachOverview {
     pub heatmap: Vec<DayActivity>,
@@ -679,17 +682,32 @@ pub struct CoachOverview {
 /// Build the Coach overview as of `now` (unix seconds): ~52 weeks of daily activity and
 /// the last 7 days of decisions / gotchas (LLM-distilled or agent-recorded).
 pub fn coach_overview(conn: &Connection, now: i64) -> Result<CoachOverview> {
+    let mut overview = coach_overview_facts(conn, now)?;
+    overview.heatmap = coach_heatmap(conn, now)?;
+    Ok(overview)
+}
+
+/// Daily user/assistant message counts since `?1`, for the Coach heatmap.
+///
+/// Human-facing activity only: skip subagent transcripts and tool/system rows so the grid
+/// reflects sessions you drove, not machine chatter (mirrors the app's lists).
+///
+/// The `+` on `m.role` keeps the planner off the (role, tool_name, embedded) count index
+/// (0026). With no ANALYZE stats it would otherwise drive from that index, fetching every
+/// user/assistant row in the table (each one walking its overflow pages to reach `ts`),
+/// which took 20-50s on a large index instead of well under a second via threads ->
+/// idx_messages_thread. Pinned by `coach_heatmap_plan_avoids_the_role_index`.
+const HEATMAP_SQL: &str = "SELECT (m.ts / 86400) * 86400 AS day, COUNT(*)
+     FROM messages m JOIN threads t ON t.id = m.thread_id
+     WHERE m.ts IS NOT NULL AND m.ts >= ?1
+       AND t.is_subagent = 0 AND +m.role IN ('user', 'assistant')
+     GROUP BY day ORDER BY day";
+
+/// ~52 weeks of daily user/assistant message counts ending at `now`.
+fn coach_heatmap(conn: &Connection, now: i64) -> Result<Vec<DayActivity>> {
     let heatmap_since = now - 364 * 86_400;
     let heatmap = {
-        // Human-facing activity only: skip subagent transcripts and tool/system rows so the
-        // grid reflects sessions you drove, not machine chatter (mirrors the app's lists).
-        let mut stmt = conn.prepare(
-            "SELECT (m.ts / 86400) * 86400 AS day, COUNT(*)
-             FROM messages m JOIN threads t ON t.id = m.thread_id
-             WHERE m.ts IS NOT NULL AND m.ts >= ?1
-               AND t.is_subagent = 0 AND m.role IN ('user', 'assistant')
-             GROUP BY day ORDER BY day",
-        )?;
+        let mut stmt = conn.prepare(HEATMAP_SQL)?;
         let rows = stmt
             .query_map([heatmap_since], |r| {
                 Ok(DayActivity {
@@ -700,7 +718,11 @@ pub fn coach_overview(conn: &Connection, now: i64) -> Result<CoachOverview> {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         rows
     };
+    Ok(heatmap)
+}
 
+/// The Coach overview without its heatmap: the last 7 days of decisions and gotchas.
+fn coach_overview_facts(conn: &Connection, now: i64) -> Result<CoachOverview> {
     let since = now - 7 * 86_400;
     let recent = |kind: &str| -> Result<Vec<CoachFact>> {
         let mut stmt = conn.prepare(
@@ -726,11 +748,42 @@ pub fn coach_overview(conn: &Connection, now: i64) -> Result<CoachOverview> {
     };
 
     Ok(CoachOverview {
-        heatmap,
+        heatmap: Vec::new(),
         decisions: recent("decision")?,
         gotchas: recent("gotcha")?,
         since,
     })
+}
+
+static STATS_CACHE: std::sync::LazyLock<cache::AggCache<(), Stats>> =
+    std::sync::LazyLock::new(cache::AggCache::new);
+static HEATMAP_CACHE: std::sync::LazyLock<cache::AggCache<i64, Vec<DayActivity>>> =
+    std::sync::LazyLock::new(cache::AggCache::new);
+
+/// [`stats`], reused for up to [`cache::ANALYTICS_TTL`] while the thread set is unchanged.
+/// For the app's Stats view; `cal stats` and tests want the live numbers.
+///
+/// The embedding counts are always read live: they move while a semantic-index build runs
+/// without the thread set changing, so a cached copy would show stale coverage for the
+/// whole TTL. Both are covering-index COUNTs, so this stays cheap.
+pub fn stats_cached(conn: &Connection) -> Result<Stats> {
+    let mut cached = STATS_CACHE.get_or_try(cache::index_version(conn)?, (), || stats(conn))?;
+    (cached.embedded, cached.embeddable) = embed::embed_progress(conn)?;
+    Ok(cached)
+}
+
+/// [`coach_overview`] with the year-long activity heatmap (a GROUP BY over most of the
+/// messages table) cached per day for up to [`cache::ANALYTICS_TTL`]. The week's decisions
+/// and gotchas are cheap and always read live, so a fact the user just hid or edited
+/// disappears from the digest immediately.
+pub fn coach_overview_cached(conn: &Connection, now: i64) -> Result<CoachOverview> {
+    let day = now.div_euclid(86_400);
+    let heatmap = HEATMAP_CACHE.get_or_try(cache::index_version(conn)?, day, || {
+        coach_heatmap(conn, now)
+    })?;
+    let mut overview = coach_overview_facts(conn, now)?;
+    overview.heatmap = heatmap;
+    Ok(overview)
 }
 
 /// Full detail + ordered messages for one thread.
@@ -1159,5 +1212,41 @@ mod tests {
             .unwrap()
             .is_empty());
         let _ = threads_with_file(&conn, "go", 20).unwrap();
+    }
+
+    /// The planner has no ANALYZE stats, so it picks indexes from the schema alone. Pin the
+    /// heatmap to the threads -> idx_messages_thread plan: driving from the role-prefixed
+    /// count index fetched every user/assistant row in the table.
+    #[test]
+    fn coach_heatmap_plan_avoids_the_role_index() {
+        let conn = temp_db();
+        let plan: Vec<String> = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {HEATMAP_SQL}"))
+            .unwrap()
+            .query_map([0_i64], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let plan = plan.join(" | ");
+        assert!(!plan.contains("idx_messages_embed_counts"), "{plan}");
+        assert!(plan.contains("idx_messages_thread"), "{plan}");
+    }
+
+    #[test]
+    fn cached_stats_report_live_embedding_progress() {
+        let mut conn = temp_db();
+        let sid = source_id(&conn, "claude_code").unwrap();
+        let thread = ParsedThread {
+            external_id: "embed-progress".into(),
+            messages: vec![msg("user", "hello there", 1), msg("assistant", "hi", 2)],
+            ..Default::default()
+        };
+        upsert_thread(&mut conn, sid, &thread).unwrap();
+        assert_eq!(stats_cached(&conn).unwrap().embedded, 0);
+        // Embedding progress moves without the thread set changing (no cache invalidation).
+        conn.execute("UPDATE messages SET embedded = 1", [])
+            .unwrap();
+        let s = stats_cached(&conn).unwrap();
+        assert_eq!((s.embedded, s.embeddable), (2, 2));
     }
 }

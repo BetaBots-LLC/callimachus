@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useEffect, useRef, useState } from "react";
+import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, SOURCE_LABELS, type CleanupRow } from "../lib/api";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -21,6 +21,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { formatTime } from "../lib/format";
+import { invalidateIndexDerived } from "../lib/queryClient";
 import { useAppForm } from "@/lib/form";
 import { ChevronLeft, ChevronRight, Loader2 } from "lucide-react";
 
@@ -51,28 +52,41 @@ export function CleanupCard() {
   const [err, setErr] = useState<string | null>(null);
   const [confirming, setConfirming] = useState(false);
 
-  const days = AGES.find((a) => a.value === age)?.days ?? null;
-  const before = days ? Math.floor(Date.now() / 1000) - days * 86400 : undefined;
-
+  // Key on the age *filter*, and compute the cutoff timestamp inside the fetch. Keying
+  // on the timestamp itself (it changes every second) made each re-render a new query,
+  // which re-seeded the form and wiped the selection before "Confirm delete".
   const rows = useQuery({
-    queryKey: ["cleanup", before],
-    queryFn: () => api.cleanupCandidates({ before, limit: FETCH_LIMIT }),
+    queryKey: ["cleanup", age],
+    queryFn: () => {
+      const days = AGES.find((a) => a.value === age)?.days ?? null;
+      const before = days ? Math.floor(Date.now() / 1000) - days * 86400 : undefined;
+      return api.cleanupCandidates({ before, limit: FETCH_LIMIT });
+    },
     staleTime: 30_000,
+    placeholderData: keepPreviousData,
   });
 
   // Form holds the full list + a per-row `selected` flag (TanStack array field).
   const form = useAppForm({ defaultValues: { rows: [] as Row[] } });
 
-  // Re-seed the form + reset paging whenever the query data changes.
+  // Re-seed the form whenever the query data changes. A refetch of the same filter (after
+  // a delete, or a background index update) keeps the selection for rows that are still
+  // listed; a new filter starts fresh from page one.
+  const seededAge = useRef<string | null>(null);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: `form` is stable; reading its current values here is the point (keep selections), not a trigger
   useEffect(() => {
-    if (rows.data) {
-      form.reset({ rows: rows.data.map((r) => ({ ...r, selected: false })) });
+    if (!rows.data || rows.isPlaceholderData) return;
+    const sameFilter = seededAge.current === age;
+    const keep = sameFilter
+      ? new Set(form.state.values.rows.filter((r) => r.selected).map((r) => r.id))
+      : new Set<number>();
+    form.reset({ rows: rows.data.map((r) => ({ ...r, selected: keep.has(r.id) })) });
+    seededAge.current = age;
+    if (!sameFilter) {
       setConfirming(false);
       setPage(0);
     }
-    // form identity is stable; depend only on the data
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [rows.data]);
+  }, [rows.data, rows.isPlaceholderData, age]);
 
   const total = rows.data?.length ?? 0;
   const pageCount = Math.max(1, Math.ceil(total / PAGE_SIZE));
@@ -80,9 +94,12 @@ export function CleanupCard() {
   const start = safePage * PAGE_SIZE;
 
   function invalidateAll() {
-    for (const key of ["db_stats", "index_stats", "cleanup", "results", "recent"]) {
+    for (const key of ["db_stats", "results", "recent"]) {
       queryClient.invalidateQueries({ queryKey: [key] });
     }
+    // delete_threads emits no index:done, so Stats / Coach / Projects (5-minute stale
+    // window) would keep listing the deleted threads without this.
+    invalidateIndexDerived();
   }
 
   const del = useMutation({

@@ -1,0 +1,76 @@
+# Weekly dependency updates. Minor + patch bumps are grouped into one PR per
+# ecosystem (and per directory for npm); majors arrive one at a time so they
+# can be reviewed and closed individually. The short cooldown skips versions
+# published in the last few days, which is when compromised releases usually
+# get caught and yanked.
+#
+# GitHub Actions are pinned to commit SHAs with a `# vX.Y.Z` comment;
+# Dependabot updates both together.
+#
+# The `ignore:` rules mirror the deliberate hand-pins. Dependabot does not read
+# pnpm-workspace.yaml's `updateConfig.ignoreDependencies`, and it would happily
+# rewrite an exact `=x.y.z` Cargo pin inside a grouped minor/patch PR, so each
+# pin has to be repeated here. Bump these by hand, on purpose.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    cooldown:
+      default-days: 3
+    groups:
+      actions-minor-patch:
+        update-types: [minor, patch]
+    commit-message:
+      prefix: "chore(ci)"
+
+  # pnpm workspace: the lockfile lives at the root, the manifests in each app.
+  - package-ecosystem: npm
+    directories:
+      - /
+      - /apps/*
+      - /packages/*
+    schedule:
+      interval: weekly
+      day: monday
+    cooldown:
+      default-days: 3
+    groups:
+      npm-minor-patch:
+        update-types: [minor, patch]
+    ignore:
+      # Must stay within apps/vscode engines.vscode (^1.85.0): vsce refuses to
+      # package a newer one, and newer typings let the extension call APIs that
+      # crash on the oldest VS Code/Cursor it supports. ~1.85.0 -> ~1.10x.0 is
+      # a "minor" bump, so it would ride along in the grouped PR.
+      - dependency-name: "@types/vscode"
+      # Tracks the Node major CI and the extension tooling run on (22).
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
+      # v3 stops versioning private packages by default, which silently halts
+      # desktop/vscode releases (see pnpm-workspace.yaml).
+      - dependency-name: "@changesets/cli"
+        update-types: ["version-update:semver-major"]
+    commit-message:
+      prefix: "chore(deps)"
+
+  - package-ecosystem: cargo
+    directory: /apps/desktop/src-tauri
+    schedule:
+      interval: weekly
+      day: monday
+    cooldown:
+      default-days: 3
+    groups:
+      cargo-minor-patch:
+        update-types: [minor, patch]
+    ignore:
+      # Exact pin (`=5.17.2`): 5.17.4+ pulls ort 2.0.0-rc.13, which needs the
+      # clean-VM and embedding-drift checks before it ships. ort comes in
+      # through fastembed, so keep it out too.
+      - dependency-name: "fastembed"
+      - dependency-name: "ort*"
+    commit-message:
+      prefix: "chore(deps)"

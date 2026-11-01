@@ -45,7 +45,7 @@ There's also a **status-bar** button (`$(history) Callimachus`) that opens searc
 - `callimachus.vaultPath` — Obsidian vault folder for the **Export** action (default empty). When empty, Export opens the note as an untitled document instead of writing to a vault.
 - `callimachus.openCommand` — CLI agent the **Open in CLI** action seeds with a thread's context (default `claude`; e.g. `codex`, `gemini`). Must be on your `PATH`.
 - `callimachus.ambientRecall` — surface past threads related to your selection / symbol / nearest error in the sidebar, with no searching (default `true`).
-- `callimachus.ambientRecallThrottle` — milliseconds to wait after the cursor/selection settles before querying for related threads (default `500`).
+- `callimachus.ambientRecallThrottle` — milliseconds to wait after the cursor/selection settles before querying for related threads (default `1500`).
 - `callimachus.ambientRecallMinContext` — minimum length of the editor context (selection or symbol) before ambient recall runs (default `10`).
 - `callimachus.ambientRecallLimit` — max related threads to show in the ambient-recall section (default `5`).
 

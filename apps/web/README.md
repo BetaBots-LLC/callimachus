@@ -27,9 +27,31 @@ so `tsc` (which CI runs before `build`) can find it.
 - `GITHUB_TOKEN` — optional; raises the GitHub API rate limit used by the smart-download server
   function (`src/server/releases.ts`). The page falls back to static `releases/latest/download` URLs
   if the API is unavailable, so this is not required.
+- `VITE_PUBLIC_POSTHOG_KEY`: the PostHog project token for site analytics. Optional: when it is
+  unset (local dev, previews, forks) PostHog is never initialised and the site sends no analytics.
+  It is a public, write-only ingestion key, inlined into the client bundle at build time, so set it
+  as a Vercel environment variable (Production only, unless you want preview traffic counted).
+- `VITE_PUBLIC_POSTHOG_HOST`: optional PostHog ingestion host. Defaults to `https://us.i.posthog.com`.
+
+### Analytics and the privacy policy
+
+Site analytics run in PostHog **cookieless mode** (no cookies, no local/session storage, no
+person profiles, no autocapture), which is what the privacy policy (`src/content/legal.ts`)
+promises. Two PostHog project settings must stay on for the policy to hold, in every project the
+website or the desktop app sends to:
+
+- **Settings → Project → Web analytics → Enable cookieless tracking**, which turns on the
+  server-side visitor hash that cookieless mode relies on.
+- **Discard client IP data** (project settings, IP data capture), because the policy says IP
+  addresses are discarded rather than stored.
+
+If you change what the site or the app collects, update `src/content/legal.ts` (and bump
+`LEGAL_UPDATED`) in the same PR. `callimachus-web` is ignored by Changesets, so call the policy
+change out in the `callimachus` changeset as well.
 
 ## Deploy (Vercel)
 
 Project **Root Directory** = `apps/web`. Build command `pnpm build`, install `pnpm install`. Set
-`VITE_SITE_URL=https://callimachus.app` (+ optional `GITHUB_TOKEN`). No `vercel.json` needed — the
-Vercel preset emits the Build Output API directory Vercel deploys directly.
+`VITE_SITE_URL=https://callimachus.app` (+ optional `GITHUB_TOKEN`, `VITE_PUBLIC_POSTHOG_KEY` and
+`VITE_PUBLIC_POSTHOG_HOST`). No `vercel.json` needed: the Vercel preset emits the Build Output API
+directory Vercel deploys directly.

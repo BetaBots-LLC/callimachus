@@ -1,4 +1,4 @@
-import { type ReactNode, useState } from "react";
+import { type ReactNode, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useDebouncedCallback } from "@tanstack/react-pacer";
 import {
@@ -14,30 +14,43 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { useAppForm } from "@/lib/form";
+import { describeKeySaveError } from "../lib/errors";
+import { baseName } from "../lib/format";
+import { invalidateIndexDerived } from "../lib/queryClient";
+import { EMBED_ERROR_KEY, useEmbedError, useEmbedStatus, useIndexError } from "../lib/queries";
+import { track } from "../lib/telemetry";
 import { useSettings } from "../store/settings";
 import { CleanupCard } from "./CleanupCard";
+import { TelemetrySetting } from "./TelemetryConsent";
 
 const INDEXABLE: SourceKind[] = INDEXABLE_SOURCES;
 
 export function SettingsView() {
   const queryClient = useQueryClient();
   const stats = useQuery({ queryKey: ["db_stats"], queryFn: api.dbStats });
-  // Progress is pushed via embed:progress/embed:done events (see main.tsx); a slow
-  // safety-net refetch covers any missed event while a build runs.
-  const embed = useQuery({
-    queryKey: ["embed_status"],
-    queryFn: api.embeddingStatus,
-    refetchInterval: (q) => (q.state.data?.running ? 5_000 : false),
-  });
+  // Event-driven; never polls while idle (see lib/queries.ts).
+  const embed = useEmbedStatus();
 
   const indexOne = useMutation({
     mutationFn: (kind: SourceKind) => api.indexSource(kind),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["db_stats"] });
       queryClient.invalidateQueries({ queryKey: ["results"] });
+      // index_source emits no index:done, so refresh Stats / Coach / Projects here.
+      invalidateIndexDerived();
     },
+    onError: () => track("error_shown", { kind: "index_failed" }),
   });
-  const buildIndex = useMutation({ mutationFn: api.buildEmbeddings });
+  const embedError = useEmbedError();
+  // Why the last full reindex failed (index:error, see main.tsx), until one succeeds.
+  const indexError = useIndexError();
+  const buildIndex = useMutation({
+    mutationFn: api.buildEmbeddings,
+    // A retry starts clean; a new failure arrives as a fresh embed:error.
+    onMutate: () => queryClient.setQueryData(EMBED_ERROR_KEY, null),
+    // Pick up running:true now; progress then streams in via embed:progress.
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["embed_status"] }),
+  });
   const vaultDir = useSettings((s) => s.vaultDir);
   const setVaultDir = useSettings((s) => s.setVaultDir);
   const synthProvider = useSettings((s) => s.synthProvider);
@@ -45,6 +58,14 @@ export function SettingsView() {
   const synthModel = useSettings((s) => s.synthModel);
   const setSynthModel = useSettings((s) => s.setSynthModel);
   const vaults = useQuery({ queryKey: ["obsidian_vaults"], queryFn: api.obsidianVaults });
+  // The vault input saves on every keystroke, so its analytics event is sent once per
+  // edit (on blur, if the value changed since focus) rather than per character.
+  const vaultAtFocus = useRef<string | null>(null);
+  const chooseVault = (path: string) => {
+    if (path === vaultDir) return;
+    setVaultDir(path);
+    track("setting_changed", { key: "vault_dir" });
+  };
 
   return (
     <div className="mx-auto w-full max-w-3xl space-y-6 overflow-y-auto p-6">
@@ -89,6 +110,16 @@ export function SettingsView() {
               </Button>
             </div>
           ))}
+          {indexOne.isError && indexOne.variables && (
+            <p role="alert" className="text-xs text-destructive">
+              Couldn't reindex {SOURCE_LABELS[indexOne.variables]}: {String(indexOne.error)}
+            </p>
+          )}
+          {indexError && (
+            <p role="alert" className="text-xs break-words text-destructive">
+              The last full reindex failed: {indexError}
+            </p>
+          )}
         </CardContent>
       </Card>
 
@@ -101,7 +132,7 @@ export function SettingsView() {
               : ""}
           </p>
         </CardHeader>
-        <CardContent>
+        <CardContent className="space-y-2">
           <Button
             size="sm"
             variant="outline"
@@ -110,6 +141,17 @@ export function SettingsView() {
           >
             {embed.data?.running ? "Building…" : "Build / update semantic index"}
           </Button>
+          {embedError && !embed.data?.running && (
+            <p role="alert" className="text-xs text-destructive">
+              The last build stopped: {embedError}. Nothing was marked as embedded, so building
+              again picks up where it left off.
+            </p>
+          )}
+          {buildIndex.isError && (
+            <p role="alert" className="text-xs text-destructive">
+              Couldn't start the build: {String(buildIndex.error)}
+            </p>
+          )}
         </CardContent>
       </Card>
 
@@ -128,13 +170,13 @@ export function SettingsView() {
             <Field label="Detected vaults">
               <div className="flex flex-wrap gap-1.5">
                 {vaults.data.map((path) => {
-                  const name = path.split("/").filter(Boolean).pop() ?? path;
+                  const name = baseName(path);
                   return (
                     <Button
                       key={path}
                       size="xs"
                       variant={vaultDir === path ? "secondary" : "outline"}
-                      onClick={() => setVaultDir(path)}
+                      onClick={() => chooseVault(path)}
                       title={path}
                     >
                       {name}
@@ -148,6 +190,16 @@ export function SettingsView() {
             <Input
               value={vaultDir}
               onChange={(e) => setVaultDir(e.target.value)}
+              onFocus={() => {
+                vaultAtFocus.current = vaultDir;
+              }}
+              onBlur={() => {
+                const before = vaultAtFocus.current;
+                vaultAtFocus.current = null;
+                if (before !== null && before !== useSettings.getState().vaultDir) {
+                  track("setting_changed", { key: "vault_dir" });
+                }
+              }}
               placeholder="/Users/you/Documents/Obsidian Vault/Vault"
               spellCheck={false}
             />
@@ -156,7 +208,10 @@ export function SettingsView() {
             <Field label="Synthesis provider">
               <select
                 value={synthProvider}
-                onChange={(e) => setSynthProvider(e.target.value)}
+                onChange={(e) => {
+                  setSynthProvider(e.target.value);
+                  track("setting_changed", { key: "synth_engine" });
+                }}
                 className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm text-foreground outline-none transition-colors focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 dark:bg-input/30"
               >
                 <option value="">Auto (first key)</option>
@@ -195,7 +250,10 @@ function GeneralCard() {
   const closeToTray = useQuery({ queryKey: ["close_to_tray"], queryFn: api.getCloseToTray });
   const setCloseToTray = useMutation({
     mutationFn: api.setCloseToTray,
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["close_to_tray"] }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["close_to_tray"] });
+      track("setting_changed", { key: "close_to_tray" });
+    },
   });
   return (
     <Card>
@@ -215,6 +273,13 @@ function GeneralCard() {
           When on, closing the window hides Callimachus to the system tray instead of quitting.
           Click the tray icon to reopen it, or use the tray menu to quit.
         </p>
+        <section aria-labelledby="usage-analytics-title" className="space-y-1 border-t pt-3">
+          <h3 id="usage-analytics-title" className="text-sm font-medium">
+            Usage analytics
+          </h3>
+          {/* Shares the consent card's ["telemetry_state"] query, so both always agree. */}
+          <TelemetrySetting />
+        </section>
       </CardContent>
     </Card>
   );
@@ -231,12 +296,23 @@ function RecallIntegrationCard() {
   const refresh = () => queryClient.invalidateQueries({ queryKey: ["recall_integration"] });
   const install = useMutation({ mutationFn: api.installRecallIntegration, onSuccess: refresh });
   const uninstall = useMutation({ mutationFn: api.uninstallRecallIntegration, onSuccess: refresh });
-  const setRecall = useMutation({ mutationFn: api.setProactiveRecall, onSuccess: refresh });
+  const setRecall = useMutation({
+    mutationFn: api.setProactiveRecall,
+    onSuccess: () => {
+      refresh();
+      track("setting_changed", { key: "proactive_recall" });
+    },
+  });
 
   const s = status.data;
   const connected =
     !!s && s.skillInstalled && s.mcpRegistered && s.hookInstalled && !s.skillOutdated;
   const partial = !!s && (s.skillInstalled || s.mcpRegistered || s.hookInstalled) && !connected;
+  // Running from a disk image, App Translocation or an AppImage mount: install would
+  // register a path that disappears, so the backend refuses with this same message.
+  // `=== false`, not `!`: a status without the field (an older backend) must not lock
+  // the install button.
+  const unstable = s?.exeStable === false;
 
   return (
     <Card>
@@ -265,9 +341,20 @@ function RecallIntegrationCard() {
           <span>{s?.mcpRegistered ? "✓ MCP server" : "○ MCP server"}</span>
           <span>{s?.hookInstalled ? "✓ memory hook" : "○ memory hook"}</span>
           <span>{s?.calInstalled ? "✓ cal CLI" : "○ cal CLI"}</span>
+          {s?.calProblem && <span className="basis-full">{s.calProblem}</span>}
         </div>
+        {s?.pathHint && <PathHint hint={s.pathHint} />}
+        {unstable && s?.exeProblem && (
+          <p role="alert" className="text-xs text-destructive">
+            {s.exeProblem}
+          </p>
+        )}
         <div className="flex items-center gap-2">
-          <Button size="sm" onClick={() => install.mutate()} disabled={install.isPending}>
+          <Button
+            size="sm"
+            onClick={() => install.mutate()}
+            disabled={install.isPending || unstable}
+          >
             {install.isPending
               ? "Installing…"
               : connected
@@ -310,9 +397,7 @@ function RecallIntegrationCard() {
             />
           </div>
         )}
-        {setRecall.isError && (
-          <p className="text-xs text-destructive">{String(setRecall.error)}</p>
-        )}
+        {setRecall.isError && <p className="text-xs text-destructive">{String(setRecall.error)}</p>}
       </CardContent>
     </Card>
   );
@@ -329,6 +414,13 @@ function OtherAgentsCard() {
   const refresh = () => queryClient.invalidateQueries({ queryKey: ["agent_integrations"] });
   const install = useMutation({ mutationFn: api.installAgentIntegrations, onSuccess: refresh });
   const uninstall = useMutation({ mutationFn: api.uninstallAgentIntegrations, onSuccess: refresh });
+  // Registering other agents refuses from an unstable app path too; the Claude Code status
+  // (same query key as that card, so no extra fetch) carries the reason.
+  const recall = useQuery({
+    queryKey: ["recall_integration"],
+    queryFn: api.recallIntegrationStatus,
+  });
+  const exeProblem = recall.data?.exeStable === false ? recall.data.exeProblem : null;
 
   const present = (status.data ?? []).filter((a) => a.present);
   const anyRegistered = present.some((a) => a.registered);
@@ -364,8 +456,17 @@ function OtherAgentsCard() {
                 </span>
               ))}
             </div>
+            {exeProblem && (
+              <p role="alert" className="text-xs text-destructive">
+                {exeProblem}
+              </p>
+            )}
             <div className="flex items-center gap-2">
-              <Button size="sm" onClick={() => install.mutate()} disabled={install.isPending}>
+              <Button
+                size="sm"
+                onClick={() => install.mutate()}
+                disabled={install.isPending || !!exeProblem}
+              >
                 {install.isPending
                   ? "Registering…"
                   : allRegistered
@@ -393,6 +494,26 @@ function OtherAgentsCard() {
         )}
       </CardContent>
     </Card>
+  );
+}
+
+/**
+ * The backend's PATH advice for `cal`, with its trailing `export PATH=...` line set apart
+ * as a selectable command so it can be copied into a shell profile in one go.
+ */
+function PathHint({ hint }: { hint: string }) {
+  const at = hint.indexOf("export PATH=");
+  const prose = at >= 0 ? hint.slice(0, at).trimEnd() : hint;
+  const command = at >= 0 ? hint.slice(at).trim() : null;
+  return (
+    <div className="space-y-1 text-xs text-muted-foreground">
+      <p>{prose}</p>
+      {command && (
+        <code className="block w-fit max-w-full select-all break-all rounded bg-muted px-1.5 py-0.5 font-mono text-foreground">
+          {command}
+        </code>
+      )}
+    </div>
   );
 }
 
@@ -424,10 +545,19 @@ function DistillationCard() {
   const queryClient = useQueryClient();
   const cfg = useQuery({ queryKey: ["knowledge_config"], queryFn: api.knowledgeConfig });
   const cliEngines = useQuery({ queryKey: ["cli_engines"], queryFn: api.cliEngines });
+  // Set when the engine picker changes, reported once the debounced save lands. Turning
+  // knowledge on is reported by the backend (knowledge_enabled), not here.
+  const engineChanged = useRef(false);
   const save = useMutation({
     mutationFn: (next: { enabled: boolean; provider: string; model: string }) =>
       api.setKnowledgeConfig(next.enabled, next.provider || undefined, next.model || undefined),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["knowledge_config"] }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["knowledge_config"] });
+      if (engineChanged.current) {
+        engineChanged.current = false;
+        track("setting_changed", { key: "knowledge_engine" });
+      }
+    },
   });
   // Debounce the actual write (toggling ON kicks a background backfill) so rapid flips
   // coalesce into one; the cache is updated optimistically so the UI stays instant.
@@ -442,6 +572,7 @@ function DistillationCard() {
   const model = c?.model ?? "";
   const update = (next: Partial<{ enabled: boolean; provider: string; model: string }>) => {
     const merged = { enabled, provider, model, ...next };
+    if (merged.provider !== provider) engineChanged.current = true;
     queryClient.setQueryData<KnowledgeConfig>(["knowledge_config"], {
       enabled: merged.enabled,
       provider: merged.provider || null,
@@ -468,7 +599,10 @@ function DistillationCard() {
       queryClient.setQueryData<KnowledgeConfig>(["knowledge_config"], (prev) =>
         prev ? { ...prev, autoDistill: on } : prev,
       ),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["knowledge_config"] }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["knowledge_config"] });
+      track("setting_changed", { key: "auto_distill" });
+    },
   });
 
   return (
@@ -513,7 +647,9 @@ function DistillationCard() {
                   onBlur={(e) => {
                     if (e.target.value !== model) update({ model: e.target.value });
                   }}
-                  placeholder={local ? "llama3.1" : isCli ? "default for CLI" : "default for engine"}
+                  placeholder={
+                    local ? "llama3.1" : isCli ? "default for CLI" : "default for engine"
+                  }
                   spellCheck={false}
                 />
               </Field>
@@ -552,7 +688,13 @@ function ProviderRow({ id, label }: { id: string; label: string }) {
   const queryClient = useQueryClient();
   const hasKey = useQuery({ queryKey: ["hasKey", id], queryFn: () => api.providerHasKey(id) });
   const invalidate = () => queryClient.invalidateQueries({ queryKey: ["hasKey", id] });
-  const remove = useMutation({ mutationFn: () => api.deleteApiKey(id), onSuccess: invalidate });
+  const remove = useMutation({
+    mutationFn: () => api.deleteApiKey(id),
+    onSuccess: () => {
+      invalidate();
+      track("setting_changed", { key: "api_key" });
+    },
+  });
 
   // Local Ollama and Ollama Cloud accept a custom server URL (persisted; shared with the chat
   // header). Local Ollama is keyless; Ollama Cloud needs a key like any cloud provider.
@@ -567,20 +709,36 @@ function ProviderRow({ id, label }: { id: string; label: string }) {
     // Reflect the new URL immediately (also mirrors to the chat header, same query key); the
     // invalidate reconciles with what the backend actually stored.
     onMutate: (url: string) => queryClient.setQueryData(["providerBaseUrl", id], url),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["providerBaseUrl", id] }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["providerBaseUrl", id] });
+      track("setting_changed", { key: "provider_base_url" });
+    },
   });
   // `null` = not editing → show the saved value; a local draft overrides it while typing so an
   // in-flight query result can't clobber the input.
   const [urlEdit, setUrlEdit] = useState<string | null>(null);
 
+  // A failed save (e.g. no Secret Service keyring on Linux) must be visible: without it,
+  // Save looks like it did nothing and chat later fails with "No API key set".
+  const saveKey = useMutation({
+    mutationFn: (key: string) => api.setApiKey(id, key),
+    onSuccess: () => {
+      invalidate();
+      track("setting_changed", { key: "api_key" });
+    },
+  });
   const form = useAppForm({
     defaultValues: { key: "" },
     onSubmit: async ({ value }) => {
       const k = value.key.trim();
       if (!k) return;
-      await api.setApiKey(id, k);
-      invalidate();
-      form.reset();
+      try {
+        await saveKey.mutateAsync(k);
+        form.reset();
+      } catch {
+        // Shown below via saveKey.error; swallowing here avoids an unhandled rejection
+        // from the (unawaited) form.handleSubmit().
+      }
     },
   });
 
@@ -632,11 +790,21 @@ function ProviderRow({ id, label }: { id: string; label: string }) {
           Remove
         </Button>
       </form>
+      {saveKey.isError && (
+        <p role="alert" className="text-xs text-destructive">
+          {describeKeySaveError(saveKey.error)}
+        </p>
+      )}
+      {remove.isError && (
+        <p role="alert" className="text-xs text-destructive">
+          Couldn't remove the key: {String(remove.error)}
+        </p>
+      )}
       {isOllamaLike && (
         <div className="flex items-center gap-2">
           <span className="w-40 shrink-0 text-xs text-muted-foreground">Server URL</span>
           <Input
-            value={urlEdit ?? (baseUrl.data ?? "")}
+            value={urlEdit ?? baseUrl.data ?? ""}
             onChange={(e) => setUrlEdit(e.target.value)}
             onBlur={(e) => {
               const url = e.target.value.trim();

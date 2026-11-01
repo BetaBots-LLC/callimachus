@@ -153,6 +153,12 @@ fn index_session(
     if session_id.is_empty() {
         return Ok(None);
     }
+    // The user deleted this thread: don't bring it back. Record the fingerprint so an
+    // unchanged file isn't re-read on every scan.
+    if crate::cleanup::is_tombstoned(conn, sid, &session_id)? {
+        set_file_state(conn, &key, KIND, mtime, size)?;
+        return Ok(None);
+    }
 
     let mut messages: Vec<ParsedMessage> = Vec::new();
     let mut usage: Vec<(usize, MsgUsage)> = Vec::new();

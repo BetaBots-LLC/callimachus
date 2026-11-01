@@ -240,7 +240,9 @@ fn extract_blocks(
                         push(out, "assistant", format!("{name}: {input}"), Some(name));
                     }
                     Some("tool_result") => {
-                        push(out, "tool", stringify_tool_result(b.get("content")), None);
+                        // Same head + tail cap as the Claude indexer.
+                        let text = stringify_tool_result(b.get("content"));
+                        push(out, "tool", super::claude::cap_tool_text(text.trim()), None);
                     }
                     _ => {}
                 }

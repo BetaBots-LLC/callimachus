@@ -5,16 +5,42 @@
 // version is kept in lockstep with the desktop release (Changesets `fixed`
 // group), so `v<version>` always names a GitHub Release that has the per-target
 // `callimachus-mcp-<triple>` asset this downloads.
+//
+// Every download is checked against a SHA-256 manifest before it is made
+// executable. The release workflow writes the manifest (`SHA256SUMS`) into
+// `lib/` right before `npm publish`, so the expected hashes come from the npm
+// tarball rather than from the same GitHub Release the binary is fetched from.
+//
+// IMPORTANT: nothing here may write to stdout. stdout is the MCP stdio
+// transport; all diagnostics go to stderr.
 
+import { createHash } from "node:crypto";
+import {
+  chmodSync,
+  createWriteStream,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  statSync,
+  unlinkSync,
+  utimesSync,
+} from "node:fs";
 import { createRequire } from "node:module";
-import { chmodSync, existsSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { Readable, Transform } from "node:stream";
+import { pipeline } from "node:stream/promises";
+import { fileURLToPath } from "node:url";
 
 const require = createRequire(import.meta.url);
 const { version } = require("../package.json");
 
 const REPO = "BetaBots-LLC/callimachus";
+const RELEASE_BASE = `https://github.com/${REPO}/releases/download/v${version}`;
+const BUNDLED_SUMS = fileURLToPath(new URL("./SHA256SUMS", import.meta.url));
 
 // Host platform -> Rust target triple uploaded by .github/workflows/build.yml.
 // Only these three targets are released today (see build.yml's matrix).
@@ -24,14 +50,42 @@ const TRIPLES = {
   "win32-x64": "x86_64-pc-windows-msvc",
 };
 
+// The Linux binary links the ONNX Runtime prebuilt, which needs glibc 2.38+
+// (Ubuntu 24.04, Debian 13, Fedora 39 or newer). Older distros fail at load
+// time with "GLIBC_2.38 not found", so check up front and say why.
+const MIN_GLIBC = [2, 38];
+
+// How to build the server yourself, from the tag matching this launcher. It
+// mirrors the repo's Dockerfile: the server lives in the desktop (Tauri) crate,
+// so Linux needs Tauri's WebKitGTK dev packages, and an empty dist/ stands in
+// for the desktop frontend the MCP server never serves. A source build links
+// the same ONNX Runtime prebuilt as the release binaries, so it can't get past
+// that prebuilt's platform limits (Intel macOS, glibc < 2.38): those errors say
+// so instead of pointing here.
+const BUILD_FROM_SOURCE =
+  `To build it yourself you need Rust and, on Linux, the pkg-config, OpenSSL, ` +
+  `webkit2gtk-4.1 and librsvg2 development packages:\n` +
+  `  git clone --depth 1 --branch v${version} https://github.com/${REPO}\n` +
+  `  cd callimachus/apps/desktop\n` +
+  `  mkdir dist\n` +
+  `  cargo build --release --locked --manifest-path src-tauri/Cargo.toml --bin callimachus-mcp\n` +
+  `then set CALLIMACHUS_MCP_BIN to the built src-tauri/target/release/callimachus-mcp. ` +
+  `Or point CALLIMACHUS_MCP_BIN at a binary you already have.`;
+
+// Cached versions other than the running one are removed only when they are
+// older and nothing has used them for this long, so clients pinned to different
+// versions (a registry entry pinned to x.y.z next to a bare `npx -y`) don't keep
+// deleting each other's ~45MB binary.
+const PRUNE_UNUSED_MS = 30 * 24 * 60 * 60 * 1000;
+
 /**
  * Returns an absolute path to a ready-to-exec `callimachus-mcp` binary,
  * downloading it on first run. Throws with an actionable message on an
- * unsupported platform or a failed download.
+ * unsupported platform, a failed download, or a checksum mismatch.
  */
 export async function ensureBinary() {
-  // Escape hatch: point at an already-installed binary (e.g. the one the
-  // desktop app puts on your PATH, or a `cargo build` output).
+  // Escape hatch: point at an already-installed binary (e.g. one built with
+  // `cargo build`, or the standalone binary from the Releases page).
   const override = process.env.CALLIMACHUS_MCP_BIN;
   if (override) {
     if (!existsSync(override)) {
@@ -42,42 +96,291 @@ export async function ensureBinary() {
 
   const key = `${process.platform}-${process.arch}`;
   const triple = TRIPLES[key];
-  if (!triple) {
-    throw new Error(
-      `unsupported platform ${key}. Released targets: ${Object.keys(TRIPLES).join(", ")}.\n` +
-        `Build from source instead:\n` +
-        `  cargo install --git https://github.com/${REPO} --bin callimachus-mcp\n` +
-        `or set CALLIMACHUS_MCP_BIN to an existing binary.`,
-    );
-  }
+  if (!triple) throw new Error(unsupportedPlatformMessage(key));
+
   const ext = process.platform === "win32" ? ".exe" : "";
   const name = `callimachus-mcp-${triple}${ext}`;
 
-  const cacheBase = process.env.XDG_CACHE_HOME || join(homedir(), ".cache");
-  const cacheDir = join(cacheBase, "callimachus-mcp", version);
+  const cacheRoot = join(
+    process.env.XDG_CACHE_HOME || join(homedir(), ".cache"),
+    "callimachus-mcp",
+  );
+  const cacheDir = join(cacheRoot, version);
   const binPath = join(cacheDir, name);
-  if (existsSync(binPath)) return binPath;
+  if (existsSync(binPath)) {
+    // Mark this version as in use, so another client's prune leaves it alone.
+    touchQuietly(cacheDir);
+    return binPath;
+  }
 
-  const url = `https://github.com/${REPO}/releases/download/v${version}/${name}`;
-  // Diagnostics MUST go to stderr: stdout is the MCP stdio transport.
-  process.stderr.write(`callimachus-mcp: downloading v${version} for ${key}...\n`);
+  // Only checked before a download: a cached binary already passed this check,
+  // and process.report is not free to generate on every MCP server start.
+  if (process.platform === "linux") assertGlibc(linuxGlibcVersion());
 
+  const expected = (await loadChecksums()).get(name);
+  if (!expected) {
+    throw new Error(
+      `no SHA-256 checksum for ${name} in the v${version} manifest, refusing to run it.\n` +
+        BUILD_FROM_SOURCE,
+    );
+  }
+
+  mkdirSync(cacheDir, { recursive: true });
+  // Download to a temp name, verify, then rename: a concurrent run never sees a
+  // partial file at the final path, and a bad download never becomes executable.
+  const tmp = join(cacheDir, `.${name}.${process.pid}.tmp`);
+  try {
+    const actual = await downloadTo(`${RELEASE_BASE}/${name}`, tmp, key);
+    if (actual !== expected) {
+      throw new Error(
+        `checksum mismatch for ${name}: expected ${expected}, got ${actual}. ` +
+          `The download was discarded.`,
+      );
+    }
+    if (process.platform !== "win32") chmodSync(tmp, 0o755);
+    renameSync(tmp, binPath);
+  } catch (err) {
+    removeQuietly(tmp);
+    throw err;
+  }
+  process.stderr.write(`callimachus-mcp: installed ${binPath}\n`);
+  pruneOldVersions(cacheRoot, version, Date.now());
+  return binPath;
+}
+
+/** The error for a platform with no released binary. */
+export function unsupportedPlatformMessage(key) {
+  const released = `Released targets: ${Object.keys(TRIPLES).join(", ")}.`;
+  if (key === "darwin-x64") {
+    // ort (fastembed's ONNX backend) publishes no x86_64-apple-darwin prebuilt,
+    // and fastembed always downloads one, so there is nothing to build against.
+    return (
+      `Intel Macs are not supported. ${released} ` +
+      `A source build fails there too: the ONNX Runtime that callimachus-mcp links ` +
+      `has no Intel macOS build. (On an Apple Silicon Mac this means Node itself is an ` +
+      `x64 build running under Rosetta: use an arm64 Node instead.)`
+    );
+  }
+  // A Linux source build inherits the ONNX Runtime prebuilt's glibc floor too.
+  const floor = key.startsWith("linux-")
+    ? ` A Linux source build needs glibc ${MIN_GLIBC.join(".")} or newer, like the released binary.`
+    : "";
+  return `unsupported platform ${key}. ${released}\n${BUILD_FROM_SOURCE}${floor}`;
+}
+
+/**
+ * Streams `url` into `dest`, hashing as it goes, and returns the hex SHA-256.
+ * Prints coarse progress to stderr so a slow first run is visibly alive.
+ */
+async function downloadTo(url, dest, label) {
+  process.stderr.write(`callimachus-mcp: downloading v${version} for ${label}...\n`);
   const res = await fetch(url, { redirect: "follow" });
-  if (!res.ok) {
+  if (!res.ok || !res.body) {
     throw new Error(
       `download failed (${res.status} ${res.statusText}) from ${url}\n` +
         `The release asset may not exist for this version/platform yet.`,
     );
   }
-  const buf = Buffer.from(await res.arrayBuffer());
 
-  mkdirSync(cacheDir, { recursive: true });
-  // Write to a temp name then rename, so a concurrent run never sees a partial
-  // file at the final path.
-  const tmp = join(cacheDir, `.${name}.${process.pid}.tmp`);
-  writeFileSync(tmp, buf);
-  if (process.platform !== "win32") chmodSync(tmp, 0o755);
-  renameSync(tmp, binPath);
-  process.stderr.write(`callimachus-mcp: installed ${binPath}\n`);
-  return binPath;
+  const total = Number(res.headers.get("content-length")) || 0;
+  const hash = createHash("sha256");
+  let received = 0;
+  let nextReport = 0.25;
+  const meter = new Transform({
+    transform(chunk, _encoding, callback) {
+      hash.update(chunk);
+      received += chunk.length;
+      if (total > 0 && received / total >= nextReport) {
+        const pct = Math.floor((received / total) * 100);
+        process.stderr.write(`callimachus-mcp: ${pct}% of ${formatMB(total)}\n`);
+        while (received / total >= nextReport) nextReport += 0.25;
+      }
+      callback(null, chunk);
+    },
+  });
+
+  await pipeline(Readable.fromWeb(res.body), meter, createWriteStream(dest));
+  return hash.digest("hex");
+}
+
+/**
+ * The expected hashes for this version: the manifest bundled into the npm
+ * package at publish time, or (for an unpublished checkout) the SHA256SUMS
+ * asset of the matching GitHub Release.
+ */
+async function loadChecksums() {
+  if (existsSync(BUNDLED_SUMS)) return parseChecksums(readFileSync(BUNDLED_SUMS, "utf8"));
+
+  const url = `${RELEASE_BASE}/SHA256SUMS`;
+  const res = await fetch(url, { redirect: "follow" });
+  if (!res.ok) {
+    throw new Error(
+      `could not fetch the checksum manifest (${res.status} ${res.statusText}) from ${url}, ` +
+        `so the binary cannot be verified.\n${BUILD_FROM_SOURCE}`,
+    );
+  }
+  return parseChecksums(await res.text());
+}
+
+/**
+ * Parses `sha256sum` output (`<hex>  <name>`, or `<hex> *<name>` in binary
+ * mode) into a Map of file name -> lowercase hex digest.
+ */
+export function parseChecksums(text) {
+  const sums = new Map();
+  for (const line of text.split(/\r?\n/)) {
+    const match = line.trim().match(/^([0-9a-fA-F]{64})\s+\*?(.+)$/);
+    if (match) sums.set(match[2].trim(), match[1].toLowerCase());
+  }
+  return sums;
+}
+
+/** The runtime glibc version as [major, minor], or null on non-glibc (musl) systems. */
+function linuxGlibcVersion() {
+  const raw = process.report?.getReport?.().header?.glibcVersionRuntime;
+  if (!raw) return null;
+  const [major, minor] = String(raw).split(".").map(Number);
+  return Number.isFinite(major) && Number.isFinite(minor) ? [major, minor] : null;
+}
+
+/** True when a glibc [major, minor] meets the Linux binary's floor. */
+export function glibcSupported(glibc) {
+  if (!glibc) return false;
+  const [major, minor] = glibc;
+  return major > MIN_GLIBC[0] || (major === MIN_GLIBC[0] && minor >= MIN_GLIBC[1]);
+}
+
+function assertGlibc(glibc) {
+  if (glibcSupported(glibc)) return;
+  throw new Error(glibcMessage(glibc));
+}
+
+/** The error for a Linux system below the glibc floor (or without glibc). */
+export function glibcMessage(glibc) {
+  const floor = MIN_GLIBC.join(".");
+  const found = glibc
+    ? `this system has glibc ${glibc.join(".")}`
+    : "no glibc was detected (musl-based distros such as Alpine are not supported)";
+  // No source-build hint: a source build links the same ONNX Runtime prebuilt and
+  // fails with undefined __isoc23_* symbols below glibc 2.38.
+  return (
+    `the prebuilt Linux binary needs glibc ${floor} or newer ` +
+    `(Ubuntu 24.04+, Debian 13+, Fedora 39+), but ${found}.\n` +
+    `Building from source doesn't get around this: the ONNX Runtime it links has the same ` +
+    `glibc ${floor} floor. Use a newer distro, or run callimachus-mcp in a container based ` +
+    `on one (the repo's Dockerfile builds it on Debian 13), with CALLIMACHUS_DB pointing at ` +
+    `your mounted index.db.`
+  );
+}
+
+const VERSION_DIR = /^\d+\.\d+\.\d+([-+][0-9A-Za-z.-]+)?$/;
+
+/**
+ * Semver precedence of two `x.y.z[-pre][+build]` strings: negative, zero or
+ * positive, like a sort comparator. Build metadata is ignored.
+ */
+export function compareVersions(a, b) {
+  const parse = (v) => {
+    const noBuild = v.split("+")[0];
+    const dash = noBuild.indexOf("-");
+    const core = (dash < 0 ? noBuild : noBuild.slice(0, dash)).split(".").map(Number);
+    const pre = dash < 0 ? [] : noBuild.slice(dash + 1).split(".");
+    return { core, pre };
+  };
+  const x = parse(a);
+  const y = parse(b);
+  for (let i = 0; i < 3; i++) {
+    if (x.core[i] !== y.core[i]) return x.core[i] - y.core[i];
+  }
+  // A release outranks its own prereleases (1.0.0 > 1.0.0-rc.1).
+  if (x.pre.length === 0 || y.pre.length === 0) return y.pre.length - x.pre.length;
+  for (let i = 0; i < Math.max(x.pre.length, y.pre.length); i++) {
+    const p = x.pre[i];
+    const q = y.pre[i];
+    if (p === undefined) return -1;
+    if (q === undefined) return 1;
+    if (p === q) continue;
+    const pNum = /^\d+$/.test(p);
+    const qNum = /^\d+$/.test(q);
+    if (pNum && qNum) return Number(p) - Number(q);
+    // Numeric identifiers sort before alphanumeric ones.
+    if (pNum !== qNum) return pNum ? -1 : 1;
+    return p < q ? -1 : 1;
+  }
+  return 0;
+}
+
+/**
+ * Whether a cached version directory may be deleted while `keep` runs: it must
+ * look like a version, be OLDER than `keep` (a newer one belongs to a client on
+ * a newer release), and have gone unused for PRUNE_UNUSED_MS. `lastUsedMs` is
+ * the newest mtime of the directory and its files, which a cache hit refreshes
+ * and an in-progress download keeps current.
+ */
+export function shouldPrune(name, keep, lastUsedMs, nowMs) {
+  if (name === keep || !VERSION_DIR.test(name)) return false;
+  if (compareVersions(name, keep) >= 0) return false;
+  return nowMs - lastUsedMs >= PRUNE_UNUSED_MS;
+}
+
+/** Newest mtime of `dir` and its direct entries (one binary, maybe a .tmp). */
+function lastUsedMs(dir) {
+  let newest = statSync(dir).mtimeMs;
+  for (const entry of readdirSync(dir)) {
+    try {
+      newest = Math.max(newest, statSync(join(dir, entry)).mtimeMs);
+    } catch {
+      // Renamed or removed under us: another run is using this directory.
+      return Number.POSITIVE_INFINITY;
+    }
+  }
+  return newest;
+}
+
+/**
+ * Best-effort cleanup of binaries cached for older, long-unused versions (each
+ * is ~40-50MB). A directory holding another run's in-progress `.tmp` download
+ * has a fresh mtime, so it is never pulled out from under that run. A binary
+ * still running from a deleted directory keeps working on Unix, and on Windows
+ * the delete just fails quietly and is retried next time.
+ */
+export function pruneOldVersions(cacheRoot, keep, nowMs) {
+  let entries;
+  try {
+    entries = readdirSync(cacheRoot, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    // Cheap name checks first, so nothing that isn't a version dir is even stat'ed.
+    if (!entry.isDirectory() || entry.name === keep || !VERSION_DIR.test(entry.name)) continue;
+    const dir = join(cacheRoot, entry.name);
+    try {
+      if (!shouldPrune(entry.name, keep, lastUsedMs(dir), nowMs)) continue;
+      rmSync(dir, { recursive: true, force: true });
+    } catch {
+      // In use or permission denied: leave it for next time.
+    }
+  }
+}
+
+function touchQuietly(path) {
+  try {
+    const now = new Date();
+    utimesSync(path, now, now);
+  } catch {
+    // Read-only cache: nothing in it can be pruned either.
+  }
+}
+
+function removeQuietly(path) {
+  try {
+    unlinkSync(path);
+  } catch {
+    // Already gone.
+  }
+}
+
+function formatMB(bytes) {
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }

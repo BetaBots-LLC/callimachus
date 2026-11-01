@@ -3,6 +3,8 @@ import { useMutation } from "@tanstack/react-query";
 import { api, SOURCE_LABELS } from "../lib/api";
 import { useUi } from "../store/ui";
 import { shortPath } from "../lib/format";
+import { isImeComposing } from "../lib/keyboard";
+import { trackError } from "../lib/telemetry";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { Loading } from "./Loading";
@@ -23,7 +25,10 @@ export function AskView() {
   const [question, setQuestion] = useState("");
   const selectThread = useUi((s) => s.selectThread);
   const setView = useUi((s) => s.setView);
-  const ask = useMutation({ mutationFn: (q: string) => api.askHistory(q) });
+  const ask = useMutation({
+    mutationFn: (q: string) => api.askHistory(q),
+    onError: (e) => trackError(e),
+  });
 
   const submit = () => {
     const q = question.trim();
@@ -39,7 +44,7 @@ export function AskView() {
           placeholder="Ask your history… e.g. how did we set up release versioning?"
           onChange={(e) => setQuestion(e.currentTarget.value)}
           onKeyDown={(e) => {
-            if (e.key === "Enter") {
+            if (e.key === "Enter" && !isImeComposing(e)) {
               e.preventDefault();
               submit();
             }

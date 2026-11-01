@@ -21,7 +21,7 @@ export const TAGLINE = "Your AI coding history, finally catalogued.";
 export const DESCRIPTION =
   "Callimachus indexes and searches your AI coding-agent conversations — across Claude Code, Codex, Cursor, Gemini and 7 more — in one fast, local, private catalogue. Desktop app, CLI, editor extension, and MCP server.";
 
-// The 11 indexed agents, numbered like catalogue entries.
+// The 12 indexed agents, numbered like catalogue entries.
 export const SOURCES = [
   "Claude Code",
   "Codex",
@@ -34,6 +34,7 @@ export const SOURCES = [
   "Cline",
   "Roo Code",
   "Kilo Code",
+  "Copilot Chat",
 ] as const;
 
 export type ProductSlug = "desktop" | "vscode" | "cli" | "mcp";

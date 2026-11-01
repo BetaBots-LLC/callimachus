@@ -40,9 +40,26 @@ export function formatUsd(n: number): string {
   });
 }
 
-// Shorten a long absolute project path to its last two segments.
+// Path separators for both POSIX and Windows. Agent histories recorded on Windows store
+// paths like `C:\Users\me\code\proj`, so splitting on "/" alone leaves them whole.
+const PATH_SEP = /[\\/]+/;
+
+/** The non-empty segments of a POSIX or Windows path. */
+function pathSegments(path: string): string[] {
+  return path.split(PATH_SEP).filter(Boolean);
+}
+
+// Shorten a long absolute project path to its last two segments, keeping the
+// separator style the path already uses.
 export function shortPath(path: string | null): string {
   if (!path) return "";
-  const parts = path.split("/").filter(Boolean);
-  return parts.length <= 2 ? path : `…/${parts.slice(-2).join("/")}`;
+  const parts = pathSegments(path);
+  if (parts.length <= 2) return path;
+  const sep = path.includes("\\") && !path.includes("/") ? "\\" : "/";
+  return `…${sep}${parts.slice(-2).join(sep)}`;
+}
+
+/** The last segment of a POSIX or Windows path (a folder or file name). */
+export function baseName(path: string): string {
+  return pathSegments(path).pop() ?? path;
 }

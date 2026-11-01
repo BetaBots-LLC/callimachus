@@ -11,7 +11,27 @@ export default defineConfig(async () => ({
   plugins: [react(), tailwindcss()],
   resolve: {
     alias: {
-      "@": path.resolve(__dirname, "./src"),
+      // import.meta.dirname (not __dirname) works with Vite's native ESM config loader.
+      "@": path.resolve(import.meta.dirname, "./src"),
+    },
+  },
+
+  build: {
+    rolldownOptions: {
+      output: {
+        // Syntax highlighting (highlight.js grammars via lowlight) is the largest single
+        // dependency. Keep it in its own chunk so the entry chunk stays small and the
+        // highlighter is parsed and cached separately from app code.
+        codeSplitting: {
+          groups: [
+            {
+              name: "highlight",
+              // Matches the package dir inside pnpm's store too (…/node_modules/<pkg>/).
+              test: /[\\/]node_modules[\\/](highlight\.js|lowlight|rehype-highlight)[\\/]/,
+            },
+          ],
+        },
+      },
     },
   },
 

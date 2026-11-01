@@ -1,12 +1,12 @@
 /// <reference types="vite/client" />
 import type { ReactNode } from "react";
 import { HeadContent, Outlet, Scripts, createRootRoute } from "@tanstack/react-router";
-import { Analytics } from "@vercel/analytics/react";
 import appCss from "@/styles/app.css?url";
 import { DESCRIPTION, TAGLINE } from "@/lib/site";
 import { seo } from "@/lib/seo";
 import { Header } from "@/components/site/Header";
 import { Footer } from "@/components/site/Footer";
+import { AnalyticsProvider } from "@/components/site/Analytics";
 
 export const Route = createRootRoute({
   head: () => ({
@@ -37,8 +37,7 @@ function RootDocument({ children }: Readonly<{ children: ReactNode }>) {
         <HeadContent />
       </head>
       <body>
-        {children}
-        <Analytics />
+        <AnalyticsProvider>{children}</AnalyticsProvider>
         <Scripts />
       </body>
     </html>

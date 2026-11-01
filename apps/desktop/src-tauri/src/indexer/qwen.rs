@@ -206,7 +206,14 @@ fn extract_parts(thread: &mut ParsedThread, role: &str, parts: Option<&Value>, t
                         .get("response")
                         .map(|v| v.to_string())
                         .unwrap_or_else(|| resp.to_string());
-                    push(thread, "tool", text, None);
+                    // Same head + tail cap as the Claude indexer (tool output is never
+                    // embedded or distilled, and dominated the index size).
+                    push(
+                        thread,
+                        "tool",
+                        super::claude::cap_tool_text(text.trim()),
+                        None,
+                    );
                 }
             }
         }

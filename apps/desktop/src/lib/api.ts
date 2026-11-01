@@ -1,6 +1,23 @@
 // Typed wrappers around Tauri commands. Keep all `invoke` calls here so the rest
 // of the app talks to a typed surface, not stringly-named commands.
 import { invoke, Channel } from "@tauri-apps/api/core";
+// telemetry.ts only imports a *type* from this file, so there is no runtime import cycle.
+import { setTelemetry, telemetryState } from "./telemetry";
+
+// Opt-in usage analytics. The wrappers live in telemetry.ts next to the event schema;
+// they're re-exported here so callers can reach the whole backend surface from one place.
+export {
+  classifyError,
+  commitSearch,
+  flushTelemetry,
+  noteSearch,
+  track,
+  trackError,
+  type Consent,
+  type ErrorKind,
+  type SettingKey,
+  type TelemetryStatus,
+} from "./telemetry";
 
 export type SourceKind =
   | "claude_code"
@@ -453,7 +470,14 @@ export const api = {
   setProviderBaseUrl: (provider: string, url: string) =>
     invoke<void>("set_provider_base_url", { provider, url }),
   resumeThread: (threadId: number) => invoke<void>("resume_thread", { threadId }),
-  threadContext: (threadId: number) => invoke<string>("thread_context", { threadId }),
+  // Whether the backend can open a terminal here (macOS/Windows always; Linux only when a
+  // terminal emulator is on PATH). Gates Resume / Open-in-CLI; fixed for the session.
+  cliLaunchSupported: () => invoke<boolean>("cli_launch_supported"),
+  // Packed context for a thread. `budgetChars` asks the backend for a smaller pack (its
+  // budget ladder drops tool output first, then elides the middle); omitted = the
+  // backend default (~48k chars). A backend without the parameter ignores it.
+  threadContext: (threadId: number, budgetChars?: number) =>
+    invoke<string>("thread_context", { threadId, budgetChars: budgetChars ?? null }),
   openThreadInCli: (threadId: number, program?: string) =>
     invoke<string>("open_thread_in_cli", { threadId, program: program ?? null }),
   // Live model list from the provider's API (needs a key for anthropic/openai).
@@ -477,6 +501,9 @@ export const api = {
   agentIntegrationsStatus: () => invoke<AgentIntegration[]>("agent_integrations_status"),
   installAgentIntegrations: () => invoke<AgentIntegration[]>("install_agent_integrations"),
   uninstallAgentIntegrations: () => invoke<void>("uninstall_agent_integrations"),
+  // Opt-in usage analytics: consent state + whether this build can send at all.
+  telemetryState,
+  setTelemetry,
 };
 
 // State of the Claude Code integration (the `/recall` skill + `callimachus` MCP server).
@@ -487,6 +514,17 @@ export interface IntegrationStatus {
   hookInstalled: boolean;
   proactiveRecallInstalled: boolean;
   calInstalled: boolean;
+  /** The app runs from a permanent location, so agents can be pointed at it. */
+  exeStable: boolean;
+  /** Why it can't be registered from where it runs (e.g. "Move Callimachus to
+   *  /Applications first"). Install refuses with this same message while it's set. */
+  exeProblem: string | null;
+  /** Why the `cal` CLI wasn't installed (another program owns `~/.local/bin/cal`, or a
+   *  per-machine Windows install dir isn't writable). Everything else still works. */
+  calProblem: string | null;
+  /** Advice when `cal` is installed but a bare `cal` won't reach it from the user's
+   *  shell. Ends with a copyable `export PATH=...` line. */
+  pathHint: string | null;
   skillPath: string;
   configPath: string;
 }
