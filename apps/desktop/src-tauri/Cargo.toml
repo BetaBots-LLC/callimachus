@@ -75,7 +75,7 @@ keyring = { version = "3", features = ["apple-native", "windows-native", "sync-s
 sqlite-vec = "0.1.9"
 zerocopy = "0.8.52"
 genai = { version = "0.7.2", default-features = false, features = ["native-tls", "system-proxy"] }
-rmcp = { version = "1.7.0", features = ["server", "transport-io", "macros"] }
+rmcp = { version = "3.8.0", features = ["server", "transport-io", "macros"] }
 schemars = "1"
 tokio-util = "0.7.18"
 r2d2 = "0.8.10"
