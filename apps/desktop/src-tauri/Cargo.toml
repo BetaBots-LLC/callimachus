@@ -85,7 +85,7 @@ uuid = { version = "1", features = ["v4"] }
 # hardcoded ~/Library/Application Support path exactly; Windows resolves to
 # %LOCALAPPDATA% / %USERPROFILE% (the old code assumed a Unix $HOME and crashed
 # on Windows). Used by db::default_index_path and the per-agent indexers.
-dirs = "6"
+dirs = "7"
 
 [profile.release]
 # Smaller, faster release binaries (the app, `cal` and `callimachus-mcp`) at the cost of longer
