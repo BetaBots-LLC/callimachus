@@ -1,6 +1,8 @@
 //! Full-text search over indexed messages (SQLite FTS5 + BM25) plus the read
 //! queries the UI needs: recent threads and a single thread's messages.
 
+pub(crate) mod cache;
+
 use crate::embed::{self, Embedder};
 use anyhow::Result;
 use rusqlite::{Connection, ToSql};
@@ -118,35 +120,48 @@ const THREAD_CAP_OVERFETCH: usize = 4;
 pub fn search(conn: &Connection, query: &str, filters: &SearchFilters) -> Result<Vec<SearchHit>> {
     let limit = filters.limit.unwrap_or(100).min(500) as usize;
     let fetch = (limit * THREAD_CAP_OVERFETCH).min(2000) as i64;
-    let hits = search_ranked(conn, query, filters, fetch)?;
+    // Back-fill only when the visible page would come up short. The strict pass usually
+    // returns fewer than `fetch` rows (4x the page, for the per-thread cap), and the OR
+    // hits are appended after the strict ones, so once the capped page is full they could
+    // never be shown: running the OR pass anyway cost seconds on a large index.
+    let hits = ranked_hits(conn, query, filters, fetch, |strict| {
+        capped_len(strict, limit) < limit
+    })?;
     Ok(cap_per_thread(hits, limit))
 }
 
 /// BM25-ranked FTS hits (strict-AND, then OR back-fill), fetching up to `fetch` rows with NO
-/// per-thread cap — `search` caps after, and the hybrid fusion needs the full per-thread
-/// signal before it merges with the semantic arm.
+/// per-thread cap, for the hybrid fusion, which needs the full per-thread signal before it
+/// merges with the semantic arm. Back-fills whenever the strict pass under-fills `fetch`.
 fn search_ranked(
     conn: &Connection,
     query: &str,
     filters: &SearchFilters,
     fetch: i64,
 ) -> Result<Vec<SearchHit>> {
-    // Each whitespace token becomes a quoted PREFIX term (`"tok"*`), so "embed" matches
-    // "embedder"/"embedding" and a natural-language query isn't gated on exact words.
-    let terms: Vec<String> = query
-        .split_whitespace()
-        .map(|t| format!("\"{}\"*", t.replace('"', "\"\"")))
-        .collect();
-    if terms.is_empty() {
-        return Ok(Vec::new());
-    }
+    ranked_hits(conn, query, filters, fetch, |_| true)
+}
 
-    // Strict pass: require ALL terms (precise). If it under-fills and there were several
-    // terms, back-fill with a looser OR pass appended AFTER the precise hits (deduped).
-    let mut hits = run_fts(conn, &terms.join(" "), filters, fetch)?;
-    if (hits.len() as i64) < fetch && terms.len() > 1 {
+/// The strict pass for `query`, then, if it returned fewer than `fetch` rows and
+/// `wants_more(strict hits)` agrees, the looser OR pass appended AFTER the precise hits
+/// (deduped, total still capped at `fetch`).
+fn ranked_hits(
+    conn: &Connection,
+    query: &str,
+    filters: &SearchFilters,
+    fetch: i64,
+    wants_more: impl Fn(&[SearchHit]) -> bool,
+) -> Result<Vec<SearchHit>> {
+    let Some(q) = FtsQuery::parse(query) else {
+        return Ok(Vec::new());
+    };
+    let mut hits = run_fts(conn, &q.strict, filters, fetch)?;
+    let Some(loose) = q.loose else {
+        return Ok(hits);
+    };
+    if (hits.len() as i64) < fetch && wants_more(&hits) {
         let seen: HashSet<i64> = hits.iter().map(|h| h.message_id).collect();
-        for h in run_fts(conn, &terms.join(" OR "), filters, fetch)? {
+        for h in run_fts(conn, &loose, filters, fetch)? {
             if (hits.len() as i64) >= fetch {
                 break;
             }
@@ -158,6 +173,110 @@ fn search_ranked(
     Ok(hits)
 }
 
+/// Words too common to narrow a keyword search. They stay exact terms in the strict pass
+/// (the prefix `"i"*` matched 970k of 1.4M messages, and an all-prefix natural-language
+/// query took 3-6 s against 0.1 s with these exact) and are left out of the OR back-fill,
+/// where `"how"* OR "the"* OR ...` matched nearly every message and took 11-27 s.
+const STOPWORDS: &[&str] = &[
+    "the", "a", "an", "is", "are", "do", "did", "how", "why", "what", "we", "i", "to", "of", "in",
+    "on", "for", "and", "or", "it", "this", "that",
+];
+
+/// ASCII tokens shorter than this match as exact terms, not prefixes: a 1-2 letter prefix
+/// expands to a large share of the vocabulary. ("ui" no longer matches "uikit".)
+const MIN_PREFIX_CHARS: usize = 3;
+
+/// The FTS5 MATCH strings for a free-text query.
+#[derive(Debug, PartialEq)]
+struct FtsQuery {
+    /// Every token, implicitly ANDed: the precise pass.
+    strict: String,
+    /// The OR of the tokens that carry meaning, to back-fill a short strict result. None
+    /// when that would add nothing: a single token, or nothing but stopwords and letters.
+    loose: Option<String>,
+}
+
+impl FtsQuery {
+    fn parse(query: &str) -> Option<Self> {
+        // Classify (and quote) each token by its core, without leading/trailing punctuation,
+        // which the FTS tokenizer drops anyway: "this?" is the stopword "this" and "ui," the
+        // short token "ui", not the prefixes this* and ui*. A token that is all punctuation
+        // ("?", "--") tokenizes to nothing, so it is not a term at all.
+        let tokens: Vec<&str> = query
+            .split_whitespace()
+            .map(|t| t.trim_matches(|c: char| !c.is_alphanumeric()))
+            .filter(|t| !t.is_empty())
+            .collect();
+        if tokens.is_empty() {
+            return None;
+        }
+        let strict = tokens
+            .iter()
+            .map(|t| fts_term(t))
+            .collect::<Vec<_>>()
+            .join(" ");
+        // A lone letter is as unselective as a stopword once it stands on its own in an OR.
+        let meaningful: Vec<String> = tokens
+            .iter()
+            .filter(|t| !is_stopword(t) && !is_lone_ascii(t))
+            .map(|t| fts_term(t))
+            .collect();
+        let loose = (tokens.len() > 1 && !meaningful.is_empty()).then(|| meaningful.join(" OR "));
+        Some(Self { strict, loose })
+    }
+}
+
+fn is_stopword(token: &str) -> bool {
+    STOPWORDS.iter().any(|w| token.eq_ignore_ascii_case(w))
+}
+
+/// One query token as a quoted FTS5 term, so punctuation is literal rather than an
+/// operator. A prefix term (`"tok"*`, so "embed" matches "embedder"/"embedding" and a
+/// natural-language query isn't gated on exact word forms), except that stopwords and
+/// ASCII tokens under [`MIN_PREFIX_CHARS`] stay exact.
+fn fts_term(token: &str) -> String {
+    let quoted = token.replace('"', "\"\"");
+    if is_stopword(token) || is_short_ascii(token) {
+        format!("\"{quoted}\"")
+    } else {
+        format!("\"{quoted}\"*")
+    }
+}
+
+/// The short-token rules (exact match, no lone letters in the OR) are ASCII-only. unicode61
+/// keeps an unspaced CJK run, and a Korean word with its attached particles, as one token,
+/// so a 1-2 character word there ("数据", "오류") only matches as a prefix of a longer token.
+/// Other non-ASCII text keeps the prefix form it always had.
+fn is_short_ascii(token: &str) -> bool {
+    token.is_ascii() && token.len() < MIN_PREFIX_CHARS
+}
+
+/// A single ASCII letter or digit (see [`is_short_ascii`] for why only ASCII).
+fn is_lone_ascii(token: &str) -> bool {
+    token.is_ascii() && token.len() == 1
+}
+
+/// Above this many bytes a hit's snippet is its leading text, unhighlighted. snippet() is
+/// quadratic in the matched term's occurrences: one 5.8 MB pasted log with 40k hits for
+/// "index" added ~8 s to every search that ranked it. octet_length() reads only the record
+/// header, and CASE evaluates only the branch it takes.
+const SNIPPET_MAX_BYTES: usize = 256 * 1024;
+
+/// The `messages m` join for a query driven by `messages_fts` hits. The filters need
+/// m.thread_id / m.role / m.ts for every hit before ranking, and the planner always picks
+/// the rowid lookup, one random read of the messages table per hit (149k reads for
+/// "error"). The covering (id, thread_id, role, ts) index from 0031 answers those from the
+/// index, and the table row is read only for rows that pass every filter. An index built
+/// before 0031 (a newer read-only sidecar on an older app's index) gets the plain join,
+/// since INDEXED BY a missing index is an error.
+pub(crate) fn fts_message_join(conn: &Connection) -> &'static str {
+    if crate::db::has_index(conn, "idx_messages_cover") {
+        "JOIN messages m INDEXED BY idx_messages_cover ON m.id = messages_fts.rowid"
+    } else {
+        "JOIN messages m ON m.id = messages_fts.rowid"
+    }
+}
+
 /// One FTS5 pass for an already-built MATCH string, with all the non-text filters applied.
 fn run_fts(
     conn: &Connection,
@@ -165,18 +284,46 @@ fn run_fts(
     filters: &SearchFilters,
     limit: i64,
 ) -> Result<Vec<SearchHit>> {
+    let (sql, args) = fts_sql(conn, match_query, filters, limit);
+    let args_ref: Vec<&dyn ToSql> = args.iter().map(|b| b.as_ref()).collect();
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(args_ref.as_slice(), |r| {
+        Ok(SearchHit {
+            thread_id: r.get(0)?,
+            message_id: r.get(1)?,
+            source: r.get(2)?,
+            title: r.get(3)?,
+            project_path: r.get(4)?,
+            role: r.get(5)?,
+            snippet: r.get(6)?,
+            ts: r.get(7)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// The SQL and arguments for [`run_fts`].
+fn fts_sql(
+    conn: &Connection,
+    match_query: &str,
+    filters: &SearchFilters,
+    limit: i64,
+) -> (String, Vec<Box<dyn ToSql>>) {
     // Use control-char sentinels (\u{1}/\u{2}) for match boundaries, not HTML tags:
     // snippet() does not escape the body, so the frontend HTML-escapes the text and
     // only then swaps the sentinels for <mark> — preventing injection from indexed
     // content (a thread might literally contain "<script>").
-    let mut sql = String::from(
+    let mut sql = format!(
         "SELECT t.id, m.id, s.kind, t.title, t.project_path, m.role,
-                snippet(messages_fts, 0, char(1), char(2), '…', 12), m.ts
+                CASE WHEN octet_length(m.text) > {SNIPPET_MAX_BYTES} THEN substr(m.text, 1, 240)
+                     ELSE snippet(messages_fts, 0, char(1), char(2), '…', 12) END,
+                m.ts
          FROM messages_fts
-         JOIN messages m ON m.id = messages_fts.rowid
+         {join}
          JOIN threads t ON t.id = m.thread_id
          JOIN sources s ON s.id = t.source_id
          WHERE messages_fts MATCH ?1",
+        join = fts_message_join(conn),
     );
     if !filters.include_subagents {
         sql.push_str(" AND t.is_subagent = 0");
@@ -214,22 +361,7 @@ fn run_fts(
     push_collection_filters(&mut sql, &mut args, filters);
     sql.push_str(" ORDER BY bm25(messages_fts) LIMIT ?");
     args.push(Box::new(limit));
-
-    let args_ref: Vec<&dyn ToSql> = args.iter().map(|b| b.as_ref()).collect();
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(args_ref.as_slice(), |r| {
-        Ok(SearchHit {
-            thread_id: r.get(0)?,
-            message_id: r.get(1)?,
-            source: r.get(2)?,
-            title: r.get(3)?,
-            project_path: r.get(4)?,
-            role: r.get(5)?,
-            snippet: r.get(6)?,
-            ts: r.get(7)?,
-        })
-    })?;
-    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    (sql, args)
 }
 
 /// Hybrid search: fuse keyword (FTS5/BM25) and semantic (cosine) result lists with
@@ -307,6 +439,20 @@ fn fuse_rrf(fts_ids: &[i64], sem: &[(i64, f32)]) -> Vec<(i64, f32)> {
     let mut ranked: Vec<(i64, f32)> = scores.into_iter().collect();
     ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
     ranked
+}
+
+/// How many of `ordered` [`cap_per_thread`] would keep, without consuming them.
+fn capped_len(ordered: &[SearchHit], limit: usize) -> usize {
+    let mut per_thread: HashMap<i64, usize> = HashMap::new();
+    ordered
+        .iter()
+        .filter(|h| {
+            let count = per_thread.entry(h.thread_id).or_insert(0);
+            *count += 1;
+            *count <= MAX_HITS_PER_THREAD
+        })
+        .take(limit)
+        .count()
 }
 
 /// Limit how many hits any single thread contributes (preserving fused/ranked order), then
@@ -537,7 +683,7 @@ fn thread_summary(conn: &Connection, id: i64) -> Result<Option<ThreadSummary>> {
 }
 
 /// Aggregate stats over the whole index, for the dashboard / `cal stats`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Stats {
     pub threads: i64,
@@ -551,7 +697,7 @@ pub struct Stats {
     pub top_projects: Vec<ProjectStat>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SourceStat {
     pub kind: String,
@@ -559,41 +705,41 @@ pub struct SourceStat {
     pub messages: i64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RoleStat {
     pub role: String,
     pub messages: i64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectStat {
     pub project: String,
     pub threads: i64,
 }
 
-/// Compute index-wide aggregate stats in one pass of small queries.
+/// Compute index-wide aggregate stats in one pass of small queries. Every query here is
+/// served by an index or the (small) threads table; none reads message bodies.
 pub fn stats(conn: &Connection) -> Result<Stats> {
     let one = |sql: &str| -> Result<i64> { Ok(conn.query_row(sql, [], |r| r.get(0))?) };
 
     let threads = one("SELECT COUNT(*) FROM threads")?;
-    let messages = one("SELECT COUNT(*) FROM messages")?;
-    let embedded = one("SELECT COUNT(DISTINCT message_id) FROM vec_chunks")?;
-    let embeddable = one("SELECT COUNT(*) FROM messages WHERE role IN ('user','assistant')")?;
+    // Same numbers (and predicate) as the embedding progress bar, from the covering count
+    // index, instead of a COUNT(DISTINCT) full scan of the vec0 table.
+    let (embedded, embeddable) = embed::embed_progress(conn)?;
     let (earliest, latest): (Option<i64>, Option<i64>) = conn.query_row(
         "SELECT MIN(created_at), MAX(updated_at) FROM threads",
         [],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
 
-    // Per-source thread + message counts (skip sources with no threads).
+    // Per-source thread + message counts (skip sources with no threads). message_count is
+    // maintained per thread by upsert_thread, so this never touches the messages table.
     let mut src_stmt = conn.prepare(
-        "SELECT s.kind,
-                (SELECT COUNT(*) FROM threads t WHERE t.source_id = s.id),
-                (SELECT COUNT(*) FROM messages m JOIN threads t ON m.thread_id = t.id
-                 WHERE t.source_id = s.id)
-         FROM sources s",
+        "SELECT s.kind, COUNT(t.id), COALESCE(SUM(t.message_count), 0)
+         FROM sources s LEFT JOIN threads t ON t.source_id = s.id
+         GROUP BY s.id",
     )?;
     let mut per_source: Vec<SourceStat> = src_stmt
         .query_map([], |r| {
@@ -617,6 +763,9 @@ pub fn stats(conn: &Connection) -> Result<Stats> {
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    // The per-role counts already cover every message (one scan of the covering count
+    // index), so the total is their sum, not a second full scan for COUNT(*).
+    let messages = per_role.iter().map(|r| r.messages).sum();
 
     let mut proj_stmt = conn.prepare(
         "SELECT project_path, COUNT(*) AS n FROM threads
@@ -646,7 +795,7 @@ pub fn stats(conn: &Connection) -> Result<Stats> {
 }
 
 /// One day's message activity, for the Coach coding heatmap.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DayActivity {
     pub day: i64, // unix seconds at UTC midnight
@@ -654,7 +803,7 @@ pub struct DayActivity {
 }
 
 /// A distilled decision or gotcha surfaced in the Coach "this week" digest.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CoachFact {
     pub id: i64,
@@ -667,7 +816,7 @@ pub struct CoachFact {
 
 /// Proactive dashboard data: a daily-activity heatmap plus the decisions and gotchas
 /// captured in the last week (so the memory layer surfaces insight, not just answers).
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CoachOverview {
     pub heatmap: Vec<DayActivity>,
@@ -679,17 +828,34 @@ pub struct CoachOverview {
 /// Build the Coach overview as of `now` (unix seconds): ~52 weeks of daily activity and
 /// the last 7 days of decisions / gotchas (LLM-distilled or agent-recorded).
 pub fn coach_overview(conn: &Connection, now: i64) -> Result<CoachOverview> {
+    let mut overview = coach_overview_facts(conn, now)?;
+    overview.heatmap = coach_heatmap(conn, now)?;
+    Ok(overview)
+}
+
+/// Daily user/assistant message counts since `?1`, for the Coach heatmap.
+///
+/// Human-facing activity only: skip subagent transcripts and tool/system rows so the grid
+/// reflects sessions you drove, not machine chatter (mirrors the app's lists).
+///
+/// The `+` on `m.role` keeps the planner off the (role, tool_name, embedded) count index
+/// (0026). With no ANALYZE stats it would otherwise drive from that index, fetching every
+/// user/assistant row in the table (each one walking its overflow pages to reach `ts`),
+/// which took 20-50s on a large index instead of well under a second via threads ->
+/// idx_messages_thread_ts (0031), which also carries ts and role, so the whole query is
+/// index-only (7-8 s down to ~0.2 s from a cold cache). Pinned by
+/// `coach_heatmap_plan_avoids_the_role_index`.
+const HEATMAP_SQL: &str = "SELECT (m.ts / 86400) * 86400 AS day, COUNT(*)
+     FROM messages m JOIN threads t ON t.id = m.thread_id
+     WHERE m.ts IS NOT NULL AND m.ts >= ?1
+       AND t.is_subagent = 0 AND +m.role IN ('user', 'assistant')
+     GROUP BY day ORDER BY day";
+
+/// ~52 weeks of daily user/assistant message counts ending at `now`.
+fn coach_heatmap(conn: &Connection, now: i64) -> Result<Vec<DayActivity>> {
     let heatmap_since = now - 364 * 86_400;
     let heatmap = {
-        // Human-facing activity only: skip subagent transcripts and tool/system rows so the
-        // grid reflects sessions you drove, not machine chatter (mirrors the app's lists).
-        let mut stmt = conn.prepare(
-            "SELECT (m.ts / 86400) * 86400 AS day, COUNT(*)
-             FROM messages m JOIN threads t ON t.id = m.thread_id
-             WHERE m.ts IS NOT NULL AND m.ts >= ?1
-               AND t.is_subagent = 0 AND m.role IN ('user', 'assistant')
-             GROUP BY day ORDER BY day",
-        )?;
+        let mut stmt = conn.prepare(HEATMAP_SQL)?;
         let rows = stmt
             .query_map([heatmap_since], |r| {
                 Ok(DayActivity {
@@ -700,7 +866,11 @@ pub fn coach_overview(conn: &Connection, now: i64) -> Result<CoachOverview> {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         rows
     };
+    Ok(heatmap)
+}
 
+/// The Coach overview without its heatmap: the last 7 days of decisions and gotchas.
+fn coach_overview_facts(conn: &Connection, now: i64) -> Result<CoachOverview> {
     let since = now - 7 * 86_400;
     let recent = |kind: &str| -> Result<Vec<CoachFact>> {
         let mut stmt = conn.prepare(
@@ -726,11 +896,42 @@ pub fn coach_overview(conn: &Connection, now: i64) -> Result<CoachOverview> {
     };
 
     Ok(CoachOverview {
-        heatmap,
+        heatmap: Vec::new(),
         decisions: recent("decision")?,
         gotchas: recent("gotcha")?,
         since,
     })
+}
+
+static STATS_CACHE: std::sync::LazyLock<cache::AggCache<(), Stats>> =
+    std::sync::LazyLock::new(cache::AggCache::new);
+static HEATMAP_CACHE: std::sync::LazyLock<cache::AggCache<i64, Vec<DayActivity>>> =
+    std::sync::LazyLock::new(cache::AggCache::new);
+
+/// [`stats`], reused for up to [`cache::ANALYTICS_TTL`] while the thread set is unchanged.
+/// For the app's Stats view; `cal stats` and tests want the live numbers.
+///
+/// The embedding counts are always read live: they move while a semantic-index build runs
+/// without the thread set changing, so a cached copy would show stale coverage for the
+/// whole TTL. Both are covering-index COUNTs, so this stays cheap.
+pub fn stats_cached(conn: &Connection) -> Result<Stats> {
+    let mut cached = STATS_CACHE.get_or_try(cache::index_version(conn)?, (), || stats(conn))?;
+    (cached.embedded, cached.embeddable) = embed::embed_progress(conn)?;
+    Ok(cached)
+}
+
+/// [`coach_overview`] with the year-long activity heatmap (a GROUP BY over most of the
+/// messages table) cached per day for up to [`cache::ANALYTICS_TTL`]. The week's decisions
+/// and gotchas are cheap and always read live, so a fact the user just hid or edited
+/// disappears from the digest immediately.
+pub fn coach_overview_cached(conn: &Connection, now: i64) -> Result<CoachOverview> {
+    let day = now.div_euclid(86_400);
+    let heatmap = HEATMAP_CACHE.get_or_try(cache::index_version(conn)?, day, || {
+        coach_heatmap(conn, now)
+    })?;
+    let mut overview = coach_overview_facts(conn, now)?;
+    overview.heatmap = heatmap;
+    Ok(overview)
 }
 
 /// Full detail + ordered messages for one thread.
@@ -1159,5 +1360,240 @@ mod tests {
             .unwrap()
             .is_empty());
         let _ = threads_with_file(&conn, "go", 20).unwrap();
+    }
+
+    /// The planner has no ANALYZE stats, so it picks indexes from the schema alone. Pin the
+    /// heatmap to the threads -> idx_messages_thread_ts plan: driving from the role-prefixed
+    /// count index fetched every user/assistant row in the table.
+    #[test]
+    fn coach_heatmap_plan_avoids_the_role_index() {
+        let conn = temp_db();
+        let plan: Vec<String> = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {HEATMAP_SQL}"))
+            .unwrap()
+            .query_map([0_i64], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let plan = plan.join(" | ");
+        assert!(!plan.contains("idx_messages_embed_counts"), "{plan}");
+        // 0031's (thread_id, ts, role) index answers the ts range and role filter without
+        // reading a single message row.
+        assert!(
+            plan.contains("COVERING INDEX idx_messages_thread_ts (thread_id=? AND ts>?)"),
+            "{plan}"
+        );
+    }
+
+    #[test]
+    fn query_terms_keep_stopwords_and_short_tokens_exact() {
+        let q = FtsQuery::parse("how do I fix the stripe webhook").unwrap();
+        assert_eq!(
+            q.strict,
+            r#""how" "do" "I" "fix"* "the" "stripe"* "webhook"*"#
+        );
+        assert_eq!(
+            q.loose.as_deref(),
+            Some(r#""fix"* OR "stripe"* OR "webhook"*"#)
+        );
+        // Short tokens are exact everywhere; a lone letter is no OR alternative.
+        let q = FtsQuery::parse("ui x bug").unwrap();
+        assert_eq!(q.strict, r#""ui" "x" "bug"*"#);
+        assert_eq!(q.loose.as_deref(), Some(r#""ui" OR "bug"*"#));
+        // Nothing to back-fill with: one token, or only stopwords.
+        assert_eq!(FtsQuery::parse("embedding").unwrap().loose, None);
+        assert_eq!(FtsQuery::parse("how do I").unwrap().loose, None);
+        assert_eq!(FtsQuery::parse("   "), None);
+        // Quotes inside a token stay literal.
+        assert_eq!(
+            FtsQuery::parse(r#"say"hi"#).unwrap().strict,
+            r#""say""hi"*"#
+        );
+    }
+
+    /// The rules apply to the word, not its punctuation: a trailing "?" or "," must not turn
+    /// a stopword or a short token back into a prefix term.
+    #[test]
+    fn query_terms_ignore_surrounding_punctuation() {
+        let q = FtsQuery::parse("how do I zqxjw this?").unwrap();
+        assert_eq!(q.strict, r#""how" "do" "I" "zqxjw"* "this""#);
+        assert_eq!(q.loose.as_deref(), Some(r#""zqxjw"*"#));
+        let q = FtsQuery::parse("ui, (x) bug?").unwrap();
+        assert_eq!(q.strict, r#""ui" "x" "bug"*"#);
+        assert_eq!(q.loose.as_deref(), Some(r#""ui" OR "bug"*"#));
+        assert_eq!(FtsQuery::parse("what did I do?").unwrap().loose, None);
+        // Inner punctuation stays; a punctuation-only token is no term.
+        let q = FtsQuery::parse("embed/mod.rs, -- ?").unwrap();
+        assert_eq!(q.strict, r#""embed/mod.rs"*"#);
+        assert_eq!(q.loose, None);
+        assert_eq!(FtsQuery::parse("? !!"), None);
+    }
+
+    /// CJK and Hangul keep prefix terms at any length, in both passes: a 1-2 character word
+    /// there is usually the start of a longer unicode61 token.
+    #[test]
+    fn short_non_ascii_tokens_stay_prefixes() {
+        let q = FtsQuery::parse("오류 数 db").unwrap();
+        assert_eq!(q.strict, r#""오류"* "数"* "db""#);
+        assert_eq!(q.loose.as_deref(), Some(r#""오류"* OR "数"* OR "db""#));
+
+        let mut conn = temp_db();
+        thread_of(
+            &mut conn,
+            "cjk",
+            &["빌드 오류가 발생했습니다 数据库连接失败"],
+        );
+        thread_of(&mut conn, "other", &["build error"]);
+        let f = SearchFilters::default();
+        // "오류" (error) is inside the token 오류가, "数据" (data) inside 数据库连接失败.
+        assert_eq!(titles(&search(&conn, "오류", &f).unwrap()), vec!["cjk"]);
+        assert_eq!(titles(&search(&conn, "数据", &f).unwrap()), vec!["cjk"]);
+        assert_eq!(titles(&search(&conn, "오류?", &f).unwrap()), vec!["cjk"]);
+    }
+
+    fn thread_of(conn: &mut Connection, ext: &str, texts: &[&str]) {
+        let sid = source_id(conn, "claude_code").unwrap();
+        let t = ParsedThread {
+            external_id: ext.into(),
+            title: Some(ext.into()),
+            messages: texts.iter().map(|x| msg("user", x, 100)).collect(),
+            ..Default::default()
+        };
+        upsert_thread(conn, sid, &t).unwrap();
+    }
+
+    fn titles(hits: &[SearchHit]) -> Vec<String> {
+        let mut t: Vec<String> = hits.iter().filter_map(|h| h.title.clone()).collect();
+        t.sort();
+        t.dedup();
+        t
+    }
+
+    #[test]
+    fn short_tokens_match_exactly_and_longer_ones_as_prefixes() {
+        let mut conn = temp_db();
+        thread_of(&mut conn, "exact", &["the ui is broken"]);
+        thread_of(&mut conn, "prefixed", &["uikit layout and embeddings"]);
+        let f = SearchFilters::default();
+        assert_eq!(titles(&search(&conn, "ui", &f).unwrap()), vec!["exact"]);
+        assert_eq!(titles(&search(&conn, "emb", &f).unwrap()), vec!["prefixed"]);
+    }
+
+    #[test]
+    fn back_fill_ignores_stopwords() {
+        let mut conn = temp_db();
+        thread_of(&mut conn, "stopword-only", &["the cat sat on the mat"]);
+        thread_of(&mut conn, "meaningful", &["webhook retries"]);
+        // No message has both words, so the OR pass runs, on "webhook" alone: the old
+        // all-prefix back-fill (`"the"* OR "webhook"*`) also returned the first thread.
+        let hits = search(&conn, "the webhook", &SearchFilters::default()).unwrap();
+        assert_eq!(titles(&hits), vec!["meaningful"]);
+        // Only stopwords: the strict pass still matches them exactly.
+        let hits = search(&conn, "the", &SearchFilters::default()).unwrap();
+        assert_eq!(titles(&hits), vec!["stopword-only"]);
+    }
+
+    #[test]
+    fn capped_len_matches_cap_per_thread() {
+        let ordered = vec![
+            mk_hit(1, 1),
+            mk_hit(1, 2),
+            mk_hit(1, 3),
+            mk_hit(1, 4),
+            mk_hit(2, 5),
+            mk_hit(3, 6),
+        ];
+        for limit in [0, 2, 4, 5, 10] {
+            assert_eq!(
+                capped_len(&ordered, limit),
+                cap_per_thread(ordered.clone(), limit).len(),
+                "limit {limit}"
+            );
+        }
+    }
+
+    #[test]
+    fn huge_messages_get_a_plain_snippet() {
+        let mut conn = temp_db();
+        let huge = format!("needle at the start {}", "needle filler ".repeat(20_000));
+        assert!(huge.len() > SNIPPET_MAX_BYTES);
+        thread_of(&mut conn, "huge", &[&huge]);
+        thread_of(&mut conn, "small", &["one needle here"]);
+        let hits = search(&conn, "needle", &SearchFilters::default()).unwrap();
+        let snippet = |title: &str| {
+            hits.iter()
+                .find(|h| h.title.as_deref() == Some(title))
+                .unwrap()
+                .snippet
+                .clone()
+        };
+        assert_eq!(snippet("huge"), huge[..240]);
+        assert!(
+            snippet("small").contains('\u{1}'),
+            "small hits keep highlights"
+        );
+    }
+
+    fn plan_of(conn: &Connection, sql: &str, args: &[Box<dyn ToSql>]) -> String {
+        let refs: Vec<&dyn ToSql> = args.iter().map(|b| b.as_ref()).collect();
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let rows = stmt
+            .query_map(refs.as_slice(), |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        rows.join(" | ")
+    }
+
+    /// FTS hits drive the query and each hit's filters come from the covering index; on an
+    /// index from before 0031 the same search runs on the plain rowid join.
+    #[test]
+    fn fts_join_uses_the_covering_index_and_falls_back_without_it() {
+        let mut conn = temp_db();
+        thread_of(&mut conn, "t", &["covering index search"]);
+        let filters = SearchFilters {
+            sources: vec!["claude_code".into()],
+            project: Some("proj".into()),
+            after: Some(1),
+            starred: Some(false),
+            tags: vec!["x".into()],
+            ..Default::default()
+        };
+        for f in [&SearchFilters::default(), &filters] {
+            let (sql, args) = fts_sql(&conn, "\"covering\"*", f, 10);
+            let plan = plan_of(&conn, &sql, &args);
+            // FTS drives the messages side (a source filter may put the tiny sources table
+            // outermost), and no message is ever reached by a scan or a rowid lookup.
+            let fts = plan.find("SCAN messages_fts VIRTUAL TABLE").expect(&plan);
+            let m = plan
+                .find("SEARCH m USING INDEX idx_messages_cover (id=?)")
+                .expect(&plan);
+            assert!(fts < m, "{plan}");
+            assert!(!plan.contains("SCAN m "), "{plan}");
+        }
+
+        conn.execute_batch("DROP INDEX idx_messages_cover").unwrap();
+        let (sql, _) = fts_sql(&conn, "\"covering\"*", &SearchFilters::default(), 10);
+        assert!(!sql.contains("INDEXED BY"), "{sql}");
+        let hits = search(&conn, "covering index", &SearchFilters::default()).unwrap();
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn cached_stats_report_live_embedding_progress() {
+        let mut conn = temp_db();
+        let sid = source_id(&conn, "claude_code").unwrap();
+        let thread = ParsedThread {
+            external_id: "embed-progress".into(),
+            messages: vec![msg("user", "hello there", 1), msg("assistant", "hi", 2)],
+            ..Default::default()
+        };
+        upsert_thread(&mut conn, sid, &thread).unwrap();
+        assert_eq!(stats_cached(&conn).unwrap().embedded, 0);
+        // Embedding progress moves without the thread set changing (no cache invalidation).
+        conn.execute("UPDATE messages SET embedded = 1", [])
+            .unwrap();
+        let s = stats_cached(&conn).unwrap();
+        assert_eq!((s.embedded, s.embeddable), (2, 2));
     }
 }

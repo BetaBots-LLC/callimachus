@@ -42,7 +42,7 @@ function DesktopPage() {
       kicker="Desktop app"
       title="The reading room."
       description="A native app for macOS, Windows, and Linux. Every thread your agents have written, browsable and searchable in one place — with a chat that can read your own history back to you."
-      cta={<DownloadButton release={release} primaryOs={primaryOs} />}
+      cta={<DownloadButton release={release} primaryOs={primaryOs} placement="desktop_page" />}
     >
       <div className="grid gap-4 lg:grid-cols-12">
         <FeaturePanel
@@ -120,8 +120,9 @@ function DesktopPage() {
           title="Reclaim the shelves"
           className="lg:col-span-4"
         >
-          A paginated, size-aware table to prune old threads and reclaim disk space when the archive
-          gets heavy.
+          A paginated, size-aware table to prune old threads when the archive gets heavy, plus
+          Shrink index, which trims the tool output older versions stored and returns the space to
+          disk.
         </FeaturePanel>
         <FeaturePanel
           icon={Boxes}

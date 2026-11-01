@@ -4,12 +4,33 @@ The [Callimachus](https://github.com/BetaBots-LLC/callimachus) MCP server, packa
 
 Callimachus keeps a **local** index of your AI coding-agent threads (Claude Code,
 Codex, Cursor, Gemini CLI, Qwen Code, Goose, OpenCode, Continue, Cline, Roo Code,
-Kilo Code) and exposes search/recall over them as MCP tools. Everything stays on
-your machine.
+Kilo Code, and Copilot Chat in VS Code-family editors) and exposes search and
+recall over them as MCP tools. Everything stays on your machine, and the MCP
+server never sends analytics.
 
 This npm package is a thin launcher: on first run it downloads the prebuilt
 `callimachus-mcp` binary for your platform from the matching GitHub Release,
+checks its SHA-256 against the checksum manifest shipped inside this package,
 caches it under `~/.cache/callimachus-mcp/<version>/`, and execs it over stdio.
+A cached version older than the one being installed is removed once nothing has
+used it for 30 days, so MCP clients pinned to different versions don't keep
+deleting each other's binary.
+
+## Build the index first
+
+The MCP server reads the index that the **Callimachus desktop app** builds; it
+does not index your agent history by itself. Install the app from
+[Releases](https://github.com/BetaBots-LLC/callimachus/releases/latest), open it
+once and let it index (**Index my history** on first launch). Until it has
+indexed, every read tool answers with a short setup notice instead of results. On
+a machine without the desktop app (a headless server, an SSH box, a Codespace)
+there is no index to search yet.
+
+Keep this launcher and the app on the same release. Whichever opens the index
+first after an update upgrades it, and an older build can't open an upgraded
+index: the server exits with an error, and an older app asks you to update.
+`npx -y callimachus-mcp` follows the newest release, so install the app's update
+when it arrives, or pin `npx -y callimachus-mcp@<app version>`.
 
 ## Use
 
@@ -32,23 +53,68 @@ Or add it to a client config:
 }
 ```
 
+Already running the desktop app? You don't need this package: **Settings → Claude
+Code → Enable for Claude Code** registers the app itself (launched with `--mcp`)
+as Claude Code's MCP server, and **Settings → Other agents** does the same for
+Codex, Cursor and Gemini CLI.
+
 ## Supported platforms
 
 Prebuilt binaries are released for:
 
-- macOS (Apple Silicon) — `aarch64-apple-darwin`
-- Linux (x64) — `x86_64-unknown-linux-gnu`
-- Windows (x64) — `x86_64-pc-windows-msvc`
+- macOS (Apple Silicon): `aarch64-apple-darwin`
+- Linux (x64): `x86_64-unknown-linux-gnu`, which needs **glibc 2.38 or newer**
+  (Ubuntu 24.04+, Debian 13+, Fedora 39+). Older distros such as Ubuntu 22.04,
+  Debian 12 and RHEL 9, and musl-based distros such as Alpine, are not supported
+  by the prebuilt binary; the launcher stops with a clear error instead of
+  downloading it.
+- Windows (x64): `x86_64-pc-windows-msvc`
 
-On any other platform, build from source
-(`cargo install --git https://github.com/BetaBots-LLC/callimachus --bin callimachus-mcp`)
-and point the launcher at it with `CALLIMACHUS_MCP_BIN=/path/to/callimachus-mcp`.
+Building from source doesn't help on an Intel Mac or below glibc 2.38: the ONNX
+Runtime the server links has no Intel macOS build, and on Linux it needs glibc
+2.38 too. On an older distro, run it in a container based on a newer one: the
+repo's [Dockerfile](https://github.com/BetaBots-LLC/callimachus/blob/main/Dockerfile)
+builds it on Debian 13 with `CALLIMACHUS_DB=/data/index.db`. Mount the folder
+that holds your `index.db` at `/data`:
+
+```bash
+docker build -t callimachus-mcp .   # in a clone of the repo
+docker run -i --rm -v ~/.local/share/dev.shaller.callimachus:/data callimachus-mcp
+```
+
+No extra flags are needed. The image's entrypoint starts the server as the owner
+of the mounted folder, so SQLite can write the index and its `-wal` / `-shm`
+files there, and those files stay yours. (`--user "$(id -u):$(id -g)"` works too.)
+With nothing mounted, the image keeps an empty index of its own in `/data`.
+
+On another platform that ONNX Runtime supports, you can build it yourself from
+the tag that matches the launcher. You need Rust and, on Linux, the
+`pkg-config`, OpenSSL, D-Bus and `webkit2gtk-4.1` development packages (on
+Debian/Ubuntu: `pkg-config libssl-dev libdbus-1-dev libwebkit2gtk-4.1-dev`; the
+server lives in the desktop app's Tauri crate). As in the repo's
+Dockerfile, an empty `dist` directory stands in for the desktop frontend, which
+the MCP server never uses:
+
+```bash
+git clone --depth 1 --branch v<version> https://github.com/BetaBots-LLC/callimachus
+cd callimachus/apps/desktop
+mkdir dist
+cargo build --release --locked --manifest-path src-tauri/Cargo.toml --bin callimachus-mcp
+```
+
+Then point the launcher at it with
+`CALLIMACHUS_MCP_BIN=/path/to/callimachus/apps/desktop/src-tauri/target/release/callimachus-mcp`.
 
 ## Environment
 
-- `CALLIMACHUS_MCP_BIN` — use this binary instead of downloading (e.g. the one the
-  desktop app installs on your PATH).
-- `XDG_CACHE_HOME` — override the cache location (defaults to `~/.cache`).
+- `CALLIMACHUS_MCP_BIN`: use this binary instead of downloading (for example a
+  `cargo build` output, or the standalone `callimachus-mcp-<triple>` binary from
+  the Releases page). It is not checksum-verified, since you chose it.
+- `XDG_CACHE_HOME`: override the cache location (defaults to `~/.cache`).
+- `CALLIMACHUS_DB`: the `index.db` to serve, when it isn't in the desktop app's
+  default location (for example a mounted index in a container, or a second
+  profile). The server creates an empty index there if the file doesn't exist
+  yet.
 
 ## License
 

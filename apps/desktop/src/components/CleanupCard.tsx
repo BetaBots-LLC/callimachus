@@ -1,6 +1,14 @@
-import { useEffect, useState } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { api, SOURCE_LABELS, type CleanupRow } from "../lib/api";
+import { useEffect, useRef, useState } from "react";
+import {
+  keepPreviousData,
+  type MutationState,
+  useIsMutating,
+  useMutation,
+  useMutationState,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
+import { api, SOURCE_LABELS, type CleanupRow, type CompactSummary } from "../lib/api";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -21,11 +29,27 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { formatTime } from "../lib/format";
+import {
+  anyJobRunning,
+  fetchJobsStatus,
+  REWRITE_KEY,
+  useJobsStatus,
+  usePushed,
+} from "../lib/queries";
+import { invalidateIndexDerived } from "../lib/queryClient";
 import { useAppForm } from "@/lib/form";
 import { ChevronLeft, ChevronRight, Loader2 } from "lucide-react";
 
 /** A cleanup row plus its form-managed selection flag. */
 type Row = CleanupRow & { selected: boolean };
+
+// Shrink index and Reclaim space each rewrite the whole file on their own connection.
+// Keyed mutations (under REWRITE_KEY), so "one is running" comes from the mutation cache
+// and survives leaving Settings (the view unmounts on every tab switch).
+const VACUUM_KEY = [...REWRITE_KEY, "vacuum"] as const;
+const COMPACT_KEY = [...REWRITE_KEY, "compact"] as const;
+/** Running totals from `compact:progress`, kept in the cache for the same reason. */
+const COMPACT_PROGRESS_KEY = ["compact_progress"] as const;
 
 const PAGE_SIZE = 12;
 const FETCH_LIMIT = 500; // oldest N threads; paginate client-side over these
@@ -51,28 +75,41 @@ export function CleanupCard() {
   const [err, setErr] = useState<string | null>(null);
   const [confirming, setConfirming] = useState(false);
 
-  const days = AGES.find((a) => a.value === age)?.days ?? null;
-  const before = days ? Math.floor(Date.now() / 1000) - days * 86400 : undefined;
-
+  // Key on the age *filter*, and compute the cutoff timestamp inside the fetch. Keying
+  // on the timestamp itself (it changes every second) made each re-render a new query,
+  // which re-seeded the form and wiped the selection before "Confirm delete".
   const rows = useQuery({
-    queryKey: ["cleanup", before],
-    queryFn: () => api.cleanupCandidates({ before, limit: FETCH_LIMIT }),
+    queryKey: ["cleanup", age],
+    queryFn: () => {
+      const days = AGES.find((a) => a.value === age)?.days ?? null;
+      const before = days ? Math.floor(Date.now() / 1000) - days * 86400 : undefined;
+      return api.cleanupCandidates({ before, limit: FETCH_LIMIT });
+    },
     staleTime: 30_000,
+    placeholderData: keepPreviousData,
   });
 
   // Form holds the full list + a per-row `selected` flag (TanStack array field).
   const form = useAppForm({ defaultValues: { rows: [] as Row[] } });
 
-  // Re-seed the form + reset paging whenever the query data changes.
+  // Re-seed the form whenever the query data changes. A refetch of the same filter (after
+  // a delete, or a background index update) keeps the selection for rows that are still
+  // listed; a new filter starts fresh from page one.
+  const seededAge = useRef<string | null>(null);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: `form` is stable; reading its current values here is the point (keep selections), not a trigger
   useEffect(() => {
-    if (rows.data) {
-      form.reset({ rows: rows.data.map((r) => ({ ...r, selected: false })) });
+    if (!rows.data || rows.isPlaceholderData) return;
+    const sameFilter = seededAge.current === age;
+    const keep = sameFilter
+      ? new Set(form.state.values.rows.filter((r) => r.selected).map((r) => r.id))
+      : new Set<number>();
+    form.reset({ rows: rows.data.map((r) => ({ ...r, selected: keep.has(r.id) })) });
+    seededAge.current = age;
+    if (!sameFilter) {
       setConfirming(false);
       setPage(0);
     }
-    // form identity is stable; depend only on the data
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [rows.data]);
+  }, [rows.data, rows.isPlaceholderData, age]);
 
   const total = rows.data?.length ?? 0;
   const pageCount = Math.max(1, Math.ceil(total / PAGE_SIZE));
@@ -80,9 +117,12 @@ export function CleanupCard() {
   const start = safePage * PAGE_SIZE;
 
   function invalidateAll() {
-    for (const key of ["db_stats", "index_stats", "cleanup", "results", "recent"]) {
+    for (const key of ["db_stats", "results", "recent"]) {
       queryClient.invalidateQueries({ queryKey: [key] });
     }
+    // delete_threads emits no index:done, so Stats / Coach / Projects (5-minute stale
+    // window) would keep listing the deleted threads without this.
+    invalidateIndexDerived();
   }
 
   const del = useMutation({
@@ -96,12 +136,54 @@ export function CleanupCard() {
     },
     onError: (e) => setErr(String(e)),
   });
+  // The backend may have refused because a job started meanwhile, or the rewrite's own
+  // claim just ended: either way, refresh the shared job flags the other buttons read.
+  const refreshJobs = () => void fetchJobsStatus(queryClient).catch(() => {});
   const vacuum = useMutation({
+    mutationKey: VACUUM_KEY,
     mutationFn: api.vacuumDb,
     onMutate: () => setErr(null),
     onSuccess: invalidateAll,
     onError: (e) => setErr(String(e)),
+    onSettled: refreshJobs,
   });
+  const compact = useMutation({
+    mutationKey: COMPACT_KEY,
+    mutationFn: () => api.compactIndex((p) => queryClient.setQueryData(COMPACT_PROGRESS_KEY, p)),
+    onMutate: () => {
+      setErr(null);
+      queryClient.setQueryData(COMPACT_PROGRESS_KEY, null);
+    },
+    // Row sizes change, so the cleanup list (an index-derived aggregate) refreshes too.
+    onSuccess: invalidateAll,
+    onError: (e) => setErr(String(e)),
+    onSettled: refreshJobs,
+  });
+  const compactProgress = usePushed<CompactSummary>(COMPACT_PROGRESS_KEY);
+  // The latest Shrink index run, from the cache: still "Shrinking…" after a remount.
+  const compactRuns = useMutationState({
+    filters: { mutationKey: COMPACT_KEY },
+    select: (m) => m.state as MutationState<CompactSummary, unknown, void>,
+  });
+  const lastCompact = compactRuns.length > 0 ? compactRuns[compactRuns.length - 1] : null;
+  const shrinking = lastCompact?.status === "pending";
+  const reclaiming = useIsMutating({ mutationKey: VACUUM_KEY }) > 0;
+  // A rewrite must not overlap another rewrite, or a reindex / semantic build / distill
+  // writing to the same file: it would wait out the lock and fail, or redo the work.
+  const rewriteRunning = useIsMutating({ mutationKey: REWRITE_KEY }) > 0;
+  const jobBusy = anyJobRunning(useJobsStatus().data);
+  const rewriting = rewriteRunning || jobBusy;
+
+  /** Start a rewrite after a fresh job check. The status is polled only while a job runs,
+   *  so one that started while every flag was idle shows up here: the fetch refreshes the
+   *  shared query, which disables the buttons, and nothing starts. */
+  async function startRewrite(run: () => void) {
+    // A failed check (an older backend without jobs_status) doesn't block: the backend
+    // refuses an overlapping rewrite itself.
+    const busy = await fetchJobsStatus(queryClient).then(anyJobRunning, () => false);
+    // A second click while the check was in flight finds the first rewrite started.
+    if (!busy && queryClient.isMutating({ mutationKey: REWRITE_KEY }) === 0) run();
+  }
 
   /** Toggle selection for the rows on the current page only. */
   function setPageSelected(value: boolean) {
@@ -151,14 +233,41 @@ export function CleanupCard() {
             size="sm"
             variant="ghost"
             className="ml-auto"
-            onClick={() => vacuum.mutate()}
-            disabled={vacuum.isPending}
+            onClick={() => void startRewrite(() => compact.mutate())}
+            disabled={rewriting}
+            title="Trim tool output stored by older versions to the size new indexing keeps, then return the space to disk"
+          >
+            {shrinking && <Loader2 className="size-3.5 animate-spin" />}
+            {shrinking ? "Shrinking…" : "Shrink index"}
+          </Button>
+          <Button
+            size="sm"
+            variant="ghost"
+            onClick={() => void startRewrite(() => vacuum.mutate())}
+            disabled={rewriting}
             title="Rewrite the database to return freed space to disk"
           >
-            {vacuum.isPending && <Loader2 className="size-3.5 animate-spin" />}
-            {vacuum.isPending ? "Reclaiming…" : "Reclaim space"}
+            {reclaiming && <Loader2 className="size-3.5 animate-spin" />}
+            {reclaiming ? "Reclaiming…" : "Reclaim space"}
           </Button>
         </div>
+        {jobBusy && !rewriteRunning && (
+          <p className="text-xs text-muted-foreground">
+            Shrink index and Reclaim space are available again once the background job that is
+            running now (a reindex, semantic build or distill) finishes.
+          </p>
+        )}
+        {(shrinking || lastCompact?.data) && (
+          <p className="text-xs text-muted-foreground">
+            {shrinking
+              ? compactProgress && compactProgress.rows > 0
+                ? `Trimmed ${compactProgress.rows.toLocaleString()} tool outputs so far…`
+                : "Looking for oversized tool output…"
+              : lastCompact?.data && lastCompact.data.rows > 0
+                ? `Trimmed ${lastCompact.data.rows.toLocaleString()} tool outputs and saved ${fmtBytes(lastCompact.data.bytesSaved)}.`
+                : "Nothing to trim: the index is already compact."}
+          </p>
+        )}
 
         <div className="rounded-lg border">
           <Table className="table-fixed">

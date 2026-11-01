@@ -1,8 +1,8 @@
 //! Agent session snapshots: durable, resumable checkpoints of an indexed thread. A snapshot
 //! captures the thread's packed transcript (via `context::pack_thread`) plus a carry-forward
 //! block of the project's distilled decisions / gotchas / open TODOs (via
-//! `knowledge::get_project_memory`), so the next agent can continue across a context-window
-//! compaction or across tools (Claude Code -> Codex -> Cursor). Resume reuses
+//! `knowledge::get_project_memory_facts`), so the next agent can continue across a
+//! context-window compaction or across tools (Claude Code -> Codex -> Cursor). Resume reuses
 //! `agent::cli_resume::launch_with_context` to relaunch any agent CLI with the checkpoint.
 
 use crate::{context, export, knowledge, search};
@@ -48,8 +48,24 @@ fn assemble(carry: &str, transcript: &str) -> String {
     body
 }
 
+/// A snapshot assembled but not yet stored.
+struct NewSnapshot {
+    thread_id: i64,
+    project_path: Option<String>,
+    source_kind: String,
+    label: String,
+    body: String,
+    token_estimate: i64,
+}
+
 /// Snapshot an indexed thread. `label` defaults to the thread title (then a generic fallback).
 pub fn create(conn: &Connection, thread_id: i64, label: Option<&str>) -> Result<Snapshot> {
+    let new = build(conn, thread_id, label)?;
+    insert(conn, new)
+}
+
+/// Pack a thread into a snapshot (reads only).
+fn build(conn: &Connection, thread_id: i64, label: Option<&str>) -> Result<NewSnapshot> {
     let detail = search::thread_detail(conn, thread_id)?
         .ok_or_else(|| anyhow!("thread {thread_id} not found"))?;
     let transcript = context::pack_thread(conn, thread_id, SNAPSHOT_BUDGET_CHARS)?
@@ -65,10 +81,22 @@ pub fn create(conn: &Connection, thread_id: i64, label: Option<&str>) -> Result<
         )
         .optional()?
         .flatten();
+    // The carry block is a short refresher (COMPACT budget), not the whole memory: the
+    // resumed session can still pull more with `cal memory` / project_memory, and its own
+    // SessionStart hook may inject memory too.
     let carry = match project_key.as_deref() {
         Some(pk) if !pk.is_empty() => {
-            let mem = knowledge::get_project_memory(conn, pk, 40)?;
-            export::agent_memory_md(pk, &mem, None)
+            let budget = export::MemoryBudget::COMPACT;
+            // Facts only: the budgeted renderer never shows the coverage counts.
+            let mem = knowledge::get_project_memory_facts(conn, pk, budget.fetch_limit())?;
+            if mem.decisions.is_empty()
+                && mem.gotchas.is_empty()
+                && !mem.open_todos.iter().any(|t| t.pinned)
+            {
+                String::new()
+            } else {
+                export::agent_memory_md_budgeted(pk, &mem, None, &budget)
+            }
         }
         _ => String::new(),
     };
@@ -79,43 +107,87 @@ pub fn create(conn: &Connection, thread_id: i64, label: Option<&str>) -> Result<
         .or_else(|| detail.title.clone())
         .unwrap_or_else(|| format!("snapshot of thread {thread_id}"));
     let token_estimate = (body.len() / 4) as i64;
-    let created_at = chrono::Utc::now().timestamp();
+    Ok(NewSnapshot {
+        thread_id,
+        project_path: detail.project_path,
+        source_kind: detail.source,
+        label,
+        body,
+        token_estimate,
+    })
+}
 
+/// Store a built snapshot.
+fn insert(conn: &Connection, new: NewSnapshot) -> Result<Snapshot> {
+    let created_at = chrono::Utc::now().timestamp();
     conn.execute(
         "INSERT INTO snapshots
             (thread_id, project_path, source_kind, label, body, token_estimate, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         rusqlite::params![
-            thread_id,
-            detail.project_path,
-            detail.source,
-            label,
-            body,
-            token_estimate,
+            new.thread_id,
+            new.project_path,
+            new.source_kind,
+            new.label,
+            new.body,
+            new.token_estimate,
             created_at,
         ],
     )?;
-
     Ok(Snapshot {
         id: conn.last_insert_rowid(),
-        thread_id: Some(thread_id),
-        project_path: detail.project_path,
-        source_kind: Some(detail.source),
-        label,
-        token_estimate,
+        thread_id: Some(new.thread_id),
+        project_path: new.project_path,
+        source_kind: Some(new.source_kind),
+        label: new.label,
+        token_estimate: new.token_estimate,
         created_at,
     })
 }
 
-/// Create a rolling AUTO snapshot (from a PreCompact / SubagentStop hook). Keeps only the
-/// latest auto-snapshot per thread — prior auto ones are dropped first — so repeated
-/// compactions or subagent stops don't flood the list. Manual (named) snapshots are untouched.
+/// Label prefix of hook-created snapshots.
+pub const AUTO_LABEL_PREFIX: &str = "auto · ";
+
+/// Create a rolling AUTO snapshot (from a hook such as PreCompact). Each event keeps one
+/// slot per thread: the new snapshot replaces only the previous auto snapshot with the SAME
+/// label, so one event can't wipe another's checkpoint, and snapshots the user named are
+/// never touched. Insert and cleanup run in one IMMEDIATE transaction, inserting first, so
+/// a failed snapshot leaves the previous one in place. The thread is packed BEFORE that
+/// transaction: the hook fires on large live sessions, and holding the write lock through
+/// the pack would stall the app's indexer, which is busy writing that same session.
 pub fn create_rolling_auto(conn: &Connection, thread_id: i64, event: &str) -> Result<Snapshot> {
-    conn.execute(
-        "DELETE FROM snapshots WHERE thread_id = ?1 AND label LIKE 'auto · %'",
-        [thread_id],
+    let label = format!("{AUTO_LABEL_PREFIX}{event}");
+    let new = build(conn, thread_id, Some(&label))?;
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let snap = insert(&tx, new)?;
+    // Also drop this thread's legacy SubagentStop checkpoint: that hook is gone, so
+    // nothing would ever replace it.
+    tx.execute(
+        "DELETE FROM snapshots WHERE thread_id = ?1 AND id != ?3
+            AND (label = ?2 OR label = ?4)",
+        rusqlite::params![thread_id, label, snap.id, LEGACY_SUBAGENT_LABEL],
     )?;
-    create(conn, thread_id, Some(&format!("auto · {event}")))
+    tx.commit()?;
+    Ok(snap)
+}
+
+/// Label of the auto snapshots the removed SubagentStop hook used to write.
+const LEGACY_SUBAGENT_LABEL: &str = "auto · SubagentStop";
+
+/// Delete the legacy SubagentStop auto snapshots that a later auto snapshot of the same
+/// thread supersedes (each was a full re-pack of the parent thread). One with nothing newer
+/// is kept: older builds kept a single auto slot per thread, so a SubagentStop after a
+/// PreCompact replaced it, and that row is now the thread's only checkpoint. The next
+/// PreCompact replaces it (`create_rolling_auto`). Safe to run at startup; returns the
+/// number removed.
+pub fn purge_legacy_auto_snapshots(conn: &Connection) -> Result<usize> {
+    Ok(conn.execute(
+        "DELETE FROM snapshots WHERE label = ?1 AND EXISTS (
+            SELECT 1 FROM snapshots n
+            WHERE n.thread_id = snapshots.thread_id AND n.id > snapshots.id
+              AND n.label LIKE ?2 AND n.label != ?1)",
+        rusqlite::params![LEGACY_SUBAGENT_LABEL, format!("{AUTO_LABEL_PREFIX}%")],
+    )?)
 }
 
 /// List snapshots newest-first, optionally scoped to a project-path substring.
@@ -268,25 +340,88 @@ mod tests {
     }
 
     #[test]
-    fn rolling_auto_keeps_one_per_thread_and_spares_manual() {
+    fn rolling_auto_keeps_one_per_event_and_spares_manual() {
         let mut conn = temp_db();
         let tid = seed_thread(&mut conn);
         let manual = create(&conn, tid, Some("manual checkpoint")).unwrap();
         create_rolling_auto(&conn, tid, "PreCompact").unwrap();
-        create_rolling_auto(&conn, tid, "SubagentStop").unwrap();
+        let latest = create_rolling_auto(&conn, tid, "PreCompact").unwrap();
+        create_rolling_auto(&conn, tid, "SessionEnd").unwrap();
 
         let snaps = list(&conn, None, 100).unwrap();
-        // The manual snapshot plus exactly one auto (the most recent).
-        assert_eq!(snaps.len(), 2);
+        // The manual snapshot plus one auto per event (the most recent of each).
+        assert_eq!(snaps.len(), 3);
         assert!(
             snaps.iter().any(|s| s.id == manual.id),
             "manual snapshot is preserved"
         );
-        let autos: Vec<_> = snaps
+        let pre: Vec<_> = snaps
             .iter()
-            .filter(|s| s.label.starts_with("auto · "))
+            .filter(|s| s.label == "auto · PreCompact")
             .collect();
-        assert_eq!(autos.len(), 1, "only the latest auto snapshot is kept");
-        assert_eq!(autos[0].label, "auto · SubagentStop");
+        assert_eq!(pre.len(), 1, "only the latest PreCompact snapshot is kept");
+        assert_eq!(pre[0].id, latest.id);
+        assert!(
+            snaps.iter().any(|s| s.label == "auto · SessionEnd"),
+            "a different event does not replace the PreCompact checkpoint"
+        );
+
+        // Legacy SubagentStop checkpoints are cleaned up.
+        create(&conn, tid, Some(LEGACY_SUBAGENT_LABEL)).unwrap();
+        create_rolling_auto(&conn, tid, "PreCompact").unwrap();
+        let labels: Vec<String> = list(&conn, None, 100)
+            .unwrap()
+            .into_iter()
+            .map(|s| s.label)
+            .collect();
+        assert!(!labels.iter().any(|l| l == LEGACY_SUBAGENT_LABEL));
+    }
+
+    #[test]
+    fn startup_purge_keeps_a_threads_only_auto_checkpoint() {
+        let mut conn = temp_db();
+        let tid = seed_thread(&mut conn);
+        // What older builds left: the SubagentStop snapshot replaced the PreCompact one, so
+        // it is the thread's only auto checkpoint.
+        let only = create(&conn, tid, Some(LEGACY_SUBAGENT_LABEL)).unwrap();
+        create(&conn, tid, Some("manual")).unwrap();
+        assert_eq!(purge_legacy_auto_snapshots(&conn).unwrap(), 0);
+        assert!(load(&conn, only.id).unwrap().is_some());
+        // A later auto snapshot of the thread supersedes it.
+        create(&conn, tid, Some("auto · PreCompact")).unwrap();
+        assert_eq!(purge_legacy_auto_snapshots(&conn).unwrap(), 1);
+        assert!(load(&conn, only.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn carry_block_is_compact_and_redacted() {
+        let mut conn = temp_db();
+        let tid = seed_thread(&mut conn);
+        for i in 0..30 {
+            knowledge::record_fact(
+                &conn,
+                "/proj/app",
+                if i % 2 == 0 { "decision" } else { "gotcha" },
+                &format!("fact number {i} {}", "context ".repeat(30)),
+                None,
+                100 + i,
+            )
+            .unwrap();
+        }
+        knowledge::record_fact(
+            &conn,
+            "/proj/app",
+            "gotcha",
+            "staging key is sk-ant-api03-AbCdEfGhIjKlMnOpQrStUv0123456789",
+            None,
+            999,
+        )
+        .unwrap();
+        let snap = create(&conn, tid, None).unwrap();
+        let body = load(&conn, snap.id).unwrap().unwrap().body;
+        let (carry, _) = body.split_once("\n\n---\n\n").expect("carry block");
+        assert!(carry.chars().count() <= export::MemoryBudget::COMPACT.max_chars);
+        assert!(carry.contains("Watch out for"));
+        assert!(!body.contains("sk-ant-api03"));
     }
 }

@@ -1,6 +1,13 @@
 import type { LegalDoc } from "@/content/legal";
 import { Container } from "./Container";
 
+/** "What the application collects" -> "what-the-application-collects". */
+const anchor = (heading: string) =>
+  heading
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-|-$/g, "");
+
 export function LegalPage({ doc }: { doc: LegalDoc }) {
   return (
     <Container className="py-16 sm:py-20">
@@ -15,7 +22,7 @@ export function LegalPage({ doc }: { doc: LegalDoc }) {
 
         <div className="mt-10 flex flex-col gap-9">
           {doc.sections.map((s) => (
-            <section key={s.heading}>
+            <section key={s.heading} id={anchor(s.heading)} className="scroll-mt-24">
               <h2 className="text-xl text-foreground">{s.heading}</h2>
               <div className="mt-3 flex flex-col gap-3">
                 {s.body.map((p) => (

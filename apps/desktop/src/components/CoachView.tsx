@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { api, type CoachFact } from "../lib/api";
+import { AGGREGATE_STALE_MS } from "../lib/queryClient";
 import { useUi } from "../store/ui";
 import { shortPath } from "../lib/format";
 import { Loading } from "./Loading";
@@ -151,6 +152,7 @@ function RecurringIssues({ todayMid }: { todayMid: number }) {
   const { data } = useQuery({
     queryKey: ["recurring_issues"],
     queryFn: () => api.recurringIssues(),
+    staleTime: AGGREGATE_STALE_MS, // refreshed by index events (main.tsx)
   });
   const issues = data ?? [];
   if (issues.length === 0) return null;
@@ -187,6 +189,7 @@ export function CoachView() {
   const { data, isLoading } = useQuery({
     queryKey: ["coach_overview"],
     queryFn: api.coachOverview,
+    staleTime: AGGREGATE_STALE_MS, // refreshed by index events (main.tsx)
   });
 
   if (isLoading) return <Loading label="Reading your history…" />;
@@ -238,33 +241,35 @@ export function CoachView() {
         </div>
         <TooltipProvider delay={80}>
           <div className="flex w-full gap-0.5">
-            {Array.from({ length: weekCount }, (_, w) => (
-              <div key={gridStart + w * 7 * SECS_PER_DAY} className="flex flex-1 flex-col gap-0.5">
-                {Array.from({ length: 7 }, (_, d) => {
-                  const day = gridStart + (w * 7 + d) * SECS_PER_DAY;
-                  if (day < startMid || day > todayMid) {
-                    return <div key={day} className="aspect-square" />;
-                  }
-                  const c = counts.get(day) ?? 0;
-                  const label = `${c} message${c === 1 ? "" : "s"} · ${new Date(
-                    day * 1000,
-                  ).toLocaleDateString(undefined, DATE_FMT)}`;
-                  return (
-                    <Tooltip key={day}>
-                      <TooltipTrigger
-                        render={
-                          <div
-                            className="aspect-square rounded-xs ring-ring/40 hover:ring-1"
-                            style={{ backgroundColor: CELL_BG[level(c, maxDay)] }}
-                          />
-                        }
-                      />
-                      <TooltipContent>{label}</TooltipContent>
-                    </Tooltip>
-                  );
-                })}
-              </div>
-            ))}
+            {Array.from({ length: weekCount }, (_, w) => gridStart + w * 7 * SECS_PER_DAY).map(
+              (weekStart) => (
+                <div key={weekStart} className="flex flex-1 flex-col gap-0.5">
+                  {Array.from({ length: 7 }, (_, d) => {
+                    const day = weekStart + d * SECS_PER_DAY;
+                    if (day < startMid || day > todayMid) {
+                      return <div key={day} className="aspect-square" />;
+                    }
+                    const c = counts.get(day) ?? 0;
+                    const label = `${c} message${c === 1 ? "" : "s"} · ${new Date(
+                      day * 1000,
+                    ).toLocaleDateString(undefined, DATE_FMT)}`;
+                    return (
+                      <Tooltip key={day}>
+                        <TooltipTrigger
+                          render={
+                            <div
+                              className="aspect-square rounded-xs ring-ring/40 hover:ring-1"
+                              style={{ backgroundColor: CELL_BG[level(c, maxDay)] }}
+                            />
+                          }
+                        />
+                        <TooltipContent>{label}</TooltipContent>
+                      </Tooltip>
+                    );
+                  })}
+                </div>
+              ),
+            )}
           </div>
         </TooltipProvider>
         <div className="mt-2 flex items-center gap-1.5 text-[0.7rem] text-muted-foreground">

@@ -9,28 +9,41 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
+env:
+  # CI builds are one-shot: incremental artifacts only bloat the cache.
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
+  # Pinned so a new stable release (and its new clippy lints) can't break CI on
+  # unrelated PRs. Bump it on purpose, together with build.yml and release-cache.yml.
+  RUST_TOOLCHAIN: "1.96.0"
+
 jobs:
   check:
     # Lint/typecheck/test on macOS (Apple Silicon, per Tauri's recommended pipeline).
-    # Cross-platform compilation is exercised by the release matrix in build.yml on every tag.
+    # check-cross below compiles the Rust crate for Linux and Windows on every PR,
+    # so platform-specific breakage shows up here instead of after a release tag.
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
 
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
-          node-version: 20
+          node-version: 22
           cache: pnpm
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy, rustfmt
 
       # rustc links `-lclang_rt.osx` but searches a clang-version subdir the current macos-latest
       # Xcode doesn't have, so the link fails ("ld: library 'clang_rt.osx' not found"). The lib
-      # IS on the runner, just under a different clang/<ver> dir — find it and add it to the
+      # IS on the runner, just under a different clang/<ver> dir: find it and add it to the
       # linker search path. (Not a dependency issue; it's where the active Xcode put compiler-rt.)
       - name: Locate compiler-rt for the linker
         run: |
@@ -42,7 +55,7 @@ jobs:
             echo "::warning::libclang_rt.osx.a not found under $(xcode-select -p)"
           fi
 
-      - uses: swatinem/rust-cache@v2
+      - uses: swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: ./apps/desktop/src-tauri -> target
 
@@ -52,14 +65,92 @@ jobs:
       - name: Typecheck + build frontend
         run: pnpm turbo run typecheck build lint
 
+      - name: npm wrapper tests
+        run: node --test packages/callimachus-mcp/test/*.test.mjs
+
+      # vsce refuses to package an @types/vscode newer than engines.vscode, but only
+      # publish-extension.yml packages the extension. `vsce ls` runs the same manifest
+      # validation without a rebuild, so a bad typings bump fails the PR, not the tag.
+      - name: Validate the VS Code extension manifest
+        run: pnpm --filter callimachus-vscode exec vsce ls --no-dependencies > /dev/null
+
       - name: Rust fmt
         working-directory: apps/desktop/src-tauri
         run: cargo fmt --check
 
+      # --locked: fail if Cargo.lock is out of date instead of silently re-resolving.
       - name: Rust clippy
         working-directory: apps/desktop/src-tauri
-        run: cargo clippy --lib --bins --tests -- -D warnings
+        run: cargo clippy --locked --lib --bins --tests -- -D warnings
 
       - name: Rust tests
         working-directory: apps/desktop/src-tauri
-        run: cargo test
+        run: cargo test --locked
+
+      # Tauri refuses to build when a tauri crate and its npm package drift apart by a minor
+      # version (tauri 2.12 vs @tauri-apps/api 2.11, the plugins likewise). Build the app the
+      # way a release does, minus bundling, so that mismatch fails the PR instead of the
+      # release tag.
+      - name: Tauri build (debug, no bundle)
+        run: pnpm --filter callimachus tauri build --debug --no-bundle
+
+  check-cross:
+    name: cargo check (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      # Same system packages as build.yml's Linux release leg (webkit2gtk pulls in
+      # libsoup/javascriptcore; the -sys crates find them via pkg-config).
+      - name: Install Linux build deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf \
+            build-essential pkg-config libssl-dev
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - uses: swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: ./apps/desktop/src-tauri -> target
+
+      # tauri::generate_context!() reads frontendDist (../dist) at compile time. This
+      # job never builds the frontend, so give it an empty placeholder.
+      - name: Placeholder frontend dist
+        shell: bash
+        run: mkdir -p apps/desktop/dist
+
+      - name: cargo check --all-targets
+        working-directory: apps/desktop/src-tauri
+        run: cargo check --locked --all-targets
+
+  lint:
+    name: Biome
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
+
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Same check as `pnpm check` (CONTRIBUTING.md), with PR annotations.
+      # TODO: drop continue-on-error once the existing Biome errors in apps/desktop
+      # (mostly the shadcn files in src/components/ui/) and apps/vscode/src/webview are
+      # fixed, so new lint regressions fail the PR.
+      - name: Biome lint + format check
+        continue-on-error: true
+        run: pnpm exec biome ci --reporter=github .

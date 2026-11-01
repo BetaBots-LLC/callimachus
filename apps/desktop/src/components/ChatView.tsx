@@ -1,8 +1,18 @@
 import { memo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { api, type ChatChunk, PROVIDERS } from "../lib/api";
-import { useChat, type StreamPart, type ToolStep } from "../store/chat";
-import { humanizeApiError } from "../lib/errors";
+import { api, PROVIDERS } from "../lib/api";
+import {
+  CONTEXT_PREFIX,
+  type ContextMeta,
+  contextTitle,
+  isContextMessage,
+  useChat,
+  type StreamPart,
+  type ToolStep,
+} from "../store/chat";
+import { describeKeySaveError } from "../lib/errors";
+import { track } from "../lib/telemetry";
+import { isSubmitEnter } from "../lib/keyboard";
 import { loadModelCache, saveModelCache, MODELS_TTL } from "../lib/models";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -41,6 +51,8 @@ import { Bubble, BubbleContent } from "@/components/ui/bubble";
 import { Marker, MarkerContent, MarkerIcon } from "@/components/ui/marker";
 import {
   Attachment,
+  AttachmentAction,
+  AttachmentActions,
   AttachmentContent,
   AttachmentDescription,
   AttachmentMedia,
@@ -55,6 +67,10 @@ export function ChatView() {
   const messages = useChat((s) => s.messages);
   const loadingThread = useChat((s) => s.loadingThread);
   const error = useChat((s) => s.error);
+  // Streaming state lives in the store, so it survives this view unmounting when the
+  // user switches tabs mid-reply (the reply, its tool steps and Stop are still here).
+  const isStreaming = useChat((s) => s.isStreaming);
+  const stop = useChat((s) => s.stop);
 
   const setProvider = useChat((s) => s.setProvider);
   const setModel = useChat((s) => s.setModel);
@@ -62,9 +78,6 @@ export function ChatView() {
 
   const [draft, setDraft] = useState("");
   const [keyDraft, setKeyDraft] = useState("");
-  // Local "busy" flag — drives the loader/Stop/streaming bubble directly so the UI
-  // updates the instant we send, independent of the store flag's render timing.
-  const [sending, setSending] = useState(false);
   const queryClient = useQueryClient();
 
   // Local Ollama and Ollama Cloud take a custom endpoint, persisted per provider and shared with
@@ -86,7 +99,10 @@ export function ChatView() {
     // Update the cache immediately so the box + model list reflect the new URL without waiting
     // on the round-trip; the invalidate then reconciles with what the backend actually stored.
     onMutate: (url: string) => queryClient.setQueryData(["providerBaseUrl", provider], url),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["providerBaseUrl", provider] }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["providerBaseUrl", provider] });
+      track("setting_changed", { key: "provider_base_url" });
+    },
   });
 
   const hasKey = useQuery({
@@ -100,6 +116,7 @@ export function ChatView() {
     onSuccess: () => {
       setKeyDraft("");
       queryClient.invalidateQueries({ queryKey: ["hasKey", provider] });
+      track("setting_changed", { key: "api_key" });
     },
   });
 
@@ -148,79 +165,11 @@ export function ChatView() {
   const modelList =
     model && !modelOptions.includes(model) ? [model, ...modelOptions] : modelOptions;
 
-  async function send() {
+  function send() {
     const text = draft.trim();
-    const chat = useChat.getState();
-    if (!text || sending) return;
-    const threadId = chat.threadId; // guard against thread switches mid-stream
-    chat.pushUser(text);
+    if (!text || useChat.getState().isStreaming) return;
     setDraft("");
-    setSending(true);
-    chat.setStreaming(true);
-    chat.setError(null);
-
-    // Coalesce streamed chunks into one store update per animation frame so we cap
-    // React renders at the display refresh regardless of token rate.
-    let textBuf = "";
-    let reasonBuf = "";
-    let raf = 0;
-    const flush = () => {
-      raf = 0;
-      const st = useChat.getState();
-      if (st.threadId !== threadId) return; // stale generation
-      if (reasonBuf) {
-        st.appendChunk({ kind: "reasoning", text: reasonBuf });
-        reasonBuf = "";
-      }
-      if (textBuf) {
-        st.appendChunk({ kind: "text", text: textBuf });
-        textBuf = "";
-      }
-    };
-    const schedule = () => {
-      if (!raf) raf = requestAnimationFrame(flush);
-    };
-    const onChunk = (chunk: ChatChunk) => {
-      if (chunk.kind === "text") {
-        textBuf += chunk.text;
-        schedule();
-      } else if (chunk.kind === "reasoning") {
-        reasonBuf += chunk.text;
-        schedule();
-      } else {
-        // tool_*: preserve interleave order — drain buffered text first, then apply.
-        if (raf) cancelAnimationFrame(raf);
-        flush();
-        if (useChat.getState().threadId === threadId) useChat.getState().appendChunk(chunk);
-      }
-    };
-
-    try {
-      const full = await api.sendChat(
-        {
-          threadId,
-          provider,
-          model,
-          baseUrl: baseUrl || null,
-          messages: useChat.getState().messages,
-        },
-        onChunk,
-      );
-      if (raf) cancelAnimationFrame(raf);
-      flush();
-      if (useChat.getState().threadId === threadId) {
-        useChat.getState().finishAssistant(full);
-        queryClient.invalidateQueries({ queryKey: ["db_stats"] });
-        queryClient.invalidateQueries({ queryKey: ["chats"] });
-      }
-    } catch (e) {
-      if (raf) cancelAnimationFrame(raf);
-      if (useChat.getState().threadId === threadId) {
-        useChat.getState().setError(humanizeApiError(String(e), provider, model));
-      }
-    } finally {
-      setSending(false);
-    }
+    void useChat.getState().send(text, { baseUrl: baseUrl || null });
   }
 
   return (
@@ -297,6 +246,11 @@ export function ChatView() {
             </Button>
           </div>
         )}
+        {needsKey && !hasKey.data && saveKey.isError && (
+          <p role="alert" className="border-b px-4 py-2 text-xs text-destructive">
+            {describeKeySaveError(saveKey.error)}
+          </p>
+        )}
 
         <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
           <MessageScrollerProvider autoScroll>
@@ -306,9 +260,12 @@ export function ChatView() {
                   className="mx-auto w-full min-w-0 max-w-3xl px-5 py-6"
                   role="log"
                   aria-live="polite"
-                  aria-relevant="additions text"
+                  // Announce only committed messages. The live reply changes every frame,
+                  // so "text" changes (and an un-busy region) would read out each token.
+                  aria-relevant="additions"
+                  aria-busy={isStreaming}
                 >
-                  {messages.length === 0 && !sending && (
+                  {messages.length === 0 && !isStreaming && (
                     <Marker variant="separator" className="my-auto">
                       <MarkerContent>Ask anything. Replies are saved and searchable.</MarkerContent>
                     </Marker>
@@ -319,10 +276,18 @@ export function ChatView() {
                       messageId={m.id}
                       scrollAnchor={m.role === "user"}
                     >
-                      <MessageRow role={m.role} content={m.content} />
+                      <MessageRow
+                        id={m.id}
+                        role={m.role}
+                        content={m.content}
+                        context={m.context}
+                        // Only context chips use this; keeping it false for other rows
+                        // means a stream starting/ending doesn't re-render every bubble.
+                        removable={!isStreaming && isContextMessage(m)}
+                      />
                     </MessageScrollerItem>
                   ))}
-                  {sending && (
+                  {isStreaming && (
                     // The live reply must never be paint-deferred. The base MessageScrollerItem
                     // sets content-visibility:auto (+ contain-intrinsic-size), which lets the
                     // browser skip rendering the growing reply while it sits a hair below the
@@ -379,18 +344,18 @@ export function ChatView() {
               placeholder="Message…"
               onChange={(e) => setDraft(e.currentTarget.value)}
               onKeyDown={(e) => {
-                if (e.key === "Enter" && !e.shiftKey) {
+                if (isSubmitEnter(e)) {
                   e.preventDefault();
                   send();
                 }
               }}
             />
-            {sending ? (
+            {isStreaming ? (
               <Button
                 type="button"
                 size="icon"
                 aria-label="Stop generating"
-                onClick={() => api.cancelChat()}
+                onClick={stop}
                 className="absolute bottom-2 right-2 size-9 rounded-full transition-transform duration-150 hover:scale-105 active:scale-95"
               >
                 <Square className="size-3.5 fill-current" />
@@ -421,14 +386,28 @@ export function ChatView() {
   );
 }
 
-/** The prefix `addContext` prepends when injecting context as a user turn (see store/chat.ts);
- *  such turns render as a compact Attachment chip instead of a wall-of-text bubble. */
-const CONTEXT_PREFIX = "Here is context for our conversation:";
+/** Rough token count for a text blob (~4 chars per token for English and code). */
+function approxTokens(chars: number): string {
+  const t = Math.round(chars / 4);
+  return t < 1000 ? `${t}` : `${(t / 1000).toFixed(1)}k`;
+}
 
 /** A committed message rendered with the shadcn conversation primitives: user = muted bubble
  *  (right), or a context Attachment; assistant = ghost bubble wrapping markdown; system = marker.
  *  Memoized so streaming a new reply never re-parses prior messages' markdown. */
-const MessageRow = memo(function MessageRow({ role, content }: { role: string; content: string }) {
+const MessageRow = memo(function MessageRow({
+  id,
+  role,
+  content,
+  context,
+  removable,
+}: {
+  id: string;
+  role: string;
+  content: string;
+  context?: ContextMeta;
+  removable: boolean;
+}) {
   if (role === "system") {
     return (
       <Marker variant="separator">
@@ -437,25 +416,8 @@ const MessageRow = memo(function MessageRow({ role, content }: { role: string; c
     );
   }
   if (role === "user") {
-    if (content.startsWith(CONTEXT_PREFIX)) {
-      const body = content.slice(CONTEXT_PREFIX.length).trim();
-      return (
-        <Message align="end">
-          <MessageContent>
-            <Attachment size="sm">
-              <AttachmentMedia>
-                <Paperclip />
-              </AttachmentMedia>
-              <AttachmentContent>
-                <AttachmentTitle>Context</AttachmentTitle>
-                <AttachmentDescription>
-                  {body.length.toLocaleString()} characters
-                </AttachmentDescription>
-              </AttachmentContent>
-            </Attachment>
-          </MessageContent>
-        </Message>
-      );
+    if (context || content.startsWith(CONTEXT_PREFIX)) {
+      return <ContextChip id={id} content={content} context={context} removable={removable} />;
     }
     return (
       <Message align="end">
@@ -480,6 +442,54 @@ const MessageRow = memo(function MessageRow({ role, content }: { role: string; c
   );
 });
 
+/** An injected thread context, shown as a compact attachment with its size. Attached
+ *  context is re-sent with every later message, so the token estimate is the per-turn
+ *  cost the user is opting into; removing it stops that. */
+function ContextChip({
+  id,
+  content,
+  context,
+  removable,
+}: {
+  id: string;
+  content: string;
+  context?: ContextMeta;
+  removable: boolean;
+}) {
+  const removeMessage = useChat((s) => s.removeMessage);
+  const body = content.slice(CONTEXT_PREFIX.length).trim();
+  const chars = context?.chars ?? body.length;
+  const title = context?.title ?? contextTitle(body);
+  return (
+    <Message align="end">
+      <MessageContent>
+        <Attachment size="sm" title="Attached context is sent with every message in this chat.">
+          <AttachmentMedia>
+            <Paperclip />
+          </AttachmentMedia>
+          <AttachmentContent>
+            <AttachmentTitle>{title ? `Context: ${title}` : "Context"}</AttachmentTitle>
+            <AttachmentDescription>
+              {chars.toLocaleString()} chars · ~{approxTokens(chars)} tokens per message
+              {context?.truncated ? " · trimmed to fit" : ""}
+            </AttachmentDescription>
+          </AttachmentContent>
+          {removable && (
+            <AttachmentActions>
+              <AttachmentAction
+                aria-label="Remove attached context"
+                onClick={() => removeMessage(id)}
+              >
+                <X />
+              </AttachmentAction>
+            </AttachmentActions>
+          )}
+        </Attachment>
+      </MessageContent>
+    </Message>
+  );
+}
+
 /** Subscribes to the live stream state itself, so per-frame token updates re-render
  *  only this subtree — not the composer, header, or committed message list. */
 function StreamingArea() {
@@ -497,14 +507,24 @@ function StreamingTurn({ reasoning, parts }: { reasoning: string; parts: StreamP
       {reasoning ? <ThinkingBlock text={reasoning} streaming={parts.length === 0} /> : null}
       {parts.map((p, i) =>
         p.kind === "text" ? (
-          <Bubble key={i} variant="ghost">
+          <Bubble
+            // biome-ignore lint/suspicious/noArrayIndexKey: parts only ever append (the last text part grows in place), so a part's index is its stable identity
+            key={i}
+            variant="ghost"
+          >
             <BubbleContent className="relative">
-              <StreamingMarkdown>{p.text}</StreamingMarkdown>
+              {/* Only the last part can still grow: an earlier one is followed by a tool
+                  step, so its blocks are final and get language detection. */}
+              <StreamingMarkdown streaming={i === parts.length - 1}>{p.text}</StreamingMarkdown>
               {i === parts.length - 1 && <TrailingDots />}
             </BubbleContent>
           </Bubble>
         ) : (
-          <ToolStepView key={i} step={p.step} />
+          <ToolStepView
+            // biome-ignore lint/suspicious/noArrayIndexKey: parts only ever append, so a part's index is its stable identity
+            key={i}
+            step={p.step}
+          />
         ),
       )}
       {empty && <TypingDots />}
@@ -599,13 +619,15 @@ function ThinkingBlock({ text, streaming }: { text: string; streaming?: boolean 
  *  first token arrives: a shimmering "Thinking" label with bouncing dots. */
 function TypingDots() {
   return (
-    <div
-      className="flex items-center gap-2 text-sm text-muted-foreground"
-      aria-label="Assistant is thinking"
-    >
-      <Brain className="size-4 animate-pulse" />
-      <span className="animate-pulse font-medium">Thinking</span>
-      <span className="flex items-center gap-1">
+    // Screen readers get the sr-only sentence; the icon, the short label and the dots are
+    // decorative.
+    <div className="flex items-center gap-2 text-sm text-muted-foreground">
+      <span className="sr-only">Assistant is thinking</span>
+      <Brain className="size-4 animate-pulse" aria-hidden="true" />
+      <span className="animate-pulse font-medium" aria-hidden="true">
+        Thinking
+      </span>
+      <span className="flex items-center gap-1" aria-hidden="true">
         {[0, 160, 320].map((delay) => (
           <span
             key={delay}
@@ -621,13 +643,12 @@ function TypingDots() {
 /** Compact bouncing dots shown trailing the most recent streamed text. */
 function TrailingDots() {
   return (
-    <span
-      className="ml-1 inline-flex translate-y-0.5 items-center gap-1 align-text-bottom"
-      aria-label="Generating"
-    >
+    <span className="ml-1 inline-flex translate-y-0.5 items-center gap-1 align-text-bottom">
+      <span className="sr-only">Generating</span>
       {[0, 160, 320].map((delay) => (
         <span
           key={delay}
+          aria-hidden="true"
           className="size-1.5 animate-bounce rounded-full bg-muted-foreground/70"
           style={{ animationDelay: `${delay}ms` }}
         />

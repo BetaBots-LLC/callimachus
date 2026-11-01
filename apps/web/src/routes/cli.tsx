@@ -35,13 +35,17 @@ function CliPage() {
             <Link to="/download" className="text-link hover:underline">
               desktop app
             </Link>{" "}
-            — it puts <code className="font-mono">cal</code> on your PATH, ready to use. Same local
-            index, nothing else to set up.
+            and click Settings → Claude Code → Enable for Claude Code. That links{" "}
+            <code className="font-mono">cal</code> at{" "}
+            <code className="font-mono">~/.local/bin/cal</code> on macOS and Linux (stock macOS
+            leaves <code className="font-mono">~/.local/bin</code> off your PATH; Settings shows the
+            line to add) and places <code className="font-mono">cal.exe</code> next to the app on
+            Windows. Same local index, nothing else to set up.
           </p>
           <p className="cat-label pt-2">Or build from source</p>
           <CommandBlock
             label="from a checkout of the repo"
-            lines={["cargo install --path apps/desktop/src-tauri --bin cal"]}
+            lines={["cargo install --locked --path apps/desktop/src-tauri --bin cal"]}
           />
         </div>
 

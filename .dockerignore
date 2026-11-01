@@ -1,12 +1,21 @@
-# Keep the build context small + reproducible (the Dockerfile only needs the
-# Rust crate source, not build output or JS deps).
-**/node_modules
-**/target
-**/dist
-**/.next
-**/out
-**/.turbo
+# Allowlist: the Dockerfile only needs the Rust crate and the image's entrypoint, so
+# send nothing else as build context (no JS workspaces, node_modules, website or .git).
+*
+!apps/desktop/src-tauri/
+!docker-entrypoint.sh
+
+# Inside the crate: build output, and local files git ignores (the old
+# CWD-relative model cache is hundreds of MB; env and key files never belong in
+# a build context).
+apps/desktop/src-tauri/target
 apps/desktop/src-tauri/gen
-*.db
-*.db-*
-.git
+**/.fastembed*
+**/.callimachus
+**/.env*
+**/*.key
+**/*.p12
+**/*.pfx
+**/*.log
+**/*.db
+**/*.db-*
+**/.DS_Store

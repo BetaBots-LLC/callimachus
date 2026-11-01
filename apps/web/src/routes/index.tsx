@@ -70,11 +70,12 @@ function Home() {
             </h1>
             <p className="max-w-[54ch] text-lg leading-relaxed text-muted-foreground">
               Callimachus quietly indexes every conversation your AI agents write — across{" "}
-              <strong className="font-medium text-foreground">eleven tools</strong> — into one fast,
-              local, searchable catalogue. Keyword and meaning. No cloud, no account, no tracking.
+              <strong className="font-medium text-foreground">twelve tools</strong> — into one fast,
+              local, searchable catalogue. Keyword and meaning. No cloud, no account, and your
+              history never leaves your machine.
             </p>
             <div className="flex flex-col gap-4 pt-2 sm:flex-row sm:items-center">
-              <DownloadButton release={release} primaryOs={primaryOs} />
+              <DownloadButton release={release} primaryOs={primaryOs} placement="hero" />
               <a
                 href={GITHUB_URL}
                 target="_blank"
@@ -105,7 +106,7 @@ function Home() {
         </Container>
 
         <Container className="relative pb-12">
-          <p className="cat-label mb-3">Eleven agents, one index</p>
+          <p className="cat-label mb-3">Twelve agents, one index</p>
           <SourceMarquee />
         </Container>
       </section>
@@ -148,8 +149,8 @@ function Home() {
               title="It never leaves your machine"
               className="lg:col-span-5"
             >
-              The index, the embeddings, the search — all on disk, on your computer. No account, no
-              sync, no telemetry. The quietest tool in your stack.
+              The index, the embeddings, the search: all on disk, on your computer. No account, no
+              sync, and no analytics unless you opt in. The quietest tool in your stack.
             </FeaturePanel>
             <FeaturePanel
               icon={RefreshCw}
@@ -157,8 +158,9 @@ function Home() {
               title="Always current, never in the way"
               className="lg:col-span-5"
             >
-              A background watcher catalogues new sessions as you work. Reindex any source on
-              demand; forget it's running the rest of the time.
+              A background watcher catalogues new sessions as you work, and each launch catches up
+              on the ones your agents wrote while the app was closed. Reindex any source on demand;
+              forget it's running the rest of the time.
             </FeaturePanel>
             <FeaturePanel
               icon={Share2}
@@ -177,8 +179,9 @@ function Home() {
               className="lg:col-span-7"
             >
               Free heuristic TODO extraction, plus opt-in LLM distillation of decisions, gotchas,
-              and summaries — with cross-thread semantic recall of past decisions and gotchas. Needs
-              local Ollama (keyless) or a cloud API key.
+              and summaries — with cross-thread semantic recall of past decisions and gotchas. Runs
+              on local Ollama (keyless), your logged-in Claude Code or Codex CLI, or a cloud API
+              key.
             </FeaturePanel>
             <FeaturePanel
               icon={MessageCircleQuestion}
@@ -210,7 +213,8 @@ function Home() {
             >
               Durable checkpoints of a thread — packed transcript plus carry-forward project memory
               — so work survives a context-window compaction or a jump to another tool.
-              Auto-captured via Claude Code hooks, or snapshot and resume by hand.
+              Auto-captured by a Claude Code hook right before a context compaction, or snapshot and
+              resume by hand.
             </FeaturePanel>
             <FeaturePanel
               icon={Scale}
@@ -293,10 +297,11 @@ function Home() {
             A library that doesn't read over your shoulder.
           </h2>
           <p className="max-w-[60ch] text-lg leading-relaxed text-muted-foreground">
-            Cookieless, aggregate analytics on this site — no tracking cookies, no cross-site
-            profiles. No telemetry in the app. Your conversations are indexed where they already
-            live — on your machine — and stay there. Open source under AGPL-3.0, so you never have
-            to take our word for it.
+            Cookieless analytics on this site: no cookies, no cross-site profiles. In the app,
+            anonymous usage analytics are off unless you choose to share them, and never include
+            your conversations, file paths or prompts. Your conversations are indexed where they
+            already live, on your machine, and stay there. Open source under AGPL-3.0, so you never
+            have to take our word for it.
           </p>
           <div className="flex flex-wrap gap-3">
             <a
@@ -335,7 +340,12 @@ function Home() {
             Free, local, and quietly yours. Run the app once and every thread you've ever written is
             a keystroke away.
           </p>
-          <DownloadButton release={release} primaryOs={primaryOs} className="sm:items-center" />
+          <DownloadButton
+            release={release}
+            primaryOs={primaryOs}
+            placement="closing_cta"
+            className="sm:items-center"
+          />
         </Container>
       </section>
     </>

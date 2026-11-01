@@ -1,5 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, type KFact } from "../lib/api";
+import { trackError } from "../lib/telemetry";
 import { Button } from "@/components/ui/button";
 import {
   Sheet,
@@ -10,7 +11,7 @@ import {
   SheetTrigger,
 } from "@/components/ui/sheet";
 import { Sparkles } from "lucide-react";
-import { InlineMarkdown } from "./Markdown";
+import { InlineMarkdown } from "./LazyMarkdown";
 
 /**
  * Distilled knowledge for a thread, in a right-side sheet so it floats over the
@@ -31,6 +32,7 @@ export function KnowledgeButton({ threadId }: { threadId: number }) {
       queryClient.setQueryData(["thread_knowledge", threadId], data);
       queryClient.invalidateQueries({ queryKey: ["open_todos"] });
     },
+    onError: (e) => trackError(e, "distill_failed"),
   });
 
   const d = k.data;

@@ -23,6 +23,7 @@ import {
   CommandList,
 } from "@/components/ui/command";
 import { api } from "../lib/api";
+import { useIndexRewriting } from "../lib/queries";
 import { useUi, type View } from "../store/ui";
 import { useTheme } from "../store/theme";
 
@@ -49,7 +50,12 @@ export function CommandPalette() {
     mutationFn: api.indexAll,
     onSuccess: () => qc.invalidateQueries({ queryKey: ["index_status"] }),
   });
-  const buildIndex = useMutation({ mutationFn: api.buildEmbeddings });
+  const buildIndex = useMutation({
+    mutationFn: api.buildEmbeddings,
+    // embed_status never refetches on its own while idle (lib/queries.ts); pick up
+    // running:true now so the progress bar appears.
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["embed_status"] }),
+  });
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -61,6 +67,9 @@ export function CommandPalette() {
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
   }, [open, setOpen]);
+
+  // Both actions do nothing while Shrink index / Reclaim space rewrites the index.
+  const rewriting = useIndexRewriting();
 
   const run = (fn: () => void) => {
     setOpen(false);
@@ -81,12 +90,17 @@ export function CommandPalette() {
           ))}
         </CommandGroup>
         <CommandGroup heading="Actions">
-          <CommandItem value="reindex history" onSelect={() => run(() => reindex.mutate())}>
+          <CommandItem
+            value="reindex history"
+            disabled={rewriting}
+            onSelect={() => run(() => reindex.mutate())}
+          >
             <RefreshCw />
             <span>Reindex history</span>
           </CommandItem>
           <CommandItem
             value="build semantic index embeddings"
+            disabled={rewriting}
             onSelect={() => run(() => buildIndex.mutate())}
           >
             <Database />

@@ -11,6 +11,9 @@ use crate::{
     agent, context, cost, db, embed, export, gitlink, issues, knowledge, search, secrets, snapshot,
 };
 use rusqlite::Connection;
+use std::borrow::Cow;
+use std::fmt::Write as _;
+use std::mem::ManuallyDrop;
 
 /// Subcommands that identify a `cal` invocation when the app is launched directly.
 pub const COMMANDS: &[&str] = &[
@@ -48,6 +51,8 @@ pub const COMMANDS: &[&str] = &[
     "cost",
     "recall-now",
     "audit-pr",
+    "version",
+    "--version",
 ];
 
 const USAGE: &str = "\
@@ -83,8 +88,8 @@ USAGE:
                                 open TODOs); defaults to the current repo
   cal done <todo-id>            mark an open TODO done (id from `cal todos`)
   cal remember <decision|gotcha> <text…> [--because WHY]
-                                record a fact for the current repo (-p PROJECT to
-                                override), pinned into its project memory
+                                record a fact in the current repo's project memory
+                                (-p PROJECT to override)
   cal check <proposal…> [-p PROJECT] [--json]
                                 contradiction guard: settled decisions on this topic
                                 (surfaces 'you already decided X because Y')
@@ -101,8 +106,9 @@ USAGE:
   cal cost [<project>] [-n LIMIT] [--json]
                                 estimated $ spend by model + priciest threads
                                 (needs a Reindex to capture token usage)
-  cal hook [<project>]          print the current repo's memory for injection (use as a
-                                Claude Code SessionStart hook command)
+  cal hook [<project>] [-n PER_KIND] [--budget CHARS]
+                                print the current repo's memory for injection (a Claude
+                                Code SessionStart hook command; size-capped, ~6k chars)
   cal agents [<project>] [-o FILE]
                                 write/refresh the memory block in AGENTS.md (or -o
                                 CLAUDE.md) so any agent reading it opens with the memory
@@ -114,12 +120,11 @@ USAGE:
   cal resume <snapshot-id> [-a AGENT]
                                 relaunch an agent CLI seeded with a snapshot (cross-tool
                                 handoff; AGENT defaults to claude, e.g. -a codex)
+  cal version                    print the Callimachus version (also --version)
   cal help
 
 OPTIONS:
-  -s, --source SOURCE   filter by source kind (claude_code, codex, cursor,
-                        gemini, qwen, goose, opencode, continue, cline, roo,
-                        kilo, in_app)
+  -s, --source SOURCE   filter by source kind ({SOURCE_KINDS})
   -p, --project PATH    substring-match the project path
       --starred         only starred threads (recent/related/search)
   -t, --tag TAG         only threads with this tag (repeatable)
@@ -127,18 +132,82 @@ OPTIONS:
   -a, --agent AGENT     target agent CLI for `resume` (default claude)
       --because WHY      rationale for a `remember decision`
   -y, --hybrid          fuse keyword + on-device semantic search
-  -n, --limit N         max results (default 20; todos 50, files 40)
+  -n, --limit N         max results (default 20; todos 50, files 40; hook: per kind)
+      --budget CHARS    max chars `hook` prints (default 6000)
   -V, --vault DIR       Obsidian vault dir for `export` (else CALLIMACHUS_VAULT)
   -o, --out FILE        write `export` output to FILE instead of a vault/stdout
   -S, --synthesize      prepend an LLM summary / decisions / gotchas / TODOs
                         to `export` (uses the first stored provider key)
-      --json            machine-readable JSON output";
+      --json            machine-readable JSON output
+      --raw             show stored text unredacted (query commands redact
+                        secrets by default; cat, export and hooks always do)";
+
+/// Where [`usage`] puts the `-s` source kinds.
+const SOURCE_KINDS_SLOT: &str = "{SOURCE_KINDS}";
+/// The OPTIONS description column, and the width the source kinds wrap to, matching the
+/// hand-wrapped lines around them.
+const OPTION_DESC_COL: usize = 24;
+const USAGE_WIDTH: usize = 76;
+
+/// `cal help`: [`USAGE`] with the `-s` source kinds filled in from `indexer::SOURCES` (plus
+/// `in_app`, the app's own chats, which no indexer scans). The registry is the one list to
+/// extend when adding a source, so a hand-written copy here would drift (it once lacked
+/// copilot).
+fn usage() -> String {
+    let kinds: Vec<&str> = crate::indexer::SOURCES
+        .iter()
+        .map(|s| s.kind)
+        .chain(["in_app"])
+        .collect();
+    let at = USAGE
+        .find(SOURCE_KINDS_SLOT)
+        .expect("USAGE has the source kinds slot");
+    let mut col = at - USAGE[..at].rfind('\n').map_or(0, |nl| nl + 1);
+    let mut list = String::new();
+    for (i, kind) in kinds.iter().enumerate() {
+        // Each kind carries its trailing "," or, for the last one, the closing ")".
+        let width = kind.len() + 1;
+        if i > 0 {
+            if col + 1 + width > USAGE_WIDTH {
+                list.push('\n');
+                list.push_str(&" ".repeat(OPTION_DESC_COL));
+                col = OPTION_DESC_COL;
+            } else {
+                list.push(' ');
+                col += 1;
+            }
+        }
+        list.push_str(kind);
+        if i + 1 < kinds.len() {
+            list.push(',');
+        }
+        col += width;
+    }
+    USAGE.replacen(SOURCE_KINDS_SLOT, &list, 1)
+}
+
+/// Hook targets Claude Code runs inside the agent loop (SessionStart, PreCompact,
+/// UserPromptSubmit). They must never fail visibly: Claude Code shows a non-zero exit plus
+/// stderr as a hook error on every session start or prompt.
+const HOOK_COMMANDS: &[&str] = &["hook", "snapshot-hook", "recall-now"];
 
 /// Run the CLI and map the result to a process exit code (printing errors). Used
 /// by both the `cal` binary and the app's cal-mode dispatch.
 pub fn run_and_exit(args: &[String]) -> i32 {
+    if args
+        .first()
+        .is_some_and(|c| HOOK_COMMANDS.contains(&c.as_str()))
+    {
+        return run_hook_silently(args);
+    }
     match run(args) {
         Ok(()) => 0,
+        // The lock outlasted the sidecar wait: almost always an index upgrade or a large
+        // cleanup in the app. Say that instead of SQLite's raw "database is locked".
+        Err(e) if db::is_busy(&e) => {
+            eprintln!("cal: the index is busy (an upgrade or a large cleanup may be running); try again shortly");
+            1
+        }
         Err(e) => {
             eprintln!("cal: {e}");
             1
@@ -146,9 +215,20 @@ pub fn run_and_exit(args: &[String]) -> i32 {
     }
 }
 
+/// Run a hook command best-effort: any error (no index, a locked DB, a schema mismatch
+/// after an update, a bad payload) and even a panic exits 0 with nothing on stderr, so the
+/// agent carries on. Interactive users who want to see errors use `cal memory`.
+fn run_hook_silently(args: &[String]) -> i32 {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let _ = std::panic::catch_unwind(|| run(args));
+    std::panic::set_hook(previous);
+    0
+}
+
 pub fn run(args: &[String]) -> anyhow::Result<()> {
     let Some((cmd, rest)) = args.split_first() else {
-        println!("{USAGE}");
+        println!("{}", usage());
         return Ok(());
     };
     match cmd.as_str() {
@@ -184,8 +264,14 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
         "cost" => cmd_cost(rest),
         "recall-now" => cmd_recall_now(rest),
         "audit-pr" => cmd_audit_pr(rest),
+        // A cheap, explicit signature for tools probing whether a `cal` on PATH is ours
+        // (the VS Code extension; the system calendar's `cal` prints a calendar instead).
+        "version" | "--version" | "-v" => {
+            println!("callimachus {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
         "help" | "-h" | "--help" => {
-            println!("{USAGE}");
+            println!("{}", usage());
             Ok(())
         }
         other => anyhow::bail!("unknown command '{other}'. Run `cal help`."),
@@ -209,7 +295,41 @@ struct Opts {
     label: Option<String>,
     agent: Option<String>,
     because: Option<String>,
+    /// `hook`: max chars to print.
+    budget: Option<usize>,
+    /// `--raw`: print stored text as is instead of redacting secrets (see [`Opts::shown`]).
+    raw: bool,
     positional: Vec<String>,
+}
+
+/// The output boundary for stored history. Query commands print titles, snippets, facts and
+/// error text straight from the index, which keeps transcripts unredacted, and agents run
+/// them too: the /recall skill falls back to `cal` when MCP isn't wired, and the VS Code
+/// extension reads `--json`. So everything printed goes through these two helpers, redacted
+/// unless the user passed `--raw` for their own terminal. `cat`, `export` and the hooks
+/// redact on their own (packed transcripts, `export::fact_line`) and never honor `--raw`.
+impl Opts {
+    /// Stored text for human output: secrets redacted unless `--raw`.
+    fn shown<'a>(&self, text: &'a str) -> Cow<'a, str> {
+        if self.raw {
+            Cow::Borrowed(text)
+        } else {
+            context::redact_secrets(text)
+        }
+    }
+
+    /// A `--json` payload, pretty-printed, with every string redacted unless `--raw`.
+    fn json<T: serde::Serialize + ?Sized>(&self, value: &T) -> anyhow::Result<String> {
+        if self.raw {
+            return Ok(serde_json::to_string_pretty(value)?);
+        }
+        // `to_redacted_json` writes compact JSON; re-indent it so `--json` prints exactly as
+        // before. Lossless: serde_json keeps key order (preserve_order), and every number
+        // parses back to the value whose shortest form it was printed as.
+        let compact = context::to_redacted_json(value)?;
+        let v: serde_json::Value = serde_json::from_str(&compact)?;
+        Ok(serde_json::to_string_pretty(&v)?)
+    }
 }
 
 fn parse(args: &[String]) -> anyhow::Result<Opts> {
@@ -234,9 +354,17 @@ fn parse(args: &[String]) -> anyhow::Result<Opts> {
             "-l" | "--label" => o.label = Some(next(&mut it, "--label")?),
             "-a" | "--agent" => o.agent = Some(next(&mut it, "--agent")?),
             "--because" => o.because = Some(next(&mut it, "--because")?),
+            "--budget" => {
+                o.budget = Some(
+                    next(&mut it, "--budget")?
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("--budget needs a number of chars"))?,
+                )
+            }
             "--starred" => o.starred = true,
             "--off" => o.off = true,
             "--json" => o.json = true,
+            "--raw" => o.raw = true,
             s if s.starts_with('-') && s.len() > 1 => anyhow::bail!("unknown flag '{s}'"),
             _ => o.positional.push(a.clone()),
         }
@@ -259,9 +387,20 @@ fn open_db() -> anyhow::Result<Connection> {
 
 /// Writable connection for the few `cal` subcommands that mutate (star/tag/distill).
 /// A read-only connection rejects writes with SQLITE_READONLY; WAL still lets this
-/// coexist with the app's writes (busy_timeout waits out the rare overlap).
+/// coexist with the app's writes (busy_timeout waits out the rare overlap). The sidecar
+/// open also waits out an index upgrade another process is running.
 fn open_db_write() -> anyhow::Result<Connection> {
-    db::open(&db::default_index_path())
+    db::open_sidecar(&db::default_index_path())
+}
+
+/// How long a hook waits for the index lock. Claude Code kills our hooks after 10-15s (see
+/// the HookSpecs in integration.rs), so the sidecar's long wait would only get the hook
+/// killed mid-run; giving up first lets `run_hook_silently` exit 0 quietly.
+const HOOK_DB_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// [`open_db_write`] for a hook, bounded by [`HOOK_DB_WAIT`].
+fn open_hook_db_write() -> anyhow::Result<Connection> {
+    db::open_with_busy_timeout(&db::default_index_path(), HOOK_DB_WAIT)
 }
 
 fn filters(o: &Opts) -> search::SearchFilters {
@@ -276,35 +415,75 @@ fn filters(o: &Opts) -> search::SearchFilters {
     }
 }
 
+/// The CLI's embedder. It never downloads: `cal` runs inside agents' shells with their
+/// working directory, and a 128 MB model download must not start from there. Without the
+/// model the app downloaded, semantic features fall back to keyword results or come back
+/// empty, and this says so once on stderr (stdout stays clean for `--json`).
+fn cli_embedder() -> ManuallyDrop<embed::Embedder> {
+    if !embed::model_is_cached() {
+        eprintln!(
+            "note: semantic search is unavailable until the embedding model is downloaded \
+             (open Callimachus and build the semantic index); using keyword matches only"
+        );
+    }
+    one_shot_embedder()
+}
+
+/// A cached-only embedder that is never dropped. Every `cal` command is a one-shot process
+/// that exits right after it prints, and tearing down a loaded model (the ONNX session and
+/// its thread pool) only spends ~3 ms freeing memory the OS reclaims at exit anyway. That
+/// adds up on `recall-now`, which runs on every prompt, hit or not. Only for `cal`: the app
+/// and the MCP server are long-lived and must drop theirs.
+fn one_shot_embedder() -> ManuallyDrop<embed::Embedder> {
+    ManuallyDrop::new(embed::Embedder::cached_only())
+}
+
 fn cmd_search(args: &[String]) -> anyhow::Result<()> {
     let o = parse(args)?;
     if o.positional.is_empty() {
         anyhow::bail!("search needs a query. e.g. `cal search \"vector index\"`");
     }
-    let query = o.positional.join(" ");
     let conn = open_db()?;
-    let f = filters(&o);
-    let hits = if o.hybrid {
-        let embedder = embed::Embedder::default();
-        search::hybrid(&conn, &embedder, &query, &f)?
+    print!("{}", search_output(&conn, &o)?);
+    Ok(())
+}
+
+/// `cal search`'s stdout (the no-matches note goes to stderr).
+fn search_output(conn: &Connection, o: &Opts) -> anyhow::Result<String> {
+    let query = o.positional.join(" ");
+    let f = filters(o);
+    let mut hits = if o.hybrid {
+        let embedder = cli_embedder();
+        search::hybrid(conn, &embedder, &query, &f)?
     } else {
-        search::search(&conn, &query, &f)?
+        search::search(conn, &query, &f)?
     };
 
     if o.json {
-        println!("{}", serde_json::to_string_pretty(&hits)?);
-        return Ok(());
+        if !o.raw {
+            // JSON keeps the FTS match sentinels (the VS Code sidebar highlights with them),
+            // but one landing inside a key splits it so the redaction pattern no longer sees
+            // it. A snippet hiding a secret that way goes out plain, without highlights.
+            for h in &mut hits {
+                if let Cow::Owned(clean) = context::redact_secrets(&strip_marks(&h.snippet)) {
+                    h.snippet = clean;
+                }
+            }
+        }
+        return Ok(format!("{}\n", o.json(&hits)?));
     }
     if hits.is_empty() {
         eprintln!("no matches for {query:?}");
-        return Ok(());
+        return Ok(String::new());
     }
+    let mut out = String::new();
     for h in &hits {
         let title = h.title.as_deref().unwrap_or("(untitled)");
-        println!("[{}] {:<11} {}", h.thread_id, h.source, title);
-        println!("    {}", strip_marks(&h.snippet));
+        writeln!(out, "[{}] {:<11} {}", h.thread_id, h.source, o.shown(title))?;
+        // Marks out first, so one inside a key can't hide it from the redaction.
+        writeln!(out, "    {}", o.shown(&strip_marks(&h.snippet)))?;
     }
-    Ok(())
+    Ok(out)
 }
 
 fn cmd_related(args: &[String]) -> anyhow::Result<()> {
@@ -327,11 +506,11 @@ fn cmd_related(args: &[String]) -> anyhow::Result<()> {
     }
 
     let conn = open_db()?;
-    let embedder = embed::Embedder::default();
+    let embedder = cli_embedder();
     let rows = search::related(&conn, &embedder, &text, &filters(&o))?;
 
     if o.json {
-        println!("{}", serde_json::to_string_pretty(&rows)?);
+        println!("{}", o.json(&rows)?);
         return Ok(());
     }
     if rows.is_empty() {
@@ -342,7 +521,10 @@ fn cmd_related(args: &[String]) -> anyhow::Result<()> {
         let title = t.title.as_deref().unwrap_or("(untitled)");
         println!(
             "[{}] {:<11} {}  ({} msgs)",
-            t.id, t.source, title, t.message_count
+            t.id,
+            t.source,
+            o.shown(title),
+            t.message_count
         );
     }
     Ok(())
@@ -351,28 +533,35 @@ fn cmd_related(args: &[String]) -> anyhow::Result<()> {
 fn cmd_recent(args: &[String]) -> anyhow::Result<()> {
     let o = parse(args)?;
     let conn = open_db()?;
-    let rows = search::recent_threads(&conn, &filters(&o))?;
+    print!("{}", recent_output(&conn, &o)?);
+    Ok(())
+}
+
+/// `cal recent`'s stdout (the empty-index note goes to stderr).
+fn recent_output(conn: &Connection, o: &Opts) -> anyhow::Result<String> {
+    let rows = search::recent_threads(conn, &filters(o))?;
 
     if o.json {
-        println!("{}", serde_json::to_string_pretty(&rows)?);
-        return Ok(());
+        return Ok(format!("{}\n", o.json(&rows)?));
     }
     if rows.is_empty() {
         eprintln!("no threads indexed yet");
-        return Ok(());
+        return Ok(String::new());
     }
+    let mut out = String::new();
     for t in &rows {
         let title = t.title.as_deref().unwrap_or("(untitled)");
-        println!(
+        writeln!(
+            out,
             "[{}] {:<11} {}  ({} msgs · {})",
             t.id,
             t.source,
-            title,
+            o.shown(title),
             t.message_count,
             fmt_time(t.updated_at)
-        );
+        )?;
     }
-    Ok(())
+    Ok(out)
 }
 
 fn thread_id_arg(o: &Opts, cmd: &str) -> anyhow::Result<i64> {
@@ -417,7 +606,7 @@ fn cmd_tags(args: &[String]) -> anyhow::Result<()> {
     let conn = open_db()?;
     let tags = search::list_tags(&conn)?;
     if o.json {
-        println!("{}", serde_json::to_string_pretty(&tags)?);
+        println!("{}", o.json(&tags)?);
         return Ok(());
     }
     if tags.is_empty() {
@@ -443,7 +632,7 @@ fn cmd_todos(args: &[String]) -> anyhow::Result<()> {
         o.limit.unwrap_or(50) as i64,
     )?;
     if o.json {
-        println!("{}", serde_json::to_string_pretty(&todos)?);
+        println!("{}", o.json(&todos)?);
         return Ok(());
     }
     if todos.is_empty() {
@@ -452,34 +641,39 @@ fn cmd_todos(args: &[String]) -> anyhow::Result<()> {
     }
     for t in &todos {
         let title = t.title.as_deref().unwrap_or("untitled");
-        println!("• {}", t.text);
-        println!("    {} · {} · thread {}", t.source, title, t.thread_id);
+        println!("• {}", o.shown(&t.text));
+        println!(
+            "    {} · {} · thread {}",
+            t.source,
+            o.shown(title),
+            t.thread_id
+        );
     }
     Ok(())
 }
 
-fn print_knowledge(k: &knowledge::ThreadKnowledge) {
+fn print_knowledge(k: &knowledge::ThreadKnowledge, o: &Opts) {
     if let Some(s) = &k.summary {
-        println!("Summary: {s}\n");
+        println!("Summary: {}\n", o.shown(s));
     }
     if !k.decisions.is_empty() {
         println!("Decisions:");
         for f in &k.decisions {
-            println!("  • {}", f.text);
+            println!("  • {}", o.shown(&f.text));
         }
         println!();
     }
     if !k.gotchas.is_empty() {
         println!("Gotchas:");
         for f in &k.gotchas {
-            println!("  • {}", f.text);
+            println!("  • {}", o.shown(&f.text));
         }
         println!();
     }
     if !k.todos.is_empty() {
         println!("TODOs:");
         for f in &k.todos {
-            println!("  • {}", f.text);
+            println!("  • {}", o.shown(&f.text));
         }
     }
     if k.stale {
@@ -493,14 +687,14 @@ fn cmd_knowledge(args: &[String]) -> anyhow::Result<()> {
     let conn = open_db()?;
     let k = knowledge::get_thread_knowledge(&conn, id)?;
     if o.json {
-        println!("{}", serde_json::to_string_pretty(&k)?);
+        println!("{}", o.json(&k)?);
         return Ok(());
     }
     if !k.extracted && k.todos.is_empty() {
         eprintln!("no knowledge for thread {id} yet — run `cal distill {id}`");
         return Ok(());
     }
-    print_knowledge(&k);
+    print_knowledge(&k, &o);
     Ok(())
 }
 
@@ -522,39 +716,53 @@ fn cmd_distill(args: &[String]) -> anyhow::Result<()> {
     ))?;
     let now = chrono::Utc::now().timestamp();
     knowledge::store_distilled(&mut conn, id, &distilled, now)?;
-    print_knowledge(&knowledge::get_thread_knowledge(&conn, id)?);
+    print_knowledge(&knowledge::get_thread_knowledge(&conn, id)?, &o);
     Ok(())
 }
 
-/// The git repo root for the cwd (walks up for `.git`), else the cwd. For `cal memory`.
+/// The project key for the cwd (`knowledge::cwd_project_key`, shared with the MCP server):
+/// its git root with worktrees resolved to their main repo and the walk stopping at $HOME,
+/// else the cwd itself. For memory lookups and write-backs.
 fn cwd_project_root() -> String {
-    let cwd = std::env::current_dir().unwrap_or_default();
-    let mut dir = cwd.as_path();
+    knowledge::cwd_project_key().unwrap_or_default()
+}
+
+/// The git WORKING directory containing `dir` (the nearest `.git` dir or worktree file),
+/// else `dir`. Unlike the project key this keeps a worktree as itself, which is what git
+/// commands and files written into the checkout need. Never climbs above $HOME, so a
+/// `~/.git` dotfiles repo doesn't capture every directory under home.
+fn git_root_of(dir: &std::path::Path) -> std::path::PathBuf {
+    let home = dirs::home_dir().map(|h| std::fs::canonicalize(&h).unwrap_or(h));
+    let start = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let mut cur = start.as_path();
     loop {
-        if dir.join(".git").exists() {
-            return dir.to_string_lossy().into_owned();
+        if home.as_deref() == Some(cur) && cur != start.as_path() {
+            break;
         }
-        match dir.parent() {
-            Some(p) => dir = p,
+        if cur.join(".git").exists() {
+            return cur.to_path_buf();
+        }
+        match cur.parent() {
+            Some(p) => cur = p,
             None => break,
         }
     }
-    cwd.to_string_lossy().into_owned()
+    start
+}
+
+/// `git_root_of` the cwd, as a string. For `cal commits` / `audit-pr` / `agents`.
+fn cwd_git_root() -> String {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    git_root_of(&cwd).to_string_lossy().into_owned()
 }
 
 fn cmd_memory(args: &[String]) -> anyhow::Result<()> {
     let o = parse(args)?;
-    let raw = if o.positional.is_empty() {
-        cwd_project_root()
-    } else {
-        o.positional.join(" ")
-    };
-    // Normalize to the canonical project key so we match however the threads were indexed.
-    let project = crate::indexer::canonical_project(&raw).unwrap_or(raw);
+    let project = project_arg(&o);
     let conn = open_db()?;
     let mem = knowledge::get_project_memory(&conn, &project, o.limit.unwrap_or(40) as usize)?;
     if o.json {
-        println!("{}", serde_json::to_string_pretty(&mem)?);
+        println!("{}", o.json(&mem)?);
         return Ok(());
     }
     println!(
@@ -567,7 +775,7 @@ fn cmd_memory(args: &[String]) -> anyhow::Result<()> {
         }
         println!("\n{title}:");
         for f in facts {
-            println!("  - {}", f.text.trim());
+            println!("  - {}", o.shown(f.text.trim()));
         }
     };
     section("Decisions", &mem.decisions);
@@ -588,41 +796,232 @@ fn cmd_done(args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Resolve the project arg (positional or cwd) to its canonical key.
+/// Resolve the project arg (positional or cwd) to its canonical key, so it matches however
+/// the threads were indexed.
 fn project_arg(o: &Opts) -> String {
-    let raw = if o.positional.is_empty() {
+    if o.positional.is_empty() {
         cwd_project_root()
     } else {
-        o.positional.join(" ")
-    };
-    crate::indexer::canonical_project(&raw).unwrap_or(raw)
+        knowledge::project_key(&o.positional.join(" "))
+    }
 }
 
+/// `cal hook`: the SessionStart hook target. Prints the repo's memory, size-capped, for
+/// Claude Code to inject. Reads the hook payload from stdin (when there is one) to decide
+/// how much to send:
+/// - `resume`: nothing, the resumed transcript already holds the earlier injection;
+/// - `compact`: a short refresher (`MemoryBudget::COMPACT`), since compaction summarized
+///   the original injection away;
+/// - `startup` / `clear` / no payload: `MemoryBudget::HOOK`.
+///
+/// Also silent when the memory is already in context through a CLAUDE.md (or a file it
+/// `@`-imports) holding the Callimachus managed block, when a launcher that already put
+/// memory in the context file set `CALLIMACHUS_SKIP_HOOK=1`, and when there are no
+/// decisions, gotchas or pinned TODOs. Errors are swallowed by `run_hook_silently`.
 fn cmd_hook(args: &[String]) -> anyhow::Result<()> {
     let o = parse(args)?;
-    let project = project_arg(&o);
-    let conn = open_db()?;
-    let mem = knowledge::get_project_memory(&conn, &project, 40)?;
-    // Emit nothing when there's no memory — a SessionStart hook shouldn't add noise.
-    if mem.decisions.is_empty() && mem.gotchas.is_empty() && mem.open_todos.is_empty() {
+    let payload = read_hook_payload();
+    let source = payload
+        .as_ref()
+        .and_then(|v| v.get("source"))
+        .and_then(|x| x.as_str())
+        .unwrap_or("startup");
+    let Some(mut budget) = hook_budget(source) else {
+        return Ok(());
+    };
+    if source == "startup" && std::env::var("CALLIMACHUS_SKIP_HOOK").as_deref() == Ok("1") {
         return Ok(());
     }
-    println!("{}", export::agent_memory_md(&project, &mem, None));
+    if let Some(n) = o.limit {
+        budget.max_decisions = n as usize;
+        budget.max_gotchas = n as usize;
+    }
+    if let Some(chars) = o.budget {
+        budget.max_chars = chars;
+    }
+
+    let cwd = hook_cwd(payload.as_ref());
+    let project = if o.positional.is_empty() {
+        knowledge::project_key(&cwd.to_string_lossy())
+    } else {
+        knowledge::project_key(&o.positional.join(" "))
+    };
+    if claude_md_has_managed_block(&claude_md_dirs(&cwd)) {
+        return Ok(());
+    }
+    // Never create an index from inside a hook.
+    if !db::default_index_path().exists() {
+        return Ok(());
+    }
+    let conn = open_db()?;
+    let per_kind = budget
+        .fetch_limit()
+        .max(budget.max_decisions)
+        .max(budget.max_gotchas);
+    // Facts only: the budgeted renderer never prints the N/M-distilled coverage counts.
+    let mem = knowledge::get_project_memory_facts(&conn, &project, per_kind)?;
+    let pinned_todo = mem.open_todos.iter().any(|t| t.pinned);
+    if mem.decisions.is_empty() && mem.gotchas.is_empty() && !pinned_todo {
+        return Ok(());
+    }
+    println!(
+        "{}",
+        export::agent_memory_md_budgeted(&project, &mem, None, &budget)
+    );
     Ok(())
 }
 
+/// The memory budget for a SessionStart `source`, or None to stay silent.
+fn hook_budget(source: &str) -> Option<export::MemoryBudget> {
+    match source {
+        "resume" => None,
+        "compact" => Some(export::MemoryBudget::COMPACT),
+        _ => Some(export::MemoryBudget::HOOK),
+    }
+}
+
+/// The session's working directory: the hook payload's `cwd`, else `CLAUDE_PROJECT_DIR`,
+/// else the process cwd.
+fn hook_cwd(payload: Option<&serde_json::Value>) -> std::path::PathBuf {
+    payload
+        .and_then(|v| v.get("cwd"))
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("CLAUDE_PROJECT_DIR").map(std::path::PathBuf::from))
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
+}
+
+/// The JSON payload Claude Code writes to a hook's stdin, read without ever hanging: a TTY,
+/// an empty pipe, a pipe nobody closes, or malformed JSON all yield None. The read runs on
+/// a helper thread with a deadline because a blocked hook stalls the agent; if it is still
+/// blocked when we finish, process exit ends it.
+fn read_hook_payload() -> Option<serde_json::Value> {
+    use std::io::{IsTerminal, Read};
+    if std::io::stdin().is_terminal() {
+        return None;
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = String::new();
+        // Cap the read: a giant pasted prompt shouldn't cost us memory; we bail on it.
+        let _ = std::io::stdin()
+            .lock()
+            .take(8 * 1024 * 1024)
+            .read_to_string(&mut buf);
+        let _ = tx.send(buf);
+    });
+    let input = rx.recv_timeout(std::time::Duration::from_secs(2)).ok()?;
+    serde_json::from_str(input.trim()).ok()
+}
+
+/// The dirs whose CLAUDE.md Claude Code loads for a session in `cwd`: cwd and each of its
+/// ancestors, excluding the filesystem root (raw and resolved spellings). NOT the canonical
+/// project key: for a linked worktree that is the main checkout, whose CLAUDE.md a session
+/// in a sibling worktree never sees. A worktree nested under the repo
+/// (`<repo>/.claude/worktrees/x`) still reaches the repo's file as an ancestor.
+fn claude_md_dirs(cwd: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let resolved = std::fs::canonicalize(cwd).ok();
+    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+    for start in std::iter::once(cwd).chain(resolved.as_deref()) {
+        for dir in start.ancestors().filter(|d| d.parent().is_some()) {
+            if !dir.as_os_str().is_empty() && !dirs.iter().any(|d| d == dir) {
+                dirs.push(dir.to_path_buf());
+            }
+        }
+    }
+    dirs
+}
+
+/// Whether a CLAUDE.md that Claude Code auto-loads for this session (`<dir>/CLAUDE.md` or
+/// `<dir>/.claude/CLAUDE.md` for each dir), or a file one of them `@`-imports, already
+/// carries the Callimachus managed block, in which case the hook would inject the same
+/// memory a second time.
+fn claude_md_has_managed_block<P: AsRef<std::path::Path>>(dirs: &[P]) -> bool {
+    let mut checked = std::collections::HashSet::new();
+    for dir in dirs {
+        let dir = dir.as_ref();
+        for rel in ["CLAUDE.md", ".claude/CLAUDE.md"] {
+            let path = dir.join(rel);
+            if !checked.insert(path.clone()) {
+                continue;
+            }
+            let Some(text) = read_small_text(&path) else {
+                continue;
+            };
+            if text.contains(export::MANAGED_START) {
+                return true;
+            }
+            let base = path.parent().unwrap_or(dir);
+            for import in claude_md_imports(&text).into_iter().take(10) {
+                let target = resolve_import(base, import);
+                if read_small_text(&target).is_some_and(|t| t.contains(export::MANAGED_START)) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// `@path` imports in a CLAUDE.md (`@AGENTS.md`, `@docs/notes.md`, `@~/x.md`). Only tokens
+/// that look like paths, so `@someone` mentions are skipped.
+fn claude_md_imports(text: &str) -> Vec<&str> {
+    text.split_whitespace()
+        .filter_map(|tok| {
+            tok.trim_start_matches(['(', '"', '\'', '`'])
+                .strip_prefix('@')
+        })
+        .map(|p| p.trim_end_matches([',', '.', ')', ';', ':', '"', '\'', '`']))
+        .filter(|p| !p.is_empty() && (p.contains('.') || p.contains('/')))
+        .collect()
+}
+
+fn resolve_import(base: &std::path::Path, import: &str) -> std::path::PathBuf {
+    if let Some(rest) = import.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    }
+    let p = std::path::Path::new(import);
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        base.join(p)
+    }
+}
+
+/// A context file's text, skipping anything unreadable or implausibly large for one.
+fn read_small_text(path: &std::path::Path) -> Option<String> {
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > 2 * 1024 * 1024 {
+        return None;
+    }
+    std::fs::read_to_string(path).ok()
+}
+
+/// `cal agents`: write/refresh the managed memory block in the repo's AGENTS.md (or `-o`
+/// CLAUDE.md). Uses the AGENTS_FILE budget (the block is committed and read by every agent
+/// and teammate), and the safe writer, which refuses to touch a file it can't read as UTF-8.
 fn cmd_agents(args: &[String]) -> anyhow::Result<()> {
     let o = parse(args)?;
     let project = project_arg(&o);
+    // Write into the checkout we're in (a worktree stays a worktree), keyed on the project.
+    let dir = if o.positional.is_empty() {
+        cwd_git_root()
+    } else {
+        project.clone()
+    };
     let filename = o.out.clone().unwrap_or_else(|| "AGENTS.md".into());
     let conn = open_db()?;
-    let mem = knowledge::get_project_memory(&conn, &project, 100)?;
-    let body = export::agent_memory_md(&project, &mem, None);
-    let path = std::path::Path::new(&project).join(&filename);
-    let existing = std::fs::read_to_string(&path).unwrap_or_default();
-    std::fs::write(&path, export::upsert_managed_block(&existing, &body))?;
+    let budget = export::MemoryBudget::AGENTS_FILE;
+    let mem = knowledge::get_project_memory(&conn, &project, budget.fetch_limit())?;
+    let body = export::agent_memory_md_budgeted(&project, &mem, None, &budget);
+    let path = std::path::Path::new(&dir).join(&filename);
+    let changed = export::write_managed_block_file(&path, &body)?;
     eprintln!(
-        "wrote {} ({}/{} threads distilled)",
+        "{} {} ({}/{} threads distilled)",
+        if changed { "wrote" } else { "unchanged:" },
         path.display(),
         mem.distilled_count,
         mem.thread_count
@@ -637,8 +1036,10 @@ fn cmd_remember(args: &[String]) -> anyhow::Result<()> {
     }
     let kind = o.positional[0].to_ascii_lowercase();
     let text = o.positional[1..].join(" ");
-    let raw = o.project.clone().unwrap_or_else(cwd_project_root);
-    let project = crate::indexer::canonical_project(&raw).unwrap_or(raw);
+    let project = o
+        .project
+        .as_deref()
+        .map_or_else(cwd_project_root, knowledge::project_key);
     let mut conn = open_db_write()?;
     let now = chrono::Utc::now().timestamp();
     let rationale = o
@@ -646,10 +1047,18 @@ fn cmd_remember(args: &[String]) -> anyhow::Result<()> {
         .as_deref()
         .map(str::trim)
         .filter(|r| !r.is_empty());
+    // Agent origin: agents run `cal remember` too, and an agent write-back is not pinned.
     knowledge::record_fact(&conn, &project, &kind, &text, rationale, now)?;
-    // Embed so it is immediately recallable.
-    let embedder = embed::Embedder::default();
-    embed::embed_pending_facts_conn(&mut conn, &embedder)?;
+    // Embed now so it is immediately recallable, but only with a model already on disk
+    // (agents call this mid-task; a 128 MB download must not happen here). The app's
+    // background job embeds it otherwise. The fact is saved either way, so an embedding
+    // failure is not reported as a failed command (which would invite a duplicate retry).
+    if embed::model_is_cached() {
+        let embedder = one_shot_embedder();
+        if let Err(e) = embed::embed_pending_facts_conn(&mut conn, &embedder) {
+            eprintln!("(saved; embedding deferred to the app: {e})");
+        }
+    }
     eprintln!("remembered {kind} for {project}");
     Ok(())
 }
@@ -662,14 +1071,14 @@ fn cmd_check(args: &[String]) -> anyhow::Result<()> {
         anyhow::bail!("usage: cal check <proposal…> [-p PROJECT]");
     }
     let proposal = o.positional.join(" ");
-    let embedder = embed::Embedder::default();
+    let embedder = cli_embedder();
     let Some(qv) = embed::embed_query(&embedder, &proposal)? else {
         return Ok(());
     };
     let conn = open_db()?;
     let hits = knowledge::check_contradiction(&conn, &qv, o.project.as_deref(), 8)?;
     if o.json {
-        println!("{}", serde_json::to_string_pretty(&hits)?);
+        println!("{}", o.json(&hits)?);
         return Ok(());
     }
     if hits.is_empty() {
@@ -680,14 +1089,14 @@ fn cmd_check(args: &[String]) -> anyhow::Result<()> {
     for h in &hits {
         println!(
             "\n  • {}  ({:.0}% match)",
-            h.text.trim(),
+            o.shown(h.text.trim()),
             h.similarity * 100.0
         );
         if let Some(why) = h.rationale.as_deref().filter(|w| !w.is_empty()) {
-            println!("    because: {}", why.trim());
+            println!("    because: {}", o.shown(why.trim()));
         }
         if let Some(title) = h.title.as_deref() {
-            println!("    from: {title}");
+            println!("    from: {}", o.shown(title));
         }
     }
     Ok(())
@@ -721,6 +1130,7 @@ fn cmd_audit_pr(args: &[String]) -> anyhow::Result<()> {
     let mut files: Vec<String> = Vec::new();
     let mut shas: Vec<String> = Vec::new();
     let mut cap: i64 = 5; // per-file / per-sha thread cap
+    let mut raw = false;
     let split = |v: &str| -> Vec<String> {
         v.split(',')
             .map(|s| s.trim().to_string())
@@ -747,13 +1157,14 @@ fn cmd_audit_pr(args: &[String]) -> anyhow::Result<()> {
                 cap = args.get(i).and_then(|v| v.parse().ok()).unwrap_or(cap);
             }
             "--json" => {} // JSON is this command's only output
+            "--raw" => raw = true,
             s if !s.starts_with('-') && repo.is_none() => repo = Some(s.to_string()),
             _ => {}
         }
         i += 1;
     }
-    let repo = repo.unwrap_or_else(cwd_project_root);
-    let key = crate::indexer::canonical_project(&repo).unwrap_or_else(|| repo.clone());
+    let repo = repo.unwrap_or_else(cwd_git_root);
+    let key = knowledge::project_key(&repo);
 
     let conn = open_db_write()?;
     // Refresh thread↔commit links for the branch first; provenance is empty without this.
@@ -839,23 +1250,28 @@ fn cmd_audit_pr(args: &[String]) -> anyhow::Result<()> {
             "threadKnowledgeAvailable": distill_on,
         },
     });
-    println!("{}", serde_json::to_string_pretty(&bundle)?);
+    // Titles, distilled reasoning, error signatures and memory, all for another agent.
+    let out = Opts {
+        raw,
+        ..Opts::default()
+    };
+    println!("{}", out.json(&bundle)?);
     Ok(())
 }
 
 fn cmd_commits(args: &[String]) -> anyhow::Result<()> {
     let o = parse(args)?;
     let repo = if o.positional.is_empty() {
-        cwd_project_root()
+        cwd_git_root()
     } else {
         o.positional.join(" ")
     };
-    let key = crate::indexer::canonical_project(&repo).unwrap_or_else(|| repo.clone());
+    let key = knowledge::project_key(&repo);
     let conn = open_db_write()?;
     let n = gitlink::link_project(&conn, &repo)?;
     let rows = gitlink::commit_timeline(&conn, &key, o.limit.unwrap_or(40) as usize)?;
     if o.json {
-        println!("{}", serde_json::to_string_pretty(&rows)?);
+        println!("{}", o.json(&rows)?);
         return Ok(());
     }
     if rows.is_empty() {
@@ -878,7 +1294,7 @@ fn cmd_commits(args: &[String]) -> anyhow::Result<()> {
             threads,
             r.best_overlap,
             if r.best_overlap == 1 { "" } else { "s" },
-            r.subject.as_deref().unwrap_or("")
+            o.shown(r.subject.as_deref().unwrap_or(""))
         );
     }
     Ok(())
@@ -893,7 +1309,7 @@ fn cmd_files(args: &[String]) -> anyhow::Result<()> {
     let conn = open_db()?;
     let threads = search::threads_with_file(&conn, &path, o.limit.unwrap_or(40) as i64)?;
     if o.json {
-        println!("{}", serde_json::to_string_pretty(&threads)?);
+        println!("{}", o.json(&threads)?);
         return Ok(());
     }
     if threads.is_empty() {
@@ -901,7 +1317,11 @@ fn cmd_files(args: &[String]) -> anyhow::Result<()> {
         return Ok(());
     }
     for t in &threads {
-        println!("{:>6}  {}", t.id, t.title.as_deref().unwrap_or("untitled"));
+        println!(
+            "{:>6}  {}",
+            t.id,
+            o.shown(t.title.as_deref().unwrap_or("untitled"))
+        );
     }
     Ok(())
 }
@@ -913,7 +1333,7 @@ fn cmd_ask(args: &[String]) -> anyhow::Result<()> {
         anyhow::bail!("usage: cal ask <question…>");
     }
     let conn = open_db()?;
-    let embedder = embed::Embedder::default();
+    let embedder = cli_embedder();
     let qv = embed::embed_query(&embedder, &question)?;
     let Some(prep) = crate::prepare_ask(&conn, &question, qv.as_deref())? else {
         eprintln!("nothing relevant found in your history");
@@ -929,13 +1349,15 @@ fn cmd_ask(args: &[String]) -> anyhow::Result<()> {
         &question,
         &prep.context,
     ))?;
-    println!("{answer}\n");
+    // The context the model saw was redacted, but it can still echo a secret from the
+    // question, and the source titles come straight from the index.
+    println!("{}\n", o.shown(&answer));
     println!("Sources:");
     for s in &prep.sources {
         println!(
             "  [thread {}] {}",
             s.thread_id,
-            s.title.as_deref().unwrap_or("untitled")
+            o.shown(s.title.as_deref().unwrap_or("untitled"))
         );
     }
     Ok(())
@@ -953,14 +1375,14 @@ fn cmd_recall(args: &[String], kind: &str) -> anyhow::Result<()> {
         anyhow::bail!("usage: cal {cmd} <query…>");
     }
     let conn = open_db()?;
-    let embedder = embed::Embedder::default();
+    let embedder = cli_embedder();
     let Some(qv) = embed::embed_query(&embedder, &query)? else {
         return Ok(());
     };
     let limit = o.limit.unwrap_or(20) as usize;
     let hits = knowledge::recall(&conn, &qv, kind, o.project.as_deref(), limit)?;
     if o.json {
-        println!("{}", serde_json::to_string_pretty(&hits)?);
+        println!("{}", o.json(&hits)?);
         return Ok(());
     }
     if hits.is_empty() {
@@ -968,10 +1390,10 @@ fn cmd_recall(args: &[String], kind: &str) -> anyhow::Result<()> {
         return Ok(());
     }
     for h in &hits {
-        println!("• {}", h.text);
+        println!("• {}", o.shown(&h.text));
         println!(
             "    {} · thread {} · {:.0}% match",
-            h.title.as_deref().unwrap_or("untitled"),
+            o.shown(h.title.as_deref().unwrap_or("untitled")),
             h.thread_id,
             h.similarity * 100.0
         );
@@ -988,14 +1410,14 @@ fn cmd_similar(args: &[String]) -> anyhow::Result<()> {
         anyhow::bail!("usage: cal similar <task description…>  [-p <project>]");
     }
     let conn = open_db()?;
-    let embedder = embed::Embedder::default();
+    let embedder = cli_embedder();
     let Some(qv) = embed::embed_query(&embedder, &query)? else {
         return Ok(());
     };
     let limit = o.limit.unwrap_or(8) as usize;
     let hits = knowledge::find_prior_work(&conn, &qv, o.project.as_deref(), limit)?;
     if o.json {
-        println!("{}", serde_json::to_string_pretty(&hits)?);
+        println!("{}", o.json(&hits)?);
         return Ok(());
     }
     if hits.is_empty() {
@@ -1005,11 +1427,11 @@ fn cmd_similar(args: &[String]) -> anyhow::Result<()> {
     for h in &hits {
         println!(
             "• {} · thread {} · {:.0}% match",
-            h.title.as_deref().unwrap_or("untitled"),
+            o.shown(h.title.as_deref().unwrap_or("untitled")),
             h.thread_id,
             h.similarity * 100.0
         );
-        println!("    {}: {}", h.kind, h.snippet);
+        println!("    {}: {}", h.kind, o.shown(&h.snippet));
     }
     Ok(())
 }
@@ -1035,7 +1457,7 @@ fn cmd_stats(args: &[String]) -> anyhow::Result<()> {
     let s = search::stats(&conn)?;
 
     if o.json {
-        println!("{}", serde_json::to_string_pretty(&s)?);
+        println!("{}", o.json(&s)?);
         return Ok(());
     }
 
@@ -1148,12 +1570,15 @@ fn cmd_snapshot(args: &[String]) -> anyhow::Result<()> {
     let conn = open_db_write()?;
     let snap = snapshot::create(&conn, id, o.label.as_deref())?;
     if o.json {
-        println!("{}", serde_json::to_string_pretty(&snap)?);
+        println!("{}", o.json(&snap)?);
         return Ok(());
     }
     println!(
         "Saved snapshot #{} \"{}\" (~{} tokens). Resume with: cal resume {}",
-        snap.id, snap.label, snap.token_estimate, snap.id
+        snap.id,
+        o.shown(&snap.label),
+        snap.token_estimate,
+        snap.id
     );
     Ok(())
 }
@@ -1169,7 +1594,7 @@ fn cmd_snapshots(args: &[String]) -> anyhow::Result<()> {
     let conn = open_db()?;
     let snaps = snapshot::list(&conn, project.as_deref(), o.limit.unwrap_or(40) as usize)?;
     if o.json {
-        println!("{}", serde_json::to_string_pretty(&snaps)?);
+        println!("{}", o.json(&snaps)?);
         return Ok(());
     }
     if snaps.is_empty() {
@@ -1182,13 +1607,20 @@ fn cmd_snapshots(args: &[String]) -> anyhow::Result<()> {
             s.id,
             fmt_time(Some(s.created_at)),
             s.source_kind.as_deref().unwrap_or("?"),
-            s.label
+            o.shown(&s.label)
         );
     }
     Ok(())
 }
 
 /// `cal resume <snapshot-id> [-a agent]` — relaunch an agent CLI seeded with a snapshot.
+///
+/// On macOS and Linux `cal` already runs in a terminal, so the agent runs right here with
+/// inherited stdio (no new Terminal window). On Windows it opens in a new console window
+/// instead: `cal.exe` is the GUI-subsystem app exe, which cmd and PowerShell don't wait for,
+/// so an agent TUI run in place would fight the shell's prompt for the same keystrokes.
+/// Either way the session gets `CALLIMACHUS_SKIP_HOOK=1`: the snapshot already carries the
+/// project's memory block, so the SessionStart hook must not inject a second copy.
 fn cmd_resume(args: &[String]) -> anyhow::Result<()> {
     let o = parse(args)?;
     let id: i64 = o
@@ -1200,48 +1632,91 @@ fn cmd_resume(args: &[String]) -> anyhow::Result<()> {
     let conn = open_db()?;
     let snap = snapshot::load(&conn, id)?
         .ok_or_else(|| anyhow::anyhow!("no snapshot #{id} (see `cal snapshots`)"))?;
+    drop(conn);
     let agent = o.agent.as_deref().unwrap_or("claude");
-    let file = agent::cli_resume::launch_with_context(
-        agent,
-        &snap.body,
-        snap.meta.project_path.as_deref(),
-    )?;
-    println!(
-        "Launched {agent} with snapshot #{id} (\"{}\"). Context: {file}",
-        snap.meta.label
+    if cfg!(windows) {
+        let file = agent::cli_resume::launch_with_context(
+            agent,
+            &snap.body,
+            snap.meta.project_path.as_deref(),
+        )?;
+        eprintln!(
+            "Opened snapshot #{id} (\"{}\") in {agent} in a new window. Context: {file}",
+            snap.meta.label
+        );
+        return Ok(());
+    }
+    let file = agent::cli_resume::write_context_file(&snap.body)?;
+    let prompt = agent::cli_resume::context_prompt(&file);
+    eprintln!(
+        "Resuming snapshot #{id} (\"{}\") in {agent}. Context: {}",
+        snap.meta.label,
+        file.display()
     );
+    run_agent_here(agent, &prompt, snap.meta.project_path.as_deref())?;
     Ok(())
 }
 
-/// Internal hook target for Claude Code's PreCompact / SubagentStop events. Reads the hook's
-/// JSON from stdin, maps the live session's `transcript_path` to its indexed thread, and saves
-/// a snapshot so context survives the compaction / the finished subagent's work is captured.
-/// Best-effort and SILENT: a hook must never break the agent loop, so every failure (no index,
-/// session not indexed yet, bad payload) just exits 0 without output.
-fn cmd_snapshot_hook(_args: &[String]) -> anyhow::Result<()> {
-    use std::io::Read;
-    let mut input = String::new();
-    if std::io::stdin().read_to_string(&mut input).is_err() {
-        return Ok(());
-    }
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&input) else {
-        return Ok(());
+/// Run an agent CLI in this terminal (inherited stdio) and wait for it to exit.
+fn run_agent_here(
+    agent: &str,
+    prompt: &str,
+    cwd: Option<&str>,
+) -> anyhow::Result<std::process::ExitStatus> {
+    let command = |program: &str| {
+        let mut c = std::process::Command::new(program);
+        c.arg(prompt).env(agent::cli_resume::SKIP_HOOK_ENV, "1");
+        if let Some(dir) = cwd.filter(|d| std::path::Path::new(d).is_dir()) {
+            c.current_dir(dir);
+        }
+        c
     };
-    let Some(transcript) = v.get("transcript_path").and_then(|x| x.as_str()) else {
+    match command(agent).status() {
+        Ok(status) => Ok(status),
+        // npm installs agent CLIs on Windows as `.cmd` shims, which a bare name doesn't
+        // resolve to.
+        #[cfg(windows)]
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => command(&format!("{agent}.cmd"))
+            .status()
+            .map_err(|e| anyhow::anyhow!("couldn't start `{agent}`: {e}")),
+        Err(e) => Err(anyhow::anyhow!("couldn't start `{agent}`: {e}")),
+    }
+}
+
+/// Internal hook target for Claude Code's PreCompact event. Reads the hook's JSON from
+/// stdin, maps the live session's `transcript_path` to its indexed thread, and saves a
+/// rolling snapshot so context survives the compaction. Best-effort and SILENT
+/// (`run_hook_silently`): a hook must never break the agent loop.
+fn cmd_snapshot_hook(_args: &[String]) -> anyhow::Result<()> {
+    let Some(v) = read_hook_payload() else {
         return Ok(());
     };
     let event = v
         .get("hook_event_name")
         .and_then(|x| x.as_str())
         .unwrap_or("hook");
-    let Some(external_id) = claude_external_id(transcript) else {
+    // SubagentStop's transcript_path is the PARENT session, so snapshotting there re-packed
+    // the whole parent on every subagent stop (dozens per workflow) and captured nothing of
+    // the subagent. The installer no longer registers it; ignore it from older installs.
+    if event == "SubagentStop" {
+        return Ok(());
+    }
+    let Some(transcript) = v.get("transcript_path").and_then(|x| x.as_str()) else {
         return Ok(());
     };
     // Only act when an index already exists — never create one from inside a hook.
     if !db::default_index_path().exists() {
         return Ok(());
     }
-    let conn = open_db_write()?;
+    let conn = open_hook_db_write()?;
+    // Fail fast rather than holding up the compaction while the app's writer is busy.
+    conn.busy_timeout(std::time::Duration::from_secs(2))?;
+    // A relocated Claude config saved in Settings must map transcripts to the same ids the
+    // indexer wrote, so apply it before deriving the id.
+    crate::indexer::claude::load_config_dir_setting(&conn);
+    let Some(external_id) = claude_external_id(transcript) else {
+        return Ok(());
+    };
     let thread_id: Option<i64> = conn
         .query_row(
             "SELECT t.id FROM threads t JOIN sources s ON s.id = t.source_id
@@ -1251,40 +1726,60 @@ fn cmd_snapshot_hook(_args: &[String]) -> anyhow::Result<()> {
         )
         .ok();
     if let Some(tid) = thread_id {
-        // Ignore errors: a failed auto-snapshot must not surface to the agent.
-        let _ = snapshot::create_rolling_auto(&conn, tid, event);
+        snapshot::create_rolling_auto(&conn, tid, event)?;
     }
     Ok(())
 }
 
 /// Map a Claude Code hook's absolute `transcript_path` back to the indexed thread's
-/// `external_id` (the path relative to `~/.claude/projects`).
+/// `external_id`. Must produce byte-identical ids to the indexer (same projects root,
+/// honoring `CLAUDE_CONFIG_DIR`, and '/' separators on every OS), or snapshots silently stop
+/// matching their thread on Windows and for relocated configs.
 fn claude_external_id(transcript_path: &str) -> Option<String> {
-    let home = dirs::home_dir()?;
-    external_id_under(transcript_path, &home.join(".claude/projects"))
+    let root = crate::indexer::claude::projects_root()?;
+    external_id_resolving(transcript_path, &root)
 }
 
-/// The path of `transcript_path` relative to `base`, as a string (the indexed `external_id`).
+/// [`external_id_under`], retried with symlinks resolved on both sides.
+fn external_id_resolving(transcript_path: &str, root: &std::path::Path) -> Option<String> {
+    external_id_under(transcript_path, root).or_else(|| {
+        // The Settings override is stored canonical (symlinks resolved), but Claude Code
+        // reports transcripts under the spelling it was configured with.
+        let real = std::fs::canonicalize(transcript_path).ok()?;
+        let real_root = std::fs::canonicalize(root).ok()?;
+        external_id_under(&real.to_string_lossy(), &real_root)
+    })
+}
+
+/// The id of `transcript_path` relative to `base`, as the indexer writes it, or None when
+/// the transcript isn't under `base`.
 fn external_id_under(transcript_path: &str, base: &std::path::Path) -> Option<String> {
-    std::path::Path::new(transcript_path)
-        .strip_prefix(base)
-        .ok()?
-        .to_str()
-        .map(str::to_string)
+    let path = std::path::Path::new(transcript_path);
+    path.strip_prefix(base).ok()?;
+    Some(crate::indexer::claude::external_id_for(base, path))
 }
 
-/// `cal recall-now` — a Claude Code UserPromptSubmit hook target. Reads the submitted prompt from
-/// the hook JSON on stdin; when it STRONGLY matches prior solved work, prints a short note that
-/// Claude Code injects into the agent's context ("you may have solved this before"). SILENT +
-/// best-effort: a weak/no match, no index, or any error just exits 0 with no output, so it never
-/// blocks the prompt. A strict floor + per-session dedup keep it signal, not noise.
+/// Cosine floor for an UNPROMPTED "you may have solved this before" note. bge-small scores
+/// cluster high, so this sits well above the on-demand guard's 0.55.
+const PROACTIVE_FLOOR: f32 = 0.68;
+
+/// Most notes per prompt, and most prompts per session that get one.
+const PROACTIVE_MAX_HITS: usize = 2;
+const PROACTIVE_MAX_INJECTIONS: u32 = 3;
+
+/// `cal recall-now`: a Claude Code UserPromptSubmit hook target. Reads the submitted
+/// prompt from the hook JSON on stdin; when it STRONGLY matches prior solved work, prints a
+/// short note that Claude Code injects into the agent's context ("you may have worked on
+/// this before"). It runs on every prompt, so the cheap gates come first and the embedding
+/// model is touched last:
+/// 1. the prompt is a real request (not a slash command, at least ~5 words);
+/// 2. an index exists and the model is already downloaded (a hook never downloads it);
+/// 3. this session hasn't used up its injections;
+/// 4. some decision/gotcha in the project mentions the prompt's key terms (plain SQL).
+///
+/// SILENT and best-effort: no match or any error exits 0 with no output.
 fn cmd_recall_now(_args: &[String]) -> anyhow::Result<()> {
-    use std::io::Read;
-    let mut input = String::new();
-    if std::io::stdin().read_to_string(&mut input).is_err() {
-        return Ok(());
-    }
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&input) else {
+    let Some(v) = read_hook_payload() else {
         return Ok(());
     };
     let prompt = v
@@ -1292,54 +1787,101 @@ fn cmd_recall_now(_args: &[String]) -> anyhow::Result<()> {
         .and_then(|x| x.as_str())
         .unwrap_or("")
         .trim();
-    if prompt.chars().count() < 12 {
-        return Ok(()); // too short to match anything meaningful
+    if !prompt_worth_recalling(prompt) {
+        return Ok(());
     }
-    if !db::default_index_path().exists() {
+    if !db::default_index_path().exists() || !embed::model_is_cached() {
         return Ok(());
     }
     let session = v.get("session_id").and_then(|x| x.as_str()).unwrap_or("");
+    let mut state = load_recall_state(session);
+    if state.injections >= PROACTIVE_MAX_INJECTIONS {
+        return Ok(());
+    }
     let project = v
         .get("cwd")
         .and_then(|x| x.as_str())
         .and_then(crate::indexer::canonical_project);
 
     let conn = open_db()?;
-    let embedder = embed::Embedder::default();
-    let Some(qv) = embed::embed_query(&embedder, prompt)? else {
+    let terms = knowledge::prompt_terms(prompt, 8);
+    if !knowledge::has_keyword_candidates(&conn, &terms, project.as_deref())? {
+        return Ok(());
+    }
+    // bge-small reads ~512 tokens; embedding more of a long prompt only costs time.
+    let query: String = prompt.chars().take(1500).collect();
+    // Cached-only: even if the model vanished since the check above, never download here.
+    let embedder = one_shot_embedder();
+    let Some(qv) = embed::embed_query_cached_only(&embedder, &query)? else {
         return Ok(());
     };
     let hits = knowledge::find_prior_work(&conn, &qv, project.as_deref(), 5)?;
-
-    // Stricter than the on-demand guard: an UNPROMPTED interruption must be clearly relevant, so
-    // surface only genuinely strong matches.
-    const PROACTIVE_FLOOR: f32 = 0.62;
-    let mut hits: Vec<_> = hits
-        .into_iter()
-        .filter(|h| h.similarity >= PROACTIVE_FLOOR)
-        .collect();
-
-    // Per-session dedup: never surface the same thread twice in one session.
-    let mut seen = load_recall_seen(session);
-    hits.retain(|h| !seen.contains(&h.thread_id));
+    let hits = select_recall_hits(hits, &state.threads);
     if hits.is_empty() {
         return Ok(());
     }
-    hits.truncate(2);
-    for h in &hits {
-        seen.insert(h.thread_id);
-    }
-    save_recall_seen(session, &seen);
+    state.threads.extend(hits.iter().map(|h| h.thread_id));
+    state.injections += 1;
+    save_recall_state(session, &state);
 
     println!("[Callimachus] You may have worked on this before. Reuse it before redoing:");
     for h in &hits {
-        let title = h.title.as_deref().unwrap_or("(untitled)");
-        println!("  • {title}  ({}: {})", h.kind, h.snippet.trim());
+        println!("{}", recall_line(h));
     }
     Ok(())
 }
 
-/// Per-session cache of thread ids already surfaced by `recall-now`, so it doesn't repeat itself.
+/// One recall hit as a bullet line, scrubbed like every other injection surface
+/// (`export::fact_line`): titles are often the first prompt and older facts were stored
+/// unredacted, so secrets are redacted, and a multi-line snippet is flattened so it can't
+/// break the list.
+fn recall_line(h: &knowledge::PriorWork) -> String {
+    let title = h
+        .title
+        .as_deref()
+        .map(|t| export::fact_line(t, 120))
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| "(untitled)".into());
+    let snippet = export::fact_line(&h.snippet, 300);
+    format!("  • {title}  ({}: {snippet})", h.kind)
+}
+
+/// Whether a submitted prompt is worth a recall lookup: not a slash command, and long
+/// enough (5+ words) to say what the task is.
+fn prompt_worth_recalling(prompt: &str) -> bool {
+    !prompt.starts_with('/')
+        && prompt.chars().count() >= 12
+        && prompt.split_whitespace().count() >= 5
+}
+
+/// Pick what to surface from `find_prior_work`'s hits (best first). Strict on purpose: if
+/// the BEST match was already shown this session, show nothing rather than falling through
+/// to weaker matches (repeating a prompt used to surface progressively less related
+/// threads). Otherwise keep unseen hits above the floor, at most PROACTIVE_MAX_HITS.
+fn select_recall_hits(
+    hits: Vec<knowledge::PriorWork>,
+    seen: &std::collections::HashSet<i64>,
+) -> Vec<knowledge::PriorWork> {
+    match hits.first() {
+        Some(best) if !seen.contains(&best.thread_id) => {}
+        _ => return Vec::new(),
+    }
+    hits.into_iter()
+        .filter(|h| h.similarity >= PROACTIVE_FLOOR && !seen.contains(&h.thread_id))
+        .take(PROACTIVE_MAX_HITS)
+        .collect()
+}
+
+/// Per-session `recall-now` state: threads already surfaced, and how many prompts got a note.
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct RecallState {
+    #[serde(default)]
+    threads: std::collections::HashSet<i64>,
+    #[serde(default)]
+    injections: u32,
+}
+
+/// Per-session cache file for `recall-now`, so it doesn't repeat itself.
 fn recall_seen_path(session: &str) -> Option<std::path::PathBuf> {
     let home = dirs::home_dir()?;
     let safe: String = session
@@ -1353,19 +1895,29 @@ fn recall_seen_path(session: &str) -> Option<std::path::PathBuf> {
     )
 }
 
-fn load_recall_seen(session: &str) -> std::collections::HashSet<i64> {
-    recall_seen_path(session)
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| serde_json::from_str(&s).ok())
+fn load_recall_state(session: &str) -> RecallState {
+    let Some(text) = recall_seen_path(session).and_then(|p| std::fs::read_to_string(p).ok()) else {
+        return RecallState::default();
+    };
+    serde_json::from_str::<RecallState>(&text)
+        .or_else(|_| {
+            // Older versions stored just the set of thread ids (up to 2 per injection).
+            serde_json::from_str::<std::collections::HashSet<i64>>(&text).map(|threads| {
+                RecallState {
+                    injections: threads.len().div_ceil(2) as u32,
+                    threads,
+                }
+            })
+        })
         .unwrap_or_default()
 }
 
-fn save_recall_seen(session: &str, seen: &std::collections::HashSet<i64>) {
+fn save_recall_state(session: &str, state: &RecallState) {
     if let Some(p) = recall_seen_path(session) {
         if let Some(dir) = p.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        if let Ok(json) = serde_json::to_string(seen) {
+        if let Ok(json) = serde_json::to_string(state) {
             let _ = std::fs::write(p, json);
         }
     }
@@ -1388,7 +1940,7 @@ fn cmd_issues(args: &[String]) -> anyhow::Result<()> {
         o.limit.unwrap_or(20) as usize,
     )?;
     if o.json {
-        println!("{}", serde_json::to_string_pretty(&found)?);
+        println!("{}", o.json(&found)?);
         return Ok(());
     }
     if found.is_empty() {
@@ -1408,7 +1960,7 @@ fn cmd_issues(args: &[String]) -> anyhow::Result<()> {
             threads,
             fmt_time(Some(i.last_seen))
         );
-        println!("    {}", i.example.trim());
+        println!("    {}", o.shown(i.example.trim()));
     }
     Ok(())
 }
@@ -1425,7 +1977,7 @@ fn cmd_cost(args: &[String]) -> anyhow::Result<()> {
     // All-time by default (cost is a lifetime figure); `since = 0`.
     let s = cost::spend(&conn, 0, project.as_deref(), o.limit.unwrap_or(8) as usize)?;
     if o.json {
-        println!("{}", serde_json::to_string_pretty(&s)?);
+        println!("{}", o.json(&s)?);
         return Ok(());
     }
     if s.tracked_calls == 0 && s.untracked_calls == 0 {
@@ -1458,7 +2010,7 @@ fn cmd_cost(args: &[String]) -> anyhow::Result<()> {
             "  ${:>9.2}   #{}  {}",
             t.cost,
             t.thread_id,
-            t.title.as_deref().unwrap_or("")
+            o.shown(t.title.as_deref().unwrap_or(""))
         );
     }
     println!("\n(estimate from list prices; not a billing record)");
@@ -1503,6 +2055,267 @@ mod tests {
     }
 
     #[test]
+    fn parse_reads_hook_budget() {
+        let o = parse(&argv(&["--budget", "4000", "-n", "5"])).unwrap();
+        assert_eq!(o.budget, Some(4000));
+        assert_eq!(o.limit, Some(5));
+        assert!(parse(&argv(&["--budget", "lots"])).is_err());
+    }
+
+    #[test]
+    fn parse_reads_raw() {
+        assert!(parse(&argv(&["--raw", "q"])).unwrap().raw);
+        assert!(!parse(&argv(&["q"])).unwrap().raw);
+    }
+
+    /// Query commands print stored history, which agents read too (the /recall skill's CLI
+    /// fallback, the VS Code extension's `--json`). A planted key comes out redacted in human
+    /// and JSON output alike, `--raw` prints it as stored, and the JSON is otherwise
+    /// byte-identical to what `--json` printed before.
+    #[test]
+    fn query_output_redacts_secrets_unless_raw() {
+        const KEY: &str = "sk-ant-api03-AbCdEfGhIjKlMnOpQrStUv0123456789";
+        const KEY_TAIL: &str = "AbCdEfGhIjKlMnOpQrStUv0123456789";
+        let mut conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let sid = crate::indexer::source_id(&conn, "claude_code").unwrap();
+        let threads = [
+            (
+                "leaky",
+                format!("wire the gateway with {KEY}"),
+                format!("the gateway rejects {KEY} on staging"),
+            ),
+            (
+                "clean",
+                "gateway timeouts".to_string(),
+                "the gateway times out under load".to_string(),
+            ),
+        ];
+        for (external_id, title, text) in threads {
+            let t = crate::indexer::ParsedThread {
+                external_id: external_id.into(),
+                title: Some(title),
+                project_path: Some("/proj/app".into()),
+                messages: vec![crate::indexer::ParsedMessage {
+                    role: "user".into(),
+                    text,
+                    tool_name: None,
+                    ts: Some(1_000),
+                }],
+                ..Default::default()
+            };
+            crate::indexer::upsert_thread(&mut conn, sid, &t).unwrap();
+        }
+        type Cmd = fn(&Connection, &Opts) -> anyhow::Result<String>;
+        let run = |cmd: Cmd, args: &[&str]| cmd(&conn, &parse(&argv(args)).unwrap()).unwrap();
+        let assert_scrubbed = |out: &str| {
+            assert!(out.contains("[REDACTED]"), "{out}");
+            assert!(!out.contains(KEY_TAIL), "{out}");
+        };
+
+        let json = run(search_output, &["gateway", "--json"]);
+        assert_scrubbed(&json);
+        let hits: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
+        let leaky = hits
+            .iter()
+            .find(|h| h["title"] == "wire the gateway with [REDACTED]");
+        assert_eq!(
+            leaky.expect("the leaky thread matches")["snippet"],
+            "the gateway rejects [REDACTED] on staging"
+        );
+        assert!(
+            hits.iter()
+                .any(|h| h["snippet"].as_str().unwrap().contains('\u{1}')),
+            "a clean snippet keeps its highlights: {json}"
+        );
+        // A match inside the key splits it with sentinels; the JSON still never carries it.
+        assert_scrubbed(&run(search_output, &["api03", "--json"]));
+
+        let text = run(search_output, &["gateway"]);
+        assert_scrubbed(&text);
+        assert!(text.contains("wire the gateway with [REDACTED]"), "{text}");
+        assert!(
+            text.contains("    the gateway rejects [REDACTED] on staging"),
+            "{text}"
+        );
+
+        let recent = run(recent_output, &[]);
+        assert_scrubbed(&recent);
+        assert!(
+            recent.contains("wire the gateway with [REDACTED]"),
+            "{recent}"
+        );
+
+        // --raw prints the history as stored, and the redacted JSON differs from it only
+        // where the key was.
+        assert!(run(search_output, &["gateway", "--json", "--raw"]).contains(KEY));
+        assert!(run(search_output, &["gateway", "--raw"]).contains(KEY));
+        assert!(run(recent_output, &["--raw"]).contains(KEY));
+        let raw_json = run(recent_output, &["--json", "--raw"]);
+        assert!(raw_json.contains(KEY), "{raw_json}");
+        assert_eq!(
+            run(recent_output, &["--json"]),
+            raw_json.replace(KEY, "[REDACTED]")
+        );
+    }
+
+    #[test]
+    fn hook_commands_never_fail_visibly() {
+        // A bad flag is an error for a normal command but a silent exit 0 for a hook.
+        assert_eq!(run_and_exit(&argv(&["hook", "--nope"])), 0);
+        assert_eq!(run_and_exit(&argv(&["bogus-cmd"])), 1);
+    }
+
+    #[test]
+    fn hook_budget_follows_session_source() {
+        assert_eq!(hook_budget("resume"), None, "resume re-sends nothing");
+        assert_eq!(hook_budget("compact"), Some(export::MemoryBudget::COMPACT));
+        assert_eq!(hook_budget("startup"), Some(export::MemoryBudget::HOOK));
+        assert_eq!(hook_budget("clear"), Some(export::MemoryBudget::HOOK));
+    }
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "calli_cli_{tag}_{}_{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn detects_managed_block_in_claude_md_and_its_imports() {
+        let plain = temp_dir("plain");
+        std::fs::write(plain.join("CLAUDE.md"), "# rules\n\nbe nice\n").unwrap();
+        assert!(!claude_md_has_managed_block(&[plain.as_path()]));
+
+        let direct = temp_dir("direct");
+        std::fs::create_dir_all(direct.join(".claude")).unwrap();
+        std::fs::write(
+            direct.join(".claude/CLAUDE.md"),
+            export::upsert_managed_block("", "BODY"),
+        )
+        .unwrap();
+        assert!(claude_md_has_managed_block(&[direct.as_path()]));
+
+        let imported = temp_dir("import");
+        std::fs::write(
+            imported.join("CLAUDE.md"),
+            "See @AGENTS.md for shared rules.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            imported.join("AGENTS.md"),
+            export::upsert_managed_block("# Agents", "BODY"),
+        )
+        .unwrap();
+        assert!(claude_md_has_managed_block(&[imported.as_path()]));
+
+        for d in [plain, direct, imported] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    #[test]
+    fn managed_block_check_follows_what_claude_code_loads() {
+        // A main checkout with the block, a sibling worktree, and one nested in the repo.
+        let root = temp_dir("worktrees");
+        let main = root.join("repo");
+        let sibling = root.join("repo-feature");
+        let nested = main.join(".claude/worktrees/x/src");
+        for d in [&main, &sibling, &nested] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(
+            main.join("CLAUDE.md"),
+            export::upsert_managed_block("", "BODY"),
+        )
+        .unwrap();
+        // The sibling session never loads repo/CLAUDE.md, so the hook must still inject.
+        assert!(!claude_md_has_managed_block(&claude_md_dirs(&sibling)));
+        // A nested worktree (or any subdir) does load it as an ancestor.
+        assert!(claude_md_has_managed_block(&claude_md_dirs(&nested)));
+        assert!(claude_md_dirs(&nested).iter().all(|d| d.parent().is_some()));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn claude_md_imports_only_path_like_tokens() {
+        let text = "Read @AGENTS.md, then @docs/style.md. Ping @ari or mail me@x.dev (@~/notes.md)";
+        assert_eq!(
+            claude_md_imports(text),
+            vec!["AGENTS.md", "docs/style.md", "~/notes.md"]
+        );
+    }
+
+    #[test]
+    fn git_root_of_finds_the_checkout() {
+        let root = temp_dir("git");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join("a/b")).unwrap();
+        let want = std::fs::canonicalize(&root).unwrap();
+        assert_eq!(git_root_of(&root.join("a/b")), want);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn prior(thread_id: i64, similarity: f32) -> knowledge::PriorWork {
+        knowledge::PriorWork {
+            thread_id,
+            title: None,
+            project_path: None,
+            source: "claude_code".into(),
+            kind: "decision".into(),
+            snippet: "s".into(),
+            similarity,
+            matches: 1,
+        }
+    }
+
+    #[test]
+    fn recall_lines_are_redacted_and_flat() {
+        let mut h = prior(1, 0.9);
+        h.title = Some("use sk-ant-api03-AbCdEfGhIjKlMnOpQrStUv0123456789 for staging".into());
+        h.snippet = "first line\n\n- second   line".into();
+        let line = recall_line(&h);
+        assert!(!line.contains("sk-ant-api03"), "{line}");
+        assert!(!line.contains('\n'), "{line}");
+        assert!(line.contains("first line - second line"), "{line}");
+        h.title = None;
+        assert!(recall_line(&h).starts_with("  • (untitled)"));
+    }
+
+    #[test]
+    fn recall_selection_is_strict() {
+        let none = std::collections::HashSet::new();
+        let picked = select_recall_hits(vec![prior(1, 0.9), prior(2, 0.8), prior(3, 0.75)], &none);
+        assert_eq!(
+            picked.iter().map(|h| h.thread_id).collect::<Vec<_>>(),
+            vec![1, 2],
+            "at most two notes"
+        );
+        let weak = select_recall_hits(vec![prior(1, 0.66), prior(2, 0.6)], &none);
+        assert!(weak.is_empty(), "below the proactive floor");
+        // The best match was already shown: stay quiet instead of offering weaker ones.
+        let seen: std::collections::HashSet<i64> = [1].into_iter().collect();
+        assert!(select_recall_hits(vec![prior(1, 0.9), prior(2, 0.85)], &seen).is_empty());
+        assert!(select_recall_hits(Vec::new(), &none).is_empty());
+    }
+
+    #[test]
+    fn recall_skips_commands_and_short_prompts() {
+        assert!(!prompt_worth_recalling(
+            "/compact keep the auth details please"
+        ));
+        assert!(!prompt_worth_recalling("fix the typo"));
+        assert!(prompt_worth_recalling(
+            "how do we install the claude code hooks into settings json"
+        ));
+    }
+
+    #[test]
     fn run_with_no_args_prints_usage_ok() {
         // Empty argv is the help path — must not touch the DB or error.
         run(&[]).unwrap();
@@ -1534,7 +2347,72 @@ mod tests {
         assert!(external_id_under("/tmp/elsewhere/x.jsonl", base).is_none());
     }
 
+    /// A canonical stored root still matches a transcript reported through a symlink.
+    #[cfg(unix)]
+    #[test]
+    fn external_id_matches_through_a_symlinked_config_dir() {
+        let dir = temp_dir("extid_symlink");
+        let real = dir.join("real");
+        std::fs::create_dir_all(real.join("projects/-proj")).unwrap();
+        std::fs::write(real.join("projects/-proj/abc.jsonl"), "{}\n").unwrap();
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let root = std::fs::canonicalize(real.join("projects")).unwrap();
+        let reported = link.join("projects/-proj/abc.jsonl");
+        assert!(external_id_under(reported.to_str().unwrap(), &root).is_none());
+        assert_eq!(
+            external_id_resolving(reported.to_str().unwrap(), &root).as_deref(),
+            Some("-proj/abc.jsonl")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // ---- docs-in-sync guards: keep `cal help` + the README/website from drifting ----
+
+    /// Flags added for `hook` must stay documented in `cal help`.
+    #[test]
+    fn usage_documents_hook_flags() {
+        assert!(USAGE.contains("--budget"));
+        assert!(USAGE.contains("cal hook [<project>] [-n PER_KIND] [--budget CHARS]"));
+    }
+
+    /// The global `--raw` opt-out stays documented, with the commands that ignore it.
+    #[test]
+    fn usage_documents_raw_flag() {
+        assert!(USAGE.contains("      --raw "), "{USAGE}");
+        assert!(USAGE.contains("hooks always do"), "{USAGE}");
+    }
+
+    /// `cal help` lists exactly the registered source kinds (plus `in_app`) for `-s`, so a
+    /// new source is documented the moment it is registered, wrapped like the lines around it.
+    #[test]
+    fn usage_lists_every_source_kind() {
+        let help = usage();
+        assert!(!help.contains(SOURCE_KINDS_SLOT), "{help}");
+        let lead = "-s, --source SOURCE   filter by source kind (";
+        let start = help.find(lead).unwrap();
+        let end = start + help[start..].find(')').unwrap() + 1;
+        let block = &help[start..end];
+        let listed: Vec<&str> = block[lead.len()..block.len() - 1]
+            .split([',', ' ', '\n'])
+            .filter(|k| !k.is_empty())
+            .collect();
+        let registered: Vec<&str> = crate::indexer::SOURCES
+            .iter()
+            .map(|s| s.kind)
+            .chain(["in_app"])
+            .collect();
+        assert_eq!(listed, registered);
+        assert!(listed.contains(&"copilot"));
+        let line_start = help[..start].rfind('\n').unwrap() + 1;
+        for (i, line) in help[line_start..end].lines().enumerate() {
+            assert!(line.len() <= USAGE_WIDTH, "too wide: {line:?}");
+            if i > 0 {
+                assert!(line.starts_with(&" ".repeat(OPTION_DESC_COL)), "{line:?}");
+                assert!(!line[OPTION_DESC_COL..].starts_with(' '), "{line:?}");
+            }
+        }
+    }
 
     /// `cal help` (USAGE) must document every real command, so a new subcommand can't ship
     /// undocumented. Internal hook targets are intentionally not user-facing.

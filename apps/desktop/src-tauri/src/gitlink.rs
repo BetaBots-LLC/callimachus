@@ -4,9 +4,8 @@
 //! files overlap — answering "which AI conversation led to this commit?". The shared-file count
 //! (`overlap`) doubles as a confidence proxy. No git crate: we shell out to `git`.
 
-use crate::indexer::canonical_project;
 use anyhow::{bail, Result};
-use rusqlite::Connection;
+use rusqlite::{Connection, Transaction, TransactionBehavior};
 use serde::Serialize;
 use std::collections::HashSet;
 
@@ -179,14 +178,37 @@ pub fn correlate(threads: &[ThreadWindow], commits: &[Commit]) -> Vec<Link> {
     out
 }
 
+/// `git` with no console window on Windows (a GUI app spawning a console program would
+/// otherwise flash one for every link pass).
+fn git_command() -> std::process::Command {
+    #[allow(unused_mut)]
+    let mut cmd = std::process::Command::new("git");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
+/// Drop Windows' verbatim `\\?\` prefix (what `std::fs::canonicalize` returns there), which
+/// git and most tools don't accept as a working directory. Unchanged elsewhere.
+fn plain_path(p: &str) -> String {
+    if let Some(rest) = p.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{rest}");
+    }
+    p.strip_prefix(r"\\?\").unwrap_or(p).to_string()
+}
+
 /// Run `git log` over `repo` since `since` (epoch secs), returning raw output for `parse_git_log`.
 fn run_git_log(repo: &str, since: i64) -> Result<String> {
     let since_iso = chrono::DateTime::from_timestamp(since.max(0), 0)
         .map(|d| d.to_rfc3339())
         .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
-    let out = std::process::Command::new("git")
+    let out = git_command()
         .arg("-C")
-        .arg(repo)
+        .arg(plain_path(repo))
         .arg("log")
         .arg("--no-merges")
         .arg(format!("--since={since_iso}"))
@@ -203,24 +225,27 @@ fn run_git_log(repo: &str, since: i64) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// Each top-level thread's first and last message time for a canonical project key.
+/// Index-only through 0031's (thread_id, ts, role) index: 53k page reads down to 1k for a
+/// big project from a cold cache.
+const THREAD_WINDOWS_SQL: &str = "SELECT t.id, MIN(m.ts), MAX(m.ts)
+     FROM threads t JOIN messages m ON m.thread_id = t.id
+     WHERE COALESCE(t.project_key, t.project_path) = ?1 AND m.ts IS NOT NULL
+       AND t.is_subagent = 0
+     GROUP BY t.id";
+
 /// Load every thread's time window + mentions for a canonical project key.
 fn thread_windows(conn: &Connection, project_key: &str) -> Result<Vec<ThreadWindow>> {
     // Only top-level threads: a subagent transcript's work is attributed to its parent session,
     // and subagent prompts (e.g. orchestration scouts) mention many files, which over-links.
-    let mut stmt = conn.prepare(
-        "SELECT t.id, MIN(m.ts), MAX(m.ts)
-         FROM threads t JOIN messages m ON m.thread_id = t.id
-         WHERE COALESCE(t.project_key, t.project_path) = ?1 AND m.ts IS NOT NULL
-           AND t.is_subagent = 0
-         GROUP BY t.id",
-    )?;
+    let mut stmt = conn.prepare(THREAD_WINDOWS_SQL)?;
     let rows: Vec<(i64, i64, i64)> = stmt
         .query_map([project_key], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
         .collect::<rusqlite::Result<_>>()?;
 
     let mut windows = Vec::with_capacity(rows.len());
+    let mut ms = conn.prepare("SELECT path FROM file_mentions WHERE thread_id = ?1")?;
     for (id, start, end) in rows {
-        let mut ms = conn.prepare("SELECT path FROM file_mentions WHERE thread_id = ?1")?;
         let mentions: HashSet<String> = ms
             .query_map([id], |r| r.get::<_, String>(0))?
             .filter_map(rusqlite::Result::ok)
@@ -242,7 +267,7 @@ fn thread_windows(conn: &Connection, project_key: &str) -> Result<Vec<ThreadWind
 /// Compute + persist thread↔commit links for the git repo at `repo_path`. Returns the number of
 /// links stored. Re-runs cleanly: it replaces the links for the threads it reconsiders.
 pub fn link_project(conn: &Connection, repo_path: &str) -> Result<usize> {
-    let key = canonical_project(repo_path).unwrap_or_else(|| repo_path.to_string());
+    let key = crate::knowledge::project_key(repo_path);
     let windows = thread_windows(conn, &key)?;
     if windows.is_empty() {
         return Ok(0);
@@ -252,30 +277,37 @@ pub fn link_project(conn: &Connection, repo_path: &str) -> Result<usize> {
     let links = correlate(&windows, &commits);
 
     let now = chrono::Utc::now().timestamp();
+    // One IMMEDIATE transaction for the replace: a reader (the app's timeline) never sees the
+    // project with zero links mid-run, and 600 links commit once instead of 600 times (about
+    // 250 ms of write-lock time down to a few ms). git ran above, outside the lock.
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     // Clear ALL of the project's links first (including any stale ones from threads we no longer
     // consider, e.g. subagents), then reinsert the fresh set — so a re-run never stacks or strands.
-    conn.execute(
+    tx.execute(
         "DELETE FROM thread_commits WHERE thread_id IN (
             SELECT id FROM threads WHERE COALESCE(project_key, project_path) = ?1
          )",
         [&key],
     )?;
-    let mut ins = conn.prepare(
-        "INSERT OR REPLACE INTO thread_commits
-            (thread_id, sha, short_sha, subject, committed_at, overlap, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-    )?;
-    for l in &links {
-        ins.execute(rusqlite::params![
-            l.thread_id,
-            l.sha,
-            l.short_sha,
-            l.subject,
-            l.committed_at,
-            l.overlap as i64,
-            now,
-        ])?;
+    {
+        let mut ins = tx.prepare(
+            "INSERT OR REPLACE INTO thread_commits
+                (thread_id, sha, short_sha, subject, committed_at, overlap, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )?;
+        for l in &links {
+            ins.execute(rusqlite::params![
+                l.thread_id,
+                l.sha,
+                l.short_sha,
+                l.subject,
+                l.committed_at,
+                l.overlap as i64,
+                now,
+            ])?;
+        }
     }
+    tx.commit()?;
     Ok(links.len())
 }
 
@@ -530,6 +562,32 @@ mod tests {
             .is_empty());
     }
 
+    /// The per-thread MIN/MAX(ts) must come from the (thread_id, ts, role) index alone, not a
+    /// read of every message row in the project.
+    #[test]
+    fn thread_windows_are_index_only() {
+        let conn = temp_db();
+        let plan: Vec<String> = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {THREAD_WINDOWS_SQL}"))
+            .unwrap()
+            .query_map(["/p"], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let plan = plan.join(" | ");
+        assert!(
+            plan.contains("COVERING INDEX idx_messages_thread_ts (thread_id=?"),
+            "{plan}"
+        );
+    }
+
+    #[test]
+    fn plain_path_strips_windows_verbatim_prefixes() {
+        assert_eq!(plain_path(r"\\?\C:\Users\me\proj"), r"C:\Users\me\proj");
+        assert_eq!(plain_path(r"\\?\UNC\server\share\x"), r"\\server\share\x");
+        assert_eq!(plain_path("/Users/me/proj"), "/Users/me/proj");
+    }
+
     #[test]
     fn link_project_end_to_end_with_real_git() {
         use crate::indexer::{source_id, upsert_thread, ParsedMessage, ParsedThread};
@@ -606,7 +664,7 @@ mod tests {
             })
             .unwrap();
         // Pin project_key to the same canonical value link_project derives, so they join.
-        let key = canonical_project(&repo).unwrap_or_else(|| repo.clone());
+        let key = crate::knowledge::project_key(&repo);
         conn.execute(
             "UPDATE threads SET project_key = ?1 WHERE id = ?2",
             rusqlite::params![key, tid],

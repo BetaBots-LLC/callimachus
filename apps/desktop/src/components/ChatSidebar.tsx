@@ -25,6 +25,10 @@ export function ChatSidebar() {
       if (!detail) return;
       const msgs: ChatMessage[] = detail.messages
         .filter((m) => m.role === "user" || m.role === "assistant" || m.role === "system")
+        // A reply stopped before its first token was saved as an empty assistant turn.
+        // Drop it: it renders as a blank bubble, and resent as history the API rejects
+        // it, which would break every later message in this chat.
+        .filter((m) => m.role !== "assistant" || m.text.trim() !== "")
         .map((m) => ({ role: m.role as ChatMessage["role"], content: m.text }));
       setActiveId(detail.id);
       // Render the (potentially large) conversation as a non-blocking transition so
@@ -53,6 +57,7 @@ export function ChatSidebar() {
         {chats.data?.length ? (
           chats.data.map((c) => (
             <button
+              type="button"
               key={c.id}
               onClick={() => load.mutate(c.id)}
               disabled={load.isPending}

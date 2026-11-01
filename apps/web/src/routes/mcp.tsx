@@ -23,7 +23,10 @@ const TOOLS: { name: string; note: string; write?: boolean }[] = [
   { name: "search_threads", note: "Keyword + optional semantic search of the whole index" },
   { name: "search_current_project", note: "Scope search to the launching repo" },
   { name: "recent_threads", note: "The most recently updated threads" },
-  { name: "get_thread", note: "Fetch a full thread as a packed transcript" },
+  {
+    name: "get_thread",
+    note: "A thread as a packed transcript, trimmed to a budget (24k chars by default)",
+  },
   { name: "list_tags", note: "Discover the user's tags / collections" },
   { name: "list_open_todos", note: "Unfinished TODOs across past sessions (no key needed)" },
   { name: "get_thread_knowledge", note: "Distilled summary, decisions, gotchas for a thread" },
@@ -33,13 +36,23 @@ const TOOLS: { name: string; note: string; write?: boolean }[] = [
     name: "find_prior_work",
     note: "Prior sessions similar to a task — the 'have I done this?' guard",
   },
-  { name: "project_memory", note: "A project's durable memory: decisions, gotchas, open TODOs" },
+  {
+    name: "project_memory",
+    note: "A project's decisions, gotchas and open TODOs as budgeted markdown (or JSON)",
+  },
   { name: "ask_history", note: "A synthesized, cited answer over your own history (RAG)" },
   { name: "threads_for_file", note: "Which past sessions touched a file path" },
   { name: "check_decision", note: "Surface settled decisions before re-litigating a proposal" },
   { name: "linked_commits", note: "The git commits a thread likely produced" },
+  {
+    name: "recurring_issues",
+    note: "Errors you keep hitting across sessions, grouped by signature (last 180 days)",
+  },
   { name: "list_snapshots", note: "Resumable session snapshots for a project" },
-  { name: "load_snapshot", note: "Load a snapshot's packed transcript + carry-forward memory" },
+  {
+    name: "load_snapshot",
+    note: "A snapshot's carry-forward memory + transcript, trimmed to a budget",
+  },
   { name: "complete_todo", note: "Mark an open TODO done — persists across re-index", write: true },
   {
     name: "record_decision",
@@ -60,7 +73,7 @@ function McpPage() {
       no="04"
       kicker="MCP server"
       title="Give every agent a memory."
-      description="callimachus-mcp exposes your local history to any MCP client through twenty-one tools — and now reads and writes the memory layer. Instead of re-explaining context, your agent can look it up: searching past sessions, recalling settled decisions and known gotchas, asking your history a cited question, linking threads to the git commits they produced, and pulling the exact thread it needs. It can also write back — closing TODOs, recording new decisions and gotchas, and snapshotting a session for handoff across a context-window compaction or another tool — but only ever touches Callimachus's own index and memory, never your files."
+      description="callimachus-mcp exposes your local history to any MCP client through twenty-two tools — and now reads and writes the memory layer. Instead of re-explaining context, your agent can look it up: searching past sessions, recalling settled decisions and known gotchas, asking your history a cited question, linking threads to the git commits they produced, and pulling the exact thread it needs. It can also write back — closing TODOs, recording new decisions and gotchas, and snapshotting a session for handoff across a context-window compaction or another tool — but only ever touches Callimachus's own index and memory, never your files."
     >
       <div className="grid gap-10 lg:grid-cols-2">
         <div className="flex flex-col gap-4">
@@ -70,17 +83,19 @@ function McpPage() {
             <Link to="/download" className="text-link hover:underline">
               desktop app
             </Link>{" "}
-            — it ships <code className="font-mono">callimachus-mcp</code> on your PATH. Then
-            register it with your client:
+            and open it once so it indexes your history. Settings → Claude Code → Enable for Claude
+            Code then registers the app itself as Claude Code's MCP server, and Settings → Other
+            agents does the same for Codex, Cursor and Gemini CLI. For any other client, register
+            the npm launcher, which downloads the prebuilt server and checks its SHA-256:
           </p>
           <CommandBlock
             label="register (Claude Code shown)"
-            lines={["claude mcp add callimachus -- callimachus-mcp"]}
+            lines={["claude mcp add callimachus -- npx -y callimachus-mcp"]}
           />
           <p className="cat-label pt-2">Or build from source</p>
           <CommandBlock
             label="from a checkout of the repo"
-            lines={["cargo install --path apps/desktop/src-tauri --bin callimachus-mcp"]}
+            lines={["cargo install --locked --path apps/desktop/src-tauri --bin callimachus-mcp"]}
           />
           <p className="text-sm leading-relaxed text-muted-foreground">
             Reads the same local index as the app — no separate database, no extra indexing. Ships a{" "}
@@ -110,7 +125,7 @@ function McpPage() {
             ))}
           </ul>
           <p className="text-sm leading-relaxed text-muted-foreground">
-            Seventeen read tools and four <span className="font-mono text-amber-500">write</span>{" "}
+            Eighteen read tools and four <span className="font-mono text-amber-500">write</span>{" "}
             tools (<code className="font-mono">complete_todo</code>,{" "}
             <code className="font-mono">record_decision</code>,{" "}
             <code className="font-mono">record_gotcha</code>,{" "}

@@ -2,12 +2,15 @@ import { useQuery } from "@tanstack/react-query";
 import { api, SOURCE_LABELS, type SourceKind } from "../lib/api";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { formatTime, formatUsd, shortPath } from "../lib/format";
+import { AGGREGATE_STALE_MS } from "../lib/queryClient";
 import { Loading } from "./Loading";
 
 export function StatsView() {
   const { data, isLoading, isError, error } = useQuery({
     queryKey: ["index_stats"],
     queryFn: api.indexStats,
+    // ~1s of SQL; refreshed by index/embed events instead of on every visit.
+    staleTime: AGGREGATE_STALE_MS,
   });
 
   if (isLoading) return <Loading label="Crunching the index…" className="h-full" />;
@@ -106,7 +109,11 @@ export function StatsView() {
 
 /** Estimated AI spend by model + the priciest threads, from captured token usage. */
 function SpendCard() {
-  const { data } = useQuery({ queryKey: ["spend"], queryFn: () => api.spend() });
+  const { data } = useQuery({
+    queryKey: ["spend"],
+    queryFn: () => api.spend(),
+    staleTime: AGGREGATE_STALE_MS,
+  });
   if (!data) return null;
 
   if (data.trackedCalls === 0 && data.untrackedCalls === 0) {
@@ -158,7 +165,9 @@ function SpendCard() {
                   <span className="truncate" title={t.title ?? undefined}>
                     {t.title || `Thread #${t.threadId}`}
                   </span>
-                  <span className="shrink-0 tabular-nums text-muted-foreground">{formatUsd(t.cost)}</span>
+                  <span className="shrink-0 tabular-nums text-muted-foreground">
+                    {formatUsd(t.cost)}
+                  </span>
                 </div>
               ))}
             </div>

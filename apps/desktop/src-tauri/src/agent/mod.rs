@@ -10,7 +10,7 @@ use anyhow::{bail, Result};
 use futures_util::StreamExt;
 use genai::adapter::AdapterKind;
 use genai::chat::{
-    ChatMessage as GMessage, ChatOptions, ChatRequest, ChatStreamEvent, Tool, ToolCall,
+    ChatMessage as GMessage, ChatOptions, ChatRequest, ChatStreamEvent, Tool, ToolCall, ToolChoice,
     ToolResponse,
 };
 use genai::resolver::{AuthData, Endpoint, ServiceTargetResolver};
@@ -18,6 +18,7 @@ use genai::{Client, ServiceTarget};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::path::{Path, PathBuf};
 
 /// One chat turn from the frontend.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -131,7 +132,7 @@ fn build_client(provider: &str, api_key: Option<&str>, base_url: Option<&str>) -
     });
 
     let builder = Client::builder().with_adapter_kind(adapter);
-    let client = match endpoint {
+    let built = match endpoint {
         Some(url) => {
             // Override the endpoint, and (when present) set the key as the request auth so
             // Bearer-authenticated endpoints (Ollama Cloud, authed proxies) work.
@@ -154,16 +155,18 @@ fn build_client(provider: &str, api_key: Option<&str>, base_url: Option<&str>) -
             })
             .build(),
     };
-    Ok(client)
+    // genai 0.7 made construction fallible: the underlying reqwest client (TLS backend, system
+    // proxy) is built here and reports failure instead of panicking inside the crate.
+    built.map_err(|e| anyhow::anyhow!("genai client: {e}"))
 }
 
 /// A non-interactive CLI LLM backend: runs the user's logged-in agent CLI (Claude Code, Codex)
 /// in print mode and reads its answer from stdout. Lets users distill/ask with their existing
 /// CLI subscription instead of a raw API key. Tools/agentic actions are disabled and the call
-/// runs in a neutral cwd, so it's a plain text completion, not a coding session.
+/// runs in a neutral scratch cwd, so it's a plain text completion, not a coding session.
 struct CliBackend {
     bin: &'static str,
-    /// Fixed args (print mode, text output, tools off).
+    /// Fixed args (print mode). Claude adds output-format and isolation flags on top.
     base_args: Vec<&'static str>,
     /// Flag used to pin a model; appended with the model when one is set.
     model_flag: &'static str,
@@ -174,7 +177,7 @@ fn cli_backend_for(provider: &str) -> Option<CliBackend> {
     match provider {
         "claude-cli" => Some(CliBackend {
             bin: "claude",
-            base_args: vec!["-p", "--output-format", "text", "--allowedTools", ""],
+            base_args: vec!["-p"],
             model_flag: "--model",
         }),
         "codex-cli" => Some(CliBackend {
@@ -228,36 +231,685 @@ pub fn cli_models(provider: &str) -> Vec<String> {
     }
 }
 
+// ---------------------------------------------------------------------------------------
+// Where CLI engines run, and recognizing their sessions
+// ---------------------------------------------------------------------------------------
+
+/// The app's dedicated scratch directory for CLI-engine calls (not created).
+///
+/// Per-user, because `claude -p` skips the workspace trust prompt and loads the cwd's
+/// CLAUDE.md and `.claude/settings.json`, so no other local user may be able to plant
+/// files there. The temp dir is per-user on macOS (`$TMPDIR`) and Windows (`%TEMP%`); when
+/// it is shared instead (Linux's `/tmp`), the per-user runtime dir (`$XDG_RUNTIME_DIR`,
+/// 0700 by spec) or cache dir is used.
+pub fn cli_work_dir_path() -> PathBuf {
+    scratch_base().join("callimachus-llm")
+}
+
+fn scratch_base() -> PathBuf {
+    let tmp = std::env::temp_dir();
+    if !is_shared_dir(&tmp) {
+        return tmp;
+    }
+    dirs::runtime_dir().or_else(dirs::cache_dir).unwrap_or(tmp)
+}
+
+/// Whether other users can create entries in `dir` (world-writable, like the sticky `/tmp`).
+#[cfg(unix)]
+fn is_shared_dir(dir: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(dir).map_or(true, |m| m.permissions().mode() & 0o002 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_shared_dir(_dir: &Path) -> bool {
+    false
+}
+
+/// The cwd every CLI-engine call runs in: a dedicated private (0700) scratch dir, so the
+/// CLI never acts on the user's repos and any session it does persist is unambiguously ours
+/// (see [`is_app_cli_session`]).
+///
+/// If that path is someone else's, or its base isn't writable (a read-only home), a
+/// per-process dir in the temp dir is used instead, never a shared path as-is: a fresh
+/// 0700 mkdir can only succeed for us, even in `/tmp`. Sessions persisted from that
+/// fallback (only Codex persists any) aren't recognized as the app's; it is a last resort.
+fn cli_work_dir() -> PathBuf {
+    let dir = cli_work_dir_path();
+    if ensure_private_dir(&dir).is_ok() {
+        return dir;
+    }
+    static FALLBACK: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+    let mut fallback = FALLBACK.lock().unwrap_or_else(|e| e.into_inner());
+    // Reuse this process's fallback while it is still ours (a tmp cleaner may remove it).
+    if let Some(p) = fallback.as_ref().filter(|p| ensure_private_dir(p).is_ok()) {
+        return p.clone();
+    }
+    let tmp = std::env::temp_dir();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    for n in 0..8u32 {
+        let fresh = tmp.join(format!(
+            "callimachus-llm-{}-{nanos}-{n}",
+            std::process::id()
+        ));
+        if create_private_dir(&fresh).is_ok() {
+            *fallback = Some(fresh.clone());
+            return fresh;
+        }
+    }
+    tmp
+}
+
+/// Create `dir` (not its parents) with mode 0700; fails if anything already exists there,
+/// so success means this process made it.
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().mode(0o700).create(dir)
+    }
+    // %TEMP% is under the user's profile, whose ACL already keeps other users out.
+    #[cfg(not(unix))]
+    {
+        std::fs::DirBuilder::new().create(dir)
+    }
+}
+
+/// Make sure `dir` exists, is a real directory (not a planted symlink) and only we can use
+/// it. A dir we just created is ours. An existing one must have no group/other permission
+/// bits (only its owner can tighten them, so an older build's 0755 dir is fixed and someone
+/// else's is refused) and be listable, which with no group/other bits only its owner (us)
+/// can do.
+fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
+    if let Some(parent) = dir.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    match create_private_dir(dir) {
+        Ok(()) => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
+    }
+    let meta = std::fs::symlink_metadata(dir)?;
+    if !meta.is_dir() {
+        return Err(std::io::Error::other("scratch path is not a directory"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if meta.permissions().mode() & 0o077 != 0 {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+        std::fs::read_dir(dir)?;
+    }
+    Ok(())
+}
+
+/// Opening of the distill prompt used up to 0.11. The sessions this matters for were all
+/// persisted by those older builds, so the purge must still recognize the old wording.
+const LEGACY_DISTILL_SYSTEM_HEAD: &str =
+    "You distill one AI coding-agent session into structured knowledge for the developer.";
+
+/// The system prompts the app sends through CLI engines. Builds before
+/// `--system-prompt`/`--no-session-persistence` folded them into the user message, so a
+/// session those builds persisted opens with one of these.
+const APP_PROMPTS: &[&str] = &[
+    DISTILL_SYSTEM,
+    LEGACY_DISTILL_SYSTEM_HEAD,
+    ANSWER_SYSTEM,
+    CHAT_SYSTEM,
+    SYNTH_SYSTEM,
+    BRIEF_SYSTEM,
+    CONFLICT_SYSTEM,
+];
+
+/// True when `text` starts with one of the app's own system prompts.
+pub fn is_app_prompt(text: &str) -> bool {
+    let t = text.trim_start();
+    APP_PROMPTS.iter().any(|p| {
+        // The first ~60 chars are distinctive; comparing a prefix tolerates small prompt
+        // edits between releases.
+        let head = p.char_indices().nth(60).map_or(*p, |(i, _)| &p[..i]);
+        t.starts_with(head)
+    })
+}
+
+/// Whether a session found by an indexer was really one of the app's own CLI-engine calls
+/// (distill / Ask / chat through `claude -p` or `codex exec`), which must not be indexed as
+/// the user's history. True when it ran in the app's scratch dir, or (older builds) in the
+/// bare temp dir AND one of its first user messages is an app prompt; people do run real
+/// sessions in /tmp, so the temp dir alone isn't enough.
+pub fn is_app_cli_session<'a>(
+    cwd: Option<&str>,
+    user_texts: impl IntoIterator<Item = &'a str>,
+) -> bool {
+    let Some(cwd) = cwd.map(str::trim).filter(|c| !c.is_empty()) else {
+        return false;
+    };
+    let cwd = Path::new(cwd);
+    if path_within(cwd, &cli_work_dir_path()) {
+        return true;
+    }
+    same_path(cwd, &std::env::temp_dir()) && user_texts.into_iter().any(is_app_prompt)
+}
+
+/// A path and (when it exists) its resolved form: macOS reports `/private/var/...` for the
+/// `/var/...` temp dir, and agents record whichever spelling their process saw.
+fn path_forms(p: &Path) -> Vec<PathBuf> {
+    let mut forms = vec![p.to_path_buf()];
+    if let Ok(real) = std::fs::canonicalize(p) {
+        if real != p {
+            forms.push(real);
+        }
+    }
+    forms
+}
+
+fn path_within(p: &Path, dir: &Path) -> bool {
+    let dirs = path_forms(dir);
+    path_forms(p)
+        .iter()
+        .any(|a| dirs.iter().any(|d| a.starts_with(d)))
+}
+
+fn same_path(p: &Path, other: &Path) -> bool {
+    let others = path_forms(other);
+    path_forms(p).iter().any(|a| others.iter().any(|o| a == o))
+}
+
+// ---------------------------------------------------------------------------------------
+// Finding and launching CLI binaries from a GUI process
+// ---------------------------------------------------------------------------------------
+
+/// Windows `CREATE_NO_WINDOW`: keep spawned console programs from flashing a window.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// Resolved CLI paths, so each completion doesn't spawn a login shell to find the binary.
+static CLI_BIN_CACHE: std::sync::Mutex<Vec<(String, PathBuf)>> = std::sync::Mutex::new(Vec::new());
+
 /// Resolve a CLI's absolute path. A GUI app launched from Finder/Dock does NOT inherit the user's
 /// shell PATH (nvm / homebrew / npm-global dirs), so we ask the login shell to resolve it, then
-/// fall back to scanning whatever PATH we do have. Returns `None` if the binary isn't found.
-async fn resolve_cli_bin(bin: &str) -> Option<std::path::PathBuf> {
+/// fall back to scanning PATH plus the usual per-user install dirs. Returns `None` if the binary
+/// isn't found.
+async fn resolve_cli_bin(bin: &str) -> Option<PathBuf> {
+    if let Ok(cache) = CLI_BIN_CACHE.lock() {
+        if let Some((_, p)) = cache.iter().find(|(b, p)| b == bin && p.is_file()) {
+            return Some(p.clone());
+        }
+    }
+    let found = find_cli_bin(bin).await?;
+    if let Ok(mut cache) = CLI_BIN_CACHE.lock() {
+        cache.retain(|(b, _)| b != bin);
+        cache.push((bin.to_string(), found.clone()));
+    }
+    Some(found)
+}
+
+async fn find_cli_bin(bin: &str) -> Option<PathBuf> {
+    #[cfg(unix)]
     if let Some(shell) = std::env::var_os("SHELL") {
         if let Ok(out) = tokio::process::Command::new(&shell)
             .arg("-lc")
             .arg(format!("command -v {bin}"))
+            .stdin(std::process::Stdio::null())
             .output()
             .await
         {
             if out.status.success() {
                 let line = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                let p = std::path::PathBuf::from(&line);
-                if !line.is_empty() && p.exists() {
+                let p = PathBuf::from(&line);
+                if !line.is_empty() && p.is_file() {
                     return Some(p);
                 }
             }
         }
     }
-    std::env::var_os("PATH").and_then(|paths| {
-        std::env::split_paths(&paths)
-            .map(|d| d.join(bin))
-            .find(|p| p.is_file())
-    })
+    // A zsh login shell skips ~/.zshrc, where nvm is usually set up, so also look in the
+    // directories those setups install into.
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let mut dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
+    dirs.extend(extra_cli_dirs());
+    dirs.iter()
+        .flat_map(|d| exe_names(bin).into_iter().map(move |n| d.join(n)))
+        .find(|p| p.is_file())
 }
 
-/// Run a CLI backend once: spawn the binary, pipe `prompt` to stdin, return trimmed stdout.
-/// Runs in a neutral temp cwd so the CLI never acts on the user's repos.
-async fn cli_complete(provider: &str, model: &str, prompt: &str) -> Result<String> {
+/// File names a command resolves to: `claude` on unix; `claude.exe` / `.cmd` (npm shims) /
+/// `.bat` on Windows.
+fn exe_names(bin: &str) -> Vec<String> {
+    if cfg!(windows) {
+        vec![
+            format!("{bin}.exe"),
+            format!("{bin}.cmd"),
+            format!("{bin}.bat"),
+            bin.to_string(),
+        ]
+    } else {
+        vec![bin.to_string()]
+    }
+}
+
+/// Per-user install dirs that a GUI-launched app's PATH usually lacks. Only existing dirs.
+fn extra_cli_dirs() -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = Vec::new();
+    if cfg!(unix) {
+        for d in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"] {
+            v.push(PathBuf::from(d));
+        }
+    }
+    if let Some(home) = dirs::home_dir() {
+        for rel in [
+            ".local/bin",
+            ".cargo/bin",
+            ".bun/bin",
+            ".volta/bin",
+            ".npm-global/bin",
+            ".asdf/shims",
+            ".local/share/mise/shims",
+            ".deno/bin",
+        ] {
+            v.push(home.join(rel));
+        }
+        if let Some(nvm) = nvm_default_bin(&home) {
+            v.push(nvm);
+        }
+    }
+    if cfg!(windows) {
+        if let Some(appdata) = std::env::var_os("APPDATA") {
+            v.push(PathBuf::from(appdata).join("npm"));
+        }
+    }
+    v.retain(|d| d.is_dir());
+    v
+}
+
+/// nvm's default node `bin` dir (`$NVM_DIR/versions/node/<default>/bin`). The alias file
+/// holds a full version (`v22.3.0`), a major/minor prefix (`22`), or a name like `node` /
+/// `lts/*`; prefixes resolve to the newest matching install, names to the newest overall.
+fn nvm_default_bin(home: &Path) -> Option<PathBuf> {
+    let nvm_dir = std::env::var_os("NVM_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".nvm"));
+    let mut installed: Vec<(Vec<u64>, PathBuf)> = std::fs::read_dir(nvm_dir.join("versions/node"))
+        .ok()?
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            let parts: Option<Vec<u64>> = name
+                .trim_start_matches('v')
+                .split('.')
+                .map(|n| n.parse().ok())
+                .collect();
+            Some((parts?, e.path()))
+        })
+        .collect();
+    installed.sort_by(|a, b| b.0.cmp(&a.0)); // newest first
+    let alias = std::fs::read_to_string(nvm_dir.join("alias/default")).unwrap_or_default();
+    let want: Vec<u64> = alias
+        .trim()
+        .trim_start_matches('v')
+        .split('.')
+        .map_while(|n| n.parse().ok())
+        .collect();
+    installed
+        .into_iter()
+        .find(|(v, _)| v.starts_with(&want))
+        .map(|(_, p)| p.join("bin"))
+}
+
+/// PATH for a spawned CLI: the binary's own dir first (npm-installed CLIs are
+/// `#!/usr/bin/env node` scripts, and under nvm/volta/homebrew node sits next to them),
+/// then the inherited PATH, then the usual per-user install dirs.
+fn augmented_path(bin: Option<&Path>) -> Option<std::ffi::OsString> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(bin) = bin {
+        if let Some(parent) = bin.parent() {
+            dirs.push(parent.to_path_buf());
+        }
+        if let Some(parent) = std::fs::canonicalize(bin)
+            .ok()
+            .and_then(|p| p.parent().map(Path::to_path_buf))
+        {
+            dirs.push(parent);
+        }
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        dirs.extend(std::env::split_paths(&path));
+    }
+    dirs.extend(extra_cli_dirs());
+    let mut seen = std::collections::HashSet::new();
+    dirs.retain(|d| !d.as_os_str().is_empty() && seen.insert(d.clone()));
+    std::env::join_paths(dirs).ok()
+}
+
+/// A Command for an agent CLI: the app's scratch cwd, an augmented PATH, and no console
+/// window on Windows.
+fn cli_command(bin: &Path) -> tokio::process::Command {
+    let mut cmd = std::process::Command::new(bin);
+    cmd.current_dir(cli_work_dir());
+    if let Some(path) = augmented_path(Some(bin)) {
+        cmd.env("PATH", path);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    tokio::process::Command::from(cmd)
+}
+
+/// The in-app agent's `run_shell` tool: `sh -c <command>` on unix and `cmd /C <command>` on
+/// Windows (where `sh` usually doesn't exist), run from the user's home directory with the
+/// same augmented PATH as the CLI engines and no console window.
+pub fn shell_command(command: &str) -> tokio::process::Command {
+    #[cfg(windows)]
+    let mut cmd = {
+        use std::os::windows::process::CommandExt;
+        let mut c = std::process::Command::new("cmd");
+        // raw_arg hands the line to cmd.exe verbatim: Rust's default quoting targets
+        // MSVC-style argv parsing, which `cmd /C` does not use. `/S` plus one added
+        // pair of outer quotes is cmd's documented form: cmd strips exactly that
+        // pair, so a command that starts with a quoted path
+        // ("C:\Program Files\...\python.exe" "x y.py") keeps its own quotes.
+        // `/D` skips any AutoRun commands from the registry.
+        c.args(["/D", "/S", "/C"])
+            .raw_arg(format!("\"{command}\""))
+            .creation_flags(CREATE_NO_WINDOW);
+        c
+    };
+    #[cfg(not(windows))]
+    let mut cmd = {
+        let mut c = std::process::Command::new("sh");
+        c.arg("-c").arg(command);
+        c
+    };
+    if let Some(home) = dirs::home_dir() {
+        cmd.current_dir(home);
+    }
+    if let Some(path) = augmented_path(None) {
+        cmd.env("PATH", path);
+    }
+    cmd.stdin(std::process::Stdio::null());
+    tokio::process::Command::from(cmd)
+}
+
+/// Max chars of `run_shell` output handed back to the model.
+const SHELL_OUTPUT_MAX_CHARS: usize = 12_000;
+
+/// Run an approved `run_shell` command and return what the model should see: stdout, then
+/// stderr under a marker, capped at 12k chars. A command that can't even be spawned comes
+/// back as text too, so it is a tool result the model can react to instead of an error
+/// that aborts the whole chat turn.
+pub async fn run_shell_capture(command: &str) -> String {
+    let output = match shell_command(command).output().await {
+        Ok(o) => o,
+        Err(e) => return format!("failed to run the command: {e}"),
+    };
+    let mut out = String::from_utf8_lossy(&output.stdout).into_owned();
+    let err = String::from_utf8_lossy(&output.stderr);
+    if !err.trim().is_empty() {
+        out.push_str("\n[stderr]\n");
+        out.push_str(&err);
+    }
+    if !output.status.success() {
+        out.push_str(&format!("\n[exit status: {}]", output.status));
+    }
+    if out.chars().count() > SHELL_OUTPUT_MAX_CHARS {
+        out = format!(
+            "{}\n…(truncated)",
+            out.chars().take(SHELL_OUTPUT_MAX_CHARS).collect::<String>()
+        );
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------------------
+// Claude CLI isolation
+// ---------------------------------------------------------------------------------------
+
+/// Which isolation flags the installed `claude` understands, read once from `claude --help`.
+/// Older builds reject unknown flags outright, so each one is only passed when advertised.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ClaudeCaps {
+    no_session_persistence: bool,
+    strict_mcp_config: bool,
+    tools: bool,
+    disable_slash_commands: bool,
+    settings: bool,
+    setting_sources: bool,
+    system_prompt: bool,
+    system_prompt_file: bool,
+}
+
+impl ClaudeCaps {
+    fn from_help(help: &str) -> Self {
+        // Match whole flag tokens: "--tools" must not match "--disallowed-tools".
+        let has = |flag: &str| {
+            help.split(|c: char| c.is_whitespace() || c == ',')
+                .any(|tok| tok == flag)
+        };
+        Self {
+            no_session_persistence: has("--no-session-persistence"),
+            strict_mcp_config: has("--strict-mcp-config"),
+            tools: has("--tools"),
+            disable_slash_commands: has("--disable-slash-commands"),
+            settings: has("--settings"),
+            setting_sources: has("--setting-sources"),
+            system_prompt: has("--system-prompt"),
+            // Print-mode only and not listed on its own line: 2.1.x mentions it as
+            // `--system-prompt[-file]` (under --bare), so accept either spelling.
+            system_prompt_file: has("--system-prompt-file")
+                || help.contains("--system-prompt[-file]"),
+        }
+    }
+}
+
+static CLAUDE_CAPS: std::sync::Mutex<Option<(PathBuf, ClaudeCaps)>> = std::sync::Mutex::new(None);
+
+/// The flags `bin` supports, probing `--help` once per binary path. A probe that fails or
+/// hangs yields no optional flags (the legacy invocation), never an error.
+async fn claude_caps(bin: &Path) -> ClaudeCaps {
+    if let Ok(slot) = CLAUDE_CAPS.lock() {
+        if let Some((p, caps)) = slot.as_ref() {
+            if p == bin {
+                return *caps;
+            }
+        }
+    }
+    let mut cmd = cli_command(bin);
+    cmd.arg("--help")
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let probe = tokio::time::timeout(std::time::Duration::from_secs(15), cmd.output()).await;
+    let caps = match probe {
+        Ok(Ok(out)) => {
+            let mut help = String::from_utf8_lossy(&out.stdout).into_owned();
+            help.push('\n');
+            help.push_str(&String::from_utf8_lossy(&out.stderr));
+            ClaudeCaps::from_help(&help)
+        }
+        _ => ClaudeCaps::default(),
+    };
+    if let Ok(mut slot) = CLAUDE_CAPS.lock() {
+        *slot = Some((bin.to_path_buf(), caps));
+    }
+    caps
+}
+
+/// Settings passed to every `claude -p` call: turn the user's hooks off. Their SessionStart
+/// / UserPromptSubmit hooks (including Callimachus's own `cal hook` / `cal recall-now`)
+/// would otherwise run and inject context into a plain text completion. Only the project
+/// and local sources are dropped (`--setting-sources user`, nothing a scratch cwd should
+/// supply): the user's own settings (env, apiKeyHelper, Bedrock/Vertex/proxy config) stay,
+/// so auth keeps working, which dropping every source with `--setting-sources ""` would not.
+const CLAUDE_CALL_SETTINGS: &str = r#"{"disableAllHooks":true}"#;
+
+/// Longest system prompt passed as one argv value. CreateProcess caps a whole command line
+/// at 32,767 UTF-16 units and Linux one argument at 128 KiB; longer text goes by file.
+const MAX_ARGV_SYSTEM_BYTES: usize = 12_000;
+
+/// The same cap for a batch shim, whose command line cmd.exe limits to 8,191 chars.
+const MAX_BATCH_SYSTEM_BYTES: usize = 4_000;
+
+/// How the system prompt reaches `claude -p`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SystemSlot {
+    /// `--system-prompt <text>`.
+    Arg,
+    /// `--system-prompt-file <path>`, for text argv can't carry.
+    File(PathBuf),
+    /// Folded into the stdin prompt: no system slot that can carry this text.
+    Stdin,
+}
+
+/// Whether `bin` is a Windows batch file, as npm installs `claude.cmd`. Not gated on
+/// Windows (no unix lookup ever resolves one) so the rule is testable everywhere.
+fn is_batch_file(bin: &Path) -> bool {
+    bin.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat"))
+}
+
+/// Whether `text` can go to `bin` as an argv value. Since Rust 1.77.2 std refuses to pass
+/// an argument containing `\r` or `\n` to a batch file (the CVE-2024-24576 hardening:
+/// cmd.exe can't quote them), so the spawn itself fails with InvalidInput.
+fn argv_can_carry(bin: &Path, text: &str) -> bool {
+    if is_batch_file(bin) {
+        !text.contains(['\r', '\n']) && text.len() <= MAX_BATCH_SYSTEM_BYTES
+    } else {
+        text.len() <= MAX_ARGV_SYSTEM_BYTES
+    }
+}
+
+/// A system prompt in a private temp file for `--system-prompt-file`, removed on drop.
+/// Keep it alive until the child exits.
+struct PromptFile(PathBuf);
+
+impl PromptFile {
+    fn write(text: &str) -> std::io::Result<Self> {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos());
+        let path = cli_work_dir().join(format!(
+            ".system-{}-{}-{nanos}.txt",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let file = Self(path);
+        opts.open(&file.0)?.write_all(text.as_bytes())?;
+        Ok(file)
+    }
+}
+
+impl Drop for PromptFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// [`claude_args`] for running `bin`, choosing the system prompt's slot: argv when it fits,
+/// else a temp file when the CLI takes one (multi-line text for an npm `claude.cmd` shim,
+/// or a prompt too long for a command line), else stdin. Returns the file's guard too.
+fn claude_invocation(
+    caps: &ClaudeCaps,
+    bin: &Path,
+    output_args: &[&str],
+    model: &str,
+    system: &str,
+    user: &str,
+) -> (Vec<String>, String, Option<PromptFile>) {
+    let fits = argv_can_carry(bin, system);
+    let file = (!system.trim().is_empty() && caps.system_prompt_file && !fits)
+        .then(|| PromptFile::write(system).ok())
+        .flatten();
+    let slot = match &file {
+        Some(f) => SystemSlot::File(f.0.clone()),
+        None if caps.system_prompt && fits => SystemSlot::Arg,
+        None => SystemSlot::Stdin,
+    };
+    let (args, stdin) = claude_args(caps, output_args, model, system, user, &slot);
+    (args, stdin, file)
+}
+
+/// argv + stdin for one `claude -p` call: the given output flags, the user's interactive
+/// setup switched off (no tools, MCP servers, skills, hooks or project settings, and no
+/// session transcript that the watcher would index as the user's own), and the system
+/// prompt in `slot` (its own slot replaces Claude Code's large default harness prompt).
+fn claude_args(
+    caps: &ClaudeCaps,
+    output_args: &[&str],
+    model: &str,
+    system: &str,
+    user: &str,
+    slot: &SystemSlot,
+) -> (Vec<String>, String) {
+    let mut args: Vec<String> = vec!["-p".into()];
+    args.extend(output_args.iter().map(|s| s.to_string()));
+    if caps.tools {
+        args.extend(["--tools".into(), String::new()]);
+    } else {
+        args.extend(["--allowedTools".into(), String::new()]);
+    }
+    if caps.no_session_persistence {
+        args.push("--no-session-persistence".into());
+    }
+    if caps.strict_mcp_config {
+        args.push("--strict-mcp-config".into());
+    }
+    if caps.disable_slash_commands {
+        args.push("--disable-slash-commands".into());
+    }
+    if caps.settings {
+        args.extend(["--settings".into(), CLAUDE_CALL_SETTINGS.into()]);
+    }
+    if caps.setting_sources {
+        args.extend(["--setting-sources".into(), "user".into()]);
+    }
+    if !model.is_empty() {
+        args.extend(["--model".into(), model.to_string()]);
+    }
+    let stdin = match slot {
+        _ if system.trim().is_empty() => user.to_string(),
+        SystemSlot::Arg => {
+            args.extend(["--system-prompt".into(), system.to_string()]);
+            user.to_string()
+        }
+        SystemSlot::File(path) => {
+            args.extend([
+                "--system-prompt-file".into(),
+                path.to_string_lossy().into_owned(),
+            ]);
+            user.to_string()
+        }
+        SystemSlot::Stdin => join_prompt(system, user),
+    };
+    (args, stdin)
+}
+
+/// One prompt for CLIs without a separate system slot.
+fn join_prompt(system: &str, user: &str) -> String {
+    if system.trim().is_empty() {
+        user.to_string()
+    } else {
+        format!("{system}\n\n{user}")
+    }
+}
+
+/// Run a CLI backend once: spawn the binary, pipe the prompt to stdin, return trimmed stdout.
+/// Runs in the app's scratch cwd so the CLI never acts on the user's repos.
+async fn cli_complete(provider: &str, model: &str, system: &str, user: &str) -> Result<String> {
     use tokio::io::AsyncWriteExt;
     let backend = cli_backend_for(provider)
         .ok_or_else(|| anyhow::anyhow!("not a CLI provider: {provider}"))?;
@@ -267,16 +919,31 @@ async fn cli_complete(provider: &str, model: &str, prompt: &str) -> Result<Strin
             backend.bin
         )
     })?;
-    let mut cmd = tokio::process::Command::new(&bin);
-    cmd.args(&backend.base_args);
-    if !model.is_empty() {
-        cmd.arg(backend.model_flag).arg(model);
-    }
+    // `_system_file` lives until this returns, after the child has exited.
+    let (args, prompt, _system_file) = if provider == "claude-cli" {
+        let caps = claude_caps(&bin).await;
+        claude_invocation(
+            &caps,
+            &bin,
+            &["--output-format", "text"],
+            model,
+            system,
+            user,
+        )
+    } else {
+        let mut args: Vec<String> = backend.base_args.iter().map(|s| s.to_string()).collect();
+        if !model.is_empty() {
+            args.extend([backend.model_flag.to_string(), model.to_string()]);
+        }
+        (args, join_prompt(system, user), None)
+    };
+    let mut cmd = cli_command(&bin);
+    cmd.args(&args);
     let mut child = cmd
-        .current_dir(std::env::temp_dir())
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
         .spawn()
         .map_err(|e| {
             anyhow::anyhow!(
@@ -315,6 +982,7 @@ async fn cli_complete(provider: &str, model: &str, prompt: &str) -> Result<Strin
 async fn cli_stream<F>(
     provider: &str,
     model: &str,
+    system: &str,
     prompt: &str,
     cancel: &tokio_util::sync::CancellationToken,
     mut on_token: F,
@@ -326,7 +994,7 @@ where
     if provider != "claude-cli" {
         let text = tokio::select! {
             _ = cancel.cancelled() => return Ok(String::new()),
-            r = cli_complete(provider, model, prompt) => r?,
+            r = cli_complete(provider, model, system, prompt) => r?,
         };
         on_token(ChunkKind::Text, &text);
         return Ok(text);
@@ -338,22 +1006,25 @@ where
             "`claude` not found. Install it and make sure it's logged in, then pick it again."
         )
     })?;
-    let mut cmd = tokio::process::Command::new(&bin);
+    let caps = claude_caps(&bin).await;
     // stream-json in print mode requires --verbose; --include-partial-messages adds token deltas.
-    cmd.args([
-        "-p",
-        "--output-format",
-        "stream-json",
-        "--verbose",
-        "--include-partial-messages",
-        "--allowedTools",
-        "",
-    ]);
-    if !model.is_empty() {
-        cmd.arg("--model").arg(model);
-    }
+    // `_system_file` lives until this returns, after the child has exited or been killed.
+    let (args, stdin_text, _system_file) = claude_invocation(
+        &caps,
+        &bin,
+        &[
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--include-partial-messages",
+        ],
+        model,
+        system,
+        prompt,
+    );
+    let mut cmd = cli_command(&bin);
+    cmd.args(&args);
     let mut child = cmd
-        .current_dir(std::env::temp_dir())
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -364,7 +1035,7 @@ where
         })?;
 
     if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(prompt.as_bytes()).await.ok();
+        stdin.write_all(stdin_text.as_bytes()).await.ok();
         // Drop stdin to send EOF so the CLI stops waiting for more input.
     }
 
@@ -433,8 +1104,9 @@ where
     Ok(full)
 }
 
-/// One non-streaming completion, routed to the user's CLI (keyless) or to genai (keyed). The CLI
-/// path has no separate system slot, so `system` and `user` are flattened into one prompt.
+/// One non-streaming completion, routed to the user's CLI (keyless) or to genai (keyed). The
+/// Claude CLI takes `system` in its own slot when it supports `--system-prompt`; other CLIs
+/// get `system` and `user` flattened into one prompt.
 #[allow(clippy::too_many_arguments)] // provider/model/key/base_url/system/user/temp/max — all distinct
 async fn complete(
     provider: &str,
@@ -447,7 +1119,7 @@ async fn complete(
     max_tokens: u32,
 ) -> Result<String> {
     if is_cli_provider(provider) {
-        return cli_complete(provider, model, &format!("{system}\n\n{user}")).await;
+        return cli_complete(provider, model, system, user).await;
     }
     let client = build_client(provider, api_key, base_url)?;
     let req = ChatRequest::new(Vec::new())
@@ -632,16 +1304,25 @@ fn parse_conflicts(raw: &str) -> Vec<ConflictPair> {
 /// System prompt for STRUCTURED distillation into the knowledge `facts` table. We ask
 /// for plain JSON and parse leniently (works identically across cloud and local Ollama
 /// — no adapter-specific response-format API). TODOs are intentionally NOT requested:
-/// those come from the free heuristic tier.
-const DISTILL_SYSTEM: &str = "You distill one AI coding-agent session into structured \
-knowledge for the developer. Output ONLY a single JSON object — no prose, no markdown \
-code fences — of exactly this shape:\n\
+/// those come from the free heuristic tier. The facts land in every future session's
+/// context for the repo, so the prompt asks for few, durable, repo-specific items; the
+/// repository reaches the model through pack_thread's `project=` envelope attribute.
+const DISTILL_SYSTEM: &str = "You distill one AI coding-agent session into durable project \
+knowledge for the developer. The <reference_thread> tag's project attribute names the \
+repository. Output ONLY a single JSON object (no prose, no markdown code fences) of exactly \
+this shape:\n\
 {\"summary\": string, \"decisions\": string[], \"gotchas\": string[]}\n\
 - summary: 1-2 sentences on what the session did and the outcome.\n\
-- decisions: concrete technical decisions made, and why — one terse sentence each.\n\
-- gotchas: pitfalls, surprises, or non-obvious constraints discovered — one each.\n\
-Ground every item in the transcript; omit anything you cannot support; never invent. \
-Use an empty string / empty array when a field has nothing.";
+- decisions: at most 3 durable technical decisions about THIS repository (architecture, \
+libraries, conventions, data formats), each one terse sentence with the reason.\n\
+- gotchas: at most 3 non-obvious pitfalls or constraints of THIS repository that a future \
+session would otherwise hit, one sentence each.\n\
+Leave out anything ephemeral or task-local (one-off commands, current branch or PR status, \
+machine-local setup such as shell profiles or PATH fixes, temporary workarounds), advice \
+about other projects or non-code topics, and anything later superseded in the same session. \
+Every item must name concrete technical specifics (files, APIs, tools, values). Ground every \
+item in the transcript; omit anything you cannot support; never invent. Use an empty \
+string / empty array when a field has nothing; an empty array is better than a weak item.";
 
 /// The distilled knowledge for one thread. Deserialized leniently from the model's
 /// JSON; `summary` carries the raw completion as a fallback if parsing fails.
@@ -721,6 +1402,39 @@ answering. Don't answer from memory when their own history could hold the answer
 commands minimal and read-only where possible. Each command needs the user's approval.\n\
 - Be concise, specific, and technical. If a search finds nothing relevant, say so — never invent.";
 
+/// Longest wait for a provider's streaming response headers (connect, send, first response).
+/// Generous on purpose: local Ollama only sends headers with its first token, i.e. after a cold
+/// model load and prompt evaluation, which can take minutes for a large model on CPU.
+const STREAM_HEADER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// Longest silence between two raw reads of a streaming body. This is not an overall deadline:
+/// every chunk, including provider heartbeats, resets it. Reasoning models (and Gemini, which
+/// sends nothing while thinking) can go quiet for a long time before the first visible token,
+/// so the bound only catches connections that have actually died.
+const STREAM_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// How "Add to chat" context starts (store/chat.ts `CONTEXT_PREFIX`).
+const CHAT_CONTEXT_PREFIX: &str = "Here is context for our conversation:";
+
+/// Index of the message to mark as an explicit prompt-cache breakpoint: the LAST injected
+/// context message, for Anthropic models only (direct, or `anthropic/*` via OpenRouter).
+/// Anthropic bills a re-sent prefix at full price unless it is marked; OpenAI and Gemini
+/// cache stable prefixes on their own, so their requests are left as they were.
+fn context_cache_breakpoint(
+    provider: &str,
+    model: &str,
+    messages: &[ChatMessage],
+) -> Option<usize> {
+    let anthropic =
+        provider == "anthropic" || (provider == "openrouter" && model.starts_with("anthropic/"));
+    if !anthropic {
+        return None;
+    }
+    messages
+        .iter()
+        .rposition(|m| m.role == "user" && m.content.starts_with(CHAT_CONTEXT_PREFIX))
+}
+
 /// Stream a chat completion via the genai crate (multi-provider, native protocols,
 /// retries). The adapter is forced per `provider`; the API key (from the keychain)
 /// is injected through an auth resolver so it never leaves Rust. `on_token` fires
@@ -767,8 +1481,8 @@ where
                 }
             }
         }
-        let prompt = format!("{system}\n{convo}\n\nAssistant:");
-        return cli_stream(provider, model, &prompt, &cancel, on_token).await;
+        let prompt = format!("{}\n\nAssistant:", convo.trim_start());
+        return cli_stream(provider, model, &system, &prompt, &cancel, on_token).await;
     }
 
     let client = build_client(provider, api_key, base_url)?;
@@ -776,7 +1490,8 @@ where
     // Split system messages out (genai takes system separately); map the rest.
     let mut system = String::from(CHAT_SYSTEM);
     let mut req = ChatRequest::new(Vec::new());
-    for m in messages {
+    let cache_context_at = context_cache_breakpoint(provider, model, messages);
+    for (i, m) in messages.iter().enumerate() {
         match m.role.as_str() {
             "system" => {
                 if !system.is_empty() {
@@ -784,8 +1499,19 @@ where
                 }
                 system.push_str(&m.content);
             }
+            // Chats saved by older builds can hold an empty turn from a reply stopped before
+            // its first token; providers reject an empty assistant message, so drop it.
+            "assistant" if m.content.trim().is_empty() => {}
             "assistant" => req = req.append_message(GMessage::assistant(m.content.clone())),
-            _ => req = req.append_message(GMessage::user(m.content.clone())),
+            _ => {
+                let mut msg = GMessage::user(m.content.clone());
+                // Injected thread context is re-sent on every turn and every tool round;
+                // mark it as a cache breakpoint where the provider bills for that.
+                if cache_context_at == Some(i) {
+                    msg = msg.with_options(genai::chat::CacheControl::Ephemeral);
+                }
+                req = req.append_message(msg);
+            }
         }
     }
     if !system.is_empty() {
@@ -795,15 +1521,31 @@ where
         req = req.with_tools(tools);
     }
 
-    // Capture content + tool calls so we can drive the multi-turn tool loop.
+    // Capture content + tool calls so we can drive the multi-turn tool loop. The stream timeouts
+    // turn a dead connection (sleep/wake, network switch, a hung proxy) into an error instead of
+    // a chat that spins until the user presses Stop.
     let options = ChatOptions::default()
         .with_capture_content(true)
-        .with_capture_tool_calls(true);
+        .with_capture_tool_calls(true)
+        .with_stream_header_timeout(STREAM_HEADER_TIMEOUT)
+        .with_stream_read_timeout(STREAM_READ_TIMEOUT);
 
     let mut full = String::new();
+    // Per-answer tool budget. Every round re-sends the whole conversation including all
+    // earlier tool results, so an unbounded loop (a weak local model that keeps calling
+    // tools) costs ever-growing requests on the user's key and never ends on its own.
+    let mut guard = ToolGuard::default();
+    let mut final_round = false;
     loop {
+        // After the budget is spent the model gets one last round with tools disabled
+        // (where the provider honors tool_choice) and stub results telling it to answer.
+        let round_options = if final_round {
+            options.clone().with_tool_choice(ToolChoice::None)
+        } else {
+            options.clone()
+        };
         let resp = client
-            .exec_chat_stream(model, req.clone(), Some(&options))
+            .exec_chat_stream(model, req.clone(), Some(&round_options))
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         let mut stream = resp.stream;
@@ -863,26 +1605,157 @@ where
         if calls.is_empty() {
             break;
         }
+        if final_round {
+            // Still asking for tools after being told to answer: stop instead of looping.
+            let note = "\n\n_(Stopped: this answer reached its tool-call limit.)_";
+            full.push_str(note);
+            on_token(ChunkKind::Text, note);
+            break;
+        }
 
         // Append the assistant's tool-call turn, run each tool, append responses, loop.
+        // Every call gets a response (even a stub), since providers reject a tool call
+        // without its matching result.
         if let Some(content) = &end.captured_content {
             req = req.append_message(GMessage::assistant(content.clone()));
         }
+        let exhausted = !guard.start_round();
         let mut responses = Vec::new();
-        for call in calls {
+        for mut call in calls {
             if cancel.is_cancelled() {
                 return Ok(full);
             }
             let id = call.call_id.clone();
-            let output = match execute_tool(call).await {
-                Ok(out) => out,
-                Err(e) => format!("tool error: {e}"),
+            let output = if exhausted {
+                TOOL_BUDGET_SPENT.to_string()
+            } else if let Some(stub) = guard.repeat_of(&call) {
+                stub
+            } else {
+                clamp_tool_args(&mut call);
+                let name = call.fn_name.clone();
+                let thread = thread_arg(&call);
+                let raw = match execute_tool(call).await {
+                    Ok(out) => out,
+                    Err(e) => format!("tool error: {e}"),
+                };
+                guard.admit(&name, thread, raw)
             };
             responses.push(ToolResponse::new(id, output));
         }
         req = req.append_message(GMessage::from(responses));
+        final_round = exhausted;
     }
     Ok(full)
+}
+
+/// Max tool-calling rounds in one answer before the model is made to answer.
+const MAX_TOOL_ROUNDS: usize = 8;
+/// Max chars of one tool result kept in the conversation (and so re-sent every round).
+const TOOL_RESULT_MAX_CHARS: usize = 12_000;
+/// Once this much tool output is in the conversation, later results are cut much harder.
+const TOOL_RESULTS_BUDGET_CHARS: usize = 48_000;
+const TOOL_RESULT_OVER_BUDGET_CHARS: usize = 2_000;
+/// Cap on the model-chosen `limit` for search_history.
+const SEARCH_LIMIT_MAX: i64 = 20;
+
+const TOOL_BUDGET_SPENT: &str = "Tool budget for this answer is used up. Do not call any more \
+tools: answer the user now from the results you already have.";
+
+/// Bookkeeping for one answer's tool use: round count, repeated calls, total size.
+#[derive(Default)]
+struct ToolGuard {
+    rounds: usize,
+    /// Call signatures already executed in this answer.
+    seen_calls: std::collections::HashSet<String>,
+    /// Hash of every get_thread result already returned, with its thread id.
+    seen_threads: std::collections::HashMap<u64, i64>,
+    /// Chars of tool output already in the conversation.
+    chars: usize,
+}
+
+impl ToolGuard {
+    /// Count a new round of tool calls. False once the round budget is spent.
+    fn start_round(&mut self) -> bool {
+        if self.rounds >= MAX_TOOL_ROUNDS {
+            return false;
+        }
+        self.rounds += 1;
+        true
+    }
+
+    /// A stub when this exact read-only call already ran in this answer (its result is
+    /// already in the conversation, so re-running it only re-sends the same text).
+    /// run_shell is never de-duplicated: re-running a command can be the point.
+    fn repeat_of(&mut self, call: &ToolCall) -> Option<String> {
+        let sig = match call.fn_name.as_str() {
+            "get_thread" => format!("get_thread:{}", thread_arg(call).unwrap_or(-1)),
+            "search_history" => format!("search_history:{}", call.fn_arguments),
+            _ => return None,
+        };
+        if self.seen_calls.insert(sig) {
+            None
+        } else {
+            Some(
+                "Same call as earlier in this answer; its result is already above. Use it \
+                 instead of calling again."
+                    .to_string(),
+            )
+        }
+    }
+
+    /// Size-limit a tool result before it joins the conversation, and replace a
+    /// get_thread result identical to one already returned (two ids, same transcript).
+    fn admit(&mut self, name: &str, thread: Option<i64>, output: String) -> String {
+        if name == "get_thread" {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            std::hash::Hash::hash(&output, &mut h);
+            let key = std::hash::Hasher::finish(&h);
+            if let Some(prev) = self.seen_threads.get(&key) {
+                return format!("Identical to the get_thread result for thread {prev} above.");
+            }
+            self.seen_threads.insert(key, thread.unwrap_or(-1));
+        }
+        let limit = if self.chars >= TOOL_RESULTS_BUDGET_CHARS {
+            TOOL_RESULT_OVER_BUDGET_CHARS
+        } else {
+            TOOL_RESULT_MAX_CHARS
+        };
+        let out = clip_tool_output(output, limit);
+        self.chars += out.chars().count();
+        out
+    }
+}
+
+/// `thread_id` argument of a get_thread call (models sometimes send it as a string).
+fn thread_arg(call: &ToolCall) -> Option<i64> {
+    let v = call.fn_arguments.get("thread_id")?;
+    v.as_i64()
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+}
+
+/// Keep model-chosen arguments within sane bounds before running the tool.
+fn clamp_tool_args(call: &mut ToolCall) {
+    if call.fn_name != "search_history" {
+        return;
+    }
+    if let Some(obj) = call.fn_arguments.as_object_mut() {
+        if let Some(limit) = obj.get("limit").and_then(serde_json::Value::as_i64) {
+            obj.insert("limit".into(), json!(limit.clamp(1, SEARCH_LIMIT_MAX)));
+        }
+    }
+}
+
+/// Cut a tool result to `max` chars (char-safe), saying how much was dropped.
+fn clip_tool_output(output: String, max: usize) -> String {
+    let total = output.chars().count();
+    if total <= max {
+        return output;
+    }
+    let kept: String = output.chars().take(max).collect();
+    format!(
+        "{kept}\n…({} more chars omitted to keep the conversation small)",
+        total - max
+    )
 }
 
 /// Persist (or replace) an in-app chat thread so it is searchable like any other.
@@ -913,12 +1786,16 @@ pub fn persist_chat(
             ts: Some(now),
         })
         .collect();
-    parsed.push(ParsedMessage {
-        role: "assistant".into(),
-        text: assistant_reply.to_string(),
-        tool_name: None,
-        ts: Some(now),
-    });
+    // A reply stopped before its first token is empty. Storing it as a turn would send an
+    // empty assistant message on the next request from this chat, which providers reject.
+    if !assistant_reply.trim().is_empty() {
+        parsed.push(ParsedMessage {
+            role: "assistant".into(),
+            text: assistant_reply.to_string(),
+            tool_name: None,
+            ts: Some(now),
+        });
+    }
 
     let thread = ParsedThread {
         external_id: thread_id.to_string(),
@@ -1049,6 +1926,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn context_cache_breakpoint_marks_the_last_injected_context_for_anthropic_only() {
+        let msg = |role: &str, content: &str| ChatMessage {
+            role: role.into(),
+            content: content.into(),
+        };
+        let messages = vec![
+            msg(
+                "user",
+                "Here is context for our conversation:\n<reference_thread>a",
+            ),
+            msg("assistant", "ok"),
+            msg(
+                "user",
+                "Here is context for our conversation:\n<reference_thread>b",
+            ),
+            msg("user", "what did we decide?"),
+        ];
+        assert_eq!(
+            context_cache_breakpoint("anthropic", "claude-sonnet-4-5", &messages),
+            Some(2)
+        );
+        assert_eq!(
+            context_cache_breakpoint("openrouter", "anthropic/claude-sonnet-4.6", &messages),
+            Some(2)
+        );
+        assert_eq!(context_cache_breakpoint("openai", "gpt-5", &messages), None);
+        assert_eq!(
+            context_cache_breakpoint("openrouter", "openai/gpt-5", &messages),
+            None
+        );
+        assert_eq!(
+            context_cache_breakpoint("anthropic", "x", &messages[1..2]),
+            None,
+            "no injected context, no breakpoint"
+        );
+    }
+
+    #[test]
     fn adapter_mapping() {
         assert!(adapter_for("anthropic").is_ok());
         assert!(adapter_for("openai").is_ok());
@@ -1098,6 +2013,7 @@ mod tests {
         let full = cli_stream(
             "claude-cli",
             "",
+            "You are terse.",
             "Reply with exactly: hello world",
             &cancel,
             move |_kind, t| {
@@ -1111,6 +2027,221 @@ mod tests {
         eprintln!("chunks={n} full={full:?}");
         assert!(!full.is_empty());
         assert!(n >= 2, "expected multiple streamed chunks, got {n}");
+    }
+
+    #[test]
+    fn claude_caps_parse_whole_flag_tokens() {
+        let help = "  --allowedTools, --allowed-tools <tools...>\n\
+                    --disallowedTools, --disallowed-tools <tools...>\n\
+                    --no-session-persistence   Disable session persistence\n\
+                    --system-prompt <prompt>   System prompt\n";
+        let caps = ClaudeCaps::from_help(help);
+        assert!(caps.no_session_persistence);
+        assert!(caps.system_prompt);
+        assert!(!caps.system_prompt_file);
+        assert!(!caps.tools, "--disallowed-tools must not count as --tools");
+        assert!(!caps.strict_mcp_config);
+        assert_eq!(ClaudeCaps::from_help(""), ClaudeCaps::default());
+        // How 2.1.x mentions the (otherwise unlisted) file variant.
+        let bare = "  --bare   ... Explicitly provide context via: --system-prompt[-file],\n\
+                    --append-system-prompt[-file], --add-dir\n\
+                    --setting-sources <sources>   Comma-separated list\n";
+        let caps = ClaudeCaps::from_help(bare);
+        assert!(caps.system_prompt_file && caps.setting_sources);
+        assert!(ClaudeCaps::from_help("--system-prompt-file <file>").system_prompt_file);
+    }
+
+    #[test]
+    fn multi_line_system_prompts_never_go_through_a_batch_shim_argv() {
+        let caps = ClaudeCaps {
+            system_prompt: true,
+            system_prompt_file: true,
+            ..ClaudeCaps::default()
+        };
+        let shim = Path::new(r"C:\Users\me\AppData\Roaming\npm\claude.CMD");
+        let exe = Path::new("/usr/local/bin/claude");
+        assert!(is_batch_file(shim) && !is_batch_file(exe));
+        assert!(!argv_can_carry(shim, DISTILL_SYSTEM), "has newlines");
+        assert!(argv_can_carry(shim, ANSWER_SYSTEM), "single line, short");
+        assert!(argv_can_carry(exe, DISTILL_SYSTEM));
+        assert!(!argv_can_carry(exe, &"x".repeat(MAX_ARGV_SYSTEM_BYTES + 1)));
+
+        // A shim gets the prompt by file, and the file is gone once the guard drops.
+        let (args, stdin, file) = claude_invocation(&caps, shim, &[], "", "SYS\nTWO", "USER");
+        let file = file.expect("prompt file");
+        let at = args
+            .iter()
+            .position(|a| a == "--system-prompt-file")
+            .unwrap();
+        assert_eq!(Path::new(&args[at + 1]), file.0);
+        assert_eq!(std::fs::read_to_string(&file.0).unwrap(), "SYS\nTWO");
+        assert!(!args.iter().any(|a| a.contains('\n')), "{args:?}");
+        assert_eq!(stdin, "USER");
+        let path = file.0.clone();
+        drop(file);
+        assert!(!path.exists());
+
+        // Without the file flag the prompt is folded into stdin, as before.
+        let no_file = ClaudeCaps {
+            system_prompt: true,
+            ..ClaudeCaps::default()
+        };
+        let (args, stdin, file) = claude_invocation(&no_file, shim, &[], "", "SYS\nTWO", "USER");
+        assert!(file.is_none() && !args.iter().any(|a| a.starts_with("--system-prompt")));
+        assert_eq!(stdin, "SYS\nTWO\n\nUSER");
+
+        // Anything else keeps the plain argv slot.
+        let (args, _, file) = claude_invocation(&caps, exe, &[], "", "SYS\nTWO", "USER");
+        assert!(file.is_none() && args.iter().any(|a| a == "--system-prompt"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scratch_dir_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = cli_work_dir();
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o077, 0, "{dir:?} is {mode:o}");
+        // An existing dir someone else could use is tightened, not trusted as is.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(cli_work_dir(), dir);
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o077, 0, "{dir:?} is {mode:o}");
+    }
+
+    #[test]
+    fn claude_args_isolate_the_call_when_supported() {
+        let all = ClaudeCaps {
+            no_session_persistence: true,
+            strict_mcp_config: true,
+            tools: true,
+            disable_slash_commands: true,
+            settings: true,
+            setting_sources: true,
+            system_prompt: true,
+            system_prompt_file: true,
+        };
+        let (args, stdin) = claude_args(
+            &all,
+            &["--output-format", "text"],
+            "sonnet",
+            "SYS",
+            "USER",
+            &SystemSlot::Arg,
+        );
+        let has = |a: &str| args.iter().any(|x| x == a);
+        for flag in [
+            "--no-session-persistence",
+            "--strict-mcp-config",
+            "--disable-slash-commands",
+            "--settings",
+            "--tools",
+            "--system-prompt",
+        ] {
+            assert!(has(flag), "missing {flag}: {args:?}");
+        }
+        let sources_at = args.iter().position(|a| a == "--setting-sources").unwrap();
+        assert_eq!(
+            args[sources_at + 1],
+            "user",
+            "keeps the user's auth settings, drops the scratch cwd's"
+        );
+        assert_eq!(stdin, "USER", "system prompt goes in its own slot");
+        let model_at = args.iter().position(|a| a == "--model").unwrap();
+        assert_eq!(args[model_at + 1], "sonnet");
+
+        // An old CLI gets only what it understands, with the prompt folded together.
+        let (old, stdin) = claude_args(
+            &ClaudeCaps::default(),
+            &[],
+            "",
+            "SYS",
+            "USER",
+            &SystemSlot::Stdin,
+        );
+        assert_eq!(
+            old,
+            vec!["-p".to_string(), "--allowedTools".into(), String::new()]
+        );
+        assert_eq!(stdin, "SYS\n\nUSER");
+    }
+
+    #[test]
+    fn recognizes_only_the_apps_own_cli_sessions() {
+        let distill = format!("{DISTILL_SYSTEM}\n\nTranscript: ...");
+        assert!(is_app_prompt(&distill));
+        assert!(!is_app_prompt("how do I activate a venv"));
+
+        let work = cli_work_dir_path();
+        let work = work.to_string_lossy();
+        assert!(is_app_cli_session(Some(&work), ["anything"]));
+        let tmp = std::env::temp_dir();
+        let tmp = tmp.to_string_lossy();
+        assert!(is_app_cli_session(Some(&tmp), [distill.as_str()]));
+        // A real session someone ran in the temp dir is kept.
+        assert!(!is_app_cli_session(Some(&tmp), ["fix my script"]));
+        assert!(!is_app_cli_session(
+            Some("/Users/me/proj"),
+            [distill.as_str()]
+        ));
+        assert!(!is_app_cli_session(None, [distill.as_str()]));
+    }
+
+    #[test]
+    fn tool_guard_caps_rounds_dedupes_and_clips() {
+        let mut g = ToolGuard::default();
+        for _ in 0..MAX_TOOL_ROUNDS {
+            assert!(g.start_round());
+        }
+        assert!(!g.start_round(), "budget spent after MAX_TOOL_ROUNDS");
+
+        let call = |name: &str, args: serde_json::Value| ToolCall {
+            call_id: "c".into(),
+            fn_name: name.into(),
+            fn_arguments: args,
+            thought_signatures: None,
+        };
+        let mut g = ToolGuard::default();
+        let t5 = call("get_thread", json!({"thread_id": 5}));
+        assert!(g.repeat_of(&t5).is_none());
+        assert!(g
+            .repeat_of(&call("get_thread", json!({"thread_id": "5"})))
+            .is_some());
+        assert!(g
+            .repeat_of(&call("run_shell", json!({"command": "ls"})))
+            .is_none());
+        assert!(g
+            .repeat_of(&call("run_shell", json!({"command": "ls"})))
+            .is_none());
+
+        // Results are clipped to the per-result cap; identical thread text is stubbed.
+        let big = "y".repeat(50_000);
+        let first = g.admit("get_thread", Some(5), big.clone());
+        assert!(first.chars().count() < TOOL_RESULT_MAX_CHARS + 100);
+        let again = g.admit("get_thread", Some(6), big);
+        assert!(again.contains("thread 5"), "{again}");
+
+        let mut search = call("search_history", json!({"query": "x", "limit": 500}));
+        clamp_tool_args(&mut search);
+        assert_eq!(search.fn_arguments["limit"], json!(SEARCH_LIMIT_MAX));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_shell_capture_reports_output_and_failures() {
+        let out = run_shell_capture("echo hello; echo oops 1>&2").await;
+        assert!(out.contains("hello"));
+        assert!(out.contains("[stderr]") && out.contains("oops"));
+        let failed = run_shell_capture("exit 3").await;
+        assert!(failed.contains("exit status"), "{failed}");
+    }
+
+    #[test]
+    fn augmented_path_puts_the_cli_dir_first() {
+        let bin = Path::new("/opt/tools/node/bin/claude");
+        let path = augmented_path(Some(bin)).unwrap();
+        let first = std::env::split_paths(&path).next().unwrap();
+        assert_eq!(first, PathBuf::from("/opt/tools/node/bin"));
     }
 
     #[test]

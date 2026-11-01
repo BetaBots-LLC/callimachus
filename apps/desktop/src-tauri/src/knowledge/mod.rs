@@ -1,8 +1,11 @@
 //! Distilled knowledge layer. Slice 1 is the FREE heuristic tier: TODO/action items
 //! pulled out of message text with conservative, low-noise markers (markdown unchecked
-//! tasks + word-boundaried TODO/FIXME), stored in the `facts` table by the indexer and
-//! surfaced via `list_open_todos` (desktop, `cal todos`, MCP). No model, no API key.
-//! The LLM tier (decisions / gotchas / summaries, lazy on-demand) reuses the same table.
+//! tasks + TODO/FIXME markers that open a line), stored in the `facts` table by the indexer
+//! and surfaced via `list_open_todos` (desktop, `cal todos`, MCP). No model, no API key.
+//! The LLM tier (decisions / gotchas / summaries, lazy on-demand) reuses the same table, as
+//! do facts recorded by the user or by agents (`record_fact_with_origin`).
+
+pub mod app_config;
 
 use crate::agent::Distilled;
 use anyhow::Result;
@@ -13,26 +16,54 @@ use serde::Serialize;
 const MAX_TODO_LEN: usize = 240;
 
 /// Pull likely TODO/action items out of one message's text. Intentionally
-/// conservative — only markdown unchecked tasks (`- [ ]`) and word-boundaried
-/// `TODO`/`FIXME` markers — so we get signal, not every "we need to" aside.
+/// conservative, so we get signal, not every "we need to" aside:
+/// - markdown unchecked tasks (`- [ ] wire up auth`), and
+/// - a `TODO` / `FIXME` marker that OPENS a line, optionally after a comment or bullet
+///   leader (`// TODO: x`, `- FIXME x`, `# TODO(ari): x`).
+///
+/// A marker in the middle of a sentence (`set_todo_done(false) and complete_todo …`,
+/// `'todo' kind`, `TODO/FIXME markers`) is prose about TODOs, not a TODO, and is ignored.
+/// So are fenced code blocks (code under discussion, not the user's action items) and
+/// injected context such as a loaded skill body, whose checklists are templates.
 pub fn extract_todos(text: &str) -> Vec<String> {
     let mut out = Vec::new();
+    if is_injected_context(text) {
+        return out;
+    }
+    let mut in_fence = false;
     for raw in text.lines() {
         let line = raw.trim();
-        if line.is_empty() {
+        if line.starts_with("```") || line.starts_with("~~~") {
+            in_fence = !in_fence;
             continue;
         }
-        let candidate = match unchecked_task(line) {
-            Some(rest) => Some(rest),
-            None => marker_pos(line).map(|i| strip_marker(&line[i..])),
-        };
-        if let Some(c) = candidate {
-            if let Some(todo) = clean(c) {
-                out.push(todo);
-            }
+        if in_fence || line.is_empty() {
+            continue;
+        }
+        let candidate = unchecked_task(line).or_else(|| leading_marker(line));
+        if let Some(todo) = candidate.and_then(clean) {
+            out.push(todo);
         }
     }
     out
+}
+
+/// Message text that an agent harness injected rather than the user or model writing it:
+/// skill bodies, slash-command expansions, system reminders, and Callimachus's own
+/// injected memory / packed threads (extracting from those would feed TODOs back to us).
+fn is_injected_context(text: &str) -> bool {
+    let t = text.trim_start();
+    const PREFIXES: [&str; 8] = [
+        "Base directory for this skill",
+        "<command-name>",
+        "<command-message>",
+        "<system-reminder>",
+        "<local-command-stdout>",
+        "Caveat: The messages below were generated",
+        "<reference_thread",
+        "<project_memory",
+    ];
+    PREFIXES.iter().any(|p| t.starts_with(p)) || t.contains(crate::export::MANAGED_START)
 }
 
 /// Text after a markdown unchecked task bullet, e.g. `- [ ] wire up auth` -> `wire up auth`.
@@ -45,39 +76,56 @@ fn unchecked_task(line: &str) -> Option<&str> {
     None
 }
 
-/// Byte index of a word-boundaried, case-insensitive TODO/FIXME marker (so "mastodon"
-/// and "fixmestyle" don't match). None if the line has no marker.
-fn marker_pos(line: &str) -> Option<usize> {
-    let lower = line.to_ascii_lowercase();
-    let bytes = lower.as_bytes();
-    for m in ["todo", "fixme"] {
-        let mut start = 0;
-        while let Some(rel) = lower[start..].find(m) {
-            let i = start + rel;
-            let before_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
-            let after_idx = i + m.len();
-            let after_ok = after_idx >= bytes.len() || !bytes[after_idx].is_ascii_alphanumeric();
-            if before_ok && after_ok {
-                return Some(i);
-            }
-            start = i + m.len();
+/// The text after a TODO/FIXME marker that opens `line` (after comment, bullet, quote,
+/// numbering or emphasis leaders). The marker must be followed by `:` or `(` in any case,
+/// or by a space / dash when written in capitals: `TODO fix x` is a marker, `Todo list
+/// for the week` is prose. Anything glued to it (`todos`, `todo_list`, `TODO/FIXME`) is not.
+fn leading_marker(line: &str) -> Option<&str> {
+    const LEADERS: [&str; 11] = ["<!--", "//", "/*", "--", "#", ";", "*", "-", "+", ">", "_"];
+    let mut rest = line;
+    loop {
+        let before = rest;
+        rest = rest.trim_start();
+        if let Some(r) = LEADERS.iter().find_map(|l| rest.strip_prefix(l)) {
+            rest = r;
+        }
+        // Ordered-list numbering: `1.` / `2)`.
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        if digits > 0 && rest[digits..].starts_with(['.', ')']) {
+            rest = &rest[digits + 1..];
+        }
+        if rest == before {
+            break;
         }
     }
-    None
+    // `get` rather than indexing: the line may start with a multi-byte char.
+    let marker = ["TODO", "FIXME"].into_iter().find(|m| {
+        rest.get(..m.len())
+            .is_some_and(|p| p.eq_ignore_ascii_case(m))
+    })?;
+    let written_upper = rest.get(..marker.len()) == Some(marker);
+    let after = &rest[marker.len()..];
+    match after.chars().next() {
+        Some(':') | Some('(') => {}
+        Some(c) if (c == ' ' || c == '\t' || c == '-') && written_upper => {}
+        _ => return None,
+    }
+    Some(strip_marker_tail(after))
 }
 
-/// Drop the leading `TODO`/`FIXME` label and its trailing punctuation:
-/// `TODO: fix the parser` -> `fix the parser`.
-fn strip_marker(frag: &str) -> &str {
-    let lower = frag.to_ascii_lowercase();
-    let rest = if lower.starts_with("todo") {
-        &frag[4..]
-    } else if lower.starts_with("fixme") {
-        &frag[5..]
-    } else {
-        frag
-    };
-    rest.trim_start_matches([':', '-', ' ', '\t', ')', '(', '.', '*'])
+/// Drop what follows a TODO marker before its text: an owner tag `(ari)`, separators, and
+/// a trailing comment closer. `(ari): fix the parser */` -> `fix the parser`.
+fn strip_marker_tail(after: &str) -> &str {
+    let mut rest = after;
+    if rest.starts_with('(') {
+        if let Some(close) = rest.find(')') {
+            rest = &rest[close + 1..];
+        }
+    }
+    rest.trim_start_matches([':', '-', ' ', '\t', ')', '.', '*', '_'])
+        .trim_end_matches("*/")
+        .trim_end_matches("-->")
+        .trim_end()
 }
 
 /// Trim, reject noise/too-short fragments, and length-cap. None = not a usable TODO.
@@ -119,6 +167,30 @@ pub fn clear_heuristic(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// `facts.created_at` for a heuristic TODO: when its source message was written, not when
+/// the thread was (re)indexed, so "newest first" means newest TODO rather than "most
+/// recently re-indexed thread". Falls back to `now` for sources without timestamps;
+/// tolerates millisecond stamps and never returns a time in the future.
+pub fn todo_created_at(message_ts: Option<i64>, now: i64) -> i64 {
+    match message_ts {
+        Some(ts) if ts > 100_000_000_000 => (ts / 1000).min(now),
+        Some(ts) if ts > 0 => ts.min(now),
+        _ => now,
+    }
+}
+
+/// Drop the open, uncurated heuristic TODOs of subagent threads (extracted before
+/// extraction skipped them). Curated ones (done / pinned / hidden) are kept. Idempotent and
+/// cheap; run once at startup. Returns the number of rows removed.
+pub fn purge_subagent_todos(conn: &Connection) -> Result<usize> {
+    Ok(conn.execute(
+        "DELETE FROM facts WHERE extractor = 'heuristic' AND kind = 'todo'
+            AND status = 'open' AND pinned = 0 AND hidden = 0
+            AND thread_id IN (SELECT id FROM threads WHERE is_subagent = 1)",
+        [],
+    )?)
+}
+
 /// Re-derive a single thread's heuristic todos from its already-stored messages,
 /// inside the caller's transaction. Shared by the indexer and the backfill.
 fn rebuild_thread_todos(tx: &Connection, thread_id: i64, now: i64) -> Result<()> {
@@ -129,14 +201,25 @@ fn rebuild_thread_todos(tx: &Connection, thread_id: i64, now: i64) -> Result<()>
             AND status = 'open' AND hidden = 0 AND pinned = 0",
         [thread_id],
     )?;
+    // Subagent transcripts are the parent session's delegated work (most of the corpus in
+    // workflow-heavy repos); their checklists and code comments are not the user's TODOs.
+    let is_subagent: bool = tx
+        .query_row(
+            "SELECT is_subagent FROM threads WHERE id = ?1",
+            [thread_id],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()?
+        .is_some_and(|v| v != 0);
+    if is_subagent {
+        return Ok(());
+    }
     let mut sel = tx.prepare(
-        "SELECT id, text FROM messages WHERE thread_id = ?1 AND role IN ('user', 'assistant')
+        "SELECT id, text, ts FROM messages WHERE thread_id = ?1 AND role IN ('user', 'assistant')
          ORDER BY seq, id",
     )?;
-    let rows: Vec<(i64, String)> = sel
-        .query_map([thread_id], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
-        })?
+    let rows: Vec<(i64, String, Option<i64>)> = sel
+        .query_map([thread_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
         .collect::<rusqlite::Result<_>>()?;
     let mut ins = tx.prepare(
         "INSERT INTO facts (thread_id, kind, text, source_message_id, status, extractor, created_at)
@@ -155,7 +238,7 @@ fn rebuild_thread_todos(tx: &Connection, thread_id: i64, now: i64) -> Result<()>
         }
     }
     let mut per = 0usize;
-    'outer: for (mid, text) in rows {
+    'outer: for (mid, text, ts) in rows {
         if per >= MAX_TODOS_PER_THREAD {
             break;
         }
@@ -164,7 +247,8 @@ fn rebuild_thread_todos(tx: &Connection, thread_id: i64, now: i64) -> Result<()>
                 break 'outer;
             }
             if seen.insert(todo.to_ascii_lowercase()) {
-                ins.execute(rusqlite::params![thread_id, todo, mid, now])?;
+                let created = todo_created_at(ts, now);
+                ins.execute(rusqlite::params![thread_id, todo, mid, created])?;
                 per += 1;
             }
         }
@@ -185,7 +269,8 @@ pub fn backfill_todos(db: &crate::db::Db, now: i64) -> Result<()> {
 
     let thread_ids: Vec<i64> = {
         let conn = lock()?;
-        let mut stmt = conn.prepare("SELECT id FROM threads ORDER BY id")?;
+        // Subagent threads get no heuristic TODOs (see rebuild_thread_todos).
+        let mut stmt = conn.prepare("SELECT id FROM threads WHERE is_subagent = 0 ORDER BY id")?;
         let ids: Vec<i64> = stmt
             .query_map([], |r| r.get::<_, i64>(0))?
             .collect::<rusqlite::Result<_>>()?;
@@ -238,8 +323,12 @@ pub fn list_open_todos(
          FROM facts f
          JOIN threads t ON t.id = f.thread_id
          JOIN sources s ON s.id = t.source_id
-         WHERE f.kind = 'todo' AND f.status = 'open' AND f.hidden = 0",
+         WHERE f.kind = 'todo' AND f.status = 'open' AND f.hidden = 0
+           AND (t.is_subagent = 0 OR f.pinned = 1)",
     );
+    // Subagent threads only ever yield uncurated heuristic TODOs, so they are left out, but
+    // one the user pinned (an older build extracted them) must stay listed: otherwise
+    // `purge_subagent_todos` keeps a row nobody can see, unpin or complete.
     let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
     // Server-side text search (over the whole corpus, not just the loaded page) so it
     // scales past the page limit for users with thousands of todos.
@@ -297,69 +386,43 @@ pub struct KnowledgeConfig {
     pub auto_distill: bool,
 }
 
-fn config_get(conn: &Connection, key: &str) -> Result<Option<String>> {
-    Ok(conn
-        .query_row("SELECT value FROM app_config WHERE key = ?1", [key], |r| {
-            r.get::<_, String>(0)
-        })
-        .optional()?)
-}
-
 /// Read the distillation config (defaults to disabled / unset).
 pub fn get_config(conn: &Connection) -> Result<KnowledgeConfig> {
     Ok(KnowledgeConfig {
-        enabled: config_get(conn, "knowledge.enabled")?.as_deref() == Some("1"),
-        provider: config_get(conn, "knowledge.provider")?.filter(|s| !s.is_empty()),
-        model: config_get(conn, "knowledge.model")?.filter(|s| !s.is_empty()),
-        auto_distill: config_get(conn, "knowledge.auto_distill")?.as_deref() == Some("1"),
+        enabled: app_config::get_flag(conn, "knowledge.enabled")?,
+        provider: app_config::get_nonblank(conn, "knowledge.provider")?,
+        model: app_config::get_nonblank(conn, "knowledge.model")?,
+        auto_distill: app_config::get_flag(conn, "knowledge.auto_distill")?,
     })
 }
 
 /// Toggle background auto-distillation (separate from `set_config` so the consent flag
 /// and engine choice aren't disturbed). Only meaningful when distillation is enabled.
 pub fn set_auto_distill(conn: &Connection, on: bool) -> Result<()> {
-    conn.execute(
-        "INSERT INTO app_config (key, value) VALUES ('knowledge.auto_distill', ?1)
-         ON CONFLICT(key) DO UPDATE SET value = ?1",
-        params![if on { "1" } else { "0" }],
-    )?;
-    Ok(())
+    app_config::put_flag(conn, "knowledge.auto_distill", on)
 }
 
 /// Whether closing the main window hides the app to the system tray instead of quitting
 /// (default off). Read by the Rust window-close handler at startup.
 pub fn get_close_to_tray(conn: &Connection) -> Result<bool> {
-    Ok(config_get(conn, "window.close_to_tray")?.as_deref() == Some("1"))
+    app_config::get_flag(conn, "window.close_to_tray")
 }
 
 /// Persist the close-to-tray preference.
 pub fn set_close_to_tray(conn: &Connection, on: bool) -> Result<()> {
-    conn.execute(
-        "INSERT INTO app_config (key, value) VALUES ('window.close_to_tray', ?1)
-         ON CONFLICT(key) DO UPDATE SET value = ?1",
-        params![if on { "1" } else { "0" }],
-    )?;
-    Ok(())
+    app_config::put_flag(conn, "window.close_to_tray", on)
 }
 
 /// Read a provider's saved custom base URL (unset / blank -> None). Non-secret config; API
 /// keys live in the OS keychain. Used for local Ollama pointed at a remote host, and for
 /// Ollama Cloud / authenticated proxies (paired with a keychain key).
 pub fn get_provider_base_url(conn: &Connection, provider: &str) -> Result<Option<String>> {
-    Ok(
-        config_get(conn, &format!("provider.{provider}.base_url"))?
-            .filter(|s| !s.trim().is_empty()),
-    )
+    app_config::get_nonblank(conn, &format!("provider.{provider}.base_url"))
 }
 
 /// Persist a provider's custom base URL. A blank string clears it (falls back to the default).
 pub fn set_provider_base_url(conn: &Connection, provider: &str, url: &str) -> Result<()> {
-    conn.execute(
-        "INSERT INTO app_config (key, value) VALUES (?1, ?2)
-         ON CONFLICT(key) DO UPDATE SET value = ?2",
-        params![format!("provider.{provider}.base_url"), url.trim()],
-    )?;
-    Ok(())
+    app_config::put(conn, &format!("provider.{provider}.base_url"), url.trim())
 }
 
 /// Persist the distillation config. Enabling it is the user's consent to send thread
@@ -370,18 +433,9 @@ pub fn set_config(
     provider: Option<&str>,
     model: Option<&str>,
 ) -> Result<()> {
-    for (k, v) in [
-        ("knowledge.enabled", if enabled { "1" } else { "0" }),
-        ("knowledge.provider", provider.unwrap_or("")),
-        ("knowledge.model", model.unwrap_or("")),
-    ] {
-        conn.execute(
-            "INSERT INTO app_config (key, value) VALUES (?1, ?2)
-             ON CONFLICT(key) DO UPDATE SET value = ?2",
-            params![k, v],
-        )?;
-    }
-    Ok(())
+    app_config::put_flag(conn, "knowledge.enabled", enabled)?;
+    app_config::put(conn, "knowledge.provider", provider.unwrap_or(""))?;
+    app_config::put(conn, "knowledge.model", model.unwrap_or(""))
 }
 
 /// Replace a thread's LLM-distilled facts with a fresh set and mark it extracted at
@@ -843,8 +897,10 @@ fn project_facts(
     let mut sql = String::from(
         "SELECT f.id, f.thread_id, f.text, t.title, f.created_at, f.pinned
          FROM facts f JOIN threads t ON t.id = f.thread_id
-         WHERE f.kind = ?1 AND COALESCE(t.project_key, t.project_path) = ?2 AND f.hidden = 0",
+         WHERE f.kind = ?1 AND COALESCE(t.project_key, t.project_path) = ?2 AND f.hidden = 0
+           AND (t.is_subagent = 0 OR f.pinned = 1)",
     );
+    // Pinned facts on subagent threads stay: the user curated them (see list_open_todos).
     if open_only {
         sql.push_str(" AND f.status = 'open'");
     }
@@ -882,6 +938,7 @@ pub fn get_project_memory(
     project: &str,
     per_kind: usize,
 ) -> Result<ProjectMemory> {
+    let mut mem = get_project_memory_facts(conn, project, per_kind)?;
     let count = |extra: &str| -> Result<i64> {
         Ok(conn.query_row(
             &format!(
@@ -892,15 +949,29 @@ pub fn get_project_memory(
             |r| r.get(0),
         )?)
     };
-    let thread_count = count("")?;
-    let distilled_count = count(" AND knowledge_extracted = 1")?;
+    mem.thread_count = count("")?;
+    mem.distilled_count = count(" AND knowledge_extracted = 1")?;
+    mem.pending_count = (mem.thread_count - mem.distilled_count).max(0);
+    Ok(mem)
+}
+
+/// [`get_project_memory`] without the coverage counts, which stay 0: just the facts. For
+/// callers that never show "N/M distilled", i.e. everything rendered through
+/// `export::agent_memory_md_budgeted` (the SessionStart hook, the compaction carry). The two
+/// counts can't use an index (`COALESCE(project_key, project_path)`), so skipping them
+/// saves about 0.85 ms on every hook run.
+pub fn get_project_memory_facts(
+    conn: &Connection,
+    project: &str,
+    per_kind: usize,
+) -> Result<ProjectMemory> {
     Ok(ProjectMemory {
         decisions: project_facts(conn, "decision", project, false, per_kind)?,
         gotchas: project_facts(conn, "gotcha", project, false, per_kind)?,
         open_todos: project_facts(conn, "todo", project, true, per_kind)?,
-        thread_count,
-        distilled_count,
-        pending_count: (thread_count - distilled_count).max(0),
+        thread_count: 0,
+        distilled_count: 0,
+        pending_count: 0,
         project: project.to_string(),
     })
 }
@@ -916,16 +987,54 @@ pub fn project_pending_threads(conn: &Connection, project: &str) -> Result<Vec<i
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-/// Record an agent- or user-authored fact (kind must be 'decision' or 'gotcha') for a
-/// project. Stored in a synthetic per-project "Recorded memory" thread, pinned + ready to
-/// embed, so it flows through Project Memory and cross-thread recall like a distilled fact.
-/// Returns the new fact id (the caller embeds via embed_pending_facts).
+/// Who wrote a recorded fact. Stored in `facts.extractor` ('user' / 'agent'), next to the
+/// machine extractors 'llm' and 'heuristic', so no schema change is needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FactOrigin {
+    /// Typed by the user in the desktop app: trusted, so it is pinned.
+    User,
+    /// Written back by an agent (MCP `record_decision` / `record_gotcha`, or `cal remember`
+    /// run by an agent). Not pinned: an agent's write-back must not permanently outrank
+    /// everything else, and a prompt-injected session must not be able to plant a fact
+    /// that leads every future context block.
+    Agent,
+}
+
+impl FactOrigin {
+    fn extractor(self) -> &'static str {
+        match self {
+            FactOrigin::User => "user",
+            FactOrigin::Agent => "agent",
+        }
+    }
+}
+
+/// Record an agent-authored fact (kind must be 'decision' or 'gotcha') for a project. Same
+/// as `record_fact_with_origin(.., FactOrigin::Agent, ..)`: unpinned, `extractor = 'agent'`.
+/// The desktop app's user-typed `remember` should use `FactOrigin::User` instead.
 pub fn record_fact(
     conn: &Connection,
     project: &str,
     kind: &str,
     text: &str,
     rationale: Option<&str>,
+    now: i64,
+) -> Result<i64> {
+    record_fact_with_origin(conn, project, kind, text, rationale, FactOrigin::Agent, now)
+}
+
+/// Record a fact (kind 'decision' or 'gotcha') for a project. Stored in a synthetic
+/// per-project "Recorded memory" thread and left ready to embed, so it flows through
+/// Project Memory and cross-thread recall like a distilled fact. User facts are pinned;
+/// agent facts rank by recency like distilled ones. Returns the new fact id (the caller
+/// embeds via embed_pending_facts).
+pub fn record_fact_with_origin(
+    conn: &Connection,
+    project: &str,
+    kind: &str,
+    text: &str,
+    rationale: Option<&str>,
+    origin: FactOrigin,
     now: i64,
 ) -> Result<i64> {
     if !matches!(kind, "decision" | "gotcha") {
@@ -949,8 +1058,16 @@ pub fn record_fact(
     )?;
     conn.execute(
         "INSERT INTO facts (thread_id, kind, text, rationale, status, extractor, pinned, created_at)
-         VALUES (?1, ?2, ?3, ?4, 'open', 'agent', 1, ?5)",
-        params![tid, kind, text.trim(), rationale.map(str::trim), now],
+         VALUES (?1, ?2, ?3, ?4, 'open', ?5, ?6, ?7)",
+        params![
+            tid,
+            kind,
+            text.trim(),
+            rationale.map(str::trim),
+            origin.extractor(),
+            i64::from(origin == FactOrigin::User),
+            now
+        ],
     )?;
     Ok(conn.last_insert_rowid())
 }
@@ -968,19 +1085,257 @@ pub fn project_decisions(conn: &Connection, project: &str) -> Result<Vec<(i64, S
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-/// IDs of threads ANYWHERE that need distilling — never distilled, or changed since their
-/// last distill. Newest first, capped. Skips threads that previously errored so a broken
-/// one isn't retried forever. The auto-distill worklist.
+/// IDs of threads ANYWHERE that need distilling: never distilled, invalidated by new turns
+/// (the indexer resets `knowledge_extracted` and drops the old facts), or distilled when
+/// the message count was recorded differently. Newest first, capped. Skips threads that
+/// previously errored so a broken one isn't retried forever.
+///
+/// A thread that is still marked distilled and has not been touched since
+/// (`updated_at <= knowledge_extracted_at`) is NOT re-queued just because its stored count
+/// disagrees: that is bookkeeping drift (for example the switch to counting only
+/// user/assistant turns), not new content, and re-sending it would re-pay a full pack.
 pub fn pending_threads(conn: &Connection, limit: i64) -> Result<Vec<i64>> {
+    pending_threads_since(conn, limit, None)
+}
+
+/// `pending_threads`, optionally limited to threads updated at or after `since`.
+pub fn pending_threads_since(
+    conn: &Connection,
+    limit: i64,
+    since: Option<i64>,
+) -> Result<Vec<i64>> {
     let mut stmt = conn.prepare(&format!(
         "SELECT id FROM threads
          WHERE {DISTILLABLE} AND knowledge_error IS NULL
-           AND (knowledge_extracted = 0 OR knowledge_msg_count != distillable_count)
+           AND (knowledge_extracted = 0
+                OR (knowledge_msg_count != distillable_count
+                    AND (knowledge_extracted_at IS NULL OR updated_at IS NULL
+                         OR updated_at > knowledge_extracted_at)))
+           AND (?2 IS NULL OR updated_at >= ?2)
          ORDER BY updated_at DESC
          LIMIT ?1"
     ))?;
-    let rows = stmt.query_map([limit], |r| r.get::<_, i64>(0))?;
+    let rows = stmt.query_map(params![limit, since], |r| r.get::<_, i64>(0))?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+// ---- background auto-distill budget ----
+//
+// Auto-distill sends each pending thread (packed up to ~12k tokens) to the configured
+// engine with nobody watching. Without a budget, turning it on with a cloud key drains the
+// whole history in one go. Two limits apply: only recently active threads are eligible,
+// and a per-day thread allowance (UTC day, stored in app_config so the app, `cal` and the
+// MCP server share it). Manual distills (a project's "Build memory", `cal distill`) are
+// user-initiated and are not counted.
+
+/// Default number of threads auto-distill may send to the engine per UTC day.
+pub const AUTO_DISTILL_DEFAULT_DAILY_CAP: i64 = 50;
+
+/// Only threads active within this window are auto-distilled; older history stays
+/// available to the explicit per-project "Build memory".
+pub const AUTO_DISTILL_RECENT_DAYS: i64 = 30;
+
+/// The per-day auto-distill allowance (`knowledge.auto_distill_daily_cap`).
+pub fn auto_distill_daily_cap(conn: &Connection) -> Result<i64> {
+    Ok(app_config::get(conn, "knowledge.auto_distill_daily_cap")?
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|v| *v >= 0)
+        .unwrap_or(AUTO_DISTILL_DEFAULT_DAILY_CAP))
+}
+
+/// Set the per-day auto-distill allowance (0 pauses auto-distill without turning it off).
+pub fn set_auto_distill_daily_cap(conn: &Connection, cap: i64) -> Result<()> {
+    app_config::put(
+        conn,
+        "knowledge.auto_distill_daily_cap",
+        &cap.max(0).to_string(),
+    )
+}
+
+fn utc_day(now: i64) -> String {
+    chrono::DateTime::from_timestamp(now, 0)
+        .map(|d| d.format("%Y-%m-%d").to_string())
+        .unwrap_or_default()
+}
+
+/// Threads already reserved by auto-distill today.
+fn auto_distill_used_today(conn: &Connection, now: i64) -> Result<i64> {
+    if app_config::get(conn, "knowledge.auto_distill_day")?.as_deref()
+        != Some(utc_day(now).as_str())
+    {
+        return Ok(0);
+    }
+    Ok(app_config::get(conn, "knowledge.auto_distill_used")?
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0))
+}
+
+/// How many more threads auto-distill may send today.
+pub fn auto_distill_remaining_today(conn: &Connection, now: i64) -> Result<i64> {
+    Ok((auto_distill_daily_cap(conn)? - auto_distill_used_today(conn, now)?).max(0))
+}
+
+/// The next auto-distill batch: at most `batch` recently active pending threads, and never
+/// more than today's remaining allowance. The returned ids are counted against the
+/// allowance immediately, so a cancelled run errs on the side of spending less. Returns an
+/// empty list once the day's allowance is used up, which ends the auto-distill drain.
+pub fn auto_distill_worklist(conn: &Connection, batch: i64, now: i64) -> Result<Vec<i64>> {
+    let take = batch.min(auto_distill_remaining_today(conn, now)?);
+    if take <= 0 {
+        return Ok(Vec::new());
+    }
+    let since = now - AUTO_DISTILL_RECENT_DAYS * 86_400;
+    let ids = pending_threads_since(conn, take, Some(since))?;
+    if !ids.is_empty() {
+        let used = auto_distill_used_today(conn, now)? + ids.len() as i64;
+        app_config::put(conn, "knowledge.auto_distill_day", &utc_day(now))?;
+        app_config::put(conn, "knowledge.auto_distill_used", &used.to_string())?;
+    }
+    Ok(ids)
+}
+
+// ---- cheap keyword prefilter for proactive recall ----
+
+/// Distinctive search terms from a prompt: lowercase words of 4+ chars that aren't
+/// stopwords, lightly stemmed, longest first (longer words are more specific), deduped,
+/// at most `max`.
+pub fn prompt_terms(prompt: &str, max: usize) -> Vec<String> {
+    const STOP: &[&str] = &[
+        "this", "that", "with", "from", "have", "what", "when", "where", "which", "there", "their",
+        "about", "would", "could", "should", "into", "your", "just", "like", "make", "some",
+        "then", "than", "them", "they", "will", "been", "were", "does", "done", "doing", "want",
+        "need", "please", "help", "also", "more", "only", "very", "here", "using", "work",
+        "working", "thing", "things", "know", "look", "take", "give", "much", "many", "each",
+        "every", "other", "file", "files", "code", "change", "update", "check", "sure", "think",
+        "right", "still", "again", "after", "before", "because", "while", "these", "those",
+        "being", "over", "under", "between",
+    ];
+    let mut terms: Vec<String> = Vec::new();
+    for word in prompt
+        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .map(str::to_lowercase)
+    {
+        if word.chars().count() < 4 || STOP.contains(&word.as_str()) {
+            continue;
+        }
+        let stem = ["ing", "ed", "es", "s"]
+            .iter()
+            .find_map(|suf| {
+                word.strip_suffix(suf)
+                    .filter(|rest| rest.chars().count() >= 4)
+            })
+            .unwrap_or(word.as_str())
+            .to_string();
+        if !terms.contains(&stem) {
+            terms.push(stem);
+        }
+    }
+    terms.sort_by_key(|t| std::cmp::Reverse(t.chars().count()));
+    terms.truncate(max);
+    terms
+}
+
+/// Whether any embedded, visible decision/gotcha (optionally in `project`, matched the same
+/// way `recall` scopes) mentions one of `terms`. A plain LIKE scan over the fact texts,
+/// which takes milliseconds, versus loading the embedding model (hundreds of ms and
+/// ~400 MB). Proactive recall runs on every prompt, so it checks this first and stays
+/// silent when nothing could match.
+pub fn has_keyword_candidates(
+    conn: &Connection,
+    terms: &[String],
+    project: Option<&str>,
+) -> Result<bool> {
+    if terms.is_empty() {
+        return Ok(false);
+    }
+    let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    let mut likes = Vec::new();
+    for t in terms {
+        // Escape LIKE wildcards in the term itself.
+        let escaped = t
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        args.push(Box::new(format!("%{escaped}%")));
+        likes.push(format!("f.text LIKE ?{} ESCAPE '\\'", args.len()));
+    }
+    let mut sql = format!(
+        "SELECT EXISTS (SELECT 1 FROM facts f JOIN threads t ON t.id = f.thread_id
+         WHERE f.kind IN ('decision', 'gotcha') AND f.hidden = 0 AND f.embedded = 1
+           AND ({})",
+        likes.join(" OR ")
+    );
+    if let Some(p) = project.filter(|p| !p.is_empty()) {
+        args.push(Box::new(format!("%{p}%")));
+        sql.push_str(&format!(
+            " AND COALESCE(t.project_key, t.project_path) LIKE ?{}",
+            args.len()
+        ));
+    }
+    sql.push(')');
+    let arg_refs: Vec<&dyn rusqlite::ToSql> = args.iter().map(|b| b.as_ref()).collect();
+    Ok(conn.query_row(&sql, arg_refs.as_slice(), |r| r.get::<_, i64>(0))? != 0)
+}
+
+/// The project key for `raw` (a path, a `~/...` path, or an already-canonical key):
+/// `indexer::canonical_project`, which resolves a worktree to its main repo and stops the
+/// walk at $HOME, falling back to `raw` itself when it is blank. Every surface that scopes
+/// to a project (`cal`, the hooks, the MCP tools) goes through this, so they all match the
+/// key the indexer stored.
+pub fn project_key(raw: &str) -> String {
+    crate::indexer::canonical_project(raw).unwrap_or_else(|| raw.to_string())
+}
+
+/// [`project_key`] for the process's working directory, or None when it can't be read
+/// (deleted out from under us). What `cal` and the MCP server scope to by default.
+pub fn cwd_project_key() -> Option<String> {
+    let cwd = std::env::current_dir().ok()?;
+    Some(project_key(&cwd.to_string_lossy()))
+}
+
+/// Recompute `threads.project_key` where the stored key is out of date with
+/// `indexer::canonical_project`: keys computed before worktrees resolved to their main
+/// repo, or before the walk up stopped at $HOME (when every non-repo dir under a
+/// `~/.git` home collapsed into one "home" project). Only paths that still exist on disk
+/// are re-resolved, plus any thread keyed to the home dir itself, so a repo that has since
+/// moved keeps its old grouping. One canonicalize per distinct path; cheap. Returns the
+/// number of threads re-keyed.
+pub fn rekey_project_keys(conn: &Connection) -> Result<usize> {
+    let home = dirs::home_dir().map(|h| {
+        std::fs::canonicalize(&h)
+            .unwrap_or(h)
+            .to_string_lossy()
+            .trim_end_matches(['/', '\\'])
+            .to_string()
+    });
+    let pairs: Vec<(String, Option<String>)> = {
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT project_path, project_key FROM threads
+             WHERE project_path IS NOT NULL AND project_path != ''",
+        )?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    let mut n = 0;
+    for (path, key) in pairs {
+        let keyed_to_home = key.is_some() && key == home;
+        let exists = std::path::Path::new(path.trim()).exists();
+        if !exists && !keyed_to_home {
+            continue;
+        }
+        let Some(fresh) = crate::indexer::canonical_project(&path) else {
+            continue;
+        };
+        if Some(&fresh) != key.as_ref() {
+            n += conn.execute(
+                "UPDATE threads SET project_key = ?1 WHERE project_path = ?2 AND project_key IS ?3",
+                params![fresh, path, key],
+            )?;
+        }
+    }
+    Ok(n)
 }
 
 #[cfg(test)]
@@ -1006,6 +1361,69 @@ mod tests {
         // the checked task is not an open todo.
         assert!(!todos.iter().any(|t| t.contains("already done")));
         assert_eq!(todos.len(), 3);
+    }
+
+    #[test]
+    fn ignores_markers_that_do_not_open_the_line() {
+        // Prose ABOUT todos (the junk the old word-boundary match produced).
+        for prose in [
+            "set_todo_done(false) and set_fact_hidden exist but are wired only to the GUI",
+            "the complete_todo tool marks it done",
+            "heuristic TODO/FIXME markers (already conservatively filtered).",
+            "facts with the 'todo' kind",
+            "Todo list for the week",
+            "todos are extracted heuristically",
+        ] {
+            assert!(extract_todos(prose).is_empty(), "matched prose: {prose}");
+        }
+        // Real markers, after comment / bullet / emphasis leaders.
+        let text = "\
+            # TODO wire the cache\n\
+            - **TODO:** bold marker here\n\
+            todo: buy more disks\n\
+            1. FIXME(ari): handle retries */\n\
+            <!-- TODO: fix the footer -->";
+        let todos = extract_todos(text);
+        assert_eq!(
+            todos,
+            vec![
+                "wire the cache",
+                "bold marker here",
+                "buy more disks",
+                "handle retries",
+                "fix the footer"
+            ]
+        );
+    }
+
+    #[test]
+    fn skips_code_fences_and_injected_context() {
+        let text = "```rust\n// TODO: inside code\n```\nTODO: outside the fence";
+        assert_eq!(extract_todos(text), vec!["outside the fence"]);
+        let skill =
+            "Base directory for this skill: /x/skills/plan\n\n- [ ] **[BLOCKS]** fill in the plan";
+        assert!(extract_todos(skill).is_empty());
+        let reminder = "<system-reminder>\nTODO: never extract this\n</system-reminder>";
+        assert!(extract_todos(reminder).is_empty());
+        // Multi-byte text at a line start must not panic the marker check.
+        assert!(extract_todos("日本語のテキスト").is_empty());
+    }
+
+    #[test]
+    fn todo_created_at_uses_message_time() {
+        assert_eq!(
+            todo_created_at(Some(1_700_000_000), 1_800_000_000),
+            1_700_000_000
+        );
+        assert_eq!(
+            todo_created_at(Some(1_700_000_000_000), 1_800_000_000),
+            1_700_000_000
+        );
+        assert_eq!(todo_created_at(None, 42), 42);
+        assert_eq!(
+            todo_created_at(Some(2_000_000_000), 1_800_000_000),
+            1_800_000_000
+        );
     }
 
     #[test]
@@ -1191,6 +1609,39 @@ mod tests {
     }
 
     #[test]
+    fn facts_only_memory_matches_full_memory_without_counts() {
+        let mut conn = temp_db();
+        let t = seed_thread(&mut conn, "cov", "/proj/c", false, &["a", "b", "c", "d"]);
+        conn.execute(
+            "UPDATE threads SET knowledge_extracted = 1 WHERE id = ?1",
+            [t],
+        )
+        .unwrap();
+        record_fact(&conn, "/proj/c", "gotcha", "watch the WAL", None, 10).unwrap();
+        record_fact(&conn, "/proj/c", "decision", "keep sqlite", None, 11).unwrap();
+
+        let full = get_project_memory(&conn, "/proj/c", 40).unwrap();
+        assert_eq!(full.distilled_count, 1);
+        assert!(full.thread_count >= 1);
+        let facts = get_project_memory_facts(&conn, "/proj/c", 40).unwrap();
+        assert_eq!(
+            (
+                facts.thread_count,
+                facts.distilled_count,
+                facts.pending_count
+            ),
+            (0, 0, 0)
+        );
+        let texts = |m: &ProjectMemory| {
+            [&m.decisions, &m.gotchas, &m.open_todos]
+                .iter()
+                .map(|l| l.iter().map(|f| f.text.clone()).collect::<Vec<_>>())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(texts(&full), texts(&facts));
+    }
+
+    #[test]
     fn recorded_fact_surfaces_in_project_memory() {
         let conn = temp_db();
         let fid = record_fact(
@@ -1213,9 +1664,29 @@ mod tests {
         assert!(
             mem.decisions
                 .iter()
-                .any(|d| d.text == "use the read pool" && d.pinned),
-            "recorded decision is pinned + shown in project memory"
+                .any(|d| d.text == "use the read pool" && !d.pinned),
+            "an agent-recorded decision is shown in project memory but NOT auto-pinned"
         );
+        let origin: String = conn
+            .query_row("SELECT extractor FROM facts WHERE id = ?1", [fid], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(origin, "agent");
+        // A user-typed fact (desktop `remember`) is pinned and ranks first.
+        record_fact_with_origin(
+            &conn,
+            "/proj/r",
+            "decision",
+            "user says: keep sqlite",
+            None,
+            FactOrigin::User,
+            50,
+        )
+        .unwrap();
+        let mem = get_project_memory(&conn, "/proj/r", 60).unwrap();
+        assert_eq!(mem.decisions[0].text, "user says: keep sqlite");
+        assert!(mem.decisions[0].pinned);
         // A second record reuses the one synthetic notes thread for the project.
         record_fact(&conn, "/proj/r", "gotcha", "watch the WAL", None, 101).unwrap();
         let n: i64 = conn
@@ -1498,5 +1969,209 @@ mod tests {
             1,
             "guard still surfaces a genuinely-related prior session"
         );
+    }
+
+    fn seed_thread(
+        conn: &mut Connection,
+        ext: &str,
+        project: &str,
+        subagent: bool,
+        texts: &[&str],
+    ) -> i64 {
+        use crate::indexer::{source_id, upsert_thread, ParsedMessage, ParsedThread};
+        let sid = source_id(conn, "claude_code").unwrap();
+        upsert_thread(
+            conn,
+            sid,
+            &ParsedThread {
+                external_id: ext.into(),
+                title: Some(ext.into()),
+                project_path: Some(project.into()),
+                created_at: Some(1),
+                updated_at: Some(2),
+                is_subagent: subagent,
+                messages: texts
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| ParsedMessage {
+                        role: if i % 2 == 0 { "user" } else { "assistant" }.into(),
+                        text: (*t).into(),
+                        tool_name: None,
+                        ts: Some(1_000 + i as i64),
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        conn.query_row(
+            "SELECT id FROM threads WHERE external_id = ?1",
+            [ext],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn subagent_todos_stay_out_of_memory_and_backfill_uses_message_time() {
+        let mut conn = temp_db();
+        set_config(&conn, true, Some("ollama"), Some("m")).unwrap();
+        let main = seed_thread(
+            &mut conn,
+            "main",
+            "/proj/s",
+            false,
+            &["TODO: real user task"],
+        );
+        let sub = seed_thread(
+            &mut conn,
+            "sub",
+            "/proj/s",
+            true,
+            &["TODO: delegated subtask"],
+        );
+        // Whatever the indexer did, a rebuild leaves subagent threads with no TODOs and
+        // stamps the main thread's TODO with its message time, not index time.
+        {
+            let tx = conn.transaction().unwrap();
+            rebuild_thread_todos(&tx, main, 9_999_999).unwrap();
+            rebuild_thread_todos(&tx, sub, 9_999_999).unwrap();
+            tx.commit().unwrap();
+        }
+        let sub_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM facts WHERE thread_id = ?1 AND extractor = 'heuristic'",
+                [sub],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(sub_count, 0, "no heuristic TODOs for subagent threads");
+        let created: i64 = conn
+            .query_row(
+                "SELECT created_at FROM facts WHERE thread_id = ?1 AND kind = 'todo'",
+                [main],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            created, 1_000,
+            "created_at is the source message's timestamp"
+        );
+
+        // The startup purge clears TODOs an older indexer extracted from subagent threads.
+        conn.execute(
+            "INSERT INTO facts (thread_id, kind, text, status, extractor, created_at)
+             VALUES (?1, 'todo', 'stale subagent todo', 'open', 'heuristic', 5)",
+            [sub],
+        )
+        .unwrap();
+        assert_eq!(purge_subagent_todos(&conn).unwrap(), 1);
+
+        // Even a subagent fact that slipped in (older indexer) never reaches project memory.
+        conn.execute(
+            "INSERT INTO facts (thread_id, kind, text, status, extractor, created_at)
+             VALUES (?1, 'gotcha', 'subagent-only gotcha', 'open', 'llm', 5)",
+            [sub],
+        )
+        .unwrap();
+        let mem = get_project_memory(&conn, "/proj/s", 40).unwrap();
+        assert!(mem.open_todos.iter().any(|t| t.text == "real user task"));
+        assert!(!mem.open_todos.iter().any(|t| t.text.contains("delegated")));
+        assert!(mem.gotchas.is_empty(), "subagent facts excluded");
+        let listed = list_open_todos(&conn, None, Some("/proj/s"), None, 50).unwrap();
+        assert!(listed.iter().all(|t| t.thread_id == main));
+
+        // A TODO the user pinned on a subagent thread (older builds extracted them) survives
+        // the purge, so it must stay listed where it can be completed or unpinned.
+        conn.execute(
+            "INSERT INTO facts (thread_id, kind, text, status, extractor, created_at, pinned)
+             VALUES (?1, 'todo', 'pinned subagent todo', 'open', 'heuristic', 6, 1)",
+            [sub],
+        )
+        .unwrap();
+        assert_eq!(purge_subagent_todos(&conn).unwrap(), 0);
+        let listed = list_open_todos(&conn, None, Some("/proj/s"), None, 50).unwrap();
+        assert!(listed.iter().any(|t| t.text == "pinned subagent todo"));
+        let mem = get_project_memory(&conn, "/proj/s", 40).unwrap();
+        assert!(mem
+            .open_todos
+            .iter()
+            .any(|t| t.text == "pinned subagent todo" && t.pinned));
+        assert!(
+            mem.gotchas.is_empty(),
+            "unpinned subagent facts still excluded"
+        );
+    }
+
+    #[test]
+    fn pending_threads_skip_unchanged_count_drift_and_auto_budget_caps() {
+        let mut conn = temp_db();
+        let four = ["a", "b", "c", "d"];
+        let fresh = seed_thread(&mut conn, "fresh", "/proj/d", false, &four);
+        let drift = seed_thread(&mut conn, "drift", "/proj/d", false, &four);
+        // `drift` was distilled after its last update, but its stored count was recorded
+        // under the old definition: bookkeeping drift, not new content.
+        conn.execute(
+            "UPDATE threads SET knowledge_extracted = 1, knowledge_extracted_at = 100,
+                knowledge_msg_count = 99, updated_at = 50 WHERE id = ?1",
+            [drift],
+        )
+        .unwrap();
+        let pending = pending_threads(&conn, 100).unwrap();
+        assert!(pending.contains(&fresh));
+        assert!(!pending.contains(&drift), "unchanged thread is not re-sent");
+        // Touched after the distill: it is re-queued.
+        conn.execute("UPDATE threads SET updated_at = 200 WHERE id = ?1", [drift])
+            .unwrap();
+        assert!(pending_threads(&conn, 100).unwrap().contains(&drift));
+
+        // Auto-distill: recent threads only, and a daily allowance that is reserved up front.
+        let now = 1_800_000_000;
+        conn.execute("UPDATE threads SET updated_at = ?1", [now - 60])
+            .unwrap();
+        set_auto_distill_daily_cap(&conn, 1).unwrap();
+        assert_eq!(auto_distill_remaining_today(&conn, now).unwrap(), 1);
+        let first = auto_distill_worklist(&conn, 25, now).unwrap();
+        assert_eq!(first.len(), 1, "capped by the daily allowance");
+        assert!(auto_distill_worklist(&conn, 25, now).unwrap().is_empty());
+        // The next UTC day starts a fresh allowance.
+        assert_eq!(
+            auto_distill_remaining_today(&conn, now + 86_400).unwrap(),
+            1
+        );
+        // Stale history is left to the explicit per-project build.
+        set_auto_distill_daily_cap(&conn, 100).unwrap();
+        conn.execute("UPDATE threads SET updated_at = 1", [])
+            .unwrap();
+        assert!(auto_distill_worklist(&conn, 25, now + 2 * 86_400)
+            .unwrap()
+            .is_empty());
+        assert_eq!(auto_distill_daily_cap(&conn).unwrap(), 100);
+    }
+
+    #[test]
+    fn keyword_prefilter_matches_project_facts() {
+        let mut conn = temp_db();
+        let tid = seed_thread(&mut conn, "kw", "/proj/kw", false, &["x"]);
+        conn.execute(
+            "INSERT INTO facts (thread_id, kind, text, status, extractor, created_at, embedded)
+             VALUES (?1, 'gotcha', 'Installing the SessionStart hook rewrites settings.json', 'open', 'llm', 1, 1)",
+            [tid],
+        )
+        .unwrap();
+        let terms = prompt_terms(
+            "how do we install the claude code hooks into settings json",
+            6,
+        );
+        assert!(terms.contains(&"install".to_string()), "{terms:?}");
+        assert!(
+            !terms.iter().any(|t| t == "into" || t == "code"),
+            "{terms:?}"
+        );
+        assert!(has_keyword_candidates(&conn, &terms, Some("/proj/kw")).unwrap());
+        assert!(!has_keyword_candidates(&conn, &terms, Some("/proj/other")).unwrap());
+        let unrelated = prompt_terms("refactor the billing invoices exporter", 6);
+        assert!(!has_keyword_candidates(&conn, &unrelated, None).unwrap());
+        assert!(!has_keyword_candidates(&conn, &[], None).unwrap());
     }
 }

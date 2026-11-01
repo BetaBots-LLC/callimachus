@@ -5,7 +5,7 @@ description = "Local index & search for AI agent threads"
 authors = ["Ari Shaller"]
 license = "AGPL-3.0-or-later"
 edition = "2021"
-# Two binaries (the app + the MCP server); make `cargo run` (tauri dev) pick the app.
+# Three binaries (the app, the MCP server and `cal`); make `cargo run` (tauri dev) pick the app.
 default-run = "callimachus"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -15,7 +15,11 @@ default-run = "callimachus"
 # to make the lib name unique and wouldn't conflict with the bin name.
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
 name = "callimachus_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+# rlib only: the three bins link it, and desktop bundling ships the bins. The Tauri template's
+# "staticlib" (iOS) and "cdylib" (Android) are mobile-only outputs; building them cost about
+# 20 s per release build plus about 1 GB of debug artifacts. Add them back, next to the
+# `cfg_attr(mobile, tauri::mobile_entry_point)` on `run()`, if a mobile target ever ships.
+crate-type = ["rlib"]
 
 # Standalone MCP server: exposes the index as tools for any LLM/agent over stdio.
 [[bin]]
@@ -38,19 +42,29 @@ tauri-plugin-opener = "2"
 tauri-plugin-updater = { version = "2", default-features = false, features = ["native-tls", "zip"] }
 tauri-plugin-process = "2"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# preserve_order: integration edits of ~/.claude.json / settings.json keep the user's key
+# order instead of re-sorting the file on every write (tauri-utils enables it already; named
+# here so the integration code doesn't depend on that).
+serde_json = { version = "1", features = ["preserve_order"] }
 # Format-preserving TOML edit for Codex's ~/.codex/config.toml MCP registration.
-toml_edit = "0.22"
+# 0.25 matches the copy tauri already pulls in, so the graph carries one fewer toml_edit.
+toml_edit = "0.25"
 # Canonical store: bundled SQLite (FTS5 is compiled into the bundled amalgamation).
-rusqlite = { version = "0.37", features = ["bundled", "functions"] }
-rusqlite_migration = "2"
+rusqlite = { version = "0.40", features = ["bundled", "functions"] }
+rusqlite_migration = "2.6"
 chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1"
 thiserror = "2"
 notify = "8.2.0"
 notify-debouncer-full = "0.7.0"
-fastembed = "5.17.2"
-tokio = { version = "1.52.3", features = ["rt", "macros", "rt-multi-thread", "io-std", "process"] }
+# Exact pin: 5.17.4+ moves ort to 2.0.0-rc.13 (ONNX Runtime 1.28, DirectML/CoreML linkage), which
+# needs its own clean-VM and embedding-drift checks, so a plain `cargo update` must not pull it in.
+# Default features are off to drop `image-models` (image/rav1e/exr/tiff/...): only TextEmbedding is
+# used. Keep the ort prebuilt download and the hf-hub model fetch, both over native-tls (see reqwest).
+fastembed = { version = "=5.17.2", default-features = false, features = ["ort-download-binaries-native-tls", "hf-hub-native-tls"] }
+# "sync" + "time": telemetry.rs uses tokio::sync::{mpsc, oneshot} and tokio::time directly, so
+# name them here instead of relying on tauri/reqwest happening to enable them.
+tokio = { version = "1.52.3", features = ["rt", "macros", "rt-multi-thread", "io-std", "process", "sync", "time"] }
 futures-util = "0.3.32"
 # default-features off: reqwest's `default-tls` is rustls (-> aws-lc-sys/ring -> clang_rt.osx,
 # which breaks linking on recent macos-latest Xcodes). Use native-tls + the rest of the defaults.
@@ -60,14 +74,25 @@ reqwest = { version = "0.13.4", default-features = false, features = ["json", "s
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
 sqlite-vec = "0.1.9"
 zerocopy = "0.8.52"
-genai = { version = "0.6.5", default-features = false, features = ["native-tls"] }
+genai = { version = "0.7.2", default-features = false, features = ["native-tls", "system-proxy"] }
 rmcp = { version = "1.7.0", features = ["server", "transport-io", "macros"] }
 schemars = "1"
 tokio-util = "0.7.18"
 r2d2 = "0.8.10"
+# Random anonymous install id for opt-in analytics (telemetry.rs). Already in the lock graph.
+uuid = { version = "1", features = ["v4"] }
 # Cross-platform per-user dirs (data/home). macOS values match the prior
 # hardcoded ~/Library/Application Support path exactly; Windows resolves to
 # %LOCALAPPDATA% / %USERPROFILE% (the old code assumed a Unix $HOME and crashed
 # on Windows). Used by db::default_index_path and the per-agent indexers.
 dirs = "6"
 
+[profile.release]
+# Smaller, faster release binaries (the app, `cal` and `callimachus-mcp`) at the cost of longer
+# release builds. CI's clippy/test jobs use the dev profile and are unaffected.
+lto = "thin"
+codegen-units = 1
+opt-level = 3
+strip = true
+# panic stays "unwind" on purpose: tokio isolates a panicking task (Tauri async commands, rmcp tool
+# handlers, background indexing) by unwinding, so "abort" would turn one bad request into an app crash.

@@ -1,6 +1,24 @@
 // Typed wrappers around Tauri commands. Keep all `invoke` calls here so the rest
 // of the app talks to a typed surface, not stringly-named commands.
 import { invoke, Channel } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+// telemetry.ts only imports a *type* from this file, so there is no runtime import cycle.
+import { setTelemetry, telemetryState } from "./telemetry";
+
+// Opt-in usage analytics. The wrappers live in telemetry.ts next to the event schema;
+// they're re-exported here so callers can reach the whole backend surface from one place.
+export {
+  classifyError,
+  commitSearch,
+  flushTelemetry,
+  noteSearch,
+  track,
+  trackError,
+  type Consent,
+  type ErrorKind,
+  type SettingKey,
+  type TelemetryStatus,
+} from "./telemetry";
 
 export type SourceKind =
   | "claude_code"
@@ -315,6 +333,40 @@ export interface Spend {
   topThreads: ThreadCost[];
 }
 
+/** What a "Shrink index" pass did (also the `compact:progress` payload, as running totals). */
+export interface CompactSummary {
+  rows: number; // tool-output rows trimmed
+  bytesSaved: number;
+}
+
+/** Overrides for relocated Claude Code / Codex data, plus what is in effect right now. */
+export interface DataRoots {
+  claudeConfigDir: string; // saved override ("" = none)
+  codexHome: string;
+  // Override, else CLAUDE_CONFIG_DIR / CODEX_HOME, else the default; null if unresolvable.
+  effectiveClaudeConfigDir: string | null;
+  effectiveCodexHome: string | null;
+}
+
+/** Which background jobs hold their run flags right now (`jobs_status`, answered from
+ *  memory, so it is cheap to poll while one runs). `index` is a full or single-source
+ *  reindex or the launch catch-up scan (`index_source` refuses while it is set), `rewrite`
+ *  a Shrink index / Reclaim space pass. */
+export interface JobsStatus {
+  index: boolean;
+  embed: boolean;
+  distill: boolean;
+  rewrite: boolean;
+}
+
+/** Background auto-distill allowance (UTC day). */
+export interface AutoDistillBudget {
+  eligibleThreads: number; // recently active and not yet distilled
+  dailyCap: number; // threads per day; 0 pauses auto-distill
+  remainingToday: number;
+  recentDays: number; // eligibility window
+}
+
 export const api = {
   dbStats: () => invoke<DbStats>("db_stats"),
   indexStats: () => invoke<Stats>("index_stats"),
@@ -347,6 +399,26 @@ export const api = {
     }),
   deleteThreads: (ids: number[]) => invoke<number>("delete_threads", { ids }),
   vacuumDb: () => invoke<void>("vacuum_db"),
+  // "Shrink index": trim tool output indexed before the per-row cap existed, then VACUUM.
+  // onProgress receives running totals while it works (the `compact:progress` event).
+  compactIndex: async (onProgress?: (p: CompactSummary) => void) => {
+    const unlisten = onProgress
+      ? await listen<CompactSummary>("compact:progress", (e) => onProgress(e.payload))
+      : null;
+    try {
+      return await invoke<CompactSummary>("compact_index");
+    } finally {
+      unlisten?.();
+    }
+  },
+  // Relocated agent data: a Finder/Dock-launched app never sees the shell's
+  // CLAUDE_CONFIG_DIR / CODEX_HOME. Pass "" to clear an override, omit to leave it as is.
+  getDataRoots: () => invoke<DataRoots>("get_data_roots"),
+  setDataRoots: (roots: { claudeConfigDir?: string; codexHome?: string }) =>
+    invoke<DataRoots>("set_data_roots", {
+      claudeConfigDir: roots.claudeConfigDir ?? null,
+      codexHome: roots.codexHome ?? null,
+    }),
   // Write a thread as an Obsidian note (transcript + [[project]] link) into vaultDir.
   exportThread: (threadId: number, vaultDir: string) =>
     invoke<string>("export_thread", { threadId, vaultDir }),
@@ -367,6 +439,7 @@ export const api = {
   indexAll: () => invoke<void>("index_all"),
   indexingStatus: () => invoke<boolean>("indexing_status"),
   indexSource: (kind: SourceKind) => invoke<IndexReport>("index_source", { kind }),
+  jobsStatus: () => invoke<JobsStatus>("jobs_status"),
   searchThreads: (query: string, filters?: SearchFilters) =>
     invoke<SearchHit[]>("search_threads", { query, filters }),
   recentThreads: (filters?: SearchFilters) =>
@@ -392,6 +465,9 @@ export const api = {
   setTodoDone: (factId: number, done: boolean) => invoke<void>("set_todo_done", { factId, done }),
   editFact: (factId: number, text: string) => invoke<void>("edit_fact", { factId, text }),
   detectConflicts: (project: string) => invoke<Conflict[]>("detect_conflicts", { project }),
+  // Write-back: record a decision or gotcha for a project. User-typed, so it is pinned.
+  remember: (project: string, kind: "decision" | "gotcha", text: string) =>
+    invoke<void>("remember", { project, kind, text }),
   getThread: (threadId: number) => invoke<ThreadDetail | null>("get_thread", { threadId }),
   // Stars & tags ("collections").
   setStar: (threadId: number, starred: boolean) => invoke<void>("set_star", { threadId, starred }),
@@ -416,6 +492,10 @@ export const api = {
     }),
   // Toggle background auto-distillation (turning on kicks an immediate drain).
   setAutoDistill: (on: boolean) => invoke<void>("set_auto_distill", { on }),
+  autoDistillBudget: () => invoke<AutoDistillBudget>("auto_distill_budget"),
+  // Threads auto-distill may send per UTC day (0 pauses it without turning it off).
+  setAutoDistillDailyCap: (cap: number) =>
+    invoke<AutoDistillBudget>("set_auto_distill_daily_cap", { cap }),
   threadKnowledge: (threadId: number) => invoke<ThreadKnowledge>("thread_knowledge", { threadId }),
   distillThread: (threadId: number) => invoke<ThreadKnowledge>("distill_thread", { threadId }),
   // Cross-thread semantic recall of distilled facts.
@@ -453,7 +533,14 @@ export const api = {
   setProviderBaseUrl: (provider: string, url: string) =>
     invoke<void>("set_provider_base_url", { provider, url }),
   resumeThread: (threadId: number) => invoke<void>("resume_thread", { threadId }),
-  threadContext: (threadId: number) => invoke<string>("thread_context", { threadId }),
+  // Whether the backend can open a terminal here (macOS/Windows always; Linux only when a
+  // terminal emulator is on PATH). Gates Resume / Open-in-CLI; fixed for the session.
+  cliLaunchSupported: () => invoke<boolean>("cli_launch_supported"),
+  // Packed context for a thread. `budgetChars` asks the backend for a smaller pack (its
+  // budget ladder drops tool output first, then elides the middle); omitted = the
+  // backend default (~48k chars). A backend without the parameter ignores it.
+  threadContext: (threadId: number, budgetChars?: number) =>
+    invoke<string>("thread_context", { threadId, budgetChars: budgetChars ?? null }),
   openThreadInCli: (threadId: number, program?: string) =>
     invoke<string>("open_thread_in_cli", { threadId, program: program ?? null }),
   // Live model list from the provider's API (needs a key for anthropic/openai).
@@ -477,6 +564,9 @@ export const api = {
   agentIntegrationsStatus: () => invoke<AgentIntegration[]>("agent_integrations_status"),
   installAgentIntegrations: () => invoke<AgentIntegration[]>("install_agent_integrations"),
   uninstallAgentIntegrations: () => invoke<void>("uninstall_agent_integrations"),
+  // Opt-in usage analytics: consent state + whether this build can send at all.
+  telemetryState,
+  setTelemetry,
 };
 
 // State of the Claude Code integration (the `/recall` skill + `callimachus` MCP server).
@@ -487,6 +577,17 @@ export interface IntegrationStatus {
   hookInstalled: boolean;
   proactiveRecallInstalled: boolean;
   calInstalled: boolean;
+  /** The app runs from a permanent location, so agents can be pointed at it. */
+  exeStable: boolean;
+  /** Why it can't be registered from where it runs (e.g. "Move Callimachus to
+   *  /Applications first"). Install refuses with this same message while it's set. */
+  exeProblem: string | null;
+  /** Why the `cal` CLI wasn't installed (another program owns `~/.local/bin/cal`, or a
+   *  per-machine Windows install dir isn't writable). Everything else still works. */
+  calProblem: string | null;
+  /** Advice when `cal` is installed but a bare `cal` won't reach it from the user's
+   *  shell. Ends with a copyable `export PATH=...` line. */
+  pathHint: string | null;
   skillPath: string;
   configPath: string;
 }

@@ -10,7 +10,7 @@ use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 
 /// One recurring error, grouped by its normalized signature.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IssueCluster {
     /// A representative raw error line (the first one seen).
@@ -98,25 +98,70 @@ fn canon_token(tok: &str) -> String {
     t.to_ascii_lowercase()
 }
 
-/// Find recurring errors across messages since `since` (epoch secs), optionally scoped to a
-/// project-path substring. Returns clusters seen in >= 2 messages, most-frequent first.
-pub fn recurring_issues(
+/// Chars of a long message's head / tail scanned for errors (see `recurring_issues`).
+const TEXT_HEAD_CHARS: usize = 6_000;
+const TEXT_TAIL_CHARS: usize = 2_000;
+
+/// Cache key: (project filter, since bucketed to the hour, limit).
+type IssuesKey = (Option<String>, i64, usize);
+
+static ISSUES_CACHE: std::sync::LazyLock<
+    crate::search::cache::AggCache<IssuesKey, Vec<IssueCluster>>,
+> = std::sync::LazyLock::new(crate::search::cache::AggCache::new);
+
+/// [`recurring_issues`], reused for up to 10 minutes while the thread set is unchanged
+/// (see `search::cache`). `since` is bucketed to the hour so "now minus 180 days" callers
+/// share an entry. For the app's Coach view; MCP and `cal` read live.
+pub fn recurring_issues_cached(
     conn: &Connection,
     project: Option<&str>,
     since: i64,
     limit: usize,
 ) -> Result<Vec<IssueCluster>> {
+    let since = since - since.rem_euclid(3600);
+    let key = (
+        project.filter(|p| !p.is_empty()).map(str::to_string),
+        since,
+        limit,
+    );
+    ISSUES_CACHE.get_or_try(crate::search::cache::index_version(conn)?, key, || {
+        recurring_issues(conn, project, since, limit)
+    })
+}
+
+/// The candidate fetch for [`recurring_issues`]: error-ish messages since `since`, newest
+/// first, as (text head + tail, ts, thread_id).
+fn candidates_sql(
+    conn: &Connection,
+    project: Option<&str>,
+    since: i64,
+) -> (String, Vec<Box<dyn ToSql>>) {
     // Cap the candidate scan; errors lead the line, so the FTS pre-filter keeps this cheap.
     const CANDIDATE_CAP: i64 = 40_000;
-    let mut sql = String::from(
-        "SELECT m.text, m.ts, m.thread_id
+    // Long tool output is read as its head and tail only: errors lead a command's output
+    // or close it (the summary / final failure), and copying every multi-KB log body into
+    // Rust is what made this view allocate 100+ MB. octet_length() reads only the record
+    // header, so short rows skip the substr work entirely.
+    //
+    // The role / ts / subagent / project filters run off the covering index that
+    // fts_message_join names, so only surviving rows read the table: 385k page reads down
+    // to 51k, ~15 s down to ~3 s from a cold cache on a large index.
+    let mut sql = format!(
+        "SELECT CASE WHEN octet_length(m.text) > {long}
+                     THEN substr(m.text, 1, {head}) || char(10) || substr(m.text, -{tail})
+                     ELSE m.text END,
+                m.ts, m.thread_id
          FROM messages_fts
-         JOIN messages m ON m.id = messages_fts.rowid
+         {join}
          JOIN threads t ON t.id = m.thread_id
          WHERE messages_fts MATCH ?1
            AND m.role IN ('user', 'tool')
            AND m.ts >= ?2
            AND t.is_subagent = 0",
+        long = TEXT_HEAD_CHARS + TEXT_TAIL_CHARS,
+        head = TEXT_HEAD_CHARS,
+        tail = TEXT_TAIL_CHARS,
+        join = crate::search::fts_message_join(conn),
     );
     let mut args: Vec<Box<dyn ToSql>> = vec![
         Box::new("error OR panicked OR exception OR traceback OR fatal".to_string()),
@@ -131,6 +176,18 @@ pub fn recurring_issues(
     }
     args.push(Box::new(CANDIDATE_CAP));
     sql.push_str(&format!(" ORDER BY m.ts DESC LIMIT ?{}", args.len()));
+    (sql, args)
+}
+
+/// Find recurring errors across messages since `since` (epoch secs), optionally scoped to a
+/// project-path substring. Returns clusters seen in >= 2 messages, most-frequent first.
+pub fn recurring_issues(
+    conn: &Connection,
+    project: Option<&str>,
+    since: i64,
+    limit: usize,
+) -> Result<Vec<IssueCluster>> {
+    let (sql, args) = candidates_sql(conn, project, since);
 
     struct Acc {
         example: String,
@@ -214,6 +271,97 @@ mod tests {
         // A genuinely different error does NOT collapse to the same key.
         let c = "error[E0277]: the trait bound `T: Clone` is not satisfied";
         assert_ne!(normalize(a), normalize(c));
+    }
+
+    #[test]
+    fn finds_errors_at_both_ends_of_long_output() {
+        let p = std::env::temp_dir().join(format!("calli_issues_{}.db", std::process::id()));
+        for ext in ["db", "db-wal", "db-shm"] {
+            let _ = std::fs::remove_file(p.with_extension(ext));
+        }
+        let conn = crate::db::open(&p).unwrap();
+        conn.execute(
+            "INSERT INTO threads (source_id, external_id, title) VALUES (1, 't', 't')",
+            [],
+        )
+        .unwrap();
+        let tid = conn.last_insert_rowid();
+        let filler = "compiling some crate\n".repeat(2_000); // ~42 KB
+        let body = format!(
+            "error[E0425]: cannot find value `x` in this scope\n{filler}\
+             error: could not compile `app` due to 1 previous error"
+        );
+        for seq in 0..2 {
+            conn.execute(
+                "INSERT INTO messages (thread_id, seq, role, text, ts) VALUES (?1, ?2, 'tool', ?3, 100)",
+                rusqlite::params![tid, seq, body],
+            )
+            .unwrap();
+        }
+        let clusters = recurring_issues(&conn, None, 0, 10).unwrap();
+        assert!(clusters
+            .iter()
+            .any(|c| c.example.starts_with("error[E0425]")));
+        assert!(clusters
+            .iter()
+            .any(|c| c.example.contains("could not compile")));
+        // The cached variant returns the same answer.
+        let cached = recurring_issues_cached(&conn, None, 0, 10).unwrap();
+        assert_eq!(cached.len(), clusters.len());
+    }
+
+    fn plan(conn: &Connection, sql: &str, args: &[Box<dyn ToSql>]) -> String {
+        let refs: Vec<&dyn ToSql> = args.iter().map(|b| b.as_ref()).collect();
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let rows = stmt
+            .query_map(refs.as_slice(), |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        rows.join(" | ")
+    }
+
+    /// The candidate scan must stay FTS-driven, with each hit's filters answered by the
+    /// covering index (not a table read per hit), and must still run on an index that
+    /// predates the covering index.
+    #[test]
+    fn candidate_scan_uses_the_covering_index_and_falls_back_without_it() {
+        let p = std::env::temp_dir().join(format!("calli_issues_plan_{}.db", std::process::id()));
+        for ext in ["db", "db-wal", "db-shm"] {
+            let _ = std::fs::remove_file(p.with_extension(ext));
+        }
+        let conn = crate::db::open(&p).unwrap();
+        for project in [None, Some("proj")] {
+            let (sql, args) = candidates_sql(&conn, project, 0);
+            let plan = plan(&conn, &sql, &args);
+            assert!(
+                plan.starts_with("SCAN messages_fts VIRTUAL TABLE"),
+                "{plan}"
+            );
+            assert!(
+                plan.contains("SEARCH m USING INDEX idx_messages_cover (id=?)"),
+                "{plan}"
+            );
+        }
+
+        conn.execute_batch("DROP INDEX idx_messages_cover").unwrap();
+        let (sql, _) = candidates_sql(&conn, None, 0);
+        assert!(!sql.contains("INDEXED BY"), "{sql}");
+        conn.execute(
+            "INSERT INTO threads (source_id, external_id, title) VALUES (1, 't', 't')",
+            [],
+        )
+        .unwrap();
+        let tid = conn.last_insert_rowid();
+        for seq in 0..2 {
+            conn.execute(
+                "INSERT INTO messages (thread_id, seq, role, text, ts)
+                 VALUES (?1, ?2, 'tool', 'error: linker failed', 100)",
+                rusqlite::params![tid, seq],
+            )
+            .unwrap();
+        }
+        assert_eq!(recurring_issues(&conn, None, 0, 10).unwrap().len(), 1);
     }
 
     #[test]

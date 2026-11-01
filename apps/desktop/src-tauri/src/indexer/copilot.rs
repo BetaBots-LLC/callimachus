@@ -12,9 +12,10 @@
 //! that switches models mid-conversation keeps each turn's model. Project path comes
 //! from the workspace's `workspace.json` folder URI.
 
+use super::common::{read_json, truncate_title};
 use super::{
-    file_state, set_file_state, source_id, upsert_thread, IndexReport, MsgUsage, ParsedMessage,
-    ParsedThread,
+    file_change_state, set_file_state, source_id, upsert_thread, IndexReport, MsgUsage,
+    ParsedMessage, ParsedThread,
 };
 use anyhow::Result;
 use rusqlite::Connection;
@@ -101,14 +102,7 @@ fn index_dir(
             continue;
         }
         tick();
-        match index_session(conn, sid, &path, project) {
-            Ok(Some(n)) => {
-                report.threads_indexed += 1;
-                report.messages_indexed += n;
-            }
-            Ok(None) => report.threads_skipped += 1,
-            Err(_) => report.errors += 1,
-        }
+        report.record(index_session(conn, sid, &path, project));
     }
 }
 
@@ -120,20 +114,11 @@ fn index_session(
     path: &Path,
     project: Option<&str>,
 ) -> Result<Option<usize>> {
-    let meta = fs::metadata(path)?;
-    let size = meta.len() as i64;
-    let mtime = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    let key = path.to_string_lossy().to_string();
-    if let Some((pm, ps)) = file_state(conn, &key)? {
-        if pm == mtime && ps == size {
-            return Ok(None);
-        }
+    let (unchanged, mtime, size) = file_change_state(conn, path)?;
+    if unchanged {
+        return Ok(None);
     }
+    let key = path.to_string_lossy().to_string();
 
     let Some(root) = read_json(path) else {
         return Ok(None);
@@ -151,6 +136,12 @@ fn index_session(
         })
         .unwrap_or_default();
     if session_id.is_empty() {
+        return Ok(None);
+    }
+    // The user deleted this thread: don't bring it back. Record the fingerprint so an
+    // unchanged file isn't re-read on every scan.
+    if crate::cleanup::is_tombstoned(conn, sid, &session_id)? {
+        set_file_state(conn, &key, KIND, mtime, size)?;
         return Ok(None);
     }
 
@@ -238,7 +229,7 @@ fn index_session(
         .map(|ms| ms / 1000);
     let thread = ParsedThread {
         external_id: session_id,
-        title: first_user.map(truncate_title),
+        title: first_user.as_deref().map(truncate_title),
         project_path: project.map(str::to_string),
         git_branch: None,
         created_at,
@@ -313,19 +304,6 @@ fn pct_decode(s: &str) -> String {
         i += 1;
     }
     out
-}
-
-fn read_json(path: &Path) -> Option<Value> {
-    serde_json::from_str(&fs::read_to_string(path).ok()?).ok()
-}
-
-fn truncate_title(s: String) -> String {
-    let s = s.trim();
-    if s.chars().count() > 80 {
-        format!("{}…", s.chars().take(80).collect::<String>())
-    } else {
-        s.to_string()
-    }
 }
 
 #[cfg(test)]

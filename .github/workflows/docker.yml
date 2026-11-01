@@ -1,0 +1,87 @@
+name: Docker
+
+# Builds the MCP-server image (the Dockerfile MCP registries such as Glama use
+# to verify the server) and checks it answers initialize + tools/list over
+# stdio. Runs when the Dockerfile, .dockerignore, docker-entrypoint.sh, the
+# crate's Cargo.toml / Cargo.lock or this workflow change, plus weekly to catch
+# base-image drift. A source-only change to the crate is not rebuilt here until
+# the next weekly run. The build context is an allowlist (.dockerignore sends
+# only apps/desktop/src-tauri/ and docker-entrypoint.sh), so anything outside
+# the crate is not available to the build.
+
+on:
+  pull_request:
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - docker-entrypoint.sh
+      - apps/desktop/src-tauri/Cargo.toml
+      - apps/desktop/src-tauri/Cargo.lock
+      - .github/workflows/docker.yml
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - docker-entrypoint.sh
+      - apps/desktop/src-tauri/Cargo.toml
+      - apps/desktop/src-tauri/Cargo.lock
+      - .github/workflows/docker.yml
+  schedule:
+    - cron: "41 5 * * 1" # Mondays 05:41 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Build image
+        run: |
+          docker build -t callimachus-mcp .
+          # Log the runtime image size so a regression (e.g. build tools leaking
+          # into the final stage) shows up in the run summary.
+          docker image ls callimachus-mcp
+
+      - name: Smoke test (initialize + tools/list over stdio)
+        run: |
+          set -euo pipefail
+          # Sends initialize + tools/list and checks the answer; arguments go to `docker run`.
+          # Keep stdin open briefly after the requests so the server can answer before it
+          # sees EOF and exits.
+          smoke() {
+            {
+              echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"ci","version":"0"}}}'
+              echo '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+              echo '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
+              sleep 10
+            } | timeout 120 docker run -i --rm "$@" callimachus-mcp > responses.jsonl || true
+            cat responses.jsonl
+            COUNT="$(jq -s '[.[] | select(.id == 2) | .result.tools | length] | first // 0' responses.jsonl)"
+            echo "tools/list returned $COUNT tools"
+            if [ "$COUNT" -lt 1 ]; then
+              echo "::error::callimachus-mcp did not answer tools/list"
+              exit 1
+            fi
+          }
+          # The image's own index (what MCP registries run).
+          smoke
+          # A host index folder, as the npm package README documents for older distros: the
+          # server must run as the folder's owner (the runner user here, not root or the
+          # image's uid), so it can write there and the index it creates stays the host's.
+          mkdir hostdata
+          smoke -v "$PWD/hostdata:/data"
+          owner="$(stat -c %u hostdata/index.db)"
+          if [ "$owner" != "$(id -u)" ]; then
+            echo "::error::index.db in a mounted folder is owned by uid $owner, not the host user $(id -u)"
+            exit 1
+          fi

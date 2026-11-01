@@ -2,20 +2,52 @@
 //! (`threads` table), and the conversation itself in the per-thread rollout file
 //! at `threads.rollout_path` (JSONL of `response_item` / `event_msg` / etc.).
 
+use super::common::{parse_rfc3339, push_message, truncate_title};
 use super::{
-    file_state, set_file_state, source_id, upsert_thread, IndexReport, ParsedMessage, ParsedThread,
+    file_change_state, set_file_state, source_id, upsert_thread, IndexReport, ParsedMessage,
+    ParsedThread,
 };
 use anyhow::Result;
 use rusqlite::Connection;
 use serde_json::Value;
+use std::collections::HashSet;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 pub const KIND: &str = "codex";
 
-/// `~/.codex`, or None if HOME is unset.
+static CODEX_HOME_OVERRIDE: std::sync::RwLock<Option<PathBuf>> = std::sync::RwLock::new(None);
+
+/// Point the indexer at a relocated Codex home (a Settings value). A GUI app launched from
+/// Finder/Dock never sees the shell's `CODEX_HOME`, so the app needs a way to set it
+/// explicitly. `None` (or an empty path) restores the default lookup.
+pub fn set_codex_home_override(dir: Option<PathBuf>) {
+    if let Ok(mut slot) = CODEX_HOME_OVERRIDE.write() {
+        *slot = dir
+            .filter(|d| !d.as_os_str().is_empty())
+            .map(super::claude::expand_tilde);
+    }
+}
+
+/// `app_config` key holding a user-chosen Codex home (a Settings value).
+pub const CODEX_HOME_SETTING: &str = "paths.codex_home";
+
+/// Apply the [`CODEX_HOME_SETTING`] override from the index (cleared when unset). Called at
+/// the start of every scan, so a changed setting takes effect on the next pass.
+pub fn load_codex_home_setting(conn: &Connection) {
+    set_codex_home_override(super::claude::read_path_setting(conn, CODEX_HOME_SETTING));
+}
+
+/// Codex's home: the override, else `$CODEX_HOME`, else `~/.codex`. The CLI, the Desktop
+/// app and the IDE extension all honor `CODEX_HOME`, so the index must too.
 pub fn codex_root() -> Option<PathBuf> {
+    if let Some(dir) = CODEX_HOME_OVERRIDE.read().ok().and_then(|g| g.clone()) {
+        return Some(dir);
+    }
+    if let Some(dir) = std::env::var_os("CODEX_HOME").filter(|v| !v.is_empty()) {
+        return Some(super::claude::expand_tilde(PathBuf::from(dir)));
+    }
     dirs::home_dir().map(|h| h.join(".codex"))
 }
 
@@ -41,6 +73,7 @@ struct ThreadMeta {
 /// `session_meta` header, so it can be indexed without the DB. Dedup is by session
 /// id, so a session present in both passes is indexed once (pass 1 wins).
 pub fn scan(conn: &mut Connection, tick: &mut dyn FnMut()) -> Result<IndexReport> {
+    load_codex_home_setting(conn);
     let Some(root) = codex_root() else {
         return Ok(IndexReport::default());
     };
@@ -53,7 +86,13 @@ fn scan_in(conn: &mut Connection, root: &Path, tick: &mut dyn FnMut()) -> Result
         return Ok(report);
     }
     let sid = source_id(conn, KIND)?;
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    // Rollout files pass 1 already covered. The watcher re-runs this scan on every Codex
+    // write, so without this pass 2 would reopen and JSON-parse every registered session's
+    // header each time, only to drop it on the id check. PathBuf equality compares
+    // components, so a doubled or trailing separator in the DB's spelling still matches;
+    // a path spelled any other way just misses here and is deduped by id as before.
+    let mut registered: HashSet<PathBuf> = HashSet::new();
 
     // Pass 1: thread metadata from the state DB, when present.
     let state_db = root.join("state_5.sqlite");
@@ -61,14 +100,8 @@ fn scan_in(conn: &mut Connection, root: &Path, tick: &mut dyn FnMut()) -> Result
         for meta in read_thread_metas(&state_db)? {
             tick();
             seen.insert(meta.id.clone());
-            match index_rollout(conn, sid, &meta) {
-                Ok(Some(n)) => {
-                    report.threads_indexed += 1;
-                    report.messages_indexed += n;
-                }
-                Ok(None) => report.threads_skipped += 1,
-                Err(_) => report.errors += 1,
-            }
+            registered.insert(PathBuf::from(&meta.rollout_path));
+            report.record(index_rollout(conn, sid, &meta));
         }
     }
 
@@ -78,20 +111,16 @@ fn scan_in(conn: &mut Connection, root: &Path, tick: &mut dyn FnMut()) -> Result
     collect_rollout_files(&root.join("archived_sessions"), &mut files);
     for f in files {
         tick();
+        if registered.contains(&f) {
+            continue; // indexed (or checked unchanged) by pass 1
+        }
         let Some(meta) = meta_from_rollout(&f) else {
             continue; // no readable session_meta header
         };
         if meta.id.is_empty() || !seen.insert(meta.id.clone()) {
             continue; // missing id, or already indexed via the state DB
         }
-        match index_rollout(conn, sid, &meta) {
-            Ok(Some(n)) => {
-                report.threads_indexed += 1;
-                report.messages_indexed += n;
-            }
-            Ok(None) => report.threads_skipped += 1,
-            Err(_) => report.errors += 1,
-        }
+        report.record(index_rollout(conn, sid, &meta));
     }
     Ok(report)
 }
@@ -122,21 +151,29 @@ fn index_rollout(conn: &mut Connection, sid: i64, meta: &ThreadMeta) -> Result<O
     if !path.exists() {
         return Ok(None);
     }
-    let m = fs::metadata(path)?;
-    let size = m.len() as i64;
-    let mtime = m
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    if let Some((pm, ps)) = file_state(conn, &meta.rollout_path)? {
-        if pm == mtime && ps == size {
-            return Ok(None);
-        }
+    let (unchanged, mtime, size) = file_change_state(conn, path)?;
+    if unchanged {
+        return Ok(None);
+    }
+    // The user deleted this thread: don't bring it back (and don't pay to parse it).
+    if crate::cleanup::is_tombstoned(conn, sid, &meta.id)? {
+        set_file_state(conn, &meta.rollout_path, KIND, mtime, size)?;
+        return Ok(None);
     }
 
     let messages = parse_rollout(path)?;
+    // `codex exec` runs the app's own distill / Ask calls (codex-cli engine) and always
+    // writes a rollout; those are not the user's history.
+    let cwd = (!meta.cwd.is_empty()).then_some(meta.cwd.as_str());
+    let user_texts = messages
+        .iter()
+        .filter(|m| m.role == "user")
+        .take(3)
+        .map(|m| m.text.as_str());
+    if crate::agent::is_app_cli_session(cwd, user_texts) {
+        set_file_state(conn, &meta.rollout_path, KIND, mtime, size)?;
+        return Ok(None);
+    }
     let title = if !meta.title.trim().is_empty() {
         Some(meta.title.clone())
     } else if !meta.first_user_message.trim().is_empty() {
@@ -207,11 +244,11 @@ fn meta_from_rollout(path: &Path) -> Option<ThreadMeta> {
     let created_at = p
         .get("timestamp")
         .and_then(Value::as_str)
-        .and_then(parse_ts)
+        .and_then(parse_rfc3339)
         .or_else(|| {
             obj.get("timestamp")
                 .and_then(Value::as_str)
-                .and_then(parse_ts)
+                .and_then(parse_rfc3339)
         });
     let updated_at = fs::metadata(path)
         .ok()
@@ -248,7 +285,7 @@ fn parse_rollout(path: &Path) -> Result<Vec<ParsedMessage>> {
         let ts = obj
             .get("timestamp")
             .and_then(Value::as_str)
-            .and_then(parse_ts);
+            .and_then(parse_rfc3339);
         let Some(payload) = obj.get("payload") else {
             continue;
         };
@@ -265,8 +302,7 @@ fn ingest_payload(out: &mut Vec<ParsedMessage>, payload: &Value, ts: Option<i64>
                 Some("user") => "user",
                 _ => "system", // developer / system instructions
             };
-            let text = content_text(payload.get("content"));
-            push(out, role, text, None, ts);
+            push_message(out, role, &content_text(payload.get("content")), None, ts);
         }
         Some("function_call") => {
             let name = payload
@@ -279,11 +315,13 @@ fn ingest_payload(out: &mut Vec<ParsedMessage>, payload: &Value, ts: Option<i64>
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
-            push(out, "assistant", format!("{name}: {args}"), Some(name), ts);
+            push_message(out, "assistant", &format!("{name}: {args}"), Some(name), ts);
         }
         Some("function_call_output") => {
             let output = payload.get("output").map(value_to_text).unwrap_or_default();
-            push(out, "tool", output, None, ts);
+            // Same index-time cap as Claude tool results (see `claude::cap_tool_text`).
+            let output = super::claude::cap_tool_text(output.trim());
+            push_message(out, "tool", &output, None, ts);
         }
         _ => {} // reasoning, etc. — skipped
     }
@@ -315,41 +353,10 @@ fn value_to_text(v: &Value) -> String {
     }
 }
 
-fn push(
-    out: &mut Vec<ParsedMessage>,
-    role: &str,
-    text: String,
-    tool: Option<String>,
-    ts: Option<i64>,
-) {
-    let text = text.trim().to_string();
-    if !text.is_empty() {
-        out.push(ParsedMessage {
-            role: role.to_string(),
-            text,
-            tool_name: tool,
-            ts,
-        });
-    }
-}
-
+/// A title from the first line of `s`, or None when `s` is blank.
 fn first_line(s: &str) -> Option<String> {
-    let s = s.trim();
-    if s.is_empty() {
-        return None;
-    }
-    let line = s.lines().next().unwrap_or(s);
-    Some(if line.chars().count() > 80 {
-        format!("{}…", line.chars().take(80).collect::<String>())
-    } else {
-        line.to_string()
-    })
-}
-
-fn parse_ts(s: &str) -> Option<i64> {
-    chrono::DateTime::parse_from_rfc3339(s)
-        .ok()
-        .map(|d| d.timestamp())
+    let line = s.trim().lines().next()?;
+    Some(truncate_title(line))
 }
 
 #[cfg(test)]
@@ -418,6 +425,117 @@ mod tests {
         // Re-scan is a no-op (rollout fingerprint unchanged).
         let again = scan_in(&mut conn, &root, &mut || {}).unwrap();
         assert_eq!(again.threads_indexed, 0);
+    }
+
+    #[test]
+    fn caps_tool_output_and_skips_the_apps_own_sessions() {
+        let root = std::env::temp_dir().join(format!("calli_codex_cap_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let day = root.join("sessions/2026/05/01");
+        std::fs::create_dir_all(&day).unwrap();
+        let big = "x".repeat(40_000);
+        let user_session = serde_json::json!([
+            {"type":"session_meta","payload":{"id":"user-1","cwd":"/Users/me/proj"}},
+            {"type":"response_item","payload":{"type":"message","role":"user",
+                "content":[{"type":"input_text","text":"run the tests"}]}},
+            {"type":"response_item","payload":{"type":"function_call_output","output": big}}
+        ]);
+        let app_cwd = crate::agent::cli_work_dir_path();
+        let app_session = serde_json::json!([
+            {"type":"session_meta","payload":{"id":"app-1","cwd": app_cwd.to_string_lossy()}},
+            {"type":"response_item","payload":{"type":"message","role":"user",
+                "content":[{"type":"input_text","text":"distill this"}]}}
+        ]);
+        for (name, lines) in [
+            ("rollout-a.jsonl", user_session),
+            ("rollout-b.jsonl", app_session),
+        ] {
+            let body: String = lines
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|l| format!("{l}\n"))
+                .collect();
+            std::fs::write(day.join(name), body).unwrap();
+        }
+
+        let dbp = std::env::temp_dir().join(format!("calli_codex_cap_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&dbp);
+        let mut conn = crate::db::open(&dbp).unwrap();
+        let report = scan_in(&mut conn, &root, &mut || {}).unwrap();
+        assert_eq!(
+            report.threads_indexed, 1,
+            "only the user's session is indexed"
+        );
+        let tool: String = conn
+            .query_row("SELECT text FROM messages WHERE role = 'tool'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(tool.chars().count() <= super::super::claude::TOOL_TEXT_CAP_CHARS);
+    }
+
+    /// Pass 2 skips rollouts pass 1 registered before reading their headers: the watcher
+    /// re-runs this scan on every Codex write. A registered file whose header id differs
+    /// from its state-DB id (so the id check alone would not catch it) is indexed once.
+    #[test]
+    fn pass_two_skips_rollouts_the_state_db_registered() {
+        let root = std::env::temp_dir().join(format!("calli_codex_reg_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let day = root.join("sessions/2026/05/02");
+        std::fs::create_dir_all(&day).unwrap();
+        let rollout = |id: &str, text: &str| {
+            format!(
+                "{}\n{}\n",
+                serde_json::json!({"type":"session_meta","payload":{"id": id,"cwd":"/p"}}),
+                serde_json::json!({"type":"response_item","payload":{"type":"message",
+                    "role":"user","content":[{"type":"input_text","text": text}]}}),
+            )
+        };
+        let registered = day.join("rollout-registered.jsonl");
+        std::fs::write(&registered, rollout("header-id", "registered session")).unwrap();
+        std::fs::write(
+            day.join("rollout-loose.jsonl"),
+            rollout("loose-id", "loose session"),
+        )
+        .unwrap();
+        let state = Connection::open(root.join("state_5.sqlite")).unwrap();
+        state
+            .execute_batch(
+                "CREATE TABLE threads (id TEXT, title TEXT, cwd TEXT, git_branch TEXT,
+                    created_at INTEGER, updated_at INTEGER, rollout_path TEXT,
+                    first_user_message TEXT)",
+            )
+            .unwrap();
+        state
+            .execute(
+                "INSERT INTO threads VALUES ('db-id', 'From the DB', '/p', NULL, 1, 2, ?1, NULL)",
+                [registered.to_string_lossy()],
+            )
+            .unwrap();
+        drop(state);
+
+        let dbp = std::env::temp_dir().join(format!("calli_codex_reg_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&dbp);
+        let mut conn = crate::db::open(&dbp).unwrap();
+        let report = scan_in(&mut conn, &root, &mut || {}).unwrap();
+        assert_eq!(
+            report.threads_indexed, 2,
+            "the registered and the loose session"
+        );
+        let mut ids: Vec<String> = conn
+            .prepare("SELECT external_id FROM threads ORDER BY external_id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec!["db-id", "loose-id"],
+            "no second copy under the header id"
+        );
     }
 
     /// Real-data smoke test. Run with `cargo test -- --ignored real_codex_index --nocapture`.

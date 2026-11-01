@@ -13,6 +13,7 @@
     "windows": [
       {
         "label": "main",
+        "create": false,
         "title": "Callimachus",
         "width": 1100,
         "height": 760,
@@ -46,7 +47,17 @@
       "icons/icon.ico"
     ],
     "windows": {
-      "signCommand": "trusted-signing-cli -e https://eus.codesigning.azure.net -a betabots -c callimachus -d Callimachus %1"
+      "nsis": {
+        "installerHooks": "./windows/hooks.nsh"
+      }
+    },
+    "linux": {
+      "deb": {
+        "depends": ["libc6 (>= 2.38)"]
+      },
+      "rpm": {
+        "depends": ["glibc >= 2.38"]
+      }
     }
   },
   "plugins": {

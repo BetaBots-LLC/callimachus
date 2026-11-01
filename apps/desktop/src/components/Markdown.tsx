@@ -1,4 +1,4 @@
-import { type ComponentProps, memo } from "react";
+import { type ComponentProps, memo, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
@@ -6,10 +6,36 @@ import { unified } from "unified";
 import remarkParse from "remark-parse";
 import remarkRehype from "remark-rehype";
 import rehypeStringify from "rehype-stringify";
+// Relative import on purpose: the VS Code webview reuses this file, and its build maps
+// "@/" to its own sources (only "@/lib/utils" is redirected back here).
+import { rehypeSafeLinks } from "../lib/safeLinks";
+import { copyText } from "../lib/clipboard";
+import { Button } from "./ui/button";
 
-// Syntax-highlight fenced code; detect the language when unlabeled, ignore unknown.
+// Syntax-highlight fenced code: detect the language when unlabeled (assistant prose often
+// omits it), ignore unknown ones, and skip fences explicitly labeled as plain text. Tool
+// output is labeled `text` (see ThreadView's toolBody), which avoids auto-detection, the
+// costliest step: it tries every registered grammar.
+const HIGHLIGHT = {
+  detect: true,
+  ignoreMissing: true,
+  plainText: ["text", "txt", "plain", "plaintext"],
+};
+
+// Every rendering path also runs rehypeSafeLinks: transcripts are untrusted, so links
+// may only open in the system browser and images never auto-load (see lib/safeLinks).
 const REHYPE: ComponentProps<typeof ReactMarkdown>["rehypePlugins"] = [
-  [rehypeHighlight, { detect: true, ignoreMissing: true }],
+  [rehypeHighlight, HIGHLIGHT],
+  rehypeSafeLinks,
+];
+
+// The block still growing in a streaming reply re-parses every frame, and auto-detecting
+// an unlabeled fence runs every registered grammar over the whole block: 17-22 ms per frame
+// at 4-8 KB, over the frame budget. So the live block highlights labeled fences only; it is
+// re-rendered with detection once it is final (see StreamingMarkdown).
+const REHYPE_LIVE: ComponentProps<typeof ReactMarkdown>["rehypePlugins"] = [
+  [rehypeHighlight, { ...HIGHLIGHT, detect: false }],
+  rehypeSafeLinks,
 ];
 
 // A single sanitizing markdown→HTML pipeline (no allowDangerousHtml, so raw HTML in a
@@ -21,7 +47,8 @@ const processor = unified()
   .use(remarkParse)
   .use(remarkGfm)
   .use(remarkRehype)
-  .use(rehypeHighlight, { detect: true, ignoreMissing: true })
+  .use(rehypeSafeLinks)
+  .use(rehypeHighlight, HIGHLIGHT)
   .use(rehypeStringify);
 
 const htmlCache = new Map<string, string>();
@@ -50,22 +77,94 @@ const PROSE =
 // pasted/packed-context message). Render those as plain, collapsed text instead.
 const MAX_MARKDOWN_CHARS = 16_000;
 
+// An expanded large message shows this much at a time. A pre-wrap block of a few hundred
+// KB lays out in well under a frame; the largest indexed messages are over 5 MB, which
+// would freeze WebKit's line breaking if mounted in one go.
+const LARGE_CHUNK_CHARS = 200_000;
+
+function charCount(n: number): string {
+  return n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M` : `${Math.round(n / 1000)}k`;
+}
+
+/** End of the chunk starting at `from`: the last line break in the window when there is
+ *  one near its end, so each chunk is whole lines and stacks without a visible seam. */
+function chunkEnd(text: string, from: number): number {
+  const end = from + LARGE_CHUNK_CHARS;
+  if (end >= text.length) return text.length;
+  const nl = text.lastIndexOf("\n", end);
+  return nl > end - LARGE_CHUNK_CHARS / 10 ? nl + 1 : end;
+}
+
+/** A message too large for the markdown pipeline. Nothing is mounted until the first
+ *  expand (most are never opened, and a virtualized thread remounts rows on scroll); then
+ *  it reveals one chunk per "Show more", each its own block, so a reveal lays out only
+ *  the new chunk. */
+function LargeMessage({ text }: { text: string }) {
+  const [ends, setEnds] = useState<number[]>([]);
+  const [copy, setCopy] = useState<"idle" | "copied" | "failed">("idle");
+  const shown = ends.length ? ends[ends.length - 1] : 0;
+  const showMore = () =>
+    setEnds((prev) => {
+      const last = prev.length ? prev[prev.length - 1] : 0;
+      return last >= text.length ? prev : [...prev, chunkEnd(text, last)];
+    });
+  return (
+    <details
+      className="rounded-md border bg-muted/30 px-3 py-2 text-sm"
+      onToggle={(e) => {
+        if (e.currentTarget.open && ends.length === 0) showMore();
+      }}
+    >
+      <summary className="cursor-pointer select-none text-muted-foreground">
+        Large message ({charCount(text.length)} chars) · click to expand
+      </summary>
+      {ends.length > 0 && (
+        <>
+          <div className="mt-2 max-h-[60vh] overflow-auto whitespace-pre-wrap wrap-break-word font-mono text-[0.85rem]">
+            {ends.map((end, i) => (
+              // biome-ignore lint/suspicious/noArrayIndexKey: chunks only append, so the index is a stable identity
+              <div key={i}>{text.slice(i === 0 ? 0 : ends[i - 1], end)}</div>
+            ))}
+          </div>
+          <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+            {shown < text.length && (
+              <>
+                <span>
+                  Showing {charCount(shown)} of {charCount(text.length)} chars
+                </span>
+                <Button size="xs" variant="outline" onClick={showMore}>
+                  Show more
+                </Button>
+              </>
+            )}
+            <Button
+              size="xs"
+              variant="ghost"
+              onClick={() =>
+                copyText(text).then(
+                  () => setCopy("copied"),
+                  () => setCopy("failed"),
+                )
+              }
+            >
+              {copy === "copied"
+                ? "Copied"
+                : copy === "failed"
+                  ? "Couldn't copy"
+                  : "Copy full message"}
+            </Button>
+          </div>
+        </>
+      )}
+    </details>
+  );
+}
+
 /** Static markdown (committed messages). Memoized so a parent re-render that
  *  doesn't change `children` skips the (expensive) re-parse. Very large messages
  *  fall back to a collapsed plain block to avoid a parse freeze. */
 export const Markdown = memo(function Markdown({ children }: { children: string }) {
-  if (children.length > MAX_MARKDOWN_CHARS) {
-    return (
-      <details className="rounded-md border bg-muted/30 px-3 py-2 text-sm">
-        <summary className="cursor-pointer select-none text-muted-foreground">
-          Large message ({Math.round(children.length / 1000)}k chars) — click to expand
-        </summary>
-        <pre className="mt-2 max-h-[60vh] overflow-auto whitespace-pre-wrap wrap-break-word text-[0.85rem]">
-          {children}
-        </pre>
-      </details>
-    );
-  }
+  if (children.length > MAX_MARKDOWN_CHARS) return <LargeMessage text={children} />;
   return (
     <div
       className={PROSE}
@@ -86,9 +185,10 @@ export const InlineMarkdown = memo(function InlineMarkdown({ children }: { child
         components={{
           // Unwrap blocks and links: distilled facts are one-liners, and any embedded
           // link (often a scraped relative file path) is dead in the webview — show its
-          // text, not a broken anchor.
+          // text, not a broken anchor. Images show their alt text and never load.
           p: ({ children }) => <>{children}</>,
           a: ({ children }) => <>{children}</>,
+          img: ({ alt }) => <>{alt ?? ""}</>,
         }}
       >
         {children}
@@ -96,15 +196,6 @@ export const InlineMarkdown = memo(function InlineMarkdown({ children }: { child
     </span>
   );
 });
-
-/** Wrap arbitrary text (e.g. tool output) as one fenced code block so it renders
- *  monospaced + syntax-highlighted through the Markdown pipeline. The fence is one
- *  backtick longer than any run already in the text, so embedded fences can't escape. */
-export function asCodeBlock(text: string, lang = ""): string {
-  const longest = (text.match(/`+/g) ?? []).reduce((m, s) => Math.max(m, s.length), 0);
-  const fence = "`".repeat(Math.max(3, longest + 1));
-  return `${fence}${lang}\n${text}\n${fence}`;
-}
 
 /** Split markdown into top-level blocks on blank lines, without breaking fenced
  *  code. Only the trailing (growing) block changes while streaming. */
@@ -138,20 +229,25 @@ export function splitBlocks(src: string): string[] {
   return blocks;
 }
 
-const Block = memo(function Block({ src }: { src: string }) {
+const Block = memo(function Block({ src, live }: { src: string; live: boolean }) {
   return (
-    <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={REHYPE}>
+    <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={live ? REHYPE_LIVE : REHYPE}>
       {src}
     </ReactMarkdown>
   );
 });
 
 /** Incremental markdown for the streaming reply: each block is memoized, so only
- *  the last (growing) block re-parses per frame instead of the whole message. */
+ *  the last (growing) block re-parses per frame instead of the whole message. The
+ *  growing block skips language auto-detection; a block that is final (a later one has
+ *  started, or `streaming` is false) re-renders once with it. */
 export const StreamingMarkdown = memo(function StreamingMarkdown({
   children,
+  streaming = true,
 }: {
   children: string;
+  /** False once this text can no longer grow (e.g. a tool step followed it). */
+  streaming?: boolean;
 }) {
   const blocks = splitBlocks(children);
   return (
@@ -162,7 +258,7 @@ export const StreamingMarkdown = memo(function StreamingMarkdown({
         // Index key is stable (streaming only appends blocks); reduced-motion disables the fade.
         // biome-ignore lint/suspicious/noArrayIndexKey: streaming blocks only append, so the index is a stable identity
         <div key={i} className="animate-in fade-in duration-300 motion-reduce:animate-none">
-          <Block src={b} />
+          <Block src={b} live={streaming && i === blocks.length - 1} />
         </div>
       ))}
     </div>

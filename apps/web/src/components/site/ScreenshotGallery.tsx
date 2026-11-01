@@ -18,7 +18,8 @@ export function ScreenshotGallery({ className, label }: { className?: string; la
 
   const move = useCallback(
     (delta: number) => setOpen((i) => (i === null ? i : (i + delta + shots.length) % shots.length)),
-    [shots.length],
+    // `shots` is the module constant SCREENSHOTS, so its length never changes.
+    [],
   );
 
   useEffect(() => {

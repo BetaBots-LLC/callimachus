@@ -1,0 +1,105 @@
+name: Warm release cache
+
+# Release builds run on tags, and GitHub scopes a cache saved on a tag to that
+# tag: no later tag can restore it. So build.yml only RESTORES its Rust cache,
+# and this workflow saves it from main (caches saved on the default branch are
+# visible to every tag). It runs when the Rust dependency set changes, and weekly
+# so the cache isn't evicted (GitHub drops caches unused for 7 days).
+#
+# Keep this in sync with build.yml's release matrix: same runners, targets,
+# toolchain, RUSTFLAGS and cargo invocations, or the restored artifacts won't
+# match and the release recompiles from scratch. rust-cache only keeps compiled
+# dependencies (never the callimachus crate itself), which is the slow part.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - apps/desktop/src-tauri/Cargo.toml
+      - apps/desktop/src-tauri/Cargo.lock
+      - .github/workflows/release-cache.yml
+  schedule:
+    - cron: "17 4 * * 1" # Mondays 04:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-cache
+  cancel-in-progress: true
+
+env:
+  # Must match build.yml: both feed rust-cache's cache key.
+  RUST_TOOLCHAIN: "1.96.0"
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  warm:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            rust_target: aarch64-apple-darwin
+          - platform: ubuntu-24.04
+            rust_target: ""
+          - platform: windows-latest
+            rust_target: ""
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Install Linux build deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf \
+            build-essential pkg-config libssl-dev
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ matrix.rust_target }}
+
+      # Same compiler-rt search-path fix as build.yml; RUSTFLAGS is part of the
+      # cache key, so it has to be set identically here.
+      - name: Locate compiler-rt for the linker (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          LIB=$(find "$(xcode-select -p)" -name 'libclang_rt.osx.a' 2>/dev/null | head -1)
+          if [ -n "$LIB" ]; then
+            echo "RUSTFLAGS=${RUSTFLAGS:-} -L $(dirname "$LIB")" >> "$GITHUB_ENV"
+            echo "compiler-rt: $LIB"
+          else
+            echo "::warning::libclang_rt.osx.a not found under $(xcode-select -p)"
+          fi
+
+      - uses: swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: ./apps/desktop/src-tauri -> target
+          shared-key: release-${{ matrix.platform }}
+
+      # generate_context!() embeds frontendDist in a custom-protocol build. Only the
+      # dependencies are cached, so a placeholder page is enough here.
+      - name: Placeholder frontend dist
+        shell: bash
+        run: |
+          mkdir -p apps/desktop/dist
+          echo '<!doctype html><title>Callimachus</title>' > apps/desktop/dist/index.html
+
+      # 1) What `tauri build` (tauri-action) runs: the release profile with the
+      #    tauri/custom-protocol feature. The tauri CLI also exports the bundle's
+      #    default macOS minimum version as MACOSX_DEPLOYMENT_TARGET (on every
+      #    platform), which C build scripts track, so set it the same way.
+      # 2) What build.yml's standalone cal/callimachus-mcp step runs.
+      - name: Build release dependencies
+        shell: bash
+        working-directory: apps/desktop/src-tauri
+        run: |
+          set -euo pipefail
+          TARGET_ARGS=()
+          if [ -n "${{ matrix.rust_target }}" ]; then TARGET_ARGS=(--target "${{ matrix.rust_target }}"); fi
+          MACOSX_DEPLOYMENT_TARGET=10.13 cargo build --release --locked ${TARGET_ARGS[@]+"${TARGET_ARGS[@]}"} \
+            --features tauri/custom-protocol
+          cargo build --release --locked ${TARGET_ARGS[@]+"${TARGET_ARGS[@]}"} --bin cal --bin callimachus-mcp

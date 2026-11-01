@@ -9,7 +9,19 @@ import {
   type SourceKind,
 } from "../lib/api";
 import { useUi } from "../store/ui";
-import { Input } from "@/components/ui/input";
+import {
+  EMBED_ERROR_KEY,
+  useEmbedError,
+  useEmbedStatus,
+  useIndexError,
+  useIndexRewriting,
+} from "../lib/queries";
+import {
+  InputGroup,
+  InputGroupAddon,
+  InputGroupButton,
+  InputGroupInput,
+} from "@/components/ui/input-group";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { Spinner } from "@/components/ui/spinner";
@@ -20,7 +32,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { Check, ChevronDown, Star } from "lucide-react";
+import { Check, ChevronDown, Star, X } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 // The three most-used sources get top-level chips; the rest live under "More".
@@ -43,7 +55,9 @@ export function SearchBar() {
 
   const tags = useQuery({ queryKey: ["list_tags"], queryFn: api.listTags, staleTime: 60_000 });
 
-  const [text, setText] = useState("");
+  // Seed from the committed query: this bar unmounts whenever another tab is shown, and
+  // the results list keeps filtering by the stored query, so the box must show it again.
+  const [text, setText] = useState(() => useUi.getState().query);
   // Pacer handles the debounce (no manual timer / useEffect).
   const commitQuery = useDebouncedCallback((value: string) => setQuery(value.trim()), {
     wait: 260,
@@ -52,6 +66,14 @@ export function SearchBar() {
   function onChange(value: string) {
     setText(value);
     commitQuery(value);
+  }
+
+  function clear() {
+    setText("");
+    // Supersede any pending debounced value (it would re-apply the old text), and clear
+    // the committed query right away instead of after the debounce.
+    commitQuery("");
+    setQuery("");
   }
 
   // Reindex runs in the BACKGROUND now: the button just kicks it off and reflects the
@@ -66,16 +88,18 @@ export function SearchBar() {
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["index_status"] }),
   });
 
-  // Progress is pushed via embed:progress/embed:done events (see main.tsx); a slow
-  // safety-net refetch covers any missed event while a build runs.
-  const embed = useQuery({
-    queryKey: ["embed_status"],
-    queryFn: api.embeddingStatus,
-    refetchInterval: (q) => (q.state.data?.running ? 5_000 : false),
-  });
+  // Event-driven; never polls while idle (see lib/queries.ts).
+  const embed = useEmbedStatus();
+  const embedError = useEmbedError();
+  // A failed full reindex otherwise ends with no visible change after clicking Reindex.
+  const indexError = useIndexError();
+  // Reindex and Build return without doing anything while Shrink index / Reclaim space runs.
+  const rewriting = useIndexRewriting();
   const buildIndex = useMutation({
     mutationFn: api.buildEmbeddings,
-    onSuccess: () => embed.refetch(),
+    // A retry starts clean; a new failure arrives as a fresh embed:error.
+    onMutate: () => queryClient.setQueryData(EMBED_ERROR_KEY, null),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["embed_status"] }),
   });
 
   const embedPct =
@@ -132,16 +156,31 @@ export function SearchBar() {
   return (
     <div className="flex flex-col gap-2 border-b px-4 py-3">
       <div className="flex gap-2">
-        <Input
-          placeholder="Search every thread…  (try file:embed/mod.rs)"
-          value={text}
-          autoFocus
-          onChange={(e) => onChange(e.currentTarget.value)}
-        />
+        <InputGroup>
+          <InputGroupInput
+            placeholder="Search every thread…  (try file:embed/mod.rs)"
+            value={text}
+            autoFocus
+            onChange={(e) => onChange(e.currentTarget.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Escape" && text) {
+                e.preventDefault();
+                clear();
+              }
+            }}
+          />
+          {text && (
+            <InputGroupAddon align="inline-end">
+              <InputGroupButton size="icon-xs" aria-label="Clear search" onClick={clear}>
+                <X />
+              </InputGroupButton>
+            </InputGroupAddon>
+          )}
+        </InputGroup>
         <Button
           variant="secondary"
           onClick={() => reindex.mutate()}
-          disabled={indexing.data || reindex.isPending || embed.data?.running}
+          disabled={indexing.data || reindex.isPending || embed.data?.running || rewriting}
         >
           {indexing.data ? (
             <>
@@ -218,12 +257,31 @@ export function SearchBar() {
         ))}
 
         <span className="ml-auto flex items-center gap-2 text-xs text-muted-foreground">
+          {indexError && !indexing.data && (
+            <span
+              role="status"
+              className="max-w-[32ch] truncate text-destructive"
+              title={indexError}
+            >
+              Reindex failed: {indexError}
+            </span>
+          )}
+          {embedError && !embed.data?.running && (
+            // Short in the toolbar; the full reason is in the tooltip and in Settings.
+            <span
+              role="status"
+              className="max-w-[32ch] truncate text-destructive"
+              title={embedError}
+            >
+              Semantic index stopped: {embedError}
+            </span>
+          )}
           {embed.data?.running ? null : embed.data && embed.data.done < embed.data.total ? (
             <Button
               size="xs"
               variant="outline"
               onClick={() => buildIndex.mutate()}
-              disabled={indexing.data || buildIndex.isPending}
+              disabled={indexing.data || buildIndex.isPending || rewriting}
               title={`${embed.data.done}/${embed.data.total} messages embedded`}
             >
               Build semantic index ({embedPct}%)

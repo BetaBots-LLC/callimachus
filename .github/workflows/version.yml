@@ -1,9 +1,11 @@
 name: Version
 
 # Runs on every push to main. Changesets opens/updates a "Version Packages" PR
-# that, when merged, bumps the version, syncs tauri.conf.json + Cargo.toml, and
-# pushes a vX.Y.Z (or vX.Y.Z-rc.N in prerelease mode) tag. That tag triggers
-# build.yml, which builds + signs the installers and publishes the Release.
+# that, when merged, bumps the shared version (desktop app, VS Code extension and
+# the callimachus-mcp npm wrapper move together), syncs tauri.conf.json,
+# Cargo.toml, Cargo.lock and server.json, and pushes a vX.Y.Z (or vX.Y.Z-rc.N in
+# prerelease mode) tag. That tag triggers build.yml (installers, binaries, npm +
+# MCP registry) and publish-extension.yml (the extension).
 
 on:
   push:
@@ -21,7 +23,7 @@ jobs:
   version:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           fetch-depth: 0
           # RELEASE_TOKEN (a PAT) is required so the pushed tag triggers build.yml.
@@ -29,18 +31,18 @@ jobs:
           # to GITHUB_TOKEN (Version PR still works; the tag just won't auto-build).
           token: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
 
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
-          node-version: 20
+          node-version: 22
           cache: pnpm
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
       - name: Create Version PR / tag release
-        uses: changesets/action@v1
+        uses: changesets/action@a45c4d594aa4e2c509dc14a9f2b3b67ba3780d0d # v1.9.0
         with:
           version: pnpm run version-packages
           publish: pnpm run release:tag

@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import { track } from "../lib/telemetry";
 
 export type Theme = "light" | "dark";
 
@@ -22,6 +23,8 @@ export const useTheme = create<ThemeState>((set) => ({
       const theme: Theme = s.theme === "dark" ? "light" : "dark";
       localStorage.setItem("theme", theme);
       apply(theme);
+      // Every entry point (header button, command palette) goes through here.
+      track("setting_changed", { key: "theme" });
       return { theme };
     }),
 }));

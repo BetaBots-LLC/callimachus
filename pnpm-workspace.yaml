@@ -1,3 +1,16 @@
 packages:
   - "apps/*"
   - "packages/*"
+
+# Kept out of `pnpm update --latest` and `pnpm outdated` on purpose (pnpm 10 name; pnpm 11 calls
+# this `update.ignoreDeps` and still reads this one). Bump these by hand, deliberately.
+updateConfig:
+  ignoreDependencies:
+    # Must not exceed apps/vscode engines.vscode (^1.85.0): vsce refuses to package otherwise, and
+    # newer typings let the extension call APIs that crash on the oldest VS Code/Cursor it supports.
+    - "@types/vscode"
+    # Tracks the Node major CI and the extension tooling run on (22), not the latest typings.
+    - "@types/node"
+    # v3 stops versioning private packages by default, which silently halts desktop/vscode
+    # releases. Needs `privatePackages` config and a dry-run release cycle before moving.
+    - "@changesets/cli"

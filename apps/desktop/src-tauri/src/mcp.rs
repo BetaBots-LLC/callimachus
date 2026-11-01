@@ -1,18 +1,16 @@
-//! Standalone `callimachus-mcp` binary — a thin entry point around
-//! `callimachus_lib::mcp_server::serve`. Register with a client, e.g.:
+//! Standalone `callimachus-mcp` binary: a thin entry point around
+//! `callimachus_lib::mcp_server::serve_stdio`. Register with a client, e.g.:
 //!   claude mcp add callimachus -- callimachus-mcp
 //! (Optionally set CALLIMACHUS_DB to point at a specific index.db.)
 //!
-//! The desktop app can also act as this server via `--mcp`, so the in-app
-//! installer registers the app itself — no separate binary required.
+//! The desktop app runs the same server via `--mcp`, so the in-app installer registers the
+//! app itself; no separate binary required.
 
-use callimachus_lib::{db, mcp_server};
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Writable: the server exposes write tools (complete_todo, record_*). WAL +
-    // busy_timeout let it coexist with the desktop app's writer.
-    let conn = db::open(&db::default_index_path())?;
-    mcp_server::serve(conn).await?;
-    Ok(())
+fn main() {
+    // This binary never indexes; only the desktop app does. serve_stdio says so in the
+    // client's server log when there is no index yet (an npx / MCP-registry install).
+    std::process::exit(callimachus_lib::mcp_server::serve_stdio(
+        "callimachus-mcp",
+        &callimachus_lib::db::default_index_path(),
+    ));
 }

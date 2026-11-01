@@ -10,7 +10,7 @@ import * as vscode from "vscode";
 import { getHtml } from "./webviewHtml";
 import { handleWebviewMessage } from "./webviewMessages";
 import { openThreadPanel } from "./threadPanel";
-import { config, relatedThreads } from "./cal";
+import { clearRelatedCache, config, relatedThreads } from "./cal";
 import { type EditorContext, EditorContextWatcher } from "./editorContext";
 import type { FromWebview, InitPayload, ToWebview } from "./protocol";
 
@@ -18,9 +18,22 @@ export class SidebarProvider implements vscode.WebviewViewProvider, vscode.Dispo
   public static readonly viewId = "callimachus.sidebar";
   private view?: vscode.WebviewView;
   private readonly watcher: EditorContextWatcher;
+  // Single-flight, latest-wins: at most one `cal related` process at a time. Contexts that
+  // arrive meanwhile collapse into `pending` (only the newest survives), and a result
+  // that a newer context has superseded is dropped instead of flashing in.
+  private inFlight = false;
+  private pending: { ctx: EditorContext | null } | undefined;
 
   constructor(private readonly extensionUri: vscode.Uri) {
-    this.watcher = new EditorContextWatcher((ctx) => void this.onContext(ctx));
+    this.watcher = new EditorContextWatcher(
+      (ctx) => void this.onContext(ctx),
+      () => this.recallActive(),
+    );
+  }
+
+  /** Ambient recall can be shown: the view is visible and the feature is enabled. */
+  private recallActive(): boolean {
+    return !!this.view?.visible && config<boolean>("ambientRecall", true);
   }
 
   resolveWebviewView(view: vscode.WebviewView): void {
@@ -53,22 +66,39 @@ export class SidebarProvider implements vscode.WebviewViewProvider, vscode.Dispo
 
   /** Ambient recall: query `cal related` for the current editor context + push. */
   private async onContext(ctx: EditorContext | null): Promise<void> {
+    if (this.inFlight) {
+      this.pending = { ctx };
+      return;
+    }
+    this.inFlight = true;
+    try {
+      let next: { ctx: EditorContext | null } | undefined = { ctx };
+      while (next) {
+        this.pending = undefined;
+        await this.recall(next.ctx);
+        next = this.pending;
+      }
+    } finally {
+      this.inFlight = false;
+    }
+  }
+
+  private async recall(ctx: EditorContext | null): Promise<void> {
     const view = this.view;
-    if (!view?.visible || !config<boolean>("ambientRecall", true)) return;
+    if (!view || !this.recallActive()) return;
     if (!ctx) {
       view.webview.postMessage({ kind: "related", label: "", results: [] } satisfies ToWebview);
       return;
     }
     try {
       const results = await relatedThreads(ctx.text);
-      // The view may have been hidden during the await.
-      if (this.view?.visible) {
-        this.view.webview.postMessage({
-          kind: "related",
-          label: ctx.label,
-          results,
-        } satisfies ToWebview);
-      }
+      // Superseded by a newer context, or the view was hidden during the await.
+      if (this.pending || !this.recallActive()) return;
+      this.view?.webview.postMessage({
+        kind: "related",
+        label: ctx.label,
+        results,
+      } satisfies ToWebview);
     } catch {
       // Background feature — stay quiet (e.g. cal missing, index not embedded).
     }
@@ -77,6 +107,15 @@ export class SidebarProvider implements vscode.WebviewViewProvider, vscode.Dispo
   /** Title-bar refresh: reload recent + re-run the current search in the webview. */
   refresh(): void {
     this.view?.webview.postMessage({ kind: "refresh" } satisfies ToWebview);
+    clearRelatedCache(); // an explicit refresh should re-query, not replay the cache
+    if (!config<boolean>("ambientRecall", true)) {
+      // Turned off: clear the section rather than leaving stale matches on screen.
+      this.view?.webview.postMessage({
+        kind: "related",
+        label: "",
+        results: [],
+      } satisfies ToWebview);
+    }
     this.watcher.refresh();
   }
 
