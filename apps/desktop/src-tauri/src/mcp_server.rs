@@ -9,6 +9,7 @@
 //! maximums, transcripts take a `budget`, and project memory defaults to the same
 //! size-budgeted markdown the SessionStart hook injects.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,7 +19,8 @@ use crate::{context, embed, search, snapshot};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolResult, Content, Implementation, JsonObject, ServerCapabilities, ServerInfo,
+    CallToolResult, ContentBlock, Implementation, JsonObject, ProtocolVersion, ServerCapabilities,
+    ServerConfig,
 };
 use rmcp::{tool, tool_handler, tool_router, ErrorData, ServerHandler, ServiceExt};
 use rusqlite::Connection;
@@ -1021,7 +1023,7 @@ fn text_result(mut text: String) -> CallToolResult {
     if let std::borrow::Cow::Owned(r) = context::redact_secrets(&text) {
         text = r;
     }
-    CallToolResult::success(vec![Content::text(text)])
+    CallToolResult::success(vec![ContentBlock::text(text)])
 }
 
 /// Compact JSON tool result with every string redacted ([`context::to_redacted_json`]).
@@ -1029,7 +1031,7 @@ fn text_result(mut text: String) -> CallToolResult {
 /// JSON just as well.
 fn json_result<T: Serialize>(value: &T) -> Result<CallToolResult, ErrorData> {
     let json = context::to_redacted_json(value).map_err(internal)?;
-    Ok(CallToolResult::success(vec![Content::text(json)]))
+    Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
 }
 
 /// A caller's `limit`, or `default`, kept within 1..=max.
@@ -1304,7 +1306,7 @@ fn project_key_or_cwd(project: Option<String>) -> String {
 // `Self::tool_router()`, would rebuild it on every call and serve the unslimmed schemas.
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for Callimachus {
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         // Implementation is #[non_exhaustive]; build via from_build_env then set fields.
         let mut server_info = Implementation::from_build_env();
         server_info.name = "callimachus".into();
@@ -1312,9 +1314,22 @@ impl ServerHandler for Callimachus {
         server_info.version = env!("CARGO_PKG_VERSION").into();
         server_info.description =
             Some("Search the user's indexed AI agent conversation history".into());
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+        // The default is ProtocolVersion::LATEST, which has no initialize handshake; name the
+        // handshake version this server answers a client it can't echo with.
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+            .with_protocol_version(ProtocolVersion::LATEST_WITH_INITIALIZE)
             .with_server_info(server_info)
             .with_instructions(INSTRUCTIONS)
+    }
+
+    // Initialize-based revisions only: the handshake Claude Code, Codex and Cursor negotiate,
+    // and the only lifecycle this server is tested on. rmcp 3's default list also offers
+    // 2026-07-28 (per-request metadata, no initialize); a client probing with it gets these
+    // versions back in the -32022 error and falls back to initialize.
+    fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
+        Cow::Borrowed(ProtocolVersion::known_up_to(
+            &ProtocolVersion::LATEST_WITH_INITIALIZE,
+        ))
     }
 }
 
@@ -1899,6 +1914,40 @@ mod tests {
         crate::knowledge::record_fact(&srv.lock().unwrap(), "/proj/x", "gotcha", "g", None, 1)
             .unwrap();
         assert!(srv.empty_index_notice().unwrap().is_some());
+    }
+
+    /// Clients negotiate over initialize: a version this server knows is echoed, and one
+    /// without a handshake (2026-07-28) or one it doesn't know gets the newest handshake
+    /// version. Pinned here because rmcp's defaults moved past initialize in 3.x.
+    #[test]
+    fn initialize_echoes_handshake_versions_and_falls_back_for_newer_ones() {
+        use rmcp::model::{ClientCapabilities, InitializeRequestParams};
+        let srv = Callimachus::new(empty_db());
+        let negotiated = |v: ProtocolVersion| {
+            let req = InitializeRequestParams::new(
+                ClientCapabilities::default(),
+                Implementation::new("test-client", "1.0"),
+            )
+            .with_protocol_version(v);
+            srv.negotiate_initialize(&req).unwrap().protocol_version
+        };
+        for v in [
+            ProtocolVersion::V_2024_11_05,
+            ProtocolVersion::V_2025_03_26,
+            ProtocolVersion::V_2025_06_18,
+            ProtocolVersion::V_2025_11_25,
+        ] {
+            assert_eq!(negotiated(v.clone()), v);
+        }
+        assert_eq!(
+            negotiated(ProtocolVersion::V_2026_07_28),
+            ProtocolVersion::V_2025_11_25
+        );
+        let unknown: ProtocolVersion = serde_json::from_str("\"2099-01-01\"").unwrap();
+        assert_eq!(negotiated(unknown), ProtocolVersion::V_2025_11_25);
+        let info = srv.get_info();
+        assert!(info.capabilities.tools.is_some());
+        assert_eq!(info.instructions.as_deref(), Some(INSTRUCTIONS));
     }
 
     #[test]
