@@ -1,0 +1,83 @@
+name: Windows signing diagnostics
+
+# Manual only. Signs a scratch file with the same Artifact Signing setup build.yml
+# uses, but with signtool's /debug output, so the Azure-side reason for a failure
+# is visible instead of signtool's generic "unexpected internal error". Also shows
+# what the service principal can see of the subscription and signing account.
+# Prints no secrets: the credentials only go to `az login` and the signing dlib.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diag:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+      SIGN_ENDPOINT: https://eus.codesigning.azure.net
+      SIGN_ACCOUNT: betabots
+      SIGN_PROFILE: callimachus
+    steps:
+      # Same pinned binary as build.yml.
+      - name: Install Artifact Signing CLI
+        shell: bash
+        env:
+          ASC_VERSION: "0.12.0"
+          ASC_SHA256: dd6fa95a0367cbd32ea520037c3df72d1ed8f523a5b07883b0c2a4034e918a53
+        run: |
+          set -euo pipefail
+          DIR="$(cygpath -u "$RUNNER_TEMP")/artifact-signing-cli"
+          mkdir -p "$DIR"
+          curl -fsSL --retry 3 -o "$DIR/artifact-signing-cli.exe" \
+            "https://github.com/Levminer/artifact-signing-cli/releases/download/$ASC_VERSION/artifact-signing-cli.exe"
+          echo "$ASC_SHA256  $DIR/artifact-signing-cli.exe" | sha256sum -c -
+          cygpath -w "$DIR" >> "$GITHUB_PATH"
+
+      - name: Service principal login and what it can see
+        shell: bash
+        run: |
+          set +e
+          az login --service-principal -u "$AZURE_CLIENT_ID" -p "$AZURE_CLIENT_SECRET" --tenant "$AZURE_TENANT_ID" -o none \
+            && echo "az login: OK" || echo "az login: FAILED"
+          echo "--- subscriptions visible to the service principal (state matters) ---"
+          az account list --query "[].{name:name, id:id, state:state}" -o table
+          echo "--- signing accounts visible to the service principal ---"
+          for sub in $(az account list --query "[].id" -o tsv); do
+            az rest --method get \
+              --url "https://management.azure.com/subscriptions/$sub/providers/Microsoft.CodeSigning/codeSigningAccounts?api-version=2024-09-30-preview" \
+              --query "value[].{name:name, location:location, status:properties.provisioningState, accountUri:properties.accountUri}" -o table 2>&1
+          done
+          echo "(an empty list or 403 only means the principal has no Reader role; signing uses a different role)"
+
+      - name: Sign a scratch file with the CLI (full output)
+        shell: bash
+        run: |
+          set +e
+          cp /c/Windows/System32/notepad.exe "$RUNNER_TEMP/diag.exe"
+          artifact-signing-cli -e "$SIGN_ENDPOINT" -a "$SIGN_ACCOUNT" -c "$SIGN_PROFILE" -d Diag \
+            "$(cygpath -w "$RUNNER_TEMP/diag.exe")" 2>&1
+          echo "cli exit=$?"
+
+      - name: signtool /debug against the same dlib and metadata
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          $st = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter signtool.exe |
+            Where-Object { $_.FullName -like "*\x64\*" } | Sort-Object FullName -Descending | Select-Object -First 1
+          $dlib = Join-Path $env:USERPROFILE ".artifact-signing-cli\lib\bin\x64\Azure.CodeSigning.Dlib.dll"
+          $md = Join-Path $env:USERPROFILE ".artifact-signing-cli\metadata.json"
+          Write-Host "signtool: $($st.FullName)"
+          Write-Host "dlib present: $(Test-Path $dlib)"
+          Write-Host "--- metadata.json (endpoint, account, profile) ---"
+          if (Test-Path $md) { Get-Content $md } else { Write-Host "missing" }
+          Write-Host "--- signtool /v /debug ---"
+          & $st.FullName sign /v /debug /fd SHA256 /tr http://timestamp.acs.microsoft.com /td SHA256 `
+            /dlib $dlib /dmdf $md "$env:RUNNER_TEMP\diag.exe"
+          Write-Host "signtool exit=$LASTEXITCODE"
+          exit 0
