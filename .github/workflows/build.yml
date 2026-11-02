@@ -261,6 +261,12 @@ jobs:
           curl -fsSL --retry 3 -o "$DIR/artifact-signing-cli.exe" \
             "https://github.com/Levminer/artifact-signing-cli/releases/download/$ASC_VERSION/artifact-signing-cli.exe"
           echo "$ASC_SHA256  $DIR/artifact-signing-cli.exe" | sha256sum -c -
+          # The build job checks out the TAG's sources, so the signCommand it reads
+          # (src-tauri/tauri.windows-sign.conf.json) can be older than this workflow.
+          # v0.11.1's overlay still calls `trusted-signing-cli`, which made the
+          # bundler fail with "program not found" after the rename. Provide both
+          # names so any tag's overlay resolves to the same pinned binary.
+          cp "$DIR/artifact-signing-cli.exe" "$DIR/trusted-signing-cli.exe"
           cygpath -w "$DIR" >> "$GITHUB_PATH"
 
       # Decode the App Store Connect API key (.p8) used for notarization. The base64
