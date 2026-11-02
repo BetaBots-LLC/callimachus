@@ -139,11 +139,11 @@ builds reputation, not immediately.
 | `AZURE_TENANT_ID` | Tenant ID |
 | `AZURE_CLIENT_SECRET` | Service principal secret (needs access to the signing account) |
 
-- The `signCommand` that runs `trusted-signing-cli` lives in a CI-only overlay,
+- The `signCommand` that runs `artifact-signing-cli` lives in a CI-only overlay,
   `apps/desktop/src-tauri/tauri.windows-sign.conf.json`, which `build.yml` passes
   to `tauri build` (`--config`) only when `AZURE_CLIENT_ID` is set. Local and fork
   Windows builds don't need the CLI and produce unsigned installers.
-- `build.yml` downloads a pinned, SHA-256-verified `trusted-signing-cli.exe`
+- `build.yml` downloads a pinned, SHA-256-verified `artifact-signing-cli.exe`
   (0.10.0) instead of compiling it, and also signs the standalone `.exe` binaries
   with it. Upstream has been renamed to `artifact-signing-cli`; moving to it means
   changing the command in the overlay and the standalone signing step together,

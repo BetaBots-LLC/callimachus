@@ -295,7 +295,7 @@ git tag v0.5.0 && git push origin v0.5.0    # → build.yml + publish-extension.
 - **Dependencies and actions.** Dependabot (`.github/dependabot.yml`) opens weekly
   grouped minor/patch PRs for npm, Cargo and GitHub Actions. Third-party actions
   are pinned to commit SHAs with a `# vX.Y.Z` comment, which Dependabot updates.
-  The `mcp-publisher` and `trusted-signing-cli` downloads in `build.yml` are
+  The `mcp-publisher` and `artifact-signing-cli` downloads in `build.yml` are
   pinned by version and SHA-256; bump those by hand.
 - **Docker image.** `docker.yml` builds the `Dockerfile` (used by MCP registries
   such as Glama to verify the server) and checks it answers `tools/list`. It
