@@ -33,6 +33,7 @@ cargo test -- --ignored real_claude_index --nocapture  # real data: run #[ignore
   `apps/web` runs Biome as its `lint` script, so there it blocks.
 - `#[ignore]` tests use your real agent history (into temp DBs), the OS keychain, the `claude`
   CLI or a ~128 MB model download.
+- Browser-only UI work: `pnpm --filter callimachus dev` then http://localhost:1420/mock.html?view=settings&section=general (src/dev/mock-tauri.ts fakes every Tauri command with scenario URL params; never shipped).
 
 ## Data safety
 
@@ -41,7 +42,9 @@ The dev build and the installed app share one index,
 which holds the user's whole history and their Settings (`app_config`).
 
 - Opening it writable runs pending migrations, after which the older installed app can no longer
-  open it. Writers: the app (`pnpm desktop:dev` too), the MCP server, the PreCompact hook and the
+  open it (0.11.0 then crashed at launch; 0.11.1+ shows an error screen). `pnpm desktop:dev`
+  therefore points `CALLIMACHUS_DB` at `index.dev.db` next to it (`scripts/desktop-dev.mjs`);
+  only a raw `tauri dev` or an explicit `CALLIMACHUS_DB` opens the real index. Other writers: the MCP server, the PreCompact hook and the
   `cal` write commands (`star`, `tag`, `distill`, `done`, `remember`, `snapshot`, `commits`,
   `audit-pr`). `cal hook`, `memory`, `stats`, `search` and the other queries open read-only.
 - A dev app launch also runs `integration::refresh_installed`, which can rewrite the installed

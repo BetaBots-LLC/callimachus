@@ -37,6 +37,39 @@ export function useEmbedStatus() {
 /** Cache slot for the last `embed:error` message (main.tsx writes it). */
 export const EMBED_ERROR_KEY = ["embed_error"] as const;
 
+/**
+ * Which background jobs the user started from the UI this session, so main.tsx can toast
+ * their completion and stay quiet about the launch scan or an agent's writes. A plain set,
+ * not query cache data: a cache entry with no observer is garbage-collected after gcTime,
+ * which would silently drop the toast of any job longer than five minutes.
+ */
+const userStarted = new Set<UserJob>();
+export type UserJob = "index" | "embed";
+/** Call from the mutation that starts the job (onMutate). */
+export function markUserStarted(job: UserJob) {
+  userStarted.add(job);
+}
+/** Call when the start was refused or failed, so a later unrelated run gets no toast. */
+export function unmarkUserStarted(job: UserJob) {
+  userStarted.delete(job);
+}
+/** Read-and-clear, for the done/error listener. */
+export function takeUserStarted(job: UserJob): boolean {
+  return userStarted.delete(job);
+}
+/**
+ * index_all and build_embeddings return without starting anything while another job holds
+ * the index. After the command resolves, keep the flag only if the job is actually running.
+ */
+export async function confirmUserStarted(queryClient: QueryClient, job: UserJob): Promise<boolean> {
+  const jobs = await fetchJobsStatus(queryClient).catch(() => null);
+  if (jobs && !jobs[job]) {
+    userStarted.delete(job);
+    return false;
+  }
+  return true;
+}
+
 /** Cache slot for the last `index:error` message (main.tsx writes it). */
 export const INDEX_ERROR_KEY = ["index_error"] as const;
 
@@ -98,7 +131,7 @@ export function fetchJobsStatus(queryClient: QueryClient): Promise<JobsStatus> {
   return queryClient.fetchQuery({ ...jobsStatusQuery, staleTime: 0 });
 }
 
-/** Mutation-key prefix shared by Shrink index and Reclaim space (CleanupCard). */
+/** Mutation-key prefix shared by Shrink index and Reclaim space (IndexSection). */
 export const REWRITE_KEY = ["index_rewrite"] as const;
 
 /** Whether Shrink index / Reclaim space is rewriting the file. Reindex and the semantic

@@ -8,7 +8,6 @@ import { ThreadView } from "./components/ThreadView";
 import { KnowledgeGate } from "./components/KnowledgeGate";
 import { Onboarding } from "./components/Onboarding";
 import { CommandPalette } from "./components/CommandPalette";
-import { UpdateBanner } from "./components/UpdateBanner";
 import { TelemetryConsent } from "./components/TelemetryConsent";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { Loading } from "./components/Loading";
@@ -81,7 +80,7 @@ function App() {
   const view = useUi((s) => s.view);
   const setView = useUi((s) => s.setView);
   const setCommandOpen = useUi((s) => s.setCommandOpen);
-  const theme = useTheme((s) => s.theme);
+  const theme = useTheme((s) => s.resolved);
   const toggleTheme = useTheme((s) => s.toggle);
   const { data: stats } = useQuery({ queryKey: ["db_stats"], queryFn: api.dbStats });
   // Knowledge powers these three views. The tabs stay visible even when it's off (each
@@ -236,10 +235,10 @@ function App() {
       </ErrorBoundary>
 
       <CommandPalette />
-      <UpdateBanner />
       {/* App-level, not inside a view: upgraded users with an existing index never see
           Onboarding, so the one-time analytics question has to live here. It sits
-          bottom-left so it never covers the bottom-right update banner. */}
+          bottom-left so it never covers the toasts (bottom-right), including the one
+          that announces an update. */}
       <TelemetryConsent />
     </div>
   );

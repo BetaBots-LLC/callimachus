@@ -15,6 +15,9 @@ import {
   useEmbedStatus,
   useIndexError,
   useIndexRewriting,
+  confirmUserStarted,
+  markUserStarted,
+  unmarkUserStarted,
 } from "../lib/queries";
 import {
   InputGroup,
@@ -85,7 +88,12 @@ export function SearchBar() {
   });
   const reindex = useMutation({
     mutationFn: api.indexAll,
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["index_status"] }),
+    onMutate: () => markUserStarted("index"), // main.tsx toasts when it finishes
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["index_status"] });
+      void confirmUserStarted(queryClient, "index"); // a no-op start (job busy) gets no toast
+    },
+    onError: () => unmarkUserStarted("index"),
   });
 
   // Event-driven; never polls while idle (see lib/queries.ts).
@@ -98,8 +106,15 @@ export function SearchBar() {
   const buildIndex = useMutation({
     mutationFn: api.buildEmbeddings,
     // A retry starts clean; a new failure arrives as a fresh embed:error.
-    onMutate: () => queryClient.setQueryData(EMBED_ERROR_KEY, null),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["embed_status"] }),
+    onMutate: () => {
+      queryClient.setQueryData(EMBED_ERROR_KEY, null);
+      markUserStarted("embed");
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["embed_status"] });
+      void confirmUserStarted(queryClient, "embed");
+    },
+    onError: () => unmarkUserStarted("embed"),
   });
 
   const embedPct =

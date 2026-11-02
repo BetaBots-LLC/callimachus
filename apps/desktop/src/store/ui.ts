@@ -11,9 +11,23 @@ export type View =
   | "stats"
   | "settings";
 
+/** The sections of the Settings view (its left-hand navigation), in display order. */
+export type SettingsSection =
+  | "general"
+  | "providers"
+  | "agents"
+  | "sources"
+  | "index"
+  | "knowledge"
+  | "export"
+  | "updates";
+
 interface UiState {
   view: View;
   setView: (v: View) => void;
+  settingsSection: SettingsSection; // which Settings section is open; survives leaving the view
+  setSettingsSection: (s: SettingsSection) => void;
+  openSettings: (section?: SettingsSection) => void; // jump straight to a section
   query: string;
   sources: SourceKind[]; // empty = all sources
   includeSubagents: boolean;
@@ -40,6 +54,10 @@ interface UiState {
 export const useUi = create<UiState>((set) => ({
   view: "search",
   setView: (view) => set({ view }),
+  settingsSection: "general",
+  setSettingsSection: (settingsSection) => set({ settingsSection }),
+  openSettings: (section) =>
+    set((state) => ({ view: "settings", settingsSection: section ?? state.settingsSection })),
   query: "",
   sources: [],
   includeSubagents: false,
