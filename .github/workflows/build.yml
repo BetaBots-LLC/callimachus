@@ -104,18 +104,36 @@ jobs:
           set -euo pipefail
           # Drafts are invisible to `releases/tags/<tag>`, so look the tag up in the
           # full list. Reusing an existing draft makes re-running a failed leg safe.
-          # Prints "<id> <draft>", e.g. "123 true".
+          # The list is served from read replicas and lags a freshly created draft
+          # by a few seconds (v0.11.1 failed on exactly that), so the lookup takes a
+          # number of attempts. `|| true` keeps a SIGPIPE from `head` from tripping
+          # pipefail. Prints "<id> <draft>", e.g. "123 true".
           find_release() {
-            gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" --paginate \
-              --jq ".[] | select(.tag_name == \"$TAG\") | \"\\(.id) \\(.draft)\"" | head -n 1
+            local attempts="$1" attempt rel
+            for attempt in $(seq 1 "$attempts"); do
+              rel="$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" --paginate \
+                --jq ".[] | select(.tag_name == \"$TAG\") | \"\\(.id) \\(.draft)\"" | head -n 1 || true)"
+              if [ -n "$rel" ]; then echo "$rel"; return 0; fi
+              if [ "$attempt" -lt "$attempts" ]; then sleep 3; fi
+            done
+            return 0
           }
-          REL="$(find_release)"
+          REL="$(find_release 2)"
           read -r ID DRAFT <<< "$REL"
           if [ -z "$ID" ]; then
-            FLAGS=(--draft --verify-tag --title "Callimachus $TAG" --notes-file "$RUNNER_TEMP/notes.md")
-            if [ "$PRERELEASE" = "true" ]; then FLAGS+=(--prerelease); fi
-            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" "${FLAGS[@]}"
-            REL="$(find_release)"
+            # Create through the API: the response carries the id, so there is no
+            # list lookup to race against. The tag already exists (it triggered this
+            # workflow), which is what `gh release create --verify-tag` checked.
+            ID="$(gh api -X POST "repos/$GITHUB_REPOSITORY/releases" \
+              -f tag_name="$TAG" -f name="Callimachus $TAG" \
+              -F body="@$RUNNER_TEMP/notes.md" -F draft=true -F prerelease="$PRERELEASE" \
+              --jq '.id')"
+            DRAFT=true
+            echo "Created draft release $ID for $TAG"
+          fi
+          if [ -z "$ID" ]; then
+            # Last resort, e.g. the POST raced a draft that appeared meanwhile.
+            REL="$(find_release 10)"
             read -r ID DRAFT <<< "$REL"
           fi
           if [ -z "$ID" ]; then
@@ -223,23 +241,26 @@ jobs:
           LINUX_GPG_PRIVATE_KEY: ${{ secrets.LINUX_GPG_PRIVATE_KEY }}
         run: echo "$LINUX_GPG_PRIVATE_KEY" | gpg --batch --import
 
-      # Prebuilt, checksum-pinned trusted-signing-cli (compiling it from source cost
-      # ~4 min per Windows release). 0.10.0 is the last release that ships the
-      # `trusted-signing-cli.exe` name the signCommand calls; the crate's 0.11.0 only
-      # adds a deprecation notice. Upstream is now artifact-signing-cli.
-      - name: Install Trusted Signing CLI (Windows)
+      # Prebuilt, checksum-pinned artifact-signing-cli (compiling it from source cost
+      # ~4 min per Windows release). Microsoft renamed Trusted Signing to Artifact
+      # Signing; the old trusted-signing-cli 0.10.0 bundled dlib 1.0.128 from the
+      # retired Microsoft.Trusted.Signing.Client package, and from v0.11.1 on the
+      # service answered it with signtool's generic "unexpected internal error" even
+      # with valid credentials. 0.12.0 ships dlib 1.0.146 from
+      # Microsoft.ArtifactSigning.Client; the -e/-a/-c/-d flags are unchanged.
+      - name: Install Artifact Signing CLI (Windows)
         if: runner.os == 'Windows' && env.HAS_AZURE == 'true'
         shell: bash
         env:
-          TSC_VERSION: "0.10.0"
-          TSC_SHA256: 8c9d750ca582891a7433925dcf302d5d3761fbed757b46c4bf5b417562dccb0e
+          ASC_VERSION: "0.12.0"
+          ASC_SHA256: dd6fa95a0367cbd32ea520037c3df72d1ed8f523a5b07883b0c2a4034e918a53
         run: |
           set -euo pipefail
-          DIR="$(cygpath -u "$RUNNER_TEMP")/trusted-signing-cli"
+          DIR="$(cygpath -u "$RUNNER_TEMP")/artifact-signing-cli"
           mkdir -p "$DIR"
-          curl -fsSL --retry 3 -o "$DIR/trusted-signing-cli.exe" \
-            "https://github.com/Levminer/artifact-signing-cli/releases/download/$TSC_VERSION/trusted-signing-cli.exe"
-          echo "$TSC_SHA256  $DIR/trusted-signing-cli.exe" | sha256sum -c -
+          curl -fsSL --retry 3 -o "$DIR/artifact-signing-cli.exe" \
+            "https://github.com/Levminer/artifact-signing-cli/releases/download/$ASC_VERSION/artifact-signing-cli.exe"
+          echo "$ASC_SHA256  $DIR/artifact-signing-cli.exe" | sha256sum -c -
           cygpath -w "$DIR" >> "$GITHUB_PATH"
 
       # Decode the App Store Connect API key (.p8) used for notarization. The base64
@@ -278,7 +299,7 @@ jobs:
           SIGN_KEY: ${{ runner.os == 'Linux' && secrets.LINUX_GPG_KEY_ID || '' }}
           APPIMAGETOOL_SIGN_PASSPHRASE: ${{ runner.os == 'Linux' && secrets.LINUX_GPG_PASSPHRASE || '' }}
           APPIMAGETOOL_FORCE_SIGN: ${{ runner.os == 'Linux' && env.HAS_LINUX_GPG == 'true' && '1' || '' }}
-          # Azure Trusted Signing creds, read by trusted-signing-cli (the Windows
+          # Azure Artifact Signing (formerly Trusted Signing) creds, read by artifact-signing-cli (the Windows
           # signCommand in src-tauri/tauri.windows-sign.conf.json). Windows only.
           AZURE_TENANT_ID: ${{ runner.os == 'Windows' && secrets.AZURE_TENANT_ID || '' }}
           AZURE_CLIENT_ID: ${{ runner.os == 'Windows' && secrets.AZURE_CLIENT_ID || '' }}
@@ -309,7 +330,7 @@ jobs:
           # Each job appends its platform/arch entry to the release's latest.json.
           includeUpdaterJson: true
           # The Windows signCommand lives in a CI-only overlay so local and fork
-          # builds without trusted-signing-cli don't fail at bundle time.
+          # builds without artifact-signing-cli don't fail at bundle time.
           args: ${{ matrix.args }}${{ runner.os == 'Windows' && env.HAS_AZURE == 'true' && ' --config src-tauri/tauri.windows-sign.conf.json' || '' }}
 
       # Standalone `cal` + `callimachus-mcp` binaries for CLI/MCP-only users (no GUI
@@ -354,7 +375,7 @@ jobs:
         run: |
           set -euo pipefail
           for f in "$STAGE/cal-$TRIPLE$EXT" "$STAGE/callimachus-mcp-$TRIPLE$EXT"; do
-            trusted-signing-cli -e https://eus.codesigning.azure.net -a betabots -c callimachus -d Callimachus "$f"
+            artifact-signing-cli -e https://eus.codesigning.azure.net -a betabots -c callimachus -d Callimachus "$f"
           done
 
       # Developer ID-sign (hardened runtime + secure timestamp) and notarize the
