@@ -1,0 +1,871 @@
+// Browser-only fake of the Tauri runtime, so the UI runs (and can be screenshotted) without Rust.
+// Use: `pnpm --filter callimachus dev`, then open
+//   http://localhost:1420/mock.html?view=settings&section=providers&theme=light
+// Params: theme, consent, knowledge, agents, keys, update, jobs (see SCENARIO below). Dev-only.
+import type {
+  AgentIntegration,
+  AutoDistillBudget,
+  CleanupRow,
+  CliEngine,
+  CompactSummary,
+  DataRoots,
+  DbStats,
+  EmbedStatus,
+  IndexReport,
+  IntegrationStatus,
+  JobsStatus,
+  KnowledgeConfig,
+  ProjectInfo,
+  ProjectMemory,
+  SearchFilters,
+  SearchHit,
+  SourceKind,
+  Stats,
+  ThreadDetail,
+  ThreadKnowledge,
+  ThreadSummary,
+} from "../lib/api";
+import type { TelemetryStatus } from "../lib/telemetry";
+
+// ---------------------------------------------------------------------------
+// Scenario (URL params)
+// ---------------------------------------------------------------------------
+
+const params = new URLSearchParams(window.location.search);
+function pick<T extends string>(name: string, allowed: readonly T[], fallback: T): T {
+  const v = params.get(name);
+  return v && (allowed as readonly string[]).includes(v) ? (v as T) : fallback;
+}
+
+const SCENARIO = {
+  theme: pick("theme", ["light", "dark"] as const, "dark"),
+  consent: pick("consent", ["unset", "granted", "denied"] as const, "unset"),
+  knowledge: pick("knowledge", ["on", "off"] as const, "on"),
+  agents: pick("agents", ["connected", "partial", "none"] as const, "partial"),
+  keys: pick("keys", ["none", "some"] as const, "some"),
+  update: pick("update", ["available", "fail", "none"] as const, "none"),
+  jobs: pick("jobs", ["idle", "indexing"] as const, "idle"),
+};
+
+// The theme store reads this at module load, which happens after this file runs.
+try {
+  if (params.has("theme")) localStorage.setItem("theme", SCENARIO.theme);
+} catch {
+  /* storage blocked: the app falls back to dark */
+}
+
+// ---------------------------------------------------------------------------
+// Callback registry (mirrors Tauri's transformCallback: window[`_${id}`] = cb)
+// ---------------------------------------------------------------------------
+
+type Callback = (payload: unknown) => void;
+const win = window as unknown as Record<string, unknown>;
+let nextCallbackId = 1;
+
+function transformCallback(callback?: Callback, once = false): number {
+  const id = nextCallbackId++;
+  const prop = `_${id}`;
+  Object.defineProperty(window, prop, {
+    value: (result: unknown) => {
+      if (once) Reflect.deleteProperty(window, prop);
+      return callback?.(result);
+    },
+    writable: false,
+    configurable: true,
+  });
+  return id;
+}
+
+function unregisterCallback(id: number): void {
+  Reflect.deleteProperty(window, `_${id}`);
+}
+
+function runCallback(id: number, payload: unknown): void {
+  const cb = win[`_${id}`];
+  if (typeof cb === "function") (cb as Callback)(payload);
+}
+
+/** Channels deliver `{ index, message }`, in order; track the index per channel. */
+const channelIndex = new Map<number, number>();
+function channelId(arg: unknown): number | null {
+  if (arg && typeof arg === "object" && "id" in arg && typeof arg.id === "number") return arg.id;
+  return null;
+}
+function sendToChannel(id: number, message: unknown): void {
+  const index = channelIndex.get(id) ?? 0;
+  channelIndex.set(id, index + 1);
+  runCallback(id, { index, message });
+}
+
+// ---------------------------------------------------------------------------
+// Events
+// ---------------------------------------------------------------------------
+
+interface Listener {
+  event: string;
+  handlerId: number;
+}
+const listeners = new Map<number, Listener>();
+let nextEventId = 1;
+
+export function emit(event: string, payload?: unknown): void {
+  for (const [id, l] of listeners) {
+    if (l.event === event) runCallback(l.handlerId, { event, id, payload });
+  }
+}
+
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+// ---------------------------------------------------------------------------
+// Fake data: a developer with a year of Claude Code + Codex history
+// ---------------------------------------------------------------------------
+
+const NOW = Math.floor(Date.now() / 1000);
+const DAY = 86_400;
+const HOME = "/Users/dev";
+
+const PROJECTS = [
+  `${HOME}/code/payments-api`,
+  `${HOME}/code/web-dashboard`,
+  `${HOME}/code/infra`,
+  `${HOME}/code/mobile-app`,
+  `${HOME}/code/data-pipeline`,
+];
+
+let threads: ThreadSummary[] = [
+  ["claude_code", "Fix flaky webhook retry test in payments", 0, 64, 0.1],
+  ["codex", "Migrate dashboard charts to Recharts 3", 1, 112, 0.4],
+  ["claude_code", "Terraform: split prod and staging state", 2, 38, 1.2],
+  ["claude_code", "Debug iOS push token refresh on cold start", 3, 91, 2.5],
+  ["codex", "Add idempotency keys to the refunds endpoint", 0, 57, 3.1],
+  ["claude_code", "Speed up nightly ETL by batching inserts", 4, 140, 5.8],
+  ["cursor", "Tailwind 4 upgrade: fix dark mode tokens", 1, 26, 9.4],
+  ["claude_code", "Rotate Stripe keys and update CI secrets", 2, 19, 14.0],
+  ["codex", "Write a migration for soft-deleted invoices", 0, 73, 21.6],
+  ["claude_code", "Profile React re-renders in the orders table", 1, 48, 33.2],
+].map(([source, title, p, count, daysAgo], i) => ({
+  id: 4100 - i * 37,
+  source: source as SourceKind,
+  title: title as string,
+  projectPath: PROJECTS[p as number],
+  messageCount: count as number,
+  updatedAt: NOW - Math.round((daysAgo as number) * DAY),
+  starred: i === 0 || i === 5,
+}));
+
+const CLEANUP_TITLES = [
+  "Scaffold the first API routes",
+  "Explore auth options (Clerk vs Supabase)",
+  "Set up GitHub Actions cache",
+  "Investigate memory leak in worker",
+  "Prototype CSV importer",
+  "Fix timezone bug in reports",
+  "Bump Node to 22 across services",
+  "Draft README for infra repo",
+];
+const CLEANUP_SOURCES: SourceKind[] = ["claude_code", "codex", "claude_code", "cursor", "gemini"];
+let cleanupRows: CleanupRow[] = Array.from({ length: 24 }, (_, i) => ({
+  id: 900 + i,
+  source: CLEANUP_SOURCES[i % CLEANUP_SOURCES.length],
+  title: `${CLEANUP_TITLES[i % CLEANUP_TITLES.length]}${i >= 8 ? ` (${Math.floor(i / 8) + 1})` : ""}`,
+  projectPath: PROJECTS[(i * 3) % PROJECTS.length],
+  messageCount: 12 + ((i * 29) % 180),
+  bytes: 40_000 + ((i * 7_919_133) % 18_000_000),
+  updatedAt: NOW - (330 - i * 9) * DAY,
+}));
+
+const embed: EmbedStatus = { done: 46_120, total: 48_213, running: false };
+let closeToTray = false;
+const keys = new Map<string, boolean>(
+  ["anthropic", "openai", "gemini", "openrouter", "ollama", "ollama_cloud"].map((p) => [
+    p,
+    SCENARIO.keys === "some" && p === "anthropic",
+  ]),
+);
+const baseUrls = new Map<string, string>();
+const knowledge: KnowledgeConfig = {
+  enabled: SCENARIO.knowledge === "on",
+  provider: SCENARIO.knowledge === "on" ? "claude-cli" : null,
+  model: SCENARIO.knowledge === "on" ? "claude-sonnet-4-6" : null,
+  autoDistill: SCENARIO.knowledge === "on",
+};
+const budget: AutoDistillBudget = {
+  eligibleThreads: 37,
+  dailyCap: 25,
+  remainingToday: 18,
+  recentDays: 14,
+};
+let telemetry: TelemetryStatus = {
+  available: true,
+  consent: SCENARIO.consent,
+  enabled: SCENARIO.consent === "granted",
+  envOptOut: false,
+  anonId: "c3a1f0e2-7b4d-4c8e-9f21-5a6b7c8d9e0f",
+};
+const dataRoots: DataRoots = {
+  claudeConfigDir: "",
+  codexHome: "",
+  effectiveClaudeConfigDir: `${HOME}/.claude`,
+  effectiveCodexHome: `${HOME}/.codex`,
+};
+const jobs: JobsStatus = {
+  index: SCENARIO.jobs === "indexing",
+  embed: false,
+  distill: false,
+  rewrite: false,
+};
+
+function recallStatus(installed: boolean): IntegrationStatus {
+  return {
+    skillInstalled: installed,
+    skillOutdated: false,
+    mcpRegistered: installed,
+    hookInstalled: installed,
+    proactiveRecallInstalled: false,
+    calInstalled: installed,
+    exeStable: true,
+    exeProblem: null,
+    calProblem: null,
+    pathHint: null,
+    skillPath: `${HOME}/.claude/skills/recall/SKILL.md`,
+    configPath: `${HOME}/.claude.json`,
+  };
+}
+let recall = recallStatus(SCENARIO.agents !== "none");
+
+function agentList(mode: "connected" | "partial" | "none"): AgentIntegration[] {
+  return [
+    {
+      id: "codex",
+      label: "Codex",
+      present: true,
+      registered: mode !== "none",
+      configPath: `${HOME}/.codex/config.toml`,
+    },
+    {
+      id: "cursor",
+      label: "Cursor",
+      present: true,
+      registered: mode === "connected",
+      configPath: `${HOME}/.cursor/mcp.json`,
+    },
+    {
+      id: "gemini",
+      label: "Gemini CLI",
+      present: false,
+      registered: false,
+      configPath: `${HOME}/.gemini/settings.json`,
+    },
+  ];
+}
+let agents = agentList(SCENARIO.agents);
+
+const SOURCE_COUNTS: [SourceKind, number, number][] = [
+  ["claude_code", 842, 33_904],
+  ["codex", 361, 11_870],
+  ["cursor", 58, 1_912],
+  ["gemini", 23, 527],
+];
+
+function dbStats(): DbStats {
+  return { threads: 1_284 - (24 - cleanupRows.length), messages: 48_213, sources: 4 };
+}
+
+function stats(): Stats {
+  return {
+    threads: dbStats().threads,
+    messages: 48_213,
+    embedded: embed.done,
+    embeddable: embed.total,
+    earliest: NOW - 371 * DAY,
+    latest: NOW - 600,
+    perSource: SOURCE_COUNTS.map(([kind, t, m]) => ({ kind, threads: t, messages: m })),
+    perRole: [
+      { role: "assistant", messages: 21_480 },
+      { role: "user", messages: 9_311 },
+      { role: "tool", messages: 17_422 },
+    ],
+    topProjects: PROJECTS.map((project, i) => ({ project, threads: [412, 318, 201, 176, 98][i] })),
+  };
+}
+
+function threadDetail(id: number): ThreadDetail | null {
+  const t = threads.find((x) => x.id === id) ?? threads[0];
+  if (!t) return null;
+  const at = t.updatedAt ?? NOW;
+  return {
+    id: t.id,
+    source: t.source,
+    externalId: "7f3c2a10-5e8b-4d1f-a2c4-9b6e0d1f2a3b",
+    title: t.title,
+    projectPath: t.projectPath,
+    gitBranch: "fix/webhook-retry",
+    createdAt: at - 3_600,
+    updatedAt: at,
+    starred: t.starred,
+    tags: ["payments", "flaky-test"],
+    messages: [
+      {
+        id: 1,
+        role: "user",
+        text: "The `webhook retries after 5xx` test fails about 1 in 10 runs on CI. Can you find out why?",
+        toolName: null,
+        ts: at - 3_600,
+        model: null,
+      },
+      {
+        id: 2,
+        role: "assistant",
+        text: "The test advances fake timers before the retry is scheduled, so the assertion races the queue. I'll await the scheduler tick first.",
+        toolName: null,
+        ts: at - 3_540,
+        model: "claude-opus-4-8",
+      },
+      {
+        id: 3,
+        role: "tool",
+        text: "PASS tests/webhooks/retry.test.ts (50 runs, 0 failures)",
+        toolName: "Bash",
+        ts: at - 3_200,
+        model: null,
+      },
+      {
+        id: 4,
+        role: "assistant",
+        text: "Fixed: `retry.test.ts` now awaits `scheduler.flush()` before advancing timers. 50 consecutive runs pass.",
+        toolName: null,
+        ts: at - 3_100,
+        model: "claude-opus-4-8",
+      },
+    ],
+  };
+}
+
+function filterThreads(filters?: SearchFilters): ThreadSummary[] {
+  let out = threads;
+  if (filters?.sources?.length) out = out.filter((t) => filters.sources?.includes(t.source));
+  if (filters?.project) out = out.filter((t) => t.projectPath === filters.project);
+  if (filters?.starred) out = out.filter((t) => t.starred);
+  return out.slice(0, filters?.limit ?? 50);
+}
+
+function searchHits(query: string, filters?: SearchFilters): SearchHit[] {
+  const q = query.trim() || "retry";
+  return filterThreads(filters)
+    .slice(0, 6)
+    .map((t, i) => ({
+      threadId: t.id,
+      messageId: 1000 + i,
+      source: t.source,
+      title: t.title,
+      projectPath: t.projectPath,
+      role: i % 2 ? "user" : "assistant",
+      snippet: `...we should <mark>${q}</mark> this before the next release, see the notes in ${t.projectPath?.split("/").pop()}...`,
+      ts: t.updatedAt,
+    }));
+}
+
+const projectInfos = (): ProjectInfo[] =>
+  PROJECTS.map((project, i) => ({
+    project,
+    threadCount: [412, 318, 201, 176, 98][i],
+    distilledCount: knowledge.enabled ? [230, 140, 88, 40, 12][i] : 0,
+    lastActivity: NOW - i * 2 * DAY,
+  }));
+
+function projectMemory(project: string): ProjectMemory {
+  const fact = (id: number, text: string, daysAgo: number, pinned = false) => ({
+    id,
+    threadId: threads[id % threads.length].id,
+    text,
+    title: threads[id % threads.length].title,
+    createdAt: NOW - daysAgo * DAY,
+    pinned,
+  });
+  return {
+    project,
+    decisions: [
+      fact(1, "Use idempotency keys on every POST that moves money.", 3, true),
+      fact(2, "Retries use exponential backoff capped at 5 minutes.", 12),
+    ],
+    gotchas: [fact(3, "Fake timers must be advanced after `scheduler.flush()`.", 1)],
+    openTodos: [fact(4, "Backfill idempotency keys for legacy refunds.", 5)],
+    threadCount: 412,
+    distilledCount: 230,
+    pendingCount: 182,
+  };
+}
+
+const threadKnowledge = (): ThreadKnowledge => ({
+  summary: "Fixed a race between fake timers and the retry scheduler in the webhook tests.",
+  decisions: [{ id: 1, text: "Await scheduler.flush() before advancing timers.", pinned: false }],
+  gotchas: [
+    { id: 3, text: "CI runs tests in parallel, which hid the race locally.", pinned: false },
+  ],
+  todos: [],
+  extracted: knowledge.enabled,
+  stale: false,
+  error: null,
+  canDistill: knowledge.enabled,
+});
+
+const CHANGELOG = `## Callimachus 0.12.0
+
+- **Settings redesign**: sections on the left, every option in one place.
+- Faster startup on large indexes (the splash closes about 40% sooner).
+- \`cal search\` gains \`--since\` and \`--project\` filters.
+- Codex sessions now show their reasoning blocks.
+- Fixed: the tray icon could stay after quitting on Windows.
+- Fixed: \`cal hook\` no longer prints a warning when the index is locked.
+
+See the full list of changes on GitHub.`;
+
+// ---------------------------------------------------------------------------
+// Command handlers
+// ---------------------------------------------------------------------------
+
+type Args = Record<string, unknown>;
+type Handler = (args: Args) => unknown;
+
+const ok = () => null;
+
+async function runIndexAll(): Promise<void> {
+  jobs.index = true;
+  const kinds = SOURCE_COUNTS.map(([k]) => k);
+  for (let i = 0; i < kinds.length; i++) {
+    emit("index:progress", { done: i, total: kinds.length, current: kinds[i] });
+    await sleep(500);
+  }
+  jobs.index = false;
+  const report: IndexReport = {
+    threadsIndexed: 12,
+    threadsSkipped: 1_272,
+    messagesIndexed: 418,
+    errors: 0,
+  };
+  emit("index:done", report);
+}
+
+async function runEmbeddings(): Promise<void> {
+  embed.running = true;
+  jobs.embed = true;
+  const start = embed.done;
+  for (let step = 1; step <= 5; step++) {
+    await sleep(550);
+    embed.done = Math.round(start + ((embed.total - start) * step) / 5);
+    emit("embed:progress", { done: embed.done, total: embed.total });
+  }
+  await sleep(250);
+  embed.running = false;
+  jobs.embed = false;
+  emit("embed:done");
+}
+
+const handlers: Record<string, Handler> = {
+  // Plugins -----------------------------------------------------------------
+  "plugin:event|listen": (a) => {
+    const id = nextEventId++;
+    listeners.set(id, { event: String(a.event), handlerId: Number(a.handler) });
+    return id;
+  },
+  "plugin:event|unlisten": (a) => {
+    listeners.delete(Number(a.eventId));
+    return null;
+  },
+  "plugin:event|emit": ok,
+  "plugin:event|emit_to": ok,
+  "plugin:app|version": () => "0.11.1",
+  "plugin:app|name": () => "Callimachus",
+  "plugin:opener|open_url": (a) => {
+    console.log("[mock] open url", a.url);
+    return null;
+  },
+  "plugin:opener|open_path": (a) => {
+    console.log("[mock] open path", a.path);
+    return null;
+  },
+  "plugin:opener|reveal_item_in_dir": (a) => {
+    console.log("[mock] reveal", a.paths);
+    return null;
+  },
+  "plugin:process|restart": () => {
+    console.log("[mock] relaunch");
+    return null;
+  },
+  "plugin:process|exit": () => {
+    console.log("[mock] exit");
+    return null;
+  },
+  "plugin:resources|close": ok,
+  "plugin:updater|check": () => {
+    if (SCENARIO.update === "fail") {
+      return Promise.reject(
+        new Error(
+          "error sending request for url (https://github.com/BetaBots-LLC/callimachus/releases/latest/download/latest.json)",
+        ),
+      );
+    }
+    if (SCENARIO.update !== "available") return null;
+    return {
+      rid: 7,
+      currentVersion: "0.11.1",
+      version: "0.12.0",
+      date: "2026-11-02T14:55:12Z",
+      body: CHANGELOG,
+      rawJson: {},
+    };
+  },
+  "plugin:updater|download": async (a) => {
+    const ch = channelId(a.onEvent);
+    if (ch !== null) {
+      sendToChannel(ch, { event: "Started", data: { contentLength: 52_000_000 } });
+      for (let i = 0; i < 10; i++) {
+        await sleep(150);
+        sendToChannel(ch, { event: "Progress", data: { chunkLength: 5_200_000 } });
+      }
+      sendToChannel(ch, { event: "Finished" });
+    }
+    return 8; // rid of the downloaded bytes
+  },
+  "plugin:updater|install": () => sleep(400).then(ok),
+
+  // Splash / telemetry ------------------------------------------------------
+  set_complete: ok,
+  telemetry_state: () => telemetry,
+  set_telemetry: (a) => {
+    const granted = Boolean(a.granted);
+    telemetry = { ...telemetry, consent: granted ? "granted" : "denied", enabled: granted };
+    return telemetry;
+  },
+  track_event: ok,
+  telemetry_flush: ok,
+
+  // Stats and index ---------------------------------------------------------
+  db_stats: dbStats,
+  index_stats: stats,
+  coach_overview: () => ({
+    heatmap: Array.from({ length: 365 }, (_, i) => ({
+      day: Math.floor((NOW - (364 - i) * DAY) / DAY) * DAY,
+      messages: (i * 37) % 7 === 0 ? 0 : 20 + ((i * 53) % 260),
+    })),
+    decisions: [],
+    gotchas: [],
+    since: NOW - 7 * DAY,
+  }),
+  recurring_issues: () => [
+    {
+      example: "error[E0502]: cannot borrow `self` as mutable",
+      count: 41,
+      threads: 17,
+      firstSeen: NOW - 300 * DAY,
+      lastSeen: NOW - 2 * DAY,
+    },
+    {
+      example: "TypeError: Cannot read properties of undefined (reading 'map')",
+      count: 28,
+      threads: 12,
+      firstSeen: NOW - 200 * DAY,
+      lastSeen: NOW - 6 * DAY,
+    },
+  ],
+  spend: () => ({
+    totalCost: 412.37,
+    trackedCalls: 18_902,
+    untrackedCalls: 311,
+    byModel: [
+      {
+        model: "claude-opus-4-8",
+        cost: 301.2,
+        input: 41_000_000,
+        output: 3_100_000,
+        cacheRead: 220_000_000,
+        calls: 9_870,
+        priced: true,
+      },
+      {
+        model: "gpt-5-codex",
+        cost: 111.17,
+        input: 22_000_000,
+        output: 1_900_000,
+        cacheRead: 64_000_000,
+        calls: 9_032,
+        priced: true,
+      },
+    ],
+    topThreads: threads.slice(0, 3).map((t, i) => ({
+      threadId: t.id,
+      title: t.title,
+      project: t.projectPath,
+      cost: [18.4, 12.9, 9.75][i],
+    })),
+  }),
+  get_close_to_tray: () => closeToTray,
+  set_close_to_tray: (a) => {
+    closeToTray = Boolean(a.on);
+    return null;
+  },
+  index_all: () => {
+    void runIndexAll();
+    return null;
+  },
+  indexing_status: () => jobs.index,
+  index_source: () =>
+    sleep(800).then(
+      (): IndexReport => ({
+        threadsIndexed: 3,
+        threadsSkipped: 358,
+        messagesIndexed: 96,
+        errors: 0,
+      }),
+    ),
+  jobs_status: () => ({ ...jobs }),
+  embedding_status: () => ({ ...embed }),
+  build_embeddings: () => {
+    void runEmbeddings();
+    return null;
+  },
+
+  // Storage -----------------------------------------------------------------
+  cleanup_candidates: (a) => {
+    const before = typeof a.before === "number" ? a.before : null;
+    const sources = Array.isArray(a.sources) ? (a.sources as string[]) : null;
+    const limit = typeof a.limit === "number" ? a.limit : 200;
+    return cleanupRows
+      .filter((r) => before === null || (r.updatedAt ?? 0) < before)
+      .filter((r) => !sources || sources.includes(r.source))
+      .slice(0, limit);
+  },
+  delete_threads: (a) => {
+    const ids = new Set(Array.isArray(a.ids) ? (a.ids as number[]) : []);
+    cleanupRows = cleanupRows.filter((r) => !ids.has(r.id));
+    threads = threads.filter((t) => !ids.has(t.id));
+    return ids.size;
+  },
+  vacuum_db: () => sleep(1_200).then(ok),
+  compact_index: async (): Promise<CompactSummary> => {
+    jobs.rewrite = true;
+    await sleep(600);
+    emit("compact:progress", { rows: 140, bytesSaved: 21_000_000 });
+    await sleep(600);
+    jobs.rewrite = false;
+    return { rows: 312, bytesSaved: 48_000_000 };
+  },
+  get_data_roots: () => ({ ...dataRoots }),
+  set_data_roots: (a) => {
+    if (typeof a.claudeConfigDir === "string") {
+      dataRoots.claudeConfigDir = a.claudeConfigDir;
+      dataRoots.effectiveClaudeConfigDir = a.claudeConfigDir || `${HOME}/.claude`;
+    }
+    if (typeof a.codexHome === "string") {
+      dataRoots.codexHome = a.codexHome;
+      dataRoots.effectiveCodexHome = a.codexHome || `${HOME}/.codex`;
+    }
+    return { ...dataRoots };
+  },
+
+  // Export ------------------------------------------------------------------
+  obsidian_vaults: () => [`${HOME}/Documents/Obsidian Vault`, `${HOME}/Notes/Work`],
+  export_thread: (a) => `${String(a.vaultDir)}/Callimachus/thread-${String(a.threadId)}.md`,
+  synthesize_export: (a) =>
+    sleep(900).then(() => `${String(a.vaultDir)}/Callimachus/thread-${String(a.threadId)}.md`),
+  can_synthesize: () => [...keys.values()].some(Boolean),
+
+  // Threads -----------------------------------------------------------------
+  search_threads: (a) => searchHits(String(a.query ?? ""), a.filters as SearchFilters | undefined),
+  recent_threads: (a) => filterThreads(a.filters as SearchFilters | undefined),
+  search_by_file: () => threads.slice(0, 3),
+  get_thread: (a) => threadDetail(Number(a.threadId)),
+  set_star: (a) => {
+    threads = threads.map((t) =>
+      t.id === Number(a.threadId) ? { ...t, starred: Boolean(a.starred) } : t,
+    );
+    return null;
+  },
+  set_thread_tags: ok,
+  list_tags: () => [
+    ["payments", 14],
+    ["infra", 9],
+    ["flaky-test", 4],
+  ],
+  thread_commits: () => [],
+  link_thread_commits: () => [
+    {
+      sha: "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+      shortSha: "a1b2c3d",
+      subject: "test: await scheduler flush before advancing timers",
+      committedAt: NOW - DAY,
+      overlap: 3,
+    },
+  ],
+  find_prior_work: () => [],
+  resume_thread: ok,
+  cli_launch_supported: () => true,
+  thread_context: () => "# Context\n\n(mock) packed thread context.",
+  open_thread_in_cli: (a) => String(a.program ?? "claude"),
+
+  // Knowledge ---------------------------------------------------------------
+  list_projects: projectInfos,
+  project_memory: (a) => projectMemory(String(a.project)),
+  project_brief: () => "Payments API: Rust + Postgres, Stripe for card processing.",
+  distill_project: ok,
+  distilling_status: () => jobs.distill,
+  cancel_distill: ok,
+  write_project_memory_file: (a) => `${String(a.project)}/MEMORY.md`,
+  write_agent_memory_file: (a) => `${String(a.project)}/${String(a.filename)}`,
+  set_fact_pinned: ok,
+  hide_fact: ok,
+  set_todo_done: ok,
+  edit_fact: ok,
+  detect_conflicts: () => [],
+  remember: ok,
+  list_open_todos: () => [
+    {
+      id: 4,
+      threadId: threads[0]?.id ?? 1,
+      text: "Backfill idempotency keys for legacy refunds.",
+      source: "claude_code",
+      title: threads[0]?.title ?? null,
+      projectPath: PROJECTS[0],
+      createdAt: NOW - 5 * DAY,
+    },
+  ],
+  knowledge_config: () => ({ ...knowledge }),
+  set_knowledge_config: (a) => {
+    knowledge.enabled = Boolean(a.enabled);
+    if (typeof a.provider === "string" || a.provider === null) knowledge.provider = a.provider;
+    if (typeof a.model === "string" || a.model === null) knowledge.model = a.model;
+    return null;
+  },
+  set_auto_distill: (a) => {
+    knowledge.autoDistill = Boolean(a.on);
+    return null;
+  },
+  auto_distill_budget: () => ({ ...budget }),
+  set_auto_distill_daily_cap: (a) => {
+    budget.dailyCap = Math.max(0, Number(a.cap) || 0);
+    budget.remainingToday = Math.min(budget.remainingToday, budget.dailyCap);
+    return { ...budget };
+  },
+  thread_knowledge: threadKnowledge,
+  distill_thread: () => sleep(900).then(threadKnowledge),
+  recall_decisions: () => [],
+  recall_gotchas: () => [],
+  ask_history: () =>
+    sleep(900).then(() => ({
+      answer: "You fixed this in the payments repo by awaiting the scheduler before timers.",
+      sources: threads.slice(0, 2).map((t) => ({
+        threadId: t.id,
+        title: t.title,
+        source: t.source,
+        projectPath: t.projectPath,
+      })),
+    })),
+
+  // Chat and providers ------------------------------------------------------
+  send_chat: async (a) => {
+    const ch = channelId(a.onToken);
+    const parts = ["Looking at your history, ", "you solved this ", "in payments-api last week."];
+    for (const text of parts) {
+      await sleep(200);
+      if (ch !== null) sendToChannel(ch, { kind: "text", text });
+    }
+    return parts.join("");
+  },
+  cancel_chat: ok,
+  approve_tool: ok,
+  set_api_key: (a) => {
+    keys.set(String(a.provider), true);
+    return null;
+  },
+  delete_api_key: (a) => {
+    keys.set(String(a.provider), false);
+    return null;
+  },
+  provider_has_key: (a) => keys.get(String(a.provider)) ?? false,
+  provider_base_url: (a) => baseUrls.get(String(a.provider)) ?? "",
+  set_provider_base_url: (a) => {
+    baseUrls.set(String(a.provider), String(a.url ?? ""));
+    return null;
+  },
+  list_models: (a) =>
+    sleep(300).then(() => {
+      switch (String(a.provider)) {
+        case "anthropic":
+          return ["claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5"];
+        case "openai":
+          return ["gpt-4o", "gpt-4.1", "o3", "o4-mini"];
+        case "ollama":
+          return ["llama3.1:8b", "qwen2.5-coder:14b"];
+        default:
+          return [];
+      }
+    }),
+  cli_engines: (): CliEngine[] => [
+    { id: "claude-cli", label: "Claude Code", bin: "claude", installed: true },
+    { id: "codex-cli", label: "Codex", bin: "codex", installed: true },
+  ],
+
+  // Agent integrations ------------------------------------------------------
+  recall_integration_status: () => ({ ...recall }),
+  install_recall_integration: () => {
+    recall = recallStatus(true);
+    return { ...recall };
+  },
+  uninstall_recall_integration: () => {
+    recall = recallStatus(false);
+    return null;
+  },
+  set_proactive_recall: (a) => {
+    recall = { ...recall, proactiveRecallInstalled: Boolean(a.enabled) };
+    return { ...recall };
+  },
+  agent_integrations_status: () => agents.map((x) => ({ ...x })),
+  install_agent_integrations: () => {
+    agents = agents.map((x) => ({ ...x, registered: x.present }));
+    return agents.map((x) => ({ ...x }));
+  },
+  uninstall_agent_integrations: () => {
+    agents = agents.map((x) => ({ ...x, registered: false }));
+    return null;
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Install
+// ---------------------------------------------------------------------------
+
+async function invoke(cmd: string, args: Args = {}): Promise<unknown> {
+  const handler = handlers[cmd];
+  if (!handler) {
+    console.warn("[mock] no handler for", cmd, args);
+    throw new Error(`[mock] no handler for ${cmd}`);
+  }
+  // A tick of latency, like real IPC, so loading states render at least once.
+  await sleep(30);
+  return handler(args);
+}
+
+win.__TAURI_INTERNALS__ = {
+  invoke,
+  transformCallback,
+  unregisterCallback,
+  convertFileSrc: (path: string, protocol = "asset") =>
+    `${protocol}://localhost/${encodeURIComponent(path)}`,
+  metadata: {
+    currentWindow: { label: "main" },
+    currentWebview: { label: "main", windowLabel: "main" },
+  },
+  plugins: {},
+};
+win.__TAURI_EVENT_PLUGIN_INTERNALS__ = {
+  unregisterListener: (_event: string, eventId: number) => {
+    listeners.delete(eventId);
+  },
+};
+
+// jobs=indexing: show a reindex in flight that never finishes, for the progress UI.
+if (SCENARIO.jobs === "indexing") {
+  setTimeout(() => emit("index:progress", { done: 1, total: 4, current: "codex" }), 500);
+}
+
+console.info("[mock] Tauri runtime faked", SCENARIO);

@@ -23,9 +23,15 @@ import {
   CommandList,
 } from "@/components/ui/command";
 import { api } from "../lib/api";
-import { useIndexRewriting } from "../lib/queries";
+import {
+  confirmUserStarted,
+  markUserStarted,
+  unmarkUserStarted,
+  useIndexRewriting,
+} from "../lib/queries";
 import { useUi, type View } from "../store/ui";
 import { useTheme } from "../store/theme";
+import { useUpdater } from "../store/updater";
 
 const NAV: { id: View; label: string; icon: typeof Search }[] = [
   { id: "search", label: "Search", icon: Search },
@@ -43,19 +49,31 @@ export function CommandPalette() {
   const open = useUi((s) => s.commandOpen);
   const setOpen = useUi((s) => s.setCommandOpen);
   const setView = useUi((s) => s.setView);
-  const theme = useTheme((s) => s.theme);
+  const theme = useTheme((s) => s.resolved);
   const toggleTheme = useTheme((s) => s.toggle);
   const qc = useQueryClient();
   const reindex = useMutation({
     mutationFn: api.indexAll,
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["index_status"] }),
+    onMutate: () => markUserStarted("index"), // main.tsx toasts when it finishes
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["index_status"] });
+      void confirmUserStarted(qc, "index"); // a no-op start (job busy) gets no toast
+    },
+    onError: () => unmarkUserStarted("index"),
   });
   const buildIndex = useMutation({
     mutationFn: api.buildEmbeddings,
+    onMutate: () => markUserStarted("embed"),
     // embed_status never refetches on its own while idle (lib/queries.ts); pick up
     // running:true now so the progress bar appears.
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["embed_status"] }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["embed_status"] });
+      void confirmUserStarted(qc, "embed");
+    },
+    onError: () => unmarkUserStarted("embed"),
   });
+  const openSettings = useUi((s) => s.openSettings);
+  const checkForUpdates = useUpdater((s) => s.check);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -109,6 +127,18 @@ export function CommandPalette() {
           <CommandItem value="toggle theme dark light" onSelect={() => run(toggleTheme)}>
             {theme === "dark" ? <Sun /> : <Moon />}
             <span>Toggle theme</span>
+          </CommandItem>
+          <CommandItem
+            value="check for updates upgrade version"
+            onSelect={() =>
+              run(() => {
+                openSettings("updates");
+                void checkForUpdates({ manual: true });
+              })
+            }
+          >
+            <RefreshCw />
+            <span>Check for updates</span>
           </CommandItem>
         </CommandGroup>
       </CommandList>

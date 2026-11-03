@@ -6,11 +6,14 @@ import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import App from "./App";
 import { ErrorBoundary } from "./components/ErrorBoundary";
-import type { EmbedStatus, IndexProgress } from "./lib/api";
-import { EMBED_ERROR_KEY, INDEX_ERROR_KEY } from "./lib/queries";
+import { Toaster } from "@/components/ui/toast";
+import type { EmbedStatus, IndexProgress, IndexReport } from "./lib/api";
+import { EMBED_ERROR_KEY, INDEX_ERROR_KEY, takeUserStarted } from "./lib/queries";
 import { AGGREGATE_KEYS, invalidateIndexDerived, queryClient } from "./lib/queryClient";
 import { isSafeExternalHref } from "./lib/safeLinks";
 import { track } from "./lib/telemetry";
+import { errorText, notify } from "./lib/toast";
+import { startUpdater } from "./store/updater";
 import "./index.css";
 
 // Push-based embedding progress: the backend emits counts per batch, so the UI never
@@ -29,14 +32,25 @@ void listen<{ done: number; total: number }>("embed:progress", (e) => {
 // or every message failed inference. Nothing was marked embedded, so the user can retry.
 // `embed:done` still follows and clears the running state as usual.
 void listen<string>("embed:error", (e) => {
-  queryClient.setQueryData(EMBED_ERROR_KEY, String(e.payload ?? "") || "unknown error");
+  const reason = String(e.payload ?? "") || "unknown error";
+  queryClient.setQueryData(EMBED_ERROR_KEY, reason);
   track("error_shown", { kind: "index_failed" });
+  if (takeUserStarted("embed")) {
+    notify.error("Semantic index build stopped", {
+      description: `${reason}. Nothing was marked as embedded, so building again picks up where it left off.`,
+    });
+  }
 });
 void listen("embed:done", () => {
   // One authoritative refetch for the final counts + running:false, plus Stats'
   // semantic-coverage figure.
   void queryClient.invalidateQueries({ queryKey: ["embed_status"] });
   void queryClient.invalidateQueries({ queryKey: ["index_stats"] });
+  if (takeUserStarted("embed") && !queryClient.getQueryData(EMBED_ERROR_KEY)) {
+    notify.success("Semantic index is up to date", {
+      description: "Natural-language search now covers your latest messages.",
+    });
+  }
 });
 // Background todo backfill (after enabling the Knowledge feature) finished.
 void listen("knowledge:todos-ready", () => {
@@ -76,11 +90,26 @@ void listen<string>("index:error", (e) => {
   track("error_shown", { kind: "index_failed" });
 });
 
-// Background re-index finished — clear progress, refresh results/stats/button state.
-void listen("index:done", () => {
+// Background re-index finished: clear progress, refresh results/stats/button state.
+void listen<IndexReport | null>("index:done", (e) => {
   queryClient.setQueryData(["index_progress"], null);
   if (!indexFailedThisRun && queryClient.getQueryData(INDEX_ERROR_KEY)) {
     queryClient.setQueryData(INDEX_ERROR_KEY, null);
+  }
+  // Only a reindex the user asked for gets a toast; the launch scan stays quiet.
+  if (takeUserStarted("index")) {
+    const r = e.payload;
+    if (indexFailedThisRun) {
+      notify.error("Reindex failed", {
+        description: errorText(queryClient.getQueryData(INDEX_ERROR_KEY)),
+      });
+    } else if (r) {
+      notify.success("Reindex finished", {
+        description: `${r.threadsIndexed.toLocaleString()} threads and ${r.messagesIndexed.toLocaleString()} messages indexed${r.errors > 0 ? `, ${r.errors} skipped with errors` : ""}.`,
+      });
+    } else {
+      notify.success("Reindex finished");
+    }
   }
   indexFailedThisRun = false;
   // A reindex has now completed at least once this session. The empty-state
@@ -170,6 +199,9 @@ window.addEventListener("unhandledrejection", (e) =>
   console.error("[ui] unhandled rejection:", e.reason),
 );
 
+// Background update checks (launch, every 6 h, on focus) and the "Updated to …" toast.
+startUpdater();
+
 // The main window is hidden at launch while the splash shows; the backend reveals it once
 // both halves report ready. If the frontend never reports (a hang, or an error before
 // AppShell's effect commits), reveal anyway after a grace period rather than leaving the
@@ -198,6 +230,7 @@ ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
       <ErrorBoundary scope="app">
         <AppShell />
       </ErrorBoundary>
+      <Toaster />
     </QueryClientProvider>
   </React.StrictMode>,
 );

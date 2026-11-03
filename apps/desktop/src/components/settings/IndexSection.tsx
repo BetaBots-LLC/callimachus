@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import {
   keepPreviousData,
   type MutationState,
@@ -8,11 +8,10 @@ import {
   useQuery,
   useQueryClient,
 } from "@tanstack/react-query";
-import { api, SOURCE_LABELS, type CleanupRow, type CompactSummary } from "../lib/api";
+import { ChevronLeft, ChevronRight } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
+import { Progress } from "@/components/ui/progress";
 import {
   Select,
   SelectContent,
@@ -20,6 +19,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { Spinner } from "@/components/ui/spinner";
 import {
   Table,
   TableBody,
@@ -28,17 +28,26 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { formatTime } from "../lib/format";
+import { useAppForm } from "@/lib/form";
+import { api, type CleanupRow, type CompactSummary, SOURCE_LABELS } from "../../lib/api";
+import { formatTime } from "../../lib/format";
 import {
   anyJobRunning,
+  confirmUserStarted,
+  EMBED_ERROR_KEY,
   fetchJobsStatus,
+  markUserStarted,
   REWRITE_KEY,
+  unmarkUserStarted,
+  useEmbedError,
+  useEmbedStatus,
+  useIndexRewriting,
   useJobsStatus,
   usePushed,
-} from "../lib/queries";
-import { invalidateIndexDerived } from "../lib/queryClient";
-import { useAppForm } from "@/lib/form";
-import { ChevronLeft, ChevronRight, Loader2 } from "lucide-react";
+} from "../../lib/queries";
+import { invalidateIndexDerived } from "../../lib/queryClient";
+import { errorText, notify } from "../../lib/toast";
+import { InlineError, Note, SectionHeader, SettingRow, SettingsGroup } from "./shared";
 
 /** A cleanup row plus its form-managed selection flag. */
 type Row = CleanupRow & { selected: boolean };
@@ -68,8 +77,102 @@ function fmtBytes(n: number): string {
   return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-export function CleanupCard() {
+/** The semantic index, and the disk space the history takes: shrink, reclaim, delete. */
+export function IndexSection() {
+  return (
+    <>
+      <SectionHeader
+        title="Index & storage"
+        description="The semantic index behind natural-language search, and the space your history takes on disk."
+      />
+      <div className="space-y-8">
+        <SettingsGroup aria-label="Semantic index">
+          <SemanticIndexRow />
+        </SettingsGroup>
+        <StorageGroup />
+      </div>
+    </>
+  );
+}
+
+function SemanticIndexRow() {
   const queryClient = useQueryClient();
+  // Event-driven; never polls while idle (see lib/queries.ts).
+  const embed = useEmbedStatus();
+  const embedError = useEmbedError();
+  // Build does nothing while Shrink index / Reclaim space runs.
+  const rewriting = useIndexRewriting();
+  // A reindex holds the index too; a build started now would return without running.
+  const indexing = !!useJobsStatus().data?.index;
+  const buildIndex = useMutation({
+    mutationFn: api.buildEmbeddings,
+    // A retry starts clean; a new failure arrives as a fresh embed:error.
+    onMutate: () => {
+      queryClient.setQueryData(EMBED_ERROR_KEY, null);
+      markUserStarted("embed"); // main.tsx toasts when it finishes
+    },
+    // Pick up running:true now; progress then streams in via embed:progress, shown in
+    // place by this row and the search bar, so a successful start gets no toast.
+    onSuccess: async () => {
+      queryClient.invalidateQueries({ queryKey: ["embed_status"] });
+      if (!(await confirmUserStarted(queryClient, "embed"))) {
+        notify.warning("Couldn't start the build", {
+          description: "Another job is using the index. Try again when it finishes.",
+        });
+      }
+    },
+    onError: (e) => {
+      unmarkUserStarted("embed");
+      notify.error("Couldn't start the build", { description: errorText(e) });
+    },
+  });
+
+  const running = !!embed.data?.running;
+  const nothingEmbedded = embed.data?.done === 0;
+  const pct =
+    embed.data && embed.data.total > 0 ? Math.round((embed.data.done / embed.data.total) * 100) : 0;
+
+  return (
+    <SettingRow
+      title="Semantic index"
+      description={
+        embed.data
+          ? `${embed.data.done.toLocaleString()} of ${embed.data.total.toLocaleString()} messages embedded`
+          : "Loading…"
+      }
+      control={
+        <Button
+          size="sm"
+          variant={nothingEmbedded ? "default" : "outline"}
+          onClick={() => buildIndex.mutate()}
+          disabled={running || rewriting || indexing}
+        >
+          {running && <Spinner data-icon="inline-start" />}
+          {running ? "Building…" : nothingEmbedded ? "Build index" : "Update index"}
+        </Button>
+      }
+    >
+      {running && (
+        <Progress value={pct} aria-label="Semantic index build" className="gap-1.5">
+          <span className="sr-only">{`${pct}% embedded`}</span>
+        </Progress>
+      )}
+      {embedError && !running && (
+        <InlineError>
+          The last build stopped: {embedError}. Nothing was marked as embedded, so building again
+          picks up where it left off.
+        </InlineError>
+      )}
+      {buildIndex.isError && (
+        <InlineError>Couldn't start the build: {errorText(buildIndex.error)}</InlineError>
+      )}
+    </SettingRow>
+  );
+}
+
+function StorageGroup() {
+  const queryClient = useQueryClient();
+  const ageId = useId();
   const [age, setAge] = useState("all");
   const [page, setPage] = useState(0);
   const [err, setErr] = useState<string | null>(null);
@@ -132,9 +235,17 @@ export function CleanupCard() {
       setConfirming(false);
       invalidateAll();
       void rows.refetch();
-      if (removed === 0) setErr("No threads were deleted.");
+      if (removed === 0) {
+        setErr("No threads were deleted.");
+        notify.warning("No threads were deleted.");
+      } else {
+        notify.success(`Deleted ${removed} thread${removed === 1 ? "" : "s"}`);
+      }
     },
-    onError: (e) => setErr(String(e)),
+    onError: (e) => {
+      setErr(String(e));
+      notify.error("Couldn't delete the threads", { description: errorText(e) });
+    },
   });
   // The backend may have refused because a job started meanwhile, or the rewrite's own
   // claim just ended: either way, refresh the shared job flags the other buttons read.
@@ -143,8 +254,14 @@ export function CleanupCard() {
     mutationKey: VACUUM_KEY,
     mutationFn: api.vacuumDb,
     onMutate: () => setErr(null),
-    onSuccess: invalidateAll,
-    onError: (e) => setErr(String(e)),
+    onSuccess: () => {
+      invalidateAll();
+      notify.success("Space reclaimed");
+    },
+    onError: (e) => {
+      setErr(String(e));
+      notify.error("Couldn't reclaim space", { description: errorText(e) });
+    },
     onSettled: refreshJobs,
   });
   const compact = useMutation({
@@ -155,8 +272,21 @@ export function CleanupCard() {
       queryClient.setQueryData(COMPACT_PROGRESS_KEY, null);
     },
     // Row sizes change, so the cleanup list (an index-derived aggregate) refreshes too.
-    onSuccess: invalidateAll,
-    onError: (e) => setErr(String(e)),
+    onSuccess: (summary) => {
+      invalidateAll();
+      notify.success(
+        summary.rows > 0
+          ? `Trimmed ${summary.rows.toLocaleString()} tool outputs`
+          : "Nothing to trim",
+        summary.bytesSaved > 0
+          ? { description: `Saved ${fmtBytes(summary.bytesSaved)}.` }
+          : undefined,
+      );
+    },
+    onError: (e) => {
+      setErr(String(e));
+      notify.error("Couldn't shrink the index", { description: errorText(e) });
+    },
     onSettled: refreshJobs,
   });
   const compactProgress = usePushed<CompactSummary>(COMPACT_PROGRESS_KEY);
@@ -207,18 +337,71 @@ export function CleanupCard() {
   }
 
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle>Storage cleanup</CardTitle>
-        <p className="text-sm text-muted-foreground">
-          Remove old threads to free space — listed least-recently-active first. Deletes cascade to
-          messages, search, and embeddings.
-        </p>
-      </CardHeader>
-      <CardContent className="space-y-3">
-        <div className="flex items-center gap-2">
-          <Select value={age} onValueChange={(v) => setAge(v ?? "all")}>
-            <SelectTrigger size="sm" className="w-52">
+    <SettingsGroup title="Storage">
+      <SettingRow
+        title="Shrink index"
+        description="Trim tool output stored by older versions to the size new indexing keeps."
+        control={
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => void startRewrite(() => compact.mutate())}
+            disabled={rewriting}
+          >
+            {shrinking && <Spinner data-icon="inline-start" />}
+            {shrinking ? "Shrinking…" : "Shrink index"}
+          </Button>
+        }
+      >
+        {jobBusy && !rewriteRunning && (
+          <Note>
+            Shrink index and Reclaim space are available again once the background job that is
+            running now (a reindex, semantic build or distill) finishes.
+          </Note>
+        )}
+        {(shrinking || lastCompact?.data) && (
+          <Note>
+            {shrinking
+              ? compactProgress && compactProgress.rows > 0
+                ? `Trimmed ${compactProgress.rows.toLocaleString()} tool outputs so far…`
+                : "Looking for oversized tool output…"
+              : lastCompact?.data && lastCompact.data.rows > 0
+                ? `Trimmed ${lastCompact.data.rows.toLocaleString()} tool outputs and saved ${fmtBytes(lastCompact.data.bytesSaved)}.`
+                : "Nothing to trim: the index is already compact."}
+          </Note>
+        )}
+      </SettingRow>
+
+      <SettingRow
+        title="Reclaim disk space"
+        description="Rewrite the database to return freed space to disk."
+        control={
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => void startRewrite(() => vacuum.mutate())}
+            disabled={rewriting}
+          >
+            {reclaiming && <Spinner data-icon="inline-start" />}
+            {reclaiming ? "Reclaiming…" : "Reclaim space"}
+          </Button>
+        }
+      />
+
+      <SettingRow
+        title="Delete old threads"
+        description="Least-recently-active first. Deleting cascades to messages, search and embeddings."
+      >
+        <div>
+          <label htmlFor={ageId} className="sr-only">
+            Thread age
+          </label>
+          <Select
+            value={age}
+            onValueChange={(v) => setAge(v ?? "all")}
+            items={AGES.map((a) => ({ value: a.value, label: a.label }))}
+          >
+            <SelectTrigger id={ageId} size="sm" className="w-52">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
@@ -229,51 +412,15 @@ export function CleanupCard() {
               ))}
             </SelectContent>
           </Select>
-          <Button
-            size="sm"
-            variant="ghost"
-            className="ml-auto"
-            onClick={() => void startRewrite(() => compact.mutate())}
-            disabled={rewriting}
-            title="Trim tool output stored by older versions to the size new indexing keeps, then return the space to disk"
-          >
-            {shrinking && <Loader2 className="size-3.5 animate-spin" />}
-            {shrinking ? "Shrinking…" : "Shrink index"}
-          </Button>
-          <Button
-            size="sm"
-            variant="ghost"
-            onClick={() => void startRewrite(() => vacuum.mutate())}
-            disabled={rewriting}
-            title="Rewrite the database to return freed space to disk"
-          >
-            {reclaiming && <Loader2 className="size-3.5 animate-spin" />}
-            {reclaiming ? "Reclaiming…" : "Reclaim space"}
-          </Button>
         </div>
-        {jobBusy && !rewriteRunning && (
-          <p className="text-xs text-muted-foreground">
-            Shrink index and Reclaim space are available again once the background job that is
-            running now (a reindex, semantic build or distill) finishes.
-          </p>
-        )}
-        {(shrinking || lastCompact?.data) && (
-          <p className="text-xs text-muted-foreground">
-            {shrinking
-              ? compactProgress && compactProgress.rows > 0
-                ? `Trimmed ${compactProgress.rows.toLocaleString()} tool outputs so far…`
-                : "Looking for oversized tool output…"
-              : lastCompact?.data && lastCompact.data.rows > 0
-                ? `Trimmed ${lastCompact.data.rows.toLocaleString()} tool outputs and saved ${fmtBytes(lastCompact.data.bytesSaved)}.`
-                : "Nothing to trim: the index is already compact."}
-          </p>
-        )}
 
-        <div className="rounded-lg border">
-          <Table className="table-fixed">
-            <TableHeader className="[&_th]:h-8 [&_th]:text-[0.68rem] [&_th]:uppercase [&_th]:tracking-wide">
+        {/* Full-bleed (cancels the row's px-4) so the hairlines meet the group's dividers. */}
+        <div className="-mx-4 border-t">
+          {/* Edge cells pad to the row's 16px so text lines up with the titles above. */}
+          <Table className="table-fixed [&_tr>*:first-child]:pl-4 [&_tr>*:last-child]:pr-4">
+            <TableHeader className="[&_th]:h-8 [&_th]:text-xs [&_th]:font-medium [&_th]:normal-case [&_th]:tracking-normal [&_th]:text-muted-foreground">
               <TableRow className="hover:bg-transparent">
-                <TableHead className="w-9">
+                <TableHead className="w-11">
                   <form.Subscribe selector={(s) => s.values.rows}>
                     {(formRows) => {
                       const pageRows = formRows.slice(start, start + PAGE_SIZE);
@@ -290,7 +437,7 @@ export function CleanupCard() {
                   </form.Subscribe>
                 </TableHead>
                 <TableHead>Thread</TableHead>
-                <TableHead className="w-28">Source</TableHead>
+                <TableHead className="w-24">Source</TableHead>
                 <TableHead className="w-16 text-right">Size</TableHead>
                 <TableHead className="w-28 text-right">Last active</TableHead>
               </TableRow>
@@ -300,7 +447,7 @@ export function CleanupCard() {
                 <TableRow className="hover:bg-transparent">
                   <TableCell colSpan={5} className="text-muted-foreground">
                     <span className="inline-flex items-center gap-2">
-                      <Loader2 className="size-3.5 animate-spin" /> Loading…
+                      <Spinner className="size-3.5" /> Loading…
                     </span>
                   </TableCell>
                 </TableRow>
@@ -312,24 +459,32 @@ export function CleanupCard() {
                   </TableCell>
                 </TableRow>
               )}
-              <form.Field name="rows" mode="array">
-                {(arrayField) =>
-                  arrayField.state.value.slice(start, start + PAGE_SIZE).map((row, j) => {
+              {/* Subscribed to the rows array itself, not an array-mode Field: in
+                  @tanstack/react-form 1.33 an array-mode field re-renders only on
+                  push/remove (`_arrayVersion`), so after `form.reset` seeded the list the
+                  table stayed empty. */}
+              <form.Subscribe selector={(s) => s.values.rows}>
+                {(formRows) =>
+                  formRows.slice(start, start + PAGE_SIZE).map((row, j) => {
                     const i = start + j;
+                    const title = row.title?.trim() || "(untitled)";
                     return (
                       <TableRow key={row.id}>
                         <TableCell>
-                          <form.AppField name={`rows[${i}].selected`}>
-                            {(f) => <f.CheckboxField />}
-                          </form.AppField>
+                          {/* Not the form's CheckboxField: each row box needs its own label. */}
+                          <form.Field name={`rows[${i}].selected`}>
+                            {(f) => (
+                              <Checkbox
+                                checked={f.state.value}
+                                onCheckedChange={(c) => f.handleChange(c === true)}
+                                aria-label={`Select ${title}`}
+                              />
+                            )}
+                          </form.Field>
                         </TableCell>
-                        <TableCell className="truncate text-foreground">
-                          {row.title?.trim() || "(untitled)"}
-                        </TableCell>
-                        <TableCell>
-                          <Badge variant="outline" className="text-[0.62rem] uppercase">
-                            {SOURCE_LABELS[row.source] ?? row.source}
-                          </Badge>
+                        <TableCell className="truncate text-foreground">{title}</TableCell>
+                        <TableCell className="truncate text-xs text-muted-foreground">
+                          {SOURCE_LABELS[row.source] ?? row.source}
                         </TableCell>
                         <TableCell className="text-right text-xs tabular-nums text-muted-foreground">
                           {fmtBytes(row.bytes)}
@@ -341,12 +496,11 @@ export function CleanupCard() {
                     );
                   })
                 }
-              </form.Field>
+              </form.Subscribe>
             </TableBody>
           </Table>
         </div>
 
-        {/* Pagination */}
         {total > 0 && (
           <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground">
             <span>
@@ -360,7 +514,7 @@ export function CleanupCard() {
                 onClick={() => setPage(safePage - 1)}
                 disabled={safePage <= 0}
               >
-                <ChevronLeft className="size-3.5" />
+                <ChevronLeft data-icon="inline-start" />
                 Prev
               </Button>
               <span>
@@ -373,27 +527,27 @@ export function CleanupCard() {
                 disabled={safePage >= pageCount - 1}
               >
                 Next
-                <ChevronRight className="size-3.5" />
+                <ChevronRight data-icon="inline-end" />
               </Button>
             </div>
           </div>
         )}
 
-        {err && <div className="text-xs text-destructive">{err}</div>}
+        {err && <InlineError>{err}</InlineError>}
 
         <form.Subscribe selector={(s) => s.values.rows}>
           {(formRows) => {
             const sel = formRows.filter((r) => r.selected);
             const bytes = sel.reduce((n, r) => n + r.bytes, 0);
             return (
-              <div className="flex items-center justify-between gap-2 border-t pt-3">
-                <span className="text-xs text-muted-foreground">
+              <div className="flex items-center justify-between gap-2">
+                <Note>
                   {confirming
                     ? `Delete ${sel.length} permanently? This can't be undone.`
                     : sel.length > 0
                       ? `${sel.length} selected · ${fmtBytes(bytes)}`
                       : "Nothing selected"}
-                </span>
+                </Note>
                 <div className="flex shrink-0 gap-2">
                   {confirming && !del.isPending && (
                     <Button size="sm" variant="ghost" onClick={() => setConfirming(false)}>
@@ -406,7 +560,7 @@ export function CleanupCard() {
                     onClick={onDeleteClick}
                     disabled={sel.length === 0 || del.isPending}
                   >
-                    {del.isPending && <Loader2 className="size-3.5 animate-spin" />}
+                    {del.isPending && <Spinner data-icon="inline-start" />}
                     {del.isPending
                       ? "Deleting…"
                       : confirming
@@ -418,7 +572,7 @@ export function CleanupCard() {
             );
           }}
         </form.Subscribe>
-      </CardContent>
-    </Card>
+      </SettingRow>
+    </SettingsGroup>
   );
 }

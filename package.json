@@ -13,7 +13,7 @@
     "check:fix": "biome check --write .",
     "clean": "turbo run clean && rm -rf node_modules .turbo",
     "desktop": "pnpm --filter callimachus",
-    "desktop:dev": "pnpm --filter callimachus tauri dev",
+    "desktop:dev": "node scripts/desktop-dev.mjs",
     "desktop:build": "pnpm --filter callimachus tauri build",
     "tauri": "pnpm --filter callimachus tauri",
     "changeset": "changeset",

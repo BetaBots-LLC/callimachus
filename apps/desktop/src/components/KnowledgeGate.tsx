@@ -18,17 +18,17 @@ export function KnowledgeGate({
   blurb: string;
   children: ReactNode;
 }) {
-  const setView = useUi((s) => s.setView);
+  const openSettings = useUi((s) => s.openSettings);
   if (enabled) return <>{children}</>;
   return (
     <div className="mx-auto flex h-full w-full max-w-md flex-col items-center justify-center gap-3 p-6 text-center">
       <h2 className="text-lg font-semibold tracking-tight">{feature}</h2>
       <p className="text-sm text-muted-foreground">{blurb}</p>
       <p className="text-xs text-muted-foreground">
-        Turn on the Knowledge layer to use it. Free heuristic TODOs need no key; decisions,
-        gotchas, and summaries use local Ollama or your own API key.
+        Turn on the Knowledge layer to use it. Free heuristic TODOs need no key; decisions, gotchas,
+        and summaries use local Ollama or your own API key.
       </p>
-      <Button className="mt-1" onClick={() => setView("settings")}>
+      <Button className="mt-1" onClick={() => openSettings("knowledge")}>
         Enable in Settings
       </Button>
     </div>

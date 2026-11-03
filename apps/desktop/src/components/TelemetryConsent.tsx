@@ -3,8 +3,8 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { X } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { Switch } from "@/components/ui/switch";
 import { PRIVACY_URL, setTelemetry, telemetryState, type TelemetryStatus } from "../lib/telemetry";
+import { useUi } from "../store/ui";
 
 /** Shared by the card and the Settings switch so both always show the same answer. */
 const TELEMETRY_KEY = ["telemetry_state"] as const;
@@ -20,7 +20,7 @@ function previewForced(): boolean {
   }
 }
 
-function useTelemetryStatus() {
+export function useTelemetryStatus() {
   return useQuery({
     queryKey: TELEMETRY_KEY,
     queryFn: telemetryState,
@@ -31,7 +31,7 @@ function useTelemetryStatus() {
   });
 }
 
-function useTelemetryChoice() {
+export function useTelemetryChoice() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: setTelemetry,
@@ -39,7 +39,7 @@ function useTelemetryChoice() {
   });
 }
 
-function openPrivacy() {
+export function openPrivacy() {
   void openUrl(PRIVACY_URL).catch(() => {
     /* no browser available: nothing useful to do */
   });
@@ -57,10 +57,13 @@ export function TelemetryConsent() {
   const status = useTelemetryStatus();
   const choose = useTelemetryChoice();
   const [deferred, setDeferred] = useState(false);
+  // Settings › General carries the same switch in place, so the card would only cover
+  // the section list there.
+  const inSettings = useUi((st) => st.view === "settings");
 
   const s = status.data;
   const shouldAsk = previewForced() || (!!s && s.available && s.consent === "unset");
-  if (deferred || !shouldAsk) return null;
+  if (deferred || inSettings || !shouldAsk) return null;
 
   return (
     <section
@@ -82,7 +85,7 @@ export function TelemetryConsent() {
           <X />
         </Button>
       </div>
-      <p className="text-xs leading-relaxed text-muted-foreground">
+      <p className="text-[13px] leading-normal text-muted-foreground">
         Share anonymous usage data, like which features get used and whether indexing succeeds.
         Never your conversations, file paths, prompts, searches or API keys.
       </p>
@@ -109,73 +112,5 @@ export function TelemetryConsent() {
       </div>
       <p className="text-[11px] text-muted-foreground">You can change this anytime in Settings.</p>
     </section>
-  );
-}
-
-/**
- * The matching switch for Settings (General card). Same state as the consent card, so
- * answering either one updates both.
- */
-export function TelemetrySetting() {
-  const status = useTelemetryStatus();
-  const choose = useTelemetryChoice();
-  const s = status.data;
-  // Builds that can't send (source builds, `tauri dev`, env opt-out) can't turn sharing
-  // ON, so nobody stores a consent they never saw explained in a real build. Turning it
-  // OFF always works: a grant stored by an official build must stay revocable here, or
-  // the next normal launch would resume sending after the user tried to stop it.
-  // Dev builds stay togglable to exercise the flow.
-  const granted = s?.consent === "granted";
-  const locked = !s || (!s.available && !import.meta.env.DEV && !granted);
-
-  let detail: string;
-  if (s?.envOptOut) {
-    detail =
-      "Turned off by the DO_NOT_TRACK or CALLIMACHUS_TELEMETRY environment variable, so nothing is sent.";
-  } else if (s && !s.available) {
-    detail = "This build doesn't include usage analytics, so nothing is sent.";
-  } else {
-    detail =
-      "Sends anonymous counts, like searches run and threads indexed (rounded into ranges), plus your OS and app version. Never conversations, file paths, prompts, searches or API keys. The cal CLI and the MCP server never send anything.";
-  }
-
-  if (granted && s && !s.available && !import.meta.env.DEV) {
-    detail +=
-      " Sharing is still on for normal launches of the official app; switch it off here to stop that too.";
-  }
-
-  return (
-    <div className="space-y-2">
-      <div className="flex items-center gap-2 text-sm">
-        <Switch
-          checked={granted}
-          disabled={locked || choose.isPending}
-          onCheckedChange={(v) => choose.mutate(v)}
-          aria-label="Share anonymous usage data"
-        />
-        Share anonymous usage data
-      </div>
-      <p className="text-xs text-muted-foreground">
-        {detail}{" "}
-        <Button
-          size="xs"
-          variant="link"
-          className="h-auto p-0 text-xs align-baseline"
-          onClick={openPrivacy}
-        >
-          What's collected
-        </Button>
-      </p>
-      {s?.consent === "granted" && s.anonId && (
-        <p className="text-xs text-muted-foreground">
-          Anonymous ID: <span className="font-mono select-all">{s.anonId}</span>
-        </p>
-      )}
-      {choose.isError && (
-        <p role="alert" className="text-xs text-destructive">
-          Couldn't save that change. Try again.
-        </p>
-      )}
-    </div>
   );
 }

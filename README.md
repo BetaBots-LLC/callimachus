@@ -80,7 +80,7 @@ Releases, versioning, and the auto-updater are documented in [RELEASING.md](RELE
 
 ```bash
 pnpm install
-pnpm desktop:dev      # launches the desktop window (tauri dev)
+pnpm desktop:dev      # launches the desktop window (tauri dev) against a separate dev index
 
 # from the repo root, across all apps:
 pnpm build            # turbo: build every app's frontend
