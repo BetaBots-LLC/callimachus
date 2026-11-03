@@ -621,7 +621,46 @@ jobs:
           echo "$MCP_PUBLISHER_SHA256  mcp-publisher.tar.gz" | sha256sum -c -
           tar xzf mcp-publisher.tar.gz mcp-publisher
 
+      # The registry validates the npm package before accepting the entry, and npm's package
+      # document lags a fresh publish behind its CDN (15+ minutes seen on 0.11.1 and 0.11.2,
+      # while the per-version endpoint answered within a minute). Wait for the version to be
+      # servable, then publish, treating "duplicate version" (a re-run) as done.
+      - name: Wait for npm to serve the new version
+        working-directory: packages/callimachus-mcp
+        run: |
+          set -euo pipefail
+          VERSION="$(node -p "require('./package.json').version")"
+          URL="https://registry.npmjs.org/callimachus-mcp/$VERSION"
+          for attempt in $(seq 1 60); do
+            code="$(curl -s -o /dev/null -w '%{http_code}' -H 'Cache-Control: no-cache' "$URL" || true)"
+            if [ "$code" = "200" ]; then
+              echo "callimachus-mcp@$VERSION is servable (attempt $attempt)"
+              exit 0
+            fi
+            echo "callimachus-mcp@$VERSION not on the registry yet (HTTP $code), waiting…"
+            sleep 20
+          done
+          echo "::error::callimachus-mcp@$VERSION never became servable on npm (20 min)"
+          exit 1
+
       - name: Publish to MCP registry (GitHub OIDC)
         run: |
+          set -euo pipefail
           ./mcp-publisher login github-oidc
-          ./mcp-publisher publish
+          for attempt in 1 2 3 4 5; do
+            if out="$(./mcp-publisher publish 2>&1)"; then
+              echo "$out"
+              exit 0
+            fi
+            echo "$out"
+            if grep -q "duplicate version" <<<"$out"; then
+              echo "This version is already in the registry; nothing to do."
+              exit 0
+            fi
+            if ! grep -q "was not found" <<<"$out"; then
+              exit 1
+            fi
+            echo "The registry still can't see the npm version; retrying in 60 s (attempt $attempt of 5)…"
+            sleep 60
+          done
+          exit 1
