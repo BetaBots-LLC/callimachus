@@ -129,6 +129,11 @@ The first npm and MCP-registry publish should be done by hand (see
 and confirm the npm package validates; after that, every release refreshes both
 automatically.
 
+The registry step waits for npm to serve the new version (its package document lags a
+publish by 15+ minutes behind the CDN, the per-version endpoint by about a minute) and
+treats a "duplicate version" answer as success, so a re-run of `build.yml` for a published
+tag is always safe.
+
 ## Normal release (stable)
 
 1. With each PR that changes the app, add a changeset:
