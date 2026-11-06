@@ -6,6 +6,10 @@
 //! do facts recorded by the user or by agents (`record_fact_with_origin`).
 
 pub mod app_config;
+pub mod harvest;
+pub mod priority;
+
+pub use priority::{distill_priority_ready, enqueue_distill_priority};
 
 use crate::agent::Distilled;
 use anyhow::Result;
@@ -51,7 +55,7 @@ pub fn extract_todos(text: &str) -> Vec<String> {
 /// Message text that an agent harness injected rather than the user or model writing it:
 /// skill bodies, slash-command expansions, system reminders, and Callimachus's own
 /// injected memory / packed threads (extracting from those would feed TODOs back to us).
-fn is_injected_context(text: &str) -> bool {
+pub(crate) fn is_injected_context(text: &str) -> bool {
     let t = text.trim_start();
     const PREFIXES: [&str; 8] = [
         "Base directory for this skill",
@@ -161,12 +165,6 @@ fn is_noise(t: &str) -> bool {
 /// Cap on heuristic todos kept per thread (matches the indexer).
 const MAX_TODOS_PER_THREAD: usize = 25;
 
-/// Wipe all heuristic todos (used when the user turns the knowledge feature off).
-pub fn clear_heuristic(conn: &Connection) -> Result<()> {
-    conn.execute("DELETE FROM facts WHERE extractor = 'heuristic'", [])?;
-    Ok(())
-}
-
 /// `facts.created_at` for a heuristic TODO: when its source message was written, not when
 /// the thread was (re)indexed, so "newest first" means newest TODO rather than "most
 /// recently re-indexed thread". Falls back to `now` for sources without timestamps;
@@ -257,15 +255,17 @@ fn rebuild_thread_todos(tx: &Connection, thread_id: i64, now: i64) -> Result<()>
 }
 
 /// Backfill heuristic todos across the whole corpus from already-indexed message text
-/// (no file reading). Used when the user opts INTO the feature so todos appear without
-/// a full re-index. Runs in BATCHES, taking the DB lock briefly per chunk of threads so
-/// the UI stays responsive — never one long lock hold. Safe to run on a background thread.
-pub fn backfill_todos(db: &crate::db::Db, now: i64) -> Result<()> {
-    const BATCH: usize = 50;
+/// (no file reading), so todos appear without a full re-index. Runs in BATCHES, taking the
+/// DB lock briefly per chunk of threads so the UI stays responsive, never one long lock
+/// hold: a batch ends after [`BACKFILL_BATCH`] threads or [`BACKFILL_BATCH_TIME`], whichever
+/// comes first, since one huge thread can hold many thousands of messages. Before each batch
+/// it waits while `pause()` says another writer job is running, the way auto-distill yields
+/// to a reindex or an embed build. Safe to run on a background thread. Each thread's rebuild
+/// replaces only its open, uncurated todos, so done / pinned / dismissed ones survive (an
+/// older build wiped every heuristic row up front, which was harmless only while turning
+/// knowledge off had already cleared them).
+pub fn backfill_todos(db: &crate::db::Db, now: i64, pause: &dyn Fn() -> bool) -> Result<()> {
     let lock = || db.0.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"));
-
-    // Clear stale heuristic facts up front (one short lock).
-    lock()?.execute("DELETE FROM facts WHERE extractor = 'heuristic'", [])?;
 
     let thread_ids: Vec<i64> = {
         let conn = lock()?;
@@ -277,21 +277,60 @@ pub fn backfill_todos(db: &crate::db::Db, now: i64) -> Result<()> {
         ids
     };
 
-    for chunk in thread_ids.chunks(BATCH) {
-        let mut conn = lock()?;
-        // The user may have toggled the feature OFF mid-backfill (which cleared the
-        // facts in the gap between batches). Re-check under the lock and stop, so we
-        // don't re-insert todos the user just turned off.
-        if !get_config(&conn)?.enabled {
-            return Ok(());
+    let mut next = 0;
+    while next < thread_ids.len() {
+        while pause() {
+            std::thread::sleep(BACKFILL_PAUSE_POLL);
         }
+        let mut conn = lock()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        for &tid in chunk {
-            rebuild_thread_todos(&tx, tid, now)?;
+        let started = std::time::Instant::now();
+        let end = (next + BACKFILL_BATCH).min(thread_ids.len());
+        while next < end {
+            rebuild_thread_todos(&tx, thread_ids[next], now)?;
+            next += 1;
+            if started.elapsed() >= BACKFILL_BATCH_TIME {
+                break;
+            }
         }
         tx.commit()?;
     }
     Ok(())
+}
+
+/// Most threads per backfill batch.
+const BACKFILL_BATCH: usize = 50;
+/// A backfill batch commits and lets go of the GUI connection once it has run this long, so
+/// star, tag and Remember writes queued behind it wait at most about this.
+const BACKFILL_BATCH_TIME: std::time::Duration = std::time::Duration::from_millis(200);
+/// How often a paused backfill checks whether the writer job it yields to is done.
+const BACKFILL_PAUSE_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Set once the one-time TODO backfill has run (or was not needed).
+const TODOS_BACKFILLED: &str = "knowledge.todos_backfilled";
+
+/// Mark the one-time backfill as not needed: an index with no threads yet gets every TODO at
+/// index time, since TODO extraction no longer depends on `knowledge.enabled`.
+pub fn mark_todos_backfilled(conn: &Connection) -> Result<()> {
+    app_config::put_flag(conn, TODOS_BACKFILLED, true)
+}
+
+/// The one-time TODO backfill for indexes from before TODOs were always on. Until then the
+/// indexer extracted TODOs only while `knowledge.enabled` was set, and turning it off wiped
+/// them, so an index that never had it on holds none. Runs [`backfill_todos`] when
+/// `knowledge.todos_backfilled` is unset and sets it after a full pass (an interrupted pass
+/// runs again next launch; each thread's rebuild is idempotent). It runs whatever
+/// `knowledge.enabled` was: the old on-enable backfill was a fire-and-forget thread with no
+/// completion record, so an app quit in the middle of it left later threads without TODOs.
+/// Returns whether the backfill ran.
+pub fn backfill_todos_once(db: &crate::db::Db, now: i64, pause: &dyn Fn() -> bool) -> Result<bool> {
+    let lock = || db.0.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"));
+    if app_config::get_flag(&*lock()?, TODOS_BACKFILLED)? {
+        return Ok(false);
+    }
+    backfill_todos(db, now, pause)?;
+    app_config::put_flag(&*lock()?, TODOS_BACKFILLED, true)?;
+    Ok(true)
 }
 
 /// An open TODO surfaced to the UI / agents, with the thread it came from.
@@ -307,6 +346,28 @@ pub struct TodoFact {
     pub project_path: Option<String>,
     #[serde(rename = "createdAt")]
     pub created_at: i64,
+    /// Who wrote it: 'heuristic', 'llm', 'user', 'agent', or an importer
+    /// ([`harvest::EXTRACTOR_CLAUDE_MEMORY`], [`harvest::EXTRACTOR_CLAUDE_COMPACT`]).
+    pub extractor: String,
+    /// Stable key of an imported fact (`facts.origin_ref`), else None.
+    #[serde(rename = "originRef")]
+    pub origin_ref: Option<String>,
+}
+
+/// `facts.origin_ref` as a select expression: the column, or NULL on an index older than
+/// migration 0032. Read-only sidecars and pooled readers never migrate (see
+/// `db::has_index`), and naming a missing column fails the whole query, so a newer `cal`
+/// or hook on an index the app has not upgraded yet would otherwise lose every fact list.
+pub(crate) fn origin_ref_sql(conn: &Connection) -> &'static str {
+    let has = conn
+        .prepare_cached("SELECT 1 FROM pragma_table_info('facts') WHERE name = 'origin_ref'")
+        .and_then(|mut stmt| stmt.exists([]))
+        .unwrap_or(false);
+    if has {
+        "f.origin_ref"
+    } else {
+        "NULL"
+    }
 }
 
 /// Open TODOs across the corpus, newest first. Optionally scoped to a project-path
@@ -318,13 +379,15 @@ pub fn list_open_todos(
     source: Option<&str>,
     limit: i64,
 ) -> Result<Vec<TodoFact>> {
-    let mut sql = String::from(
-        "SELECT f.id, f.thread_id, f.text, s.kind, t.title, t.project_path, f.created_at
+    let mut sql = format!(
+        "SELECT f.id, f.thread_id, f.text, s.kind, t.title, t.project_path, f.created_at,
+                f.extractor, {}
          FROM facts f
          JOIN threads t ON t.id = f.thread_id
          JOIN sources s ON s.id = t.source_id
          WHERE f.kind = 'todo' AND f.status = 'open' AND f.hidden = 0
            AND (t.is_subagent = 0 OR f.pinned = 1)",
+        origin_ref_sql(conn)
     );
     // Subagent threads only ever yield uncurated heuristic TODOs, so they are left out, but
     // one the user pinned (an older build extracted them) must stay listed: otherwise
@@ -365,6 +428,8 @@ pub fn list_open_todos(
             title: r.get(4)?,
             project_path: r.get(5)?,
             created_at: r.get(6)?,
+            extractor: r.get(7)?,
+            origin_ref: r.get(8)?,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -375,11 +440,14 @@ pub fn list_open_todos(
 // ---------------------------------------------------------------------------
 
 /// Distillation engine config, shared across the app / cal / MCP via `app_config`.
-/// `enabled` is the consent flag — nothing distills until the user turns it on.
+/// `enabled` is the consent flag for LLM distillation only: nothing distills until the user
+/// turns it on. Heuristic TODOs, Remember and project memory work with it off.
 #[derive(Debug, Serialize)]
 pub struct KnowledgeConfig {
     pub enabled: bool,
-    pub provider: Option<String>, // None = first available cloud key
+    /// None = the first saved API key (the legacy default existing users consented to; never
+    /// reinterpreted as a CLI engine).
+    pub provider: Option<String>,
     pub model: Option<String>,
     /// Auto-distill new/changed threads in the background (opt-in; uses the engine).
     #[serde(rename = "autoDistill")]
@@ -426,7 +494,7 @@ pub fn set_provider_base_url(conn: &Connection, provider: &str, url: &str) -> Re
 }
 
 /// Persist the distillation config. Enabling it is the user's consent to send thread
-/// text to the chosen engine (cloud key) — or to keep it local (Ollama).
+/// text to the chosen engine (a CLI subscription or cloud key), or to keep it local (Ollama).
 pub fn set_config(
     conn: &Connection,
     enabled: bool,
@@ -436,6 +504,58 @@ pub fn set_config(
     app_config::put_flag(conn, "knowledge.enabled", enabled)?;
     app_config::put(conn, "knowledge.provider", provider.unwrap_or(""))?;
     app_config::put(conn, "knowledge.model", model.unwrap_or(""))
+}
+
+/// One engine the memory setup card offers. `kind` is `cli` (a logged-in agent CLI),
+/// `ollama` (a local server) or `key` (a cloud provider with a saved API key).
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryEngine {
+    pub id: String,
+    pub label: String,
+    pub kind: &'static str,
+    pub detected: bool,
+    /// The CLI's path or "not found", the Ollama server state, or "API key saved".
+    pub detail: String,
+}
+
+/// What the memory setup card shows: the current config, the engines it can turn on, the
+/// one to preselect, and the auto-distill budget the consent copy quotes.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemorySetup {
+    pub enabled: bool,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub engines: Vec<MemoryEngine>,
+    pub recommended: Option<String>,
+    pub eligible_threads: usize,
+    pub daily_cap: i64,
+}
+
+/// The engine to preselect: the first detected of claude-cli, codex-cli, local Ollama, then
+/// the first saved key. A CLI needs no key and runs on the subscription the user already
+/// has; Ollama keeps text on the machine; a saved key bills per token, so it comes last.
+pub fn recommended_engine(engines: &[MemoryEngine]) -> Option<String> {
+    let rank = |e: &MemoryEngine| match (e.id.as_str(), e.kind) {
+        ("claude-cli", _) => 0,
+        ("codex-cli", _) => 1,
+        (_, "ollama") => 2,
+        _ => 3,
+    };
+    engines
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.detected)
+        .min_by_key(|(i, e)| (rank(e), *i))
+        .map(|(_, e)| e.id.clone())
+}
+
+/// Turn on LLM memory with an explicit engine: the one-click consent from the memory setup
+/// card. Stores the provider by name (never None, so the choice the user saw is the one
+/// that runs) and turns background auto-distill on with it.
+pub fn enable_memory(conn: &Connection, provider: &str, model: Option<&str>) -> Result<()> {
+    set_config(conn, true, Some(provider), model)?;
+    set_auto_distill(conn, true)
 }
 
 /// Replace a thread's LLM-distilled facts with a fresh set and mark it extracted at
@@ -652,6 +772,10 @@ pub struct RecallHit {
     /// ADR rationale ("why"), when the decision has one. NULL for gotchas/todos.
     pub rationale: Option<String>,
     pub similarity: f32,
+    /// See [`TodoFact::extractor`].
+    pub extractor: String,
+    #[serde(rename = "originRef")]
+    pub origin_ref: Option<String>,
 }
 
 /// Cross-thread semantic recall of distilled facts. `qv` is a PRECOMPUTED query vector
@@ -666,13 +790,14 @@ pub fn recall(
 ) -> Result<Vec<RecallHit>> {
     // Over-fetch chunks so the kind/project filter (applied AFTER the KNN) still leaves k.
     let knn_k = (k * 5).max(100);
+    let origin_ref = origin_ref_sql(conn);
     let mut sql = format!(
         "WITH knn AS MATERIALIZED (
             SELECT fact_id, distance FROM vec_facts
             WHERE embedding MATCH ?1 AND k = {knn_k} ORDER BY distance
          )
          SELECT f.id, f.thread_id, f.kind, f.text, f.rationale, s.kind, t.title, t.project_path,
-                MIN(knn.distance) AS d
+                MIN(knn.distance) AS d, f.extractor, {origin_ref}
          FROM knn
          JOIN facts f ON f.id = knn.fact_id
          JOIN threads t ON t.id = f.thread_id
@@ -719,6 +844,8 @@ pub fn recall(
             title: r.get(6)?,
             project_path: r.get(7)?,
             similarity: (1.0 - dist) as f32,
+            extractor: r.get(9)?,
+            origin_ref: r.get(10)?,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -817,7 +944,7 @@ pub fn check_contradiction(
 
 /// A thread is "distillable" (worth an LLM pass / counted in coverage) if it's a real
 /// top-level thread with enough substance. Keeps batch distill off trivial/subagent rows.
-const DISTILLABLE: &str = "is_subagent = 0 AND message_count >= 4";
+pub(crate) const DISTILLABLE: &str = "is_subagent = 0 AND message_count >= 4";
 
 /// One distilled fact in a project's aggregated memory, with its source thread.
 #[derive(Debug, Serialize)]
@@ -830,6 +957,14 @@ pub struct MemoryFact {
     #[serde(rename = "createdAt")]
     pub created_at: i64,
     pub pinned: bool,
+    /// Who wrote it: `llm`, `heuristic`, `user`, `agent`, or a harvest origin such as
+    /// `claude-memory`. The SessionStart hook and the managed AGENTS.md / CLAUDE.md block
+    /// drop `claude-memory` facts, which Claude Code already loads from its own auto memory,
+    /// and so does `.callimachus/memory.md`, a repo file people commit; MCP results and the
+    /// Projects tab keep them.
+    pub extractor: String,
+    #[serde(rename = "originRef")]
+    pub origin_ref: Option<String>,
 }
 
 /// Durable, aggregated knowledge for one project: decisions + gotchas + open TODOs
@@ -887,29 +1022,42 @@ pub fn list_projects(conn: &Connection) -> Result<Vec<ProjectInfo>> {
 }
 
 /// Distilled facts of one `kind` across a project, newest first, deduped by text, capped.
+/// `exclude` leaves one extractor's facts out in SQL, before the cap and the dedupe, so a
+/// project with many of them (harvested auto memories sort by file mtime, so they are often
+/// the newest) can neither push the other facts out of the window nor shadow an identical
+/// fact from another extractor.
 fn project_facts(
     conn: &Connection,
     kind: &str,
     project: &str,
     open_only: bool,
     limit: usize,
+    exclude: Option<&str>,
 ) -> Result<Vec<MemoryFact>> {
     // Match the canonical project key (callers pass it; falls back to project_path until
     // backfill), so all of one repo's threads aggregate together.
-    let mut sql = String::from(
-        "SELECT f.id, f.thread_id, f.text, t.title, f.created_at, f.pinned
+    let mut sql = format!(
+        "SELECT f.id, f.thread_id, f.text, t.title, f.created_at, f.pinned, f.extractor, {}
          FROM facts f JOIN threads t ON t.id = f.thread_id
          WHERE f.kind = ?1 AND COALESCE(t.project_key, t.project_path) = ?2 AND f.hidden = 0
            AND (t.is_subagent = 0 OR f.pinned = 1)",
+        origin_ref_sql(conn)
     );
     // Pinned facts on subagent threads stay: the user curated them (see list_open_todos).
     if open_only {
         sql.push_str(" AND f.status = 'open'");
     }
+    if exclude.is_some() {
+        sql.push_str(" AND f.extractor != ?3");
+    }
     // Pinned facts first, then newest. Pinned ones are the user's trusted set.
     sql.push_str(" ORDER BY f.pinned DESC, f.created_at DESC, f.id DESC");
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(rusqlite::params![kind, project], |r| {
+    let mut params: Vec<&dyn rusqlite::ToSql> = vec![&kind, &project];
+    if let Some(x) = &exclude {
+        params.push(x);
+    }
+    let rows = stmt.query_map(params.as_slice(), |r| {
         Ok(MemoryFact {
             id: r.get(0)?,
             thread_id: r.get(1)?,
@@ -917,6 +1065,8 @@ fn project_facts(
             title: r.get(3)?,
             created_at: r.get(4)?,
             pinned: r.get::<_, i64>(5)? != 0,
+            extractor: r.get(6)?,
+            origin_ref: r.get(7)?,
         })
     })?;
     let mut seen = std::collections::HashSet::new();
@@ -940,7 +1090,28 @@ pub fn get_project_memory(
     project: &str,
     per_kind: usize,
 ) -> Result<ProjectMemory> {
-    let mut mem = get_project_memory_facts(conn, project, per_kind)?;
+    project_memory(conn, project, per_kind, None)
+}
+
+/// [`get_project_memory`] without one extractor's facts (see [`project_facts`] for why the
+/// filter runs in SQL). For surfaces Claude Code reads next to its own auto memory, and
+/// files people commit: [`harvest::EXTRACTOR_CLAUDE_MEMORY`].
+pub fn get_project_memory_excluding(
+    conn: &Connection,
+    project: &str,
+    per_kind: usize,
+    extractor: &str,
+) -> Result<ProjectMemory> {
+    project_memory(conn, project, per_kind, Some(extractor))
+}
+
+fn project_memory(
+    conn: &Connection,
+    project: &str,
+    per_kind: usize,
+    exclude: Option<&str>,
+) -> Result<ProjectMemory> {
+    let mut mem = project_memory_facts(conn, project, per_kind, exclude)?;
     let count = |extra: &str| -> Result<i64> {
         Ok(conn.query_row(
             &format!(
@@ -967,10 +1138,30 @@ pub fn get_project_memory_facts(
     project: &str,
     per_kind: usize,
 ) -> Result<ProjectMemory> {
+    project_memory_facts(conn, project, per_kind, None)
+}
+
+/// [`get_project_memory_facts`] without one extractor's facts, filtered in SQL (see
+/// [`get_project_memory_excluding`]).
+pub fn get_project_memory_facts_excluding(
+    conn: &Connection,
+    project: &str,
+    per_kind: usize,
+    extractor: &str,
+) -> Result<ProjectMemory> {
+    project_memory_facts(conn, project, per_kind, Some(extractor))
+}
+
+fn project_memory_facts(
+    conn: &Connection,
+    project: &str,
+    per_kind: usize,
+    exclude: Option<&str>,
+) -> Result<ProjectMemory> {
     Ok(ProjectMemory {
-        decisions: project_facts(conn, "decision", project, false, per_kind)?,
-        gotchas: project_facts(conn, "gotcha", project, false, per_kind)?,
-        open_todos: project_facts(conn, "todo", project, true, per_kind)?,
+        decisions: project_facts(conn, "decision", project, false, per_kind, exclude)?,
+        gotchas: project_facts(conn, "gotcha", project, false, per_kind, exclude)?,
+        open_todos: project_facts(conn, "todo", project, true, per_kind, exclude)?,
         thread_count: 0,
         distilled_count: 0,
         pending_count: 0,
@@ -1042,22 +1233,7 @@ pub fn record_fact_with_origin(
     if !matches!(kind, "decision" | "gotcha") {
         anyhow::bail!("record_fact kind must be 'decision' or 'gotcha'");
     }
-    let source_id: i64 =
-        conn.query_row("SELECT id FROM sources WHERE kind = 'in_app'", [], |r| {
-            r.get(0)
-        })?;
-    let ext = format!("callimachus-notes:{project}");
-    conn.execute(
-        "INSERT INTO threads (source_id, external_id, title, project_path, project_key, created_at, updated_at)
-         VALUES (?1, ?2, 'Recorded memory', ?3, ?3, ?4, ?4)
-         ON CONFLICT(source_id, external_id) DO UPDATE SET updated_at = ?4",
-        params![source_id, ext, project, now],
-    )?;
-    let tid: i64 = conn.query_row(
-        "SELECT id FROM threads WHERE source_id = ?1 AND external_id = ?2",
-        params![source_id, ext],
-        |r| r.get(0),
-    )?;
+    let tid = notes_thread_id(conn, project, now)?;
     conn.execute(
         "INSERT INTO facts (thread_id, kind, text, rationale, status, extractor, pinned, created_at)
          VALUES (?1, ?2, ?3, ?4, 'open', ?5, ?6, ?7)",
@@ -1072,6 +1248,28 @@ pub fn record_fact_with_origin(
         ],
     )?;
     Ok(conn.last_insert_rowid())
+}
+
+/// The project's synthetic "Recorded memory" thread (created on first use, `updated_at`
+/// bumped on each write), which holds facts that came from no transcript of their own:
+/// recorded ones and imported ones ([`harvest`]).
+pub(crate) fn notes_thread_id(conn: &Connection, project: &str, now: i64) -> Result<i64> {
+    let source_id: i64 =
+        conn.query_row("SELECT id FROM sources WHERE kind = 'in_app'", [], |r| {
+            r.get(0)
+        })?;
+    let ext = format!("callimachus-notes:{project}");
+    conn.execute(
+        "INSERT INTO threads (source_id, external_id, title, project_path, project_key, created_at, updated_at)
+         VALUES (?1, ?2, 'Recorded memory', ?3, ?3, ?4, ?4)
+         ON CONFLICT(source_id, external_id) DO UPDATE SET updated_at = ?4",
+        params![source_id, ext, project, now],
+    )?;
+    Ok(conn.query_row(
+        "SELECT id FROM threads WHERE source_id = ?1 AND external_id = ?2",
+        params![source_id, ext],
+        |r| r.get(0),
+    )?)
 }
 
 /// Visible (non-hidden) distilled decisions for a project, id + text — for conflict review.
@@ -1207,7 +1405,9 @@ pub fn auto_distill_remaining_today(conn: &Connection, now: i64) -> Result<i64> 
 
 /// The next auto-distill batch: at most `batch` recently active pending threads that have
 /// gone idle ([`AUTO_DISTILL_IDLE_SECS`]), and never
-/// more than today's remaining allowance. The returned ids are counted against the
+/// more than today's remaining allowance. Sessions in the priority queue (they just ended,
+/// see [`priority`]) come first, whatever their age or idle time. The returned ids are
+/// counted against the
 /// allowance immediately, so a cancelled run errs on the side of spending less. Returns an
 /// empty list once the day's allowance is used up, which ends the auto-distill drain.
 pub fn auto_distill_worklist(conn: &Connection, batch: i64, now: i64) -> Result<Vec<i64>> {
@@ -1215,8 +1415,16 @@ pub fn auto_distill_worklist(conn: &Connection, batch: i64, now: i64) -> Result<
     if take <= 0 {
         return Ok(Vec::new());
     }
-    let since = now - AUTO_DISTILL_RECENT_DAYS * 86_400;
-    let ids = pending_threads_window(conn, take, Some(since), Some(now - AUTO_DISTILL_IDLE_SECS))?;
+    let mut ids = priority::take_priority(conn, take, now)?;
+    let room = take - ids.len() as i64;
+    if room > 0 {
+        let since = now - AUTO_DISTILL_RECENT_DAYS * 86_400;
+        // `take` rows, not `room`: up to all of the queued ones can be in this list too.
+        let regular =
+            pending_threads_window(conn, take, Some(since), Some(now - AUTO_DISTILL_IDLE_SECS))?;
+        let fresh: Vec<i64> = regular.into_iter().filter(|id| !ids.contains(id)).collect();
+        ids.extend(fresh.into_iter().take(room as usize));
+    }
     if !ids.is_empty() {
         let used = auto_distill_used_today(conn, now)? + ids.len() as i64;
         app_config::put(conn, "knowledge.auto_distill_day", &utc_day(now))?;
@@ -1229,13 +1437,19 @@ pub fn auto_distill_worklist(conn: &Connection, batch: i64, now: i64) -> Result<
 /// same recent-and-idle filter, so Settings does not count live sessions it will skip.
 pub fn auto_distill_eligible_count(conn: &Connection, now: i64) -> Result<usize> {
     let since = now - AUTO_DISTILL_RECENT_DAYS * 86_400;
-    Ok(pending_threads_window(
+    let regular = pending_threads_window(
         conn,
         i64::MAX,
         Some(since),
         Some(now - AUTO_DISTILL_IDLE_SECS),
-    )?
-    .len())
+    )?;
+    // Plus queued sessions the recent-and-idle filter leaves out (read-only: Settings
+    // asks on a pooled reader).
+    let queued = priority::ready_priority(conn, now)?
+        .into_iter()
+        .filter(|id| !regular.contains(id))
+        .count();
+    Ok(regular.len() + queued)
 }
 
 /// Margin past the idle edge before the deadline kick, so a clock tick of skew cannot land
@@ -1791,7 +2005,6 @@ mod tests {
     fn todo_done_survives_reindex() {
         use crate::indexer::{source_id, upsert_thread, ParsedMessage, ParsedThread};
         let mut conn = temp_db();
-        set_config(&conn, true, Some("ollama"), Some("m")).unwrap(); // enable todo extraction
         let sid = source_id(&conn, "claude_code").unwrap();
         let m = |t: &str| ParsedMessage {
             role: "user".into(),
@@ -2055,6 +2268,158 @@ mod tests {
             1,
             "guard still surfaces a genuinely-related prior session"
         );
+    }
+
+    fn heuristic_todos(conn: &Connection, thread_id: i64) -> Vec<(String, String)> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT text, status FROM facts WHERE thread_id = ?1 AND extractor = 'heuristic'
+                 ORDER BY text",
+            )
+            .unwrap();
+        stmt.query_map([thread_id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    /// TODO extraction no longer waits for the distillation opt-in, and turning
+    /// distillation off keeps the TODOs (it used to wipe every heuristic row).
+    #[test]
+    fn heuristic_todos_need_no_opt_in_and_survive_disable() {
+        let mut conn = temp_db();
+        assert!(!get_config(&conn).unwrap().enabled);
+        let t = seed_thread(&mut conn, "h1", "/proj/h", false, &["TODO: ship the card"]);
+        assert_eq!(
+            heuristic_todos(&conn, t),
+            vec![("ship the card".to_string(), "open".to_string())],
+            "extracted at index time with distillation off"
+        );
+        set_config(&conn, true, Some("ollama"), Some("m")).unwrap();
+        set_config(&conn, false, None, None).unwrap();
+        assert_eq!(heuristic_todos(&conn, t).len(), 1, "disable keeps TODOs");
+        assert_eq!(
+            list_open_todos(&conn, None, None, None, 10).unwrap().len(),
+            1
+        );
+    }
+
+    /// The upgrade backfill runs once, whatever knowledge.enabled was, keeps curated TODOs,
+    /// and waits while another writer job runs.
+    #[test]
+    fn todo_backfill_runs_once_and_keeps_curated_todos() {
+        let mut conn = temp_db();
+        let t = seed_thread(
+            &mut conn,
+            "b1",
+            "/proj/b",
+            false,
+            &["TODO: first task", "TODO: second task"],
+        );
+        // An index from before TODOs were always on: none extracted, except one the user
+        // closed back when they had knowledge on.
+        conn.execute(
+            "DELETE FROM facts WHERE thread_id = ?1 AND text = 'first task'",
+            [t],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE facts SET status = 'done' WHERE thread_id = ?1 AND text = 'second task'",
+            [t],
+        )
+        .unwrap();
+        let db = crate::db::Db(std::sync::Mutex::new(conn));
+        let polls = std::cell::Cell::new(0);
+        let pause = || {
+            polls.set(polls.get() + 1);
+            false
+        };
+        assert!(
+            backfill_todos_once(&db, 5_000, &pause).unwrap(),
+            "first launch runs it"
+        );
+        assert!(polls.get() >= 1, "asks before its batch");
+        {
+            let conn = db.0.lock().unwrap();
+            assert_eq!(
+                heuristic_todos(&conn, t),
+                vec![
+                    ("first task".to_string(), "open".to_string()),
+                    ("second task".to_string(), "done".to_string()),
+                ],
+                "backfilled, and the closed TODO stays closed without a duplicate"
+            );
+            assert!(app_config::get_flag(&conn, TODOS_BACKFILLED).unwrap());
+        }
+        assert!(
+            !backfill_todos_once(&db, 5_000, &|| false).unwrap(),
+            "later launches skip it"
+        );
+
+        // An index that had knowledge on runs it too: the old on-enable pass kept no record
+        // of finishing.
+        let mut conn = temp_db();
+        let t = seed_thread(&mut conn, "b2", "/proj/c", false, &["TODO: later task"]);
+        conn.execute("DELETE FROM facts WHERE thread_id = ?1", [t])
+            .unwrap();
+        set_config(&conn, true, Some("claude-cli"), None).unwrap();
+        let db = crate::db::Db(std::sync::Mutex::new(conn));
+        assert!(backfill_todos_once(&db, 5_000, &|| false).unwrap());
+        assert_eq!(heuristic_todos(&db.0.lock().unwrap(), t).len(), 1);
+        assert!(app_config::get_flag(&db.0.lock().unwrap(), TODOS_BACKFILLED).unwrap());
+    }
+
+    fn engine(id: &str, kind: &'static str, detected: bool) -> MemoryEngine {
+        MemoryEngine {
+            id: id.into(),
+            label: id.into(),
+            kind,
+            detected,
+            detail: String::new(),
+        }
+    }
+
+    #[test]
+    fn recommended_engine_prefers_cli_then_ollama_then_first_key() {
+        let all = |claude, codex, ollama| {
+            vec![
+                engine("claude-cli", "cli", claude),
+                engine("codex-cli", "cli", codex),
+                engine("ollama", "ollama", ollama),
+                engine("openai", "key", true),
+                engine("gemini", "key", true),
+            ]
+        };
+        let rec = |e: Vec<MemoryEngine>| recommended_engine(&e);
+        assert_eq!(rec(all(true, true, true)).as_deref(), Some("claude-cli"));
+        assert_eq!(rec(all(false, true, true)).as_deref(), Some("codex-cli"));
+        assert_eq!(rec(all(false, false, true)).as_deref(), Some("ollama"));
+        assert_eq!(rec(all(false, false, false)).as_deref(), Some("openai"));
+        // Order in the list does not outrank the preference.
+        let mut reversed = all(true, false, true);
+        reversed.reverse();
+        assert_eq!(rec(reversed).as_deref(), Some("claude-cli"));
+        let none = vec![
+            engine("claude-cli", "cli", false),
+            engine("ollama", "ollama", false),
+        ];
+        assert_eq!(rec(none), None);
+    }
+
+    /// The one-click consent stores the named engine (not the legacy None) and turns
+    /// auto-distill on; a later Settings off keeps the engine for the next on.
+    #[test]
+    fn enable_memory_names_the_engine_and_turns_auto_distill_on() {
+        let conn = temp_db();
+        enable_memory(&conn, "claude-cli", None).unwrap();
+        let cfg = get_config(&conn).unwrap();
+        assert!(cfg.enabled && cfg.auto_distill);
+        assert_eq!(cfg.provider.as_deref(), Some("claude-cli"));
+        assert_eq!(cfg.model, None);
+        enable_memory(&conn, "ollama", Some("qwen3")).unwrap();
+        let cfg = get_config(&conn).unwrap();
+        assert_eq!(cfg.provider.as_deref(), Some("ollama"));
+        assert_eq!(cfg.model.as_deref(), Some("qwen3"));
     }
 
     fn seed_thread(

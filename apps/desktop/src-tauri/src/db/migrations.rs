@@ -77,13 +77,49 @@ pub static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
         M::up(include_str!(
             "../../migrations/0031_messages_cover_indexes.sql"
         )),
+        // 0032: facts.origin_ref, the stable key of a fact imported from an agent's own
+        // files (Claude Code auto memory, compaction summaries), replaced by that key.
+        M::up(include_str!("../../migrations/0032_fact_origin_ref.sql")),
     ])
 });
+
+/// Migrations (by number, so 32 is 0032) that never scan `messages` or another big table:
+/// column adds and indexes over small tables. When every pending migration is listed here,
+/// `db::migrate` skips its sequential pre-read of the whole file, which costs about 1.2 s
+/// warm (several seconds cold) on a 5.1 GB index, far more than these migrations themselves
+/// (0032 is one ALTER ADD COLUMN and a partial index over `facts`). Add a migration here only
+/// when it touches no large table.
+pub const SCAN_FREE_MIGRATIONS: &[usize] = &[32];
+
+/// Whether every migration after `applied` (the index's `user_version`) up to `latest` is in
+/// [`SCAN_FREE_MIGRATIONS`].
+pub fn pending_are_scan_free(applied: usize, latest: usize) -> bool {
+    (applied + 1..=latest).all(|n| SCAN_FREE_MIGRATIONS.contains(&n))
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    #[test]
+    fn scan_free_pending_skips_the_preread() {
+        assert!(pending_are_scan_free(31, 32), "0032 alone is cheap");
+        assert!(
+            !pending_are_scan_free(30, 32),
+            "0031 builds indexes on messages"
+        );
+        assert!(pending_are_scan_free(32, 32), "nothing pending");
+        let latest = MIGRATIONS
+            .pending_migrations(&rusqlite::Connection::open_in_memory().unwrap())
+            .unwrap() as usize;
+        assert!(
+            SCAN_FREE_MIGRATIONS
+                .iter()
+                .all(|n| (1..=latest).contains(n)),
+            "every listed migration exists"
+        );
+    }
 
     static N: AtomicU32 = AtomicU32::new(0);
 

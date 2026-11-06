@@ -1,4 +1,4 @@
-import { useId, useRef } from "react";
+import { useId, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useDebouncedCallback } from "@tanstack/react-pacer";
 import { Field, FieldLabel } from "@/components/ui/field";
@@ -20,7 +20,7 @@ import { InlineError, Note, SectionHeader, SettingRow, SettingsGroup } from "./s
  *  auto is a sentinel here and maps back to the stored "". */
 const AUTO = "auto";
 const DISTILL_ENGINES = [
-  { id: AUTO, label: "Auto (first API key)" },
+  { id: AUTO, label: "First saved API key" },
   { id: "ollama", label: "Ollama (local · private)" },
   { id: "ollama_cloud", label: "Ollama Cloud" },
   { id: "anthropic", label: "Anthropic" },
@@ -31,8 +31,9 @@ const DISTILL_ENGINES = [
 
 type KnowledgeDraft = { enabled: boolean; provider: string; model: string };
 
-/** Opt-in knowledge: TODO extraction, plus optional LLM distillation (local Ollama, a CLI
- *  subscription or a cloud key) and its background auto-distill allowance. */
+/** Knowledge: open TODOs and Remember are always on; the switch here is only the opt-in LLM
+ *  distillation (local Ollama, a logged-in CLI or a cloud key) and its background
+ *  auto-distill allowance. */
 export function KnowledgeSection() {
   const queryClient = useQueryClient();
   const enabledId = useId();
@@ -51,6 +52,8 @@ export function KnowledgeSection() {
       api.setKnowledgeConfig(next.enabled, next.provider || undefined, next.model || undefined),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["knowledge_config"] });
+      // The memory card preselects the saved engine and model from memory_setup.
+      queryClient.invalidateQueries({ queryKey: ["memory_setup"] });
       if (engineChanged.current) {
         engineChanged.current = false;
         track("setting_changed", { key: "knowledge_engine" });
@@ -83,17 +86,51 @@ export function KnowledgeSection() {
     });
     debouncedSave(merged);
   };
+  // The engine the switch picked for the user (label), shown until they pick another.
+  const [autoPicked, setAutoPicked] = useState<{ id: string; label: string } | null>(null);
+  /** Turning distillation on with "First saved API key" and no key saved would make every
+   *  distill fail ("none is saved"). So a fresh enable with that sentinel takes the engine
+   *  the memory card recommends instead, and says so. Only on the user's own switch flip:
+   *  an existing config is never switched behind their back. */
+  const toggle = (on: boolean) => {
+    setAutoPicked(null);
+    update({ enabled: on });
+    if (!on || provider) return;
+    queryClient
+      .fetchQuery({ queryKey: ["memory_setup"], queryFn: api.memorySetup })
+      .then((setup) => {
+        const now = queryClient.getQueryData<KnowledgeConfig>(["knowledge_config"]);
+        // Turned off again, or an engine was picked while the probe ran.
+        if (!now?.enabled || now.provider) return;
+        if (setup.engines.some((e) => e.kind === "key" && e.detected)) return;
+        const rec = setup.engines.find((e) => e.id === setup.recommended && e.detected);
+        if (!rec) return;
+        update({ enabled: true, provider: rec.id });
+        // Not the user's pick, so not reported as an engine change.
+        engineChanged.current = false;
+        setAutoPicked({ id: rec.id, label: rec.label });
+      })
+      .catch(() => {
+        // The probe failed: keep the sentinel; the engine picker below still works.
+      });
+  };
   const local = provider === "ollama";
   // CLI backends (claude-cli / codex-cli) are keyless like Ollama, but the text DOES leave the
-  // machine (via the CLI's subscription), so they're "no key" without Ollama's privacy claim.
+  // machine (to the CLI's provider), so they're "no key" without Ollama's privacy claim.
   const isCli = provider.endsWith("-cli");
   const keyless = local || isCli;
-  // Offer installed CLI backends alongside the static engines.
+  // Installed CLI backends first: a logged-in subscription is the keyless default the
+  // memory card recommends, so the picker leads with the same thing.
   const installedClis = (cliEngines.data ?? []).filter((e) => e.installed);
   const engineOptions = [
+    ...installedClis.map((e) => ({ id: e.id, label: `${e.label} (detected)` })),
     ...DISTILL_ENGINES,
-    ...installedClis.map((e) => ({ id: e.id, label: `${e.label} (subscription · no key)` })),
   ];
+  // A saved CLI engine that is no longer on PATH still has to show its label.
+  if (provider.endsWith("-cli") && !engineOptions.some((e) => e.id === provider)) {
+    const known = cliEngines.data?.find((e) => e.id === provider);
+    engineOptions.unshift({ id: provider, label: `${known?.label ?? provider} (not found)` });
+  }
   // Base UI's SelectValue renders the matching item's label from `items`.
   const engineItems = engineOptions.map((e) => ({ value: e.id, label: e.label }));
   const autoDistill = c?.autoDistill ?? false;
@@ -129,7 +166,7 @@ export function KnowledgeSection() {
   const privacy = local
     ? "Runs locally via Ollama, so thread text never leaves your machine."
     : isCli
-      ? "Runs through your logged-in CLI subscription, so no API key is needed. Thread text is sent to that CLI's provider, on demand per thread."
+      ? "Runs through your logged-in CLI (billed to that login), so no API key is needed. Thread text is sent to that CLI's provider, on demand per thread."
       : provider
         ? `Sends thread text to ${provider} using your stored API key, on demand per thread.`
         : "Uses the first provider you've added a key for. Sends thread text to that provider, on demand per thread.";
@@ -138,23 +175,29 @@ export function KnowledgeSection() {
     <>
       <SectionHeader
         title="Knowledge"
-        description="Decisions, gotchas and open TODOs distilled from your sessions. TODO extraction is free and on-device; distillation uses local Ollama, a CLI subscription or your own API key."
+        description="Each repo's decisions, gotchas and open TODOs, from your sessions. Distillation runs on local Ollama, a logged-in claude or codex CLI, or your own API key; TODO extraction stays on this machine."
       />
       <div className="space-y-8">
         <SettingsGroup aria-label="Knowledge">
           <SettingRow
             htmlFor={enabledId}
-            title="Enable knowledge"
-            description="Extracts open TODOs from your threads and adds a Todos tab."
+            title="LLM distillation"
+            description="An LLM reads your sessions and keeps each repo's decisions, gotchas and summaries for Ask, recall, Projects and your agents' hooks. Open TODOs and Remember work with it off."
             control={
               <Switch
                 id={enabledId}
                 checked={enabled}
                 disabled={cfg.isPending}
-                onCheckedChange={(v) => update({ enabled: v })}
+                onCheckedChange={toggle}
               />
             }
           >
+            {enabled && autoPicked && provider === autoPicked.id && (
+              <Note>
+                No API key is saved, so distillation uses {autoPicked.label}, the engine this
+                machine has. Pick another under Distillation engine.
+              </Note>
+            )}
             {cfg.isError && (
               <InlineError>
                 Couldn't load the knowledge settings: {errorText(cfg.error)}
@@ -171,7 +214,7 @@ export function KnowledgeSection() {
         {enabled && (
           <SettingsGroup
             title="Distillation engine"
-            description="Optional. TODOs need none. Pick one to distill decisions and gotchas per thread."
+            description="The LLM that reads your sessions. Distilled threads go only to the engine picked here."
           >
             {/* No title: the group names this row, and the two fields carry their labels. */}
             <SettingRow>

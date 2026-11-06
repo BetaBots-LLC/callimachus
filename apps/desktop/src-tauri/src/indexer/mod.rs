@@ -771,9 +771,10 @@ fn insert_messages<'a>(
 
 /// Free heuristic knowledge tier: re-derive this thread's TODO facts every index
 /// (delete + rescan) so they never go stale. Only user/assistant text is scanned.
-/// The LLM-distilled facts (extractor='llm') are left untouched here. Gated on the
-/// opt-in: when knowledge is off we don't write todo facts at all. Subagent threads are
-/// skipped: their "TODO"s are the parent agent's task list echoed back, not the user's.
+/// The LLM-distilled facts (extractor='llm') are left untouched here. Always on: it needs
+/// no LLM and nothing leaves the machine, so it no longer waits for the distillation
+/// opt-in (which left TODOs, the hook and Projects empty for most users). Subagent threads
+/// are skipped: their "TODO"s are the parent agent's task list echoed back, not the user's.
 fn derive_todos(
     tx: &Connection,
     thread_id: i64,
@@ -782,7 +783,7 @@ fn derive_todos(
     is_subagent: bool,
     now: i64,
 ) -> Result<()> {
-    if !crate::knowledge::get_config(tx)?.enabled || is_subagent {
+    if is_subagent {
         return Ok(());
     }
     const MAX_TODOS_PER_THREAD: usize = 25;

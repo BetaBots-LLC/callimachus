@@ -350,7 +350,8 @@ fn build_status(
 
 /// Install (or refresh) the skill, the MCP registration, the `cal` CLI and the Claude Code hooks
 /// (SessionStart injects each repo's memory; PreCompact snapshots the session before
-/// compaction). Idempotent.
+/// compaction and keeps its summary; SessionEnd queues the session for auto-distill).
+/// Idempotent.
 ///
 /// Refuses to run from a temporary location (see [`stable_app_exe`]). A `cal` failure is
 /// reported in `cal_problem` rather than aborting halfway: the hooks and MCP entry launch the app
@@ -394,6 +395,21 @@ pub fn set_proactive_recall(app_exe: &Path, enabled: bool) -> Result<Integration
 /// ones older versions installed), and our `cal` link(s). Leaves the rest of each config intact
 /// and never removes a `cal` that isn't ours. Tries every step, then reports any failures.
 pub fn uninstall() -> Result<()> {
+    let mut errors = Vec::new();
+    if let Err(e) = uninstall_pieces() {
+        errors.push(format!("{e:#}"));
+    }
+    // After a deliberate uninstall, the next Install adds SessionEnd itself, so the once-only
+    // record has nothing left to guard. (The Windows uninstaller path keeps it: a restore from
+    // its marker must not re-add a SessionEnd hook the user had deleted.)
+    if let Err(e) = remove_if_exists(&session_end_marker_path()) {
+        errors.push(format!("SessionEnd marker: {e:#}"));
+    }
+    combine_errors(errors)
+}
+
+/// [`uninstall`] without the SessionEnd marker cleanup.
+fn uninstall_pieces() -> Result<()> {
     let exe = current_stable_exe();
     let mut errors = Vec::new();
     let mut attempt = |what: &str, result: Result<()>| {
@@ -434,7 +450,8 @@ const REMOVED_MARKER: &str = "integration-removed.json";
 #[derive(Debug, Default, PartialEq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 struct RemovedIntegration {
-    /// Base Claude Code hook events that held our hook (`SessionStart`, `PreCompact`).
+    /// Base Claude Code hook events that held our hook (`SessionStart`, `PreCompact`,
+    /// `SessionEnd`).
     claude_hooks: Vec<String>,
     /// The opt-in UserPromptSubmit hook.
     proactive_recall: bool,
@@ -565,7 +582,7 @@ pub fn uninstall_all_with_marker() -> Result<()> {
             errors.push(format!("marker: {e:#}"));
         }
     }
-    if let Err(e) = uninstall() {
+    if let Err(e) = uninstall_pieces() {
         errors.push(format!("{e:#}"));
     }
     if let Err(e) = uninstall_agents() {
@@ -696,6 +713,7 @@ pub fn refresh_installed(current_exe: &Path) -> Result<bool> {
         settings_path()
             .and_then(|p| update_json_file(&p, false, |obj| refresh_hooks_in(obj, &exe))),
     );
+    record("SessionEnd hook", add_session_end_hook_once(&exe));
     record(
         "Claude Code MCP entry",
         claude_config_path().and_then(|c| refresh_mcp_json(&c, &exe)),
@@ -795,6 +813,7 @@ const SHIPPED_SKILL_HASHES: &[u64] = &[
     0x1bcddf4e180eb040, // f4394bf
     0x5047d4f99f7147e9, // fe1902e
     0xd572be1865981676, // version: 1.1.0 (first with the rendered CLI note)
+    0x29e126dbe1770847, // version: 1.2.0 (Batch D: prompts, fallbacks, digest note)
 ];
 
 /// Stable across builds and platforms, unlike `DefaultHasher`. Only identifies known texts.
@@ -873,6 +892,17 @@ const PRE_COMPACT_HOOK: HookSpec = HookSpec {
     timeout_secs: 10,
 };
 
+/// Moves the session that just ended to the front of the auto-distill queue (`cal
+/// session-end`: one small write). Claude Code runs SessionEnd hooks in the background with
+/// a 1.5 s budget shared by all of them, raised to a hook's own timeout (max 60), so 5 s
+/// covers a slow disk without holding anything up.
+const SESSION_END_HOOK: HookSpec = HookSpec {
+    event: "SessionEnd",
+    subcommand: "session-end",
+    matcher: None,
+    timeout_secs: 5,
+};
+
 /// Opt-in: injects "you may have solved this before" notes. Toggled by `set_proactive_recall`.
 const PROACTIVE_RECALL_HOOK: HookSpec = HookSpec {
     event: "UserPromptSubmit",
@@ -883,16 +913,17 @@ const PROACTIVE_RECALL_HOOK: HookSpec = HookSpec {
 
 /// What `install()` sets up. Proactive recall stays a separate opt-in because it reads every
 /// prompt.
-const BASE_HOOKS: [&HookSpec; 2] = [&SESSION_START_HOOK, &PRE_COMPACT_HOOK];
+const BASE_HOOKS: [&HookSpec; 3] = [&SESSION_START_HOOK, &PRE_COMPACT_HOOK, &SESSION_END_HOOK];
 
 /// Events older versions installed into and this one doesn't. Our hooks there are stripped on
 /// install and refresh.
 const LEGACY_HOOK_EVENTS: [&str; 1] = ["SubagentStop"];
 
 /// Every event that can hold a Callimachus hook, current or legacy (what uninstall sweeps).
-const ALL_HOOK_EVENTS: [&str; 4] = [
+const ALL_HOOK_EVENTS: [&str; 5] = [
     "SessionStart",
     "PreCompact",
+    "SessionEnd",
     "UserPromptSubmit",
     "SubagentStop",
 ];
@@ -931,7 +962,7 @@ fn sh_double_quote(s: &str) -> String {
 }
 
 /// The subcommands our hooks run.
-const HOOK_SUBCOMMANDS: [&str; 3] = ["hook", "snapshot-hook", "recall-now"];
+const HOOK_SUBCOMMANDS: [&str; 4] = ["hook", "snapshot-hook", "recall-now", "session-end"];
 
 /// The subcommand of a command shaped like ours. Every form we've written (`"<cal>" hook`, the
 /// guarded `[ ! -x "<exe>" ] || "<exe>" hook`, and the Windows `"<exe>" hook`) ends with a
@@ -1116,6 +1147,7 @@ fn refresh_hooks_in(obj: &mut Map<String, Value>, exe: &Path) -> Result<()> {
         for spec in [
             &SESSION_START_HOOK,
             &PRE_COMPACT_HOOK,
+            &SESSION_END_HOOK,
             &PROACTIVE_RECALL_HOOK,
         ] {
             let Some(groups) = events.get_mut(spec.event).and_then(Value::as_array_mut) else {
@@ -1130,6 +1162,80 @@ fn refresh_hooks_in(obj: &mut Map<String, Value>, exe: &Path) -> Result<()> {
         strip_our_hooks(obj, event, exe);
     }
     Ok(())
+}
+
+/// `<index dir>/session-end-hook-added`: SessionEnd was offered to this install once.
+const SESSION_END_MARKER: &str = "session-end-hook-added";
+
+/// `<index dir>/session-end-hook-added`, beside the index like the uninstaller's record.
+fn session_end_marker_path() -> PathBuf {
+    crate::db::default_index_path()
+        .parent()
+        .map(|d| d.join(SESSION_END_MARKER))
+        .unwrap_or_else(|| PathBuf::from(SESSION_END_MARKER))
+}
+
+/// The SessionEnd hook arrived after the other base hooks, and refresh never adds a missing
+/// hook (so a hook the user deleted stays deleted). Without this, an existing install would
+/// only get it from a fresh Install click. So once per install, add it next to our
+/// SessionStart hook, then leave a marker in the data dir: a user who removes it afterwards
+/// keeps it removed.
+fn add_session_end_hook_once(exe: &Path) -> Result<bool> {
+    let marker = session_end_marker_path();
+    if marker.exists() {
+        return Ok(false);
+    }
+    let path = settings_path()?;
+    let mut outcome = SessionEndAdd::NoInstall;
+    let changed = update_json_file(&path, false, |obj| {
+        outcome = add_session_end_hook_in(obj, exe);
+        Ok(())
+    })?;
+    // Only once the hook is there (added now, or already present): before an Install there is
+    // nothing to join, and Install itself adds the hook; while SessionStart runs another
+    // binary, the newest one adds it on its own launch.
+    if matches!(outcome, SessionEndAdd::Added | SessionEndAdd::Present) {
+        if let Some(dir) = marker.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(&marker, b"").with_context(|| format!("writing {}", marker.display()))?;
+    }
+    Ok(changed)
+}
+
+/// What [`add_session_end_hook_in`] did.
+#[derive(Debug, PartialEq, Eq)]
+enum SessionEndAdd {
+    Added,
+    /// Our SessionEnd hook is already there.
+    Present,
+    /// No SessionStart hook of ours to join.
+    NoInstall,
+    /// Our SessionStart hook runs another live Callimachus binary. That binary may predate
+    /// `session-end` (the installed release while a dev build runs, or any build after a
+    /// downgrade), and an older main.rs treats an unknown subcommand as a GUI launch, which
+    /// would open a window at every session end. So leave it to that binary's own launch.
+    OtherBinary,
+}
+
+/// [`add_session_end_hook_once`] on a parsed settings object: adds our SessionEnd hook when
+/// our SessionStart hook is present, runs `exe`, and SessionEnd holds none of ours.
+fn add_session_end_hook_in(obj: &mut Map<String, Value>, exe: &Path) -> SessionEndAdd {
+    let Some(start) = our_hook_command(obj, SESSION_START_HOOK.event, exe) else {
+        return SessionEndAdd::NoInstall;
+    };
+    if our_hook_command(obj, SESSION_END_HOOK.event, exe).is_some() {
+        return SessionEndAdd::Present;
+    }
+    if refresh_target(&start, exe) != exe {
+        return SessionEndAdd::OtherBinary;
+    }
+    let command = hook_command(exe, SESSION_END_HOOK.subcommand);
+    match upsert_hook(obj, &SESSION_END_HOOK, &command, exe) {
+        Ok(()) => SessionEndAdd::Added,
+        // A malformed hooks value: leave the marker unwritten so a later launch retries.
+        Err(_) => SessionEndAdd::NoInstall,
+    }
 }
 
 /// [`refresh_hooks_in`] for one hook group.
@@ -2483,6 +2589,7 @@ mod tests {
             "no duplicate on reinstall"
         );
         assert_eq!(ours_in(&root, "PreCompact"), 1);
+        assert_eq!(ours_in(&root, "SessionEnd"), 1);
         assert_eq!(
             ours_in(&root, "SubagentStop"),
             0,
@@ -2509,6 +2616,14 @@ mod tests {
         let compact = our_group(&root, "PreCompact");
         assert!(compact.get("matcher").is_none());
         assert_eq!(compact["hooks"][0]["timeout"], 10);
+        let end = our_group(&root, "SessionEnd");
+        assert!(end.get("matcher").is_none());
+        assert_eq!(end["hooks"][0]["timeout"], 5);
+        assert_eq!(
+            end["hooks"][0]["command"],
+            hook_command(exe, "session-end").as_str()
+        );
+        assert!(is_our_hook(&hook_command(exe, "session-end"), exe));
         assert!(event_has_our_hook(&root, "SessionStart", exe));
 
         // Proactive recall: its own timeout, and survives a base reinstall.
@@ -2589,6 +2704,66 @@ mod tests {
         assert_eq!(root["model"], "opus");
     }
 
+    /// An install from before SessionEnd existed gets it once, from the binary its SessionStart
+    /// hook runs; without our SessionStart hook, or with SessionEnd already there, nothing
+    /// changes. While SessionStart runs another live binary (an installed release while a dev
+    /// build runs), that binary may not know `session-end`, so nothing is added either.
+    #[test]
+    fn session_end_joins_an_existing_install_once() {
+        let tmp = TempDir::new("session_end");
+        let exe = tmp.path().join("callimachus");
+        std::fs::write(&exe, "").unwrap();
+        let other = tmp.path().join("installed-callimachus");
+        std::fs::write(&other, "").unwrap();
+
+        let mut bare = json!({"hooks": {"PreToolUse": []}});
+        assert_eq!(
+            add_session_end_hook_in(bare.as_object_mut().unwrap(), &exe),
+            SessionEndAdd::NoInstall
+        );
+        assert_eq!(ours_in(&bare, "SessionEnd"), 0);
+
+        let mut elsewhere = json!({});
+        upsert_hook(
+            elsewhere.as_object_mut().unwrap(),
+            &SESSION_START_HOOK,
+            &hook_command(&other, "hook"),
+            &exe,
+        )
+        .unwrap();
+        assert_eq!(
+            add_session_end_hook_in(elsewhere.as_object_mut().unwrap(), &exe),
+            SessionEndAdd::OtherBinary
+        );
+        assert_eq!(ours_in(&elsewhere, "SessionEnd"), 0);
+
+        let mut root = json!({});
+        upsert_hook(
+            root.as_object_mut().unwrap(),
+            &SESSION_START_HOOK,
+            &hook_command(&exe, "hook"),
+            &exe,
+        )
+        .unwrap();
+        assert_eq!(
+            add_session_end_hook_in(root.as_object_mut().unwrap(), &exe),
+            SessionEndAdd::Added
+        );
+        assert_eq!(
+            our_group(&root, "SessionEnd")["hooks"][0]["command"],
+            hook_command(&exe, "session-end").as_str()
+        );
+        assert_eq!(
+            add_session_end_hook_in(root.as_object_mut().unwrap(), &exe),
+            SessionEndAdd::Present
+        );
+        assert_eq!(ours_in(&root, "SessionEnd"), 1);
+        // Refresh then keeps it in shape like the other hooks.
+        let before = root.clone();
+        refresh_hooks_in(root.as_object_mut().unwrap(), &exe).unwrap();
+        assert_eq!(root, before);
+    }
+
     #[test]
     fn refresh_upgrades_present_hooks_only() {
         let tmp = TempDir::new("refresh_hooks");
@@ -2610,6 +2785,11 @@ mod tests {
             hook_command(&exe, "hook").as_str()
         );
         assert_eq!(ours_in(&root, "PreCompact"), 0, "not re-added");
+        assert_eq!(
+            ours_in(&root, "SessionEnd"),
+            0,
+            "refresh alone adds nothing"
+        );
         assert!(root["hooks"].get("SubagentStop").is_none());
 
         // A second refresh changes nothing.

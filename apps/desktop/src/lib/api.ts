@@ -155,6 +155,18 @@ export interface ThreadDetail {
   messages: MessageRow[];
 }
 
+/** Where a fact came from: "llm" (distilled), "heuristic" (TODO extraction), "user"
+ *  (Remember), "agent" (an MCP write), "claude-memory" (a harvested Claude Code auto-memory
+ *  file) or "claude-compact" (a PreCompact compaction summary). Older backends omit it. */
+export type FactExtractor =
+  | "llm"
+  | "heuristic"
+  | "user"
+  | "agent"
+  | "claude-memory"
+  | "claude-compact"
+  | (string & {});
+
 /** An open TODO extracted from history (knowledge layer). */
 export interface TodoFact {
   id: number;
@@ -164,6 +176,8 @@ export interface TodoFact {
   title: string | null;
   projectPath: string | null;
   createdAt: number;
+  extractor?: FactExtractor;
+  originRef?: string | null;
 }
 
 /** Distillation engine config (shared across app/cal/MCP via the DB). */
@@ -178,6 +192,8 @@ export interface KFact {
   id: number;
   text: string;
   pinned: boolean;
+  extractor?: FactExtractor;
+  originRef?: string | null;
 }
 
 /** Two distilled decisions the LLM flagged as conflicting / superseding. */
@@ -197,6 +213,9 @@ export interface MemoryFact {
   title: string | null;
   createdAt: number;
   pinned: boolean;
+  extractor: FactExtractor;
+  /** e.g. "claude-memory:<slug>/<file>" for a harvested fact; null for distilled ones. */
+  originRef: string | null;
 }
 
 /** Durable, aggregated knowledge for one project + distillation coverage. */
@@ -241,6 +260,8 @@ export interface RecallHit {
   title: string | null;
   projectPath: string | null;
   similarity: number;
+  extractor?: FactExtractor;
+  originRef?: string | null;
 }
 
 /** Distilled knowledge for one thread. */
@@ -410,6 +431,41 @@ export interface AutoDistillBudget {
   recentDays: number; // eligibility window
 }
 
+/** An engine LLM distillation can run on, with whether this machine has it. `cli`: a
+ *  logged-in claude / codex CLI (detail = its path or "not found"); `ollama`: a local server
+ *  that answered; `key`: a cloud provider with a saved API key. */
+export interface MemoryEngine {
+  id: string; // provider id, e.g. "claude-cli", "ollama", "anthropic"
+  label: string;
+  kind: "cli" | "ollama" | "key";
+  detected: boolean;
+  detail: string;
+}
+
+/** What the "Turn on memory" card offers (`memory_setup`). */
+export interface MemorySetup {
+  enabled: boolean;
+  provider: string | null;
+  model: string | null;
+  engines: MemoryEngine[];
+  /** First detected of claude-cli, codex-cli, ollama, the first key; null if none. */
+  recommended: string | null;
+  eligibleThreads: number;
+  dailyCap: number;
+}
+
+/** The SessionStart hook's recent-sessions digest (`hook_settings`). */
+export interface HookSettings {
+  digestEnabled: boolean;
+  mutedProjects: string[];
+}
+
+/** Importing Claude Code auto memory into project memory (`harvest_settings`). */
+export interface HarvestSettings {
+  claudeMemory: boolean;
+  importedFacts: number;
+}
+
 export const api = {
   dbStats: () => invoke<DbStats>("db_stats"),
   indexStats: () => invoke<Stats>("index_stats"),
@@ -539,6 +595,18 @@ export const api = {
       provider: provider ?? null,
       model: model ?? null,
     }),
+  // The engines the memory card can offer, with detection and the auto-distill allowance.
+  memorySetup: () => invoke<MemorySetup>("memory_setup"),
+  // One-click consent: turns on LLM distillation with this explicit engine (model null =
+  // the engine's default) plus auto-distill, and starts the drain.
+  enableMemory: (provider: string, model?: string | null) =>
+    invoke<KnowledgeConfig>("enable_memory", { provider, model: model ?? null }),
+  // The SessionStart hook's recent-sessions digest for repos with no memory yet.
+  hookSettings: () => invoke<HookSettings>("hook_settings"),
+  setHookDigest: (on: boolean) => invoke<void>("set_hook_digest", { on }),
+  // Harvest Claude Code's own auto-memory files into project memory.
+  harvestSettings: () => invoke<HarvestSettings>("harvest_settings"),
+  setHarvestClaudeMemory: (on: boolean) => invoke<void>("set_harvest_claude_memory", { on }),
   // Toggle background auto-distillation (turning on kicks an immediate drain).
   setAutoDistill: (on: boolean) => invoke<void>("set_auto_distill", { on }),
   autoDistillBudget: () => invoke<AutoDistillBudget>("auto_distill_budget"),
@@ -647,6 +715,7 @@ export interface CliEngine {
   label: string;
   bin: string; // binary name probed on PATH
   installed: boolean;
+  path?: string | null; // where the binary resolved, when installed (optional for the mock)
 }
 
 // One non-Claude agent's MCP integration state.

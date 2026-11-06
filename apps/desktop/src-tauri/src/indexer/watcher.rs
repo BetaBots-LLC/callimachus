@@ -385,6 +385,11 @@ fn run(app: AppHandle) -> anyhow::Result<()> {
     // Not on a first run: until something is indexed, indexing waits for the user to start
     // it from onboarding. Roots are already watched, so a write during the pass is queued.
     let mut catch_up_at = has_threads(&conn).then(Instant::now);
+    if catch_up_at.is_none() {
+        // Nothing indexed yet: every TODO will come from indexing itself, so the one-time
+        // backfill for older indexes has nothing to do.
+        let _ = crate::knowledge::mark_todos_backfilled(&conn);
+    }
 
     loop {
         if catch_up_at.is_some_and(|at| at <= Instant::now()) {
@@ -392,6 +397,11 @@ fn run(app: AppHandle) -> anyhow::Result<()> {
                 // Sessions written while the app was closed (and anything a sidecar
                 // indexed) may need vectors: top up once things settle.
                 embed_timer.poke(Instant::now());
+                // Then the memory Claude Code wrote meanwhile, once per launch.
+                crate::harvest_claude_memory_tick(&app, &conn);
+                // And the one-time TODO backfill (a no-op after its first full pass), only
+                // now so it never competes with the catch-up for the writer.
+                crate::todo_backfill_kick(&app);
                 None
             } else {
                 Some(Instant::now() + CATCH_UP_RETRY)
@@ -455,6 +465,7 @@ fn run(app: AppHandle) -> anyhow::Result<()> {
                 rollup.record(paths, threads, &clock);
                 if threads > 0 {
                     embed_timer.poke(Instant::now());
+                    priority_distill_kick(&app, &conn);
                 }
                 last_run.insert(kind, Instant::now());
             }
@@ -468,6 +479,15 @@ fn run(app: AppHandle) -> anyhow::Result<()> {
             }
             crate::embed_reap_tick(&app);
             auto_distill_idle_tick(&app, &conn, &mut distill_idle_at);
+            // A session that ended while its transcript was already indexed has nothing to
+            // index again, so the batch check above never sees its queue entry.
+            priority_distill_kick(&app, &conn);
+            // Claude Code writes auto memory in the middle of a session, a few files at most.
+            // Not before the first index: imported facts live in "Recorded memory" threads,
+            // which would make the next launch's has_threads skip onboarding's start.
+            if has_agent_threads(&conn) {
+                crate::harvest_claude_memory_tick(&app, &conn);
+            }
             table = register_roots(&conn, &mut debouncer, &mut watched, &mut warned);
             last_root_check = Instant::now();
         }
@@ -502,6 +522,30 @@ fn auto_distill_idle_tick(app: &AppHandle, conn: &Connection, armed: &mut Option
         *armed = crate::knowledge::auto_distill_next_idle_at(conn, now)
             .ok()
             .flatten();
+    }
+}
+
+/// Whether an agent source has indexed anything (threads other than the app's own `in_app`
+/// ones: chats, recorded and imported memory).
+fn has_agent_threads(conn: &Connection) -> bool {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM threads
+                       WHERE source_id != (SELECT id FROM sources WHERE kind = 'in_app'))",
+        [],
+        |r| r.get(0),
+    )
+    .unwrap_or(false)
+}
+
+/// Kick auto-distill when a session the SessionEnd hook queued (`knowledge::priority`) is
+/// indexed and pending, so it distills right after it ends instead of waiting out the idle
+/// window. The hook is a separate process and can only write the queue. A no-op unless
+/// distillation and auto-distill are on and today's allowance is not spent; with nothing
+/// queued it is one `app_config` lookup.
+fn priority_distill_kick(app: &AppHandle, conn: &Connection) {
+    let now = chrono::Utc::now().timestamp();
+    if crate::knowledge::distill_priority_ready(conn, now).unwrap_or(false) {
+        crate::auto_distill_kick(app);
     }
 }
 

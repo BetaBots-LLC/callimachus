@@ -50,6 +50,7 @@ pub const COMMANDS: &[&str] = &[
     "issues",
     "cost",
     "recall-now",
+    "session-end",
     "audit-pr",
     "version",
     "--version",
@@ -108,7 +109,12 @@ USAGE:
                                 (needs a Reindex to capture token usage)
   cal hook [<project>] [-n PER_KIND] [--budget CHARS]
                                 print the current repo's memory for injection (a Claude
-                                Code SessionStart hook command; size-capped, ~6k chars)
+                                Code SessionStart hook command; size-capped, ~6k chars),
+                                with a recent-sessions digest while it has no memory yet
+  cal hook --explain [<path>]   show what a new session in the repo would get, or why
+                                the hook stays silent there
+  cal hook --mute|--unmute [<path>]
+                                turn the recent-sessions digest off / on for one repo
   cal agents [<project>] [-o FILE]
                                 write/refresh the memory block in AGENTS.md (or -o
                                 CLAUDE.md) so any agent reading it opens with the memory
@@ -187,9 +193,9 @@ fn usage() -> String {
 }
 
 /// Hook targets Claude Code runs inside the agent loop (SessionStart, PreCompact,
-/// UserPromptSubmit). They must never fail visibly: Claude Code shows a non-zero exit plus
-/// stderr as a hook error on every session start or prompt.
-const HOOK_COMMANDS: &[&str] = &["hook", "snapshot-hook", "recall-now"];
+/// UserPromptSubmit, SessionEnd). They must never fail visibly: Claude Code shows a non-zero
+/// exit plus stderr as a hook error on every session start or prompt.
+const HOOK_COMMANDS: &[&str] = &["hook", "snapshot-hook", "recall-now", "session-end"];
 
 /// Run the CLI and map the result to a process exit code (printing errors). Used
 /// by both the `cal` binary and the app's cal-mode dispatch.
@@ -197,6 +203,7 @@ pub fn run_and_exit(args: &[String]) -> i32 {
     if args
         .first()
         .is_some_and(|c| HOOK_COMMANDS.contains(&c.as_str()))
+        && !is_interactive_hook(args)
     {
         return run_hook_silently(args);
     }
@@ -263,6 +270,7 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
         "issues" => cmd_issues(rest),
         "cost" => cmd_cost(rest),
         "recall-now" => cmd_recall_now(rest),
+        "session-end" => cmd_session_end(rest),
         "audit-pr" => cmd_audit_pr(rest),
         // A cheap, explicit signature for tools probing whether a `cal` on PATH is ours
         // (the VS Code extension; the system calendar's `cal` prints a calendar instead).
@@ -398,9 +406,12 @@ fn open_db_write() -> anyhow::Result<Connection> {
 /// killed mid-run; giving up first lets `run_hook_silently` exit 0 quietly.
 const HOOK_DB_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// [`open_db_write`] for a hook, bounded by [`HOOK_DB_WAIT`].
-fn open_hook_db_write() -> anyhow::Result<Connection> {
-    db::open_with_busy_timeout(&db::default_index_path(), HOOK_DB_WAIT)
+/// [`open_db_write`] for a hook: never creates the index and never migrates it (an
+/// upgrade can hold the lock for tens of seconds, past every hook's budget, so it is left to
+/// the app or a `cal` command the user runs), and waits at most `wait` for the lock. A
+/// schema mismatch or a busy index is an error the hook swallows (`run_hook_silently`).
+fn open_hook_db_write(wait: std::time::Duration) -> anyhow::Result<Connection> {
+    db::open_sidecar_current_with(&db::default_index_path(), wait.min(HOOK_DB_WAIT))
 }
 
 fn filters(o: &Opts) -> search::SearchFilters {
@@ -812,71 +823,295 @@ fn project_arg(o: &Opts) -> String {
 /// Claude Code to inject. Reads the hook payload from stdin (when there is one) to decide
 /// how much to send:
 /// - `resume`: nothing, the resumed transcript already holds the earlier injection;
-/// - `compact`: a short refresher (`MemoryBudget::COMPACT`), since compaction summarized
-///   the original injection away;
-/// - `startup` / `clear` / no payload: `MemoryBudget::HOOK`.
+/// - `compact`: a short refresher (`MemoryBudget::COMPACT`), facts only, since compaction
+///   summarized the original injection away and the session is its own recent activity;
+/// - `startup` / `clear` / no payload: `MemoryBudget::HOOK`, plus the recent-sessions
+///   digest (`export::session_digest`): on its own when the repo has no decisions, gotchas
+///   or pinned TODOs yet, appended when the facts leave room for it.
 ///
-/// Also silent when the memory is already in context through a CLAUDE.md (or a file it
-/// `@`-imports) holding the Callimachus managed block, when a launcher that already put
-/// memory in the context file set `CALLIMACHUS_SKIP_HOOK=1`, and when there are no
-/// decisions, gotchas or pinned TODOs. Errors are swallowed by `run_hook_silently`.
+/// Also silent when the memory is already in context through a file Claude Code loads
+/// holding the Callimachus managed block ([`managed_block_source`]), and when a launcher
+/// that already put memory in the context file set `CALLIMACHUS_SKIP_HOOK=1`. Errors are
+/// swallowed by `run_hook_silently`.
+///
+/// Interactive flags (errors shown, see [`is_interactive_hook`]): `--mute [path]` /
+/// `--unmute [path]` toggle the digest for one repo, `--explain [path]` prints what a
+/// `startup` session there would get, or why it would get nothing.
 fn cmd_hook(args: &[String]) -> anyhow::Result<()> {
-    let o = parse(args)?;
+    let mut action = None;
+    let rest: Vec<String> = args
+        .iter()
+        .filter(|a| {
+            let interactive = HOOK_INTERACTIVE_FLAGS.contains(&a.as_str());
+            if interactive {
+                action = Some(a.to_string());
+            }
+            !interactive
+        })
+        .cloned()
+        .collect();
+    let o = parse(&rest)?;
+    match action.as_deref() {
+        Some("--mute") => return cmd_hook_mute(&o, true),
+        Some("--unmute") => return cmd_hook_mute(&o, false),
+        Some("--explain") => return cmd_hook_explain(&o),
+        _ => {}
+    }
     let payload = read_hook_payload();
     let source = payload
         .as_ref()
         .and_then(|v| v.get("source"))
         .and_then(|x| x.as_str())
         .unwrap_or("startup");
-    let Some(mut budget) = hook_budget(source) else {
-        return Ok(());
-    };
-    if source == "startup" && std::env::var("CALLIMACHUS_SKIP_HOOK").as_deref() == Ok("1") {
-        return Ok(());
-    }
-    if let Some(n) = o.limit {
-        budget.max_decisions = n as usize;
-        budget.max_gotchas = n as usize;
-    }
-    if let Some(chars) = o.budget {
-        budget.max_chars = chars;
-    }
-
     let cwd = hook_cwd(payload.as_ref());
     let project = if o.positional.is_empty() {
         knowledge::project_key(&cwd.to_string_lossy())
     } else {
         knowledge::project_key(&o.positional.join(" "))
     };
-    if claude_md_has_managed_block(&claude_md_dirs(&cwd)) {
-        return Ok(());
+    let req = HookRequest {
+        source,
+        cwd: &cwd,
+        project: &project,
+        limit: o.limit,
+        max_chars: o.budget,
+    };
+    if let HookOutcome::Print(text) = hook_outcome(&req, &db::default_index_path())? {
+        println!("{text}");
+    }
+    Ok(())
+}
+
+/// `cal hook` flags a person types, so their errors print instead of being swallowed.
+const HOOK_INTERACTIVE_FLAGS: &[&str] = &["--mute", "--unmute", "--explain"];
+
+/// `cal hook --mute|--unmute|--explain`: run as a normal command, not a silent hook.
+fn is_interactive_hook(args: &[String]) -> bool {
+    args.first().is_some_and(|c| c == "hook")
+        && args[1..]
+            .iter()
+            .any(|a| HOOK_INTERACTIVE_FLAGS.contains(&a.as_str()))
+}
+
+/// What one SessionStart hook run is asked to do.
+struct HookRequest<'a> {
+    source: &'a str,
+    /// The session's working directory: decides which context files Claude Code loads.
+    cwd: &'a std::path::Path,
+    /// The canonical project key the memory and digest are scoped to.
+    project: &'a str,
+    /// `-n`: facts per kind.
+    limit: Option<u32>,
+    /// `--budget`: max chars printed.
+    max_chars: Option<usize>,
+}
+
+/// The hook's result: the text it prints, or why it prints nothing.
+#[derive(Debug, PartialEq, Eq)]
+enum HookOutcome {
+    Print(String),
+    Silent(String),
+}
+
+/// The hook's output for `req` against the index at `index`. The checks that need no
+/// database run first; the index is opened read-only and never created.
+fn hook_outcome(req: &HookRequest, index: &std::path::Path) -> anyhow::Result<HookOutcome> {
+    // A forked session starts from a copy of its parent's transcript, earlier injection
+    // included, just as a resumed one does.
+    if matches!(req.source, "resume" | "fork") {
+        return Ok(HookOutcome::Silent(format!(
+            "{} session: the transcript already holds the earlier injection",
+            if req.source == "fork" {
+                "forked"
+            } else {
+                "resumed"
+            }
+        )));
+    }
+    if req.source == "startup" && std::env::var("CALLIMACHUS_SKIP_HOOK").as_deref() == Ok("1") {
+        return Ok(HookOutcome::Silent(
+            "CALLIMACHUS_SKIP_HOOK=1 is set (a launcher already put the memory in context)".into(),
+        ));
+    }
+    if let Some(file) = managed_block_source(&claude_md_dirs(req.cwd)) {
+        return Ok(HookOutcome::Silent(format!(
+            "managed block found in {} (Claude Code already loads this memory)",
+            file.display()
+        )));
     }
     // Never create an index from inside a hook.
-    if !db::default_index_path().exists() {
-        return Ok(());
+    if !index.exists() {
+        return Ok(HookOutcome::Silent(format!(
+            "no index at {} (open the Callimachus app once to build it)",
+            index.display()
+        )));
     }
-    let conn = open_db()?;
+    let conn = db::open_readonly(index)?;
+    hook_output(&conn, req)
+}
+
+/// Remaining chars past the facts below which the hook appends no digest: three sessions
+/// need about 900 (the header plus ~250 per session).
+const HOOK_DIGEST_MIN_ROOM: usize = 900;
+
+/// [`hook_outcome`] once the index is open: the facts, the digest, or the reason for
+/// silence.
+fn hook_output(conn: &Connection, req: &HookRequest) -> anyhow::Result<HookOutcome> {
+    let Some(mut budget) = hook_budget(req.source) else {
+        return Ok(HookOutcome::Silent("resumed session".into()));
+    };
+    if let Some(n) = req.limit {
+        budget.max_decisions = n as usize;
+        budget.max_gotchas = n as usize;
+    }
+    if let Some(chars) = req.max_chars {
+        budget.max_chars = chars;
+    }
     let per_kind = budget
         .fetch_limit()
         .max(budget.max_decisions)
         .max(budget.max_gotchas);
     // Facts only: the budgeted renderer never prints the N/M-distilled coverage counts.
-    let mem = knowledge::get_project_memory_facts(&conn, &project, per_kind)?;
+    // Claude Code loads its own auto memory every session; injecting the harvested copy
+    // would say the same thing twice. MCP, `cal memory` and the Projects tab keep them.
+    // Filtered in SQL, so a repo full of recent auto memories still fills the window with
+    // its other facts.
+    let mem = knowledge::get_project_memory_facts_excluding(
+        conn,
+        req.project,
+        per_kind,
+        knowledge::harvest::EXTRACTOR_CLAUDE_MEMORY,
+    )?;
     let pinned_todo = mem.open_todos.iter().any(|t| t.pinned);
-    if mem.decisions.is_empty() && mem.gotchas.is_empty() && !pinned_todo {
-        return Ok(());
+    let has_facts = !mem.decisions.is_empty() || !mem.gotchas.is_empty() || pinned_todo;
+    // A compacted session is its own recent activity: facts only.
+    let wants_digest = req.source != "compact";
+    let digest_off = !export::hook_settings::digest_enabled(conn)?;
+    let muted = export::hook_settings::is_muted(conn, req.project)?;
+
+    if has_facts {
+        let mut out = export::agent_memory_md_budgeted(req.project, &mem, None, &budget);
+        let room = budget
+            .max_chars
+            .saturating_sub(out.chars().count() + "\n\n".len());
+        if wants_digest && !digest_off && !muted && room >= HOOK_DIGEST_MIN_ROOM {
+            let opts = export::DigestOpts {
+                max_sessions: 3,
+                max_chars: room,
+            };
+            if let Some(digest) = export::session_digest(conn, req.project, &opts)? {
+                out.push_str("\n\n");
+                out.push_str(&digest);
+            }
+        }
+        return Ok(HookOutcome::Print(out));
     }
+    if !wants_digest {
+        return Ok(HookOutcome::Silent(
+            "no decisions, gotchas or pinned TODOs (after compaction the hook sends facts only)"
+                .into(),
+        ));
+    }
+    if muted {
+        return Ok(HookOutcome::Silent(format!(
+            "muted: no memory yet and the digest is muted for {} (`cal hook --unmute` to undo)",
+            req.project
+        )));
+    }
+    if digest_off {
+        return Ok(HookOutcome::Silent(
+            "digest off: no memory yet and the recent-sessions digest is off (Settings > Agents)"
+                .into(),
+        ));
+    }
+    let opts = export::DigestOpts {
+        max_sessions: 5,
+        max_chars: budget.max_chars.min(2500),
+    };
+    Ok(match export::session_digest(conn, req.project, &opts)? {
+        Some(digest) => HookOutcome::Print(digest),
+        None => HookOutcome::Silent(format!(
+            "no threads: nothing indexed for {} yet",
+            req.project
+        )),
+    })
+}
+
+/// Claude Code's cap on a hook's injected context, past which the agent sees a preview.
+const HOOK_OUTPUT_CAP: usize = 10_000;
+
+/// `cal hook --explain [path]`: the exact text a `startup` session in `path` (default: the
+/// current directory) would get, then its size, or the one reason it would get nothing.
+fn cmd_hook_explain(o: &Opts) -> anyhow::Result<()> {
+    let cwd = hook_target_dir(o)?;
+    let project = knowledge::project_key(&cwd.to_string_lossy());
+    let req = HookRequest {
+        source: "startup",
+        cwd: &cwd,
+        project: &project,
+        limit: o.limit,
+        max_chars: o.budget,
+    };
     println!(
         "{}",
-        export::agent_memory_md_budgeted(&project, &mem, None, &budget)
+        explain_text(&hook_outcome(&req, &db::default_index_path())?)
     );
     Ok(())
+}
+
+fn explain_text(outcome: &HookOutcome) -> String {
+    match outcome {
+        HookOutcome::Print(text) => format!(
+            "{text}\n{} chars (cap {HOOK_OUTPUT_CAP})",
+            text.chars().count()
+        ),
+        HookOutcome::Silent(reason) => format!("Silent for a new session: {reason}."),
+    }
+}
+
+/// The directory a `cal hook --explain|--mute` names (its positional path), else the cwd.
+fn hook_target_dir(o: &Opts) -> anyhow::Result<std::path::PathBuf> {
+    if o.positional.is_empty() {
+        return Ok(std::env::current_dir()?);
+    }
+    let raw = o.positional.join(" ");
+    let p = std::path::PathBuf::from(&raw);
+    Ok(std::fs::canonicalize(&p).unwrap_or(p))
+}
+
+/// `cal hook --mute|--unmute [path]`: stop or resume the recent-sessions digest for one repo
+/// (stored by project key in `hook.muted_projects`). Facts still inject.
+fn cmd_hook_mute(o: &Opts, mute: bool) -> anyhow::Result<()> {
+    let project = knowledge::project_key(&hook_target_dir(o)?.to_string_lossy());
+    let index = db::default_index_path();
+    if !index.exists() {
+        anyhow::bail!(
+            "no index at {}: open the Callimachus app once to build it",
+            index.display()
+        );
+    }
+    let conn = open_db_write()?;
+    let changed = export::hook_settings::set_muted(&conn, &project, mute)?;
+    println!("{}", mute_message(&project, mute, changed));
+    Ok(())
+}
+
+fn mute_message(project: &str, mute: bool, changed: bool) -> String {
+    match (mute, changed) {
+        (true, true) => format!(
+            "Muted the recent-sessions digest for {project}. Undo with `cal hook --unmute`."
+        ),
+        (true, false) => format!("The digest was already muted for {project}."),
+        (false, true) => format!("Unmuted the recent-sessions digest for {project}."),
+        (false, false) => format!("The digest was not muted for {project}."),
+    }
 }
 
 /// The memory budget for a SessionStart `source`, or None to stay silent.
 fn hook_budget(source: &str) -> Option<export::MemoryBudget> {
     match source {
-        "resume" => None,
+        // Both carry the parent transcript, with its earlier injection.
+        "resume" | "fork" => None,
         "compact" => Some(export::MemoryBudget::COMPACT),
         _ => Some(export::MemoryBudget::HOOK),
     }
@@ -935,35 +1170,51 @@ fn claude_md_dirs(cwd: &std::path::Path) -> Vec<std::path::PathBuf> {
     dirs
 }
 
-/// Whether a CLAUDE.md that Claude Code auto-loads for this session (`<dir>/CLAUDE.md` or
-/// `<dir>/.claude/CLAUDE.md` for each dir), or a file one of them `@`-imports, already
-/// carries the Callimachus managed block, in which case the hook would inject the same
-/// memory a second time.
-fn claude_md_has_managed_block<P: AsRef<std::path::Path>>(dirs: &[P]) -> bool {
+/// The context file that already carries the Callimachus managed block for a session in
+/// these dirs, in which case the hook would inject the same memory a second time. Mirrors
+/// what Claude Code loads: every `CLAUDE.md`, `.claude/CLAUDE.md` and `CLAUDE.local.md` in
+/// the dirs (and the files they `@`-import); and only when none of those exists, the dirs'
+/// `AGENTS.md`, which Claude Code (v2.1.277+) reads as project instructions only then. The
+/// user-scope `~/.claude/CLAUDE.md` is checked for the block but is not a project file, so
+/// it does not hide an `AGENTS.md`.
+fn managed_block_source<P: AsRef<std::path::Path>>(dirs: &[P]) -> Option<std::path::PathBuf> {
+    let homes: Vec<std::path::PathBuf> = dirs::home_dir()
+        .into_iter()
+        .flat_map(|h| [std::fs::canonicalize(&h).ok(), Some(h)])
+        .flatten()
+        .collect();
     let mut checked = std::collections::HashSet::new();
+    let mut project_file_exists = false;
     for dir in dirs {
         let dir = dir.as_ref();
-        for rel in ["CLAUDE.md", ".claude/CLAUDE.md"] {
+        for rel in ["CLAUDE.md", ".claude/CLAUDE.md", "CLAUDE.local.md"] {
             let path = dir.join(rel);
-            if !checked.insert(path.clone()) {
+            if !checked.insert(path.clone()) || !path.is_file() {
                 continue;
             }
+            let user_scope = rel == ".claude/CLAUDE.md" && homes.iter().any(|h| h == dir);
+            project_file_exists |= !user_scope;
             let Some(text) = read_small_text(&path) else {
                 continue;
             };
             if text.contains(export::MANAGED_START) {
-                return true;
+                return Some(path);
             }
             let base = path.parent().unwrap_or(dir);
             for import in claude_md_imports(&text).into_iter().take(10) {
                 let target = resolve_import(base, import);
                 if read_small_text(&target).is_some_and(|t| t.contains(export::MANAGED_START)) {
-                    return true;
+                    return Some(target);
                 }
             }
         }
     }
-    false
+    if project_file_exists {
+        return None;
+    }
+    dirs.iter()
+        .map(|d| d.as_ref().join("AGENTS.md"))
+        .find(|p| read_small_text(p).is_some_and(|t| t.contains(export::MANAGED_START)))
 }
 
 /// `@path` imports in a CLAUDE.md (`@AGENTS.md`, `@docs/notes.md`, `@~/x.md`). Only tokens
@@ -1017,7 +1268,13 @@ fn cmd_agents(args: &[String]) -> anyhow::Result<()> {
     let filename = o.out.clone().unwrap_or_else(|| "AGENTS.md".into());
     let conn = open_db()?;
     let budget = export::MemoryBudget::AGENTS_FILE;
-    let mem = knowledge::get_project_memory(&conn, &project, budget.fetch_limit())?;
+    // Claude Code loads its own auto memory and reads this file too: no second copy.
+    let mem = knowledge::get_project_memory_excluding(
+        &conn,
+        &project,
+        budget.fetch_limit(),
+        knowledge::harvest::EXTRACTOR_CLAUDE_MEMORY,
+    )?;
     let body = export::agent_memory_md_budgeted(&project, &mem, None, &budget);
     let path = std::path::Path::new(&dir).join(&filename);
     let changed = export::write_managed_block_file(&path, &body)?;
@@ -1690,8 +1947,11 @@ fn run_agent_here(
 
 /// Internal hook target for Claude Code's PreCompact event. Reads the hook's JSON from
 /// stdin, maps the live session's `transcript_path` to its indexed thread, and saves a
-/// rolling snapshot so context survives the compaction. Best-effort and SILENT
-/// (`run_hook_silently`): a hook must never break the agent loop.
+/// rolling snapshot so context survives the compaction. When the payload carries the
+/// `compaction_summary`, it is stored as the thread's summary fact (extractor
+/// `claude-compact`), so the session's gist is in memory without a distill. Best-effort and
+/// SILENT (`run_hook_silently`): a hook must never break the agent loop, and PreCompact's
+/// plain stdout becomes compaction instructions, so it prints nothing.
 fn cmd_snapshot_hook(_args: &[String]) -> anyhow::Result<()> {
     let Some(v) = read_hook_payload() else {
         return Ok(());
@@ -1713,9 +1973,8 @@ fn cmd_snapshot_hook(_args: &[String]) -> anyhow::Result<()> {
     if !db::default_index_path().exists() {
         return Ok(());
     }
-    let conn = open_hook_db_write()?;
     // Fail fast rather than holding up the compaction while the app's writer is busy.
-    conn.busy_timeout(std::time::Duration::from_secs(2))?;
+    let conn = open_hook_db_write(std::time::Duration::from_secs(2))?;
     // A relocated Claude config saved in Settings must map transcripts to the same ids the
     // indexer wrote, so apply it before deriving the id.
     crate::indexer::claude::load_config_dir_setting(&conn);
@@ -1730,10 +1989,56 @@ fn cmd_snapshot_hook(_args: &[String]) -> anyhow::Result<()> {
             |r| r.get(0),
         )
         .ok();
-    if let Some(tid) = thread_id {
-        snapshot::create_rolling_auto(&conn, tid, event)?;
+    let Some(tid) = thread_id else {
+        return Ok(());
+    };
+    let snapshot = snapshot::create_rolling_auto(&conn, tid, event).map(|_| ());
+    // Independent of the snapshot: either one failing (a busy writer) must not lose the other.
+    let summary = v
+        .get("compaction_summary")
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.trim().is_empty());
+    if let Some(summary) = summary {
+        let session = v.get("session_id").and_then(|x| x.as_str()).unwrap_or("");
+        let now = chrono::Utc::now().timestamp();
+        knowledge::harvest::store_compaction_summary(&conn, tid, session, summary, now)?;
     }
-    Ok(())
+    snapshot
+}
+
+/// Internal hook target for Claude Code's SessionEnd event: puts the session that just
+/// ended at the front of the auto-distill queue (`knowledge::enqueue_distill_priority`), so
+/// its memory lands minutes after it ends instead of after the 30-minute idle wait. The app
+/// distills it (the watcher kicks a round once the transcript is indexed); this only writes
+/// one `app_config` row. SessionEnd has no `transcript_path` and a 1.5 s budget shared by
+/// every SessionEnd hook, so it waits at most 1 s for the lock, skips the write when memory
+/// is off, and exits 0 silently on anything else.
+fn cmd_session_end(_args: &[String]) -> anyhow::Result<()> {
+    let Some(v) = read_hook_payload() else {
+        return Ok(());
+    };
+    if v.get("session_id").and_then(|x| x.as_str()).is_none() || !db::default_index_path().exists()
+    {
+        return Ok(());
+    }
+    let conn = open_hook_db_write(std::time::Duration::from_secs(1))?;
+    session_end(&conn, &v, chrono::Utc::now().timestamp())
+}
+
+/// [`cmd_session_end`] after the payload is read and the index opened.
+fn session_end(conn: &Connection, payload: &serde_json::Value, now: i64) -> anyhow::Result<()> {
+    let Some(session) = payload
+        .get("session_id")
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty())
+    else {
+        return Ok(());
+    };
+    let cfg = knowledge::get_config(conn)?;
+    if !cfg.enabled || !cfg.auto_distill {
+        return Ok(());
+    }
+    knowledge::enqueue_distill_priority(conn, &format!("claude:{session}"), now)
 }
 
 /// Map a Claude Code hook's absolute `transcript_path` back to the indexed thread's
@@ -2173,6 +2478,11 @@ mod tests {
     #[test]
     fn hook_budget_follows_session_source() {
         assert_eq!(hook_budget("resume"), None, "resume re-sends nothing");
+        assert_eq!(
+            hook_budget("fork"),
+            None,
+            "a fork holds its parent's injection"
+        );
         assert_eq!(hook_budget("compact"), Some(export::MemoryBudget::COMPACT));
         assert_eq!(hook_budget("startup"), Some(export::MemoryBudget::HOOK));
         assert_eq!(hook_budget("clear"), Some(export::MemoryBudget::HOOK));
@@ -2195,7 +2505,7 @@ mod tests {
     fn detects_managed_block_in_claude_md_and_its_imports() {
         let plain = temp_dir("plain");
         std::fs::write(plain.join("CLAUDE.md"), "# rules\n\nbe nice\n").unwrap();
-        assert!(!claude_md_has_managed_block(&[plain.as_path()]));
+        assert!(managed_block_source(&[plain.as_path()]).is_none());
 
         let direct = temp_dir("direct");
         std::fs::create_dir_all(direct.join(".claude")).unwrap();
@@ -2204,7 +2514,7 @@ mod tests {
             export::upsert_managed_block("", "BODY"),
         )
         .unwrap();
-        assert!(claude_md_has_managed_block(&[direct.as_path()]));
+        assert!(managed_block_source(&[direct.as_path()]).is_some());
 
         let imported = temp_dir("import");
         std::fs::write(
@@ -2217,7 +2527,7 @@ mod tests {
             export::upsert_managed_block("# Agents", "BODY"),
         )
         .unwrap();
-        assert!(claude_md_has_managed_block(&[imported.as_path()]));
+        assert!(managed_block_source(&[imported.as_path()]).is_some());
 
         for d in [plain, direct, imported] {
             let _ = std::fs::remove_dir_all(d);
@@ -2240,11 +2550,235 @@ mod tests {
         )
         .unwrap();
         // The sibling session never loads repo/CLAUDE.md, so the hook must still inject.
-        assert!(!claude_md_has_managed_block(&claude_md_dirs(&sibling)));
+        assert!(managed_block_source(&claude_md_dirs(&sibling)).is_none());
         // A nested worktree (or any subdir) does load it as an ancestor.
-        assert!(claude_md_has_managed_block(&claude_md_dirs(&nested)));
+        assert!(managed_block_source(&claude_md_dirs(&nested)).is_some());
         assert!(claude_md_dirs(&nested).iter().all(|d| d.parent().is_some()));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn agents_md_counts_only_when_no_claude_md_exists() {
+        // Only AGENTS.md: Claude Code reads it, so its block means the memory is loaded.
+        let only = temp_dir("agents_only");
+        std::fs::write(
+            only.join("AGENTS.md"),
+            export::upsert_managed_block("# Agents", "BODY"),
+        )
+        .unwrap();
+        assert_eq!(
+            managed_block_source(&[only.as_path()]),
+            Some(only.join("AGENTS.md"))
+        );
+
+        // A CLAUDE.md (or CLAUDE.local.md) anywhere in the dirs hides AGENTS.md from Claude
+        // Code, so the hook must still inject, even from an ancestor.
+        for name in ["CLAUDE.md", "CLAUDE.local.md"] {
+            let root = temp_dir("agents_hidden");
+            let child = root.join("pkg");
+            std::fs::create_dir_all(&child).unwrap();
+            std::fs::write(root.join(name), "# rules\n").unwrap();
+            std::fs::write(
+                child.join("AGENTS.md"),
+                export::upsert_managed_block("", "BODY"),
+            )
+            .unwrap();
+            assert_eq!(
+                managed_block_source(&[child.as_path(), root.as_path()]),
+                None,
+                "{name}"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        // CLAUDE.local.md is loaded like CLAUDE.md, so a block in it counts.
+        let local = temp_dir("local_block");
+        std::fs::write(
+            local.join("CLAUDE.local.md"),
+            export::upsert_managed_block("", "BODY"),
+        )
+        .unwrap();
+        assert_eq!(
+            managed_block_source(&[local.as_path()]),
+            Some(local.join("CLAUDE.local.md"))
+        );
+        for d in [only, local] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    #[test]
+    fn interactive_hook_flags_bypass_the_silent_runner() {
+        assert!(is_interactive_hook(&argv(&["hook", "--explain"])));
+        assert!(is_interactive_hook(&argv(&["hook", "--mute", "/x"])));
+        assert!(!is_interactive_hook(&argv(&["hook"])));
+        assert!(!is_interactive_hook(&argv(&["memory", "--mute"])));
+        // A typed command shows its error: `--mute` with a bad flag fails visibly.
+        assert_eq!(run_and_exit(&argv(&["hook", "--mute", "--nope"])), 1);
+    }
+
+    // ---- SessionStart hook output ----
+
+    use crate::export::digest_test_support as dts;
+
+    const HOOK_PROJ: &str = "/Users/me/hook-proj";
+
+    fn hook_req(source: &str) -> HookRequest<'_> {
+        HookRequest {
+            source,
+            cwd: std::path::Path::new("/"),
+            project: HOOK_PROJ,
+            limit: None,
+            max_chars: None,
+        }
+    }
+
+    fn hook_conn() -> (Connection, i64) {
+        let mut conn = dts::temp_db("hook");
+        let tid = dts::session(
+            &mut conn,
+            "s1",
+            HOOK_PROJ,
+            "Ship the release",
+            3600,
+            &["cut the release branch and tag it"],
+        );
+        (conn, tid)
+    }
+
+    fn printed(o: HookOutcome) -> String {
+        match o {
+            HookOutcome::Print(s) => s,
+            HookOutcome::Silent(r) => panic!("silent: {r}"),
+        }
+    }
+
+    fn silent(o: HookOutcome) -> String {
+        match o {
+            HookOutcome::Silent(r) => r,
+            HookOutcome::Print(s) => panic!("printed: {s}"),
+        }
+    }
+
+    #[test]
+    fn hook_falls_back_to_the_digest_when_there_are_no_facts() {
+        let (conn, _) = hook_conn();
+        let out = printed(hook_output(&conn, &hook_req("startup")).unwrap());
+        assert!(out.starts_with("## Recent sessions in this repo"), "{out}");
+        assert!(out.contains("gist: cut the release branch and tag it"));
+        assert!(out.chars().count() <= 2500);
+        // `/clear` gets it too; a compacted session gets facts only, so nothing here.
+        assert!(printed(hook_output(&conn, &hook_req("clear")).unwrap()).contains("Recent"));
+        assert!(silent(hook_output(&conn, &hook_req("compact")).unwrap()).contains("facts only"));
+
+        // An empty repo stays silent.
+        let mut empty = hook_req("startup");
+        empty.project = "/Users/me/nothing-here";
+        assert!(silent(hook_output(&conn, &empty).unwrap()).starts_with("no threads"));
+    }
+
+    #[test]
+    fn hook_appends_the_digest_after_facts_when_there_is_room() {
+        let (conn, tid) = hook_conn();
+        dts::fact(
+            &conn,
+            tid,
+            "gotcha",
+            "the release job needs the signing key",
+            "llm",
+        );
+        let out = printed(hook_output(&conn, &hook_req("startup")).unwrap());
+        let facts = out.find("**Watch out for:**").expect("facts first");
+        let digest = out
+            .find("## Recent sessions in this repo")
+            .expect("digest after");
+        assert!(facts < digest, "{out}");
+        assert!(out.chars().count() <= export::MemoryBudget::HOOK.max_chars);
+
+        // Not enough room past the facts: facts only.
+        let mut tight = hook_req("startup");
+        tight.max_chars = Some(1000);
+        let out = printed(hook_output(&conn, &tight).unwrap());
+        assert!(
+            out.contains("signing key") && !out.contains("Recent sessions"),
+            "{out}"
+        );
+
+        // After compaction: facts, never the digest.
+        let out = printed(hook_output(&conn, &hook_req("compact")).unwrap());
+        assert!(
+            out.contains("signing key") && !out.contains("Recent sessions"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn hook_skips_harvested_claude_memory_facts() {
+        let (conn, tid) = hook_conn();
+        dts::fact(
+            &conn,
+            tid,
+            "decision",
+            "harvested from auto memory",
+            "claude-memory",
+        );
+        // Only a harvested fact: treated as no memory, so the digest shows instead.
+        let out = printed(hook_output(&conn, &hook_req("startup")).unwrap());
+        assert!(!out.contains("harvested from auto memory"), "{out}");
+        assert!(out.starts_with("## Recent sessions"), "{out}");
+    }
+
+    #[test]
+    fn hook_digest_respects_mute_and_the_setting() {
+        let (conn, tid) = hook_conn();
+        export::hook_settings::set_muted(&conn, HOOK_PROJ, true).unwrap();
+        assert!(silent(hook_output(&conn, &hook_req("startup")).unwrap()).starts_with("muted"));
+        // Muting drops only the digest: facts still inject.
+        dts::fact(&conn, tid, "gotcha", "mind the signing key", "llm");
+        let out = printed(hook_output(&conn, &hook_req("startup")).unwrap());
+        assert!(
+            out.contains("signing key") && !out.contains("Recent sessions"),
+            "{out}"
+        );
+        conn.execute("DELETE FROM facts", []).unwrap();
+
+        export::hook_settings::set_muted(&conn, HOOK_PROJ, false).unwrap();
+        export::hook_settings::set_digest_enabled(&conn, false).unwrap();
+        assert!(silent(hook_output(&conn, &hook_req("startup")).unwrap()).starts_with("digest off"));
+    }
+
+    #[test]
+    fn hook_outcome_checks_files_and_the_index_before_opening_it() {
+        let dir = temp_dir("outcome");
+        let missing = dir.join("no-index.db");
+        let mut req = hook_req("startup");
+        req.cwd = &dir;
+        let reason = silent(hook_outcome(&req, &missing).unwrap());
+        assert!(reason.starts_with("no index at"), "{reason}");
+        assert!(!missing.exists(), "a hook never creates the index");
+
+        std::fs::write(dir.join("CLAUDE.md"), export::upsert_managed_block("", "B")).unwrap();
+        let reason = silent(hook_outcome(&req, &missing).unwrap());
+        assert!(reason.starts_with("managed block found in "), "{reason}");
+        assert!(reason.contains("CLAUDE.md"), "{reason}");
+        assert!(silent(hook_outcome(&hook_req("resume"), &missing).unwrap()).contains("resumed"));
+        assert!(silent(hook_outcome(&hook_req("fork"), &missing).unwrap()).contains("forked"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn explain_prints_the_output_and_its_size_or_the_reason() {
+        let text = "## Recent sessions in this repo\n\n- one";
+        assert_eq!(
+            explain_text(&HookOutcome::Print(text.into())),
+            format!("{text}\n{} chars (cap 10000)", text.chars().count())
+        );
+        assert_eq!(
+            explain_text(&HookOutcome::Silent("digest off: x".into())),
+            "Silent for a new session: digest off: x."
+        );
+        assert!(mute_message("/p", true, true).starts_with("Muted the recent-sessions digest"));
+        assert!(mute_message("/p", false, false).contains("was not muted"));
     }
 
     #[test]
@@ -2419,11 +2953,39 @@ mod tests {
         }
     }
 
+    /// SessionEnd queues the session for auto-distill, only while memory and auto-distill
+    /// are on (no write otherwise), and ignores a payload without a session id.
+    #[test]
+    fn session_end_enqueues_the_ended_session() {
+        let p = std::env::temp_dir().join(format!("calli_session_end_{}.db", std::process::id()));
+        for ext in ["db", "db-wal", "db-shm"] {
+            let _ = std::fs::remove_file(p.with_extension(ext));
+        }
+        drop(db::open(&p).unwrap());
+        let conn = db::open_sidecar_current(&p).unwrap();
+        let payload = serde_json::json!({
+            "session_id": "abc-123", "cwd": "/x", "reason": "exit",
+            "hook_event_name": "SessionEnd"
+        });
+        let queue = |conn: &Connection| {
+            knowledge::app_config::get(conn, knowledge::priority::PRIORITY_KEY).unwrap()
+        };
+        session_end(&conn, &payload, 100).unwrap();
+        assert_eq!(queue(&conn), None, "memory off: nothing written");
+        knowledge::app_config::put_flag(&conn, "knowledge.enabled", true).unwrap();
+        knowledge::set_auto_distill(&conn, true).unwrap();
+        session_end(&conn, &serde_json::json!({ "reason": "exit" }), 100).unwrap();
+        assert_eq!(queue(&conn), None);
+        session_end(&conn, &payload, 100).unwrap();
+        let q = queue(&conn).unwrap();
+        assert!(q.contains("\"claude:abc-123\""), "{q}");
+    }
+
     /// `cal help` (USAGE) must document every real command, so a new subcommand can't ship
     /// undocumented. Internal hook targets are intentionally not user-facing.
     #[test]
     fn usage_documents_every_command() {
-        const INTERNAL: &[&str] = &["snapshot-hook", "recall-now"];
+        const INTERNAL: &[&str] = &["snapshot-hook", "recall-now", "session-end"];
         for &c in COMMANDS {
             if INTERNAL.contains(&c) {
                 continue;

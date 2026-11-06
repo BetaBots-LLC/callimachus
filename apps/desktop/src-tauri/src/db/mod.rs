@@ -108,6 +108,90 @@ pub fn open_with_busy_timeout(path: &Path, busy: Duration) -> Result<Connection>
     open_with(path, busy, busy)
 }
 
+/// The index's schema is not the one this binary was built for: older (an update has not
+/// run its migrations yet) or newer (an older `cal` or hook binary is still installed).
+/// [`open_sidecar_current`] returns it instead of migrating; hooks treat it as "stay quiet".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SchemaMismatch {
+    /// Migrations this binary would apply: positive when the index is behind, negative
+    /// when it is ahead.
+    pub pending: i32,
+}
+
+impl std::fmt::Display for SchemaMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.pending > 0 {
+            write!(
+                f,
+                "the index needs {} schema upgrade(s); open Callimachus to apply them",
+                self.pending
+            )
+        } else {
+            write!(
+                f,
+                "the index was upgraded by a newer Callimachus; update this binary"
+            )
+        }
+    }
+}
+
+impl std::error::Error for SchemaMismatch {}
+
+/// True when `e` is (or wraps) a [`SchemaMismatch`].
+pub fn is_schema_mismatch(e: &anyhow::Error) -> bool {
+    e.chain()
+        .any(|c| c.downcast_ref::<SchemaMismatch>().is_some())
+}
+
+/// A writable sidecar connection that never migrates and never creates the index, for the
+/// hooks Claude Code runs inside the agent loop (PreCompact, SessionEnd). An upgrade can
+/// hold the write lock for tens of seconds on a large index (see [`UPGRADE_WAIT`]) and a
+/// SessionEnd hook has 1.5 s, so the first process to see a new schema must be the app or
+/// a `cal` command the user ran, never a hook the agent kills mid-migration. Errors with
+/// [`SchemaMismatch`] when the schema is behind or ahead of this binary, and with a plain
+/// error when the file does not exist. Waits [`SIDECAR_BUSY_TIMEOUT`] on locks like
+/// [`open_sidecar`]; a hook with its own deadline uses [`open_sidecar_current_with`].
+pub fn open_sidecar_current(path: &Path) -> Result<Connection> {
+    open_sidecar_current_with(path, SIDECAR_BUSY_TIMEOUT)
+}
+
+/// [`open_sidecar_current`] waiting at most `busy` on locks, from the first statement on: the
+/// `user_version` read already waits on a writer that holds the lock, so a short-lived hook
+/// must not inherit the sidecar's 60 s there.
+pub fn open_sidecar_current_with(path: &Path, busy: Duration) -> Result<Connection> {
+    // Fact deletes fire 0012's trigger into vec_facts, which needs vec0 loaded.
+    register_vec();
+    if !path.exists() {
+        anyhow::bail!("no index at {}", path.display());
+    }
+    // READ_WRITE without CREATE: a vanished file is an error, not a new empty index.
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .with_context(|| format!("opening database at {}", path.display()))?;
+    conn.busy_timeout(busy)?;
+    let pending = migrations::MIGRATIONS
+        .pending_migrations(&conn)
+        .context("reading the schema version")?;
+    if pending != 0 {
+        return Err(SchemaMismatch { pending }.into());
+    }
+    // The app set WAL when it built the index (it is persistent in the file); these are the
+    // per-connection settings a short-lived writer needs. A small cache: a hook writes a
+    // row or two and exits.
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    conn.pragma_update(None, "temp_store", "MEMORY")?;
+    conn.pragma_update(None, "cache_size", -4096_i64)?; // 4 MiB
+                                                        // No checkpoint from a hook's commit. SQLite's default autocheckpoint is 1000 pages and
+                                                        // the app runs at 2000, so during indexing the WAL often sits between the two, and a hook's
+                                                        // one-row commit would run a 4 to 8 MB PASSIVE checkpoint plus an fsync inside SessionEnd's
+                                                        // 1.5 s budget. The app's own connections keep checkpointing.
+    conn.pragma_update(None, "wal_autocheckpoint", 0_i64)?;
+    Ok(conn)
+}
+
 /// True when `e` is SQLite giving up on a lock, SQLITE_BUSY or SQLITE_LOCKED (any extended
 /// code), anywhere in its chain: under `.context()`, inside a migration error, behind an
 /// `AppError`, or flattened to text by `anyhow!(e.to_string())`. The one lock check for
@@ -228,8 +312,18 @@ fn migrate(conn: &mut Connection, busy: Duration, upgrade_wait: Duration) -> Res
         // A newer build's schema: to_latest reports DatabaseTooFarAhead without locking.
         return m.to_latest(conn).context("running migrations");
     }
-    if let Some(path) = conn.path().filter(|p| !p.is_empty()) {
-        preread_for_migration(Path::new(path));
+    // Skip the pre-read when only scan-free migrations are pending (see
+    // `migrations::SCAN_FREE_MIGRATIONS`): reading 5 GB to add one column costs more than the
+    // migration.
+    let applied: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap_or(0);
+    let applied = usize::try_from(applied).unwrap_or(0);
+    let latest = applied + usize::try_from(pending).unwrap_or(0);
+    if !migrations::pending_are_scan_free(applied, latest) {
+        if let Some(path) = conn.path().filter(|p| !p.is_empty()) {
+            preread_for_migration(Path::new(path));
+        }
     }
     conn.busy_timeout(upgrade_wait)?;
     conn.set_transaction_behavior(TransactionBehavior::Immediate);
@@ -588,6 +682,50 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v, version);
+    }
+
+    /// Hooks open with `open_sidecar_current`, which refuses an index behind this binary's
+    /// schema (an upgrade would hold the lock past the hook's budget) or ahead of it (an
+    /// older binary must not write a newer schema), and never creates a missing one.
+    #[test]
+    fn sidecar_current_open_never_migrates() {
+        let p = fresh_path("current");
+        assert!(open_sidecar_current(&p).is_err(), "missing index");
+        assert!(!p.exists(), "a hook never creates the index");
+        drop(open(&p).unwrap());
+        let conn = open_sidecar_current(&p).expect("current schema opens");
+        conn.execute("INSERT INTO app_config (key, value) VALUES ('k', 'v')", [])
+            .expect("writable");
+        let auto: i64 = conn
+            .query_row("PRAGMA wal_autocheckpoint", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(auto, 0, "a hook's commit never runs a checkpoint");
+        drop(conn);
+        let conn = open_sidecar_current_with(&p, Duration::from_millis(700)).unwrap();
+        let busy_ms: i64 = conn
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(busy_ms, 700, "the caller's wait, not the sidecar's 60 s");
+        drop(conn);
+
+        let raw = Connection::open(&p).unwrap();
+        let version: i64 = raw
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        raw.pragma_update(None, "user_version", version - 1)
+            .unwrap();
+        let err = open_sidecar_current(&p).unwrap_err();
+        assert!(is_schema_mismatch(&err), "{err:#}");
+        let after: i64 = raw
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(after, version - 1, "behind: left for the app to upgrade");
+
+        raw.pragma_update(None, "user_version", version + 1)
+            .unwrap();
+        let err = open_sidecar_current(&p).unwrap_err();
+        assert!(is_schema_mismatch(&err), "{err:#}");
+        assert!(!is_schema_mismatch(&anyhow::anyhow!("unrelated")));
     }
 
     #[test]

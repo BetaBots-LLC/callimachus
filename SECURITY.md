@@ -107,6 +107,23 @@ browser storage, no cross-site tracking.
   it). What you type into the chat yourself is not redacted.
 - The in-app agent's `run_shell` tool requires **explicit per-command approval**
   before anything executes.
+- The Claude Code hooks Callimachus installs (SessionStart `cal hook`, PreCompact
+  `cal snapshot-hook`, SessionEnd `cal session-end`, and the opt-in
+  UserPromptSubmit `cal recall-now`) only read and write the local index. They
+  never create the index, never upgrade its schema (that waits for the app or a
+  `cal` command you run), and exit silently on any error. The PreCompact hook
+  stores Claude Code's compaction summary, redacted, and prints nothing; the
+  SessionEnd hook only queues the session for auto-distillation, which then
+  sends it to the provider you chose, if you turned that on.
+- Claude Code auto memory (`~/.claude/projects/*/memory/*.md`) is read by the
+  desktop app only and redacted before it is stored in the local index, and the
+  PreCompact hook's compaction summaries are stored the same way. Both then
+  become project memory and leave the machine only along its paths: MCP results
+  and recall to the agents you connected (which send them to their own
+  providers), and the LLM features (a project brief, a conflict review, Ask) to
+  the provider you picked. Imported Claude Code memory is left out of
+  `.callimachus/memory.md` and the managed `AGENTS.md` / `CLAUDE.md` block.
+  Turning the import off in Settings > Agents removes every imported fact.
 - Agent-recorded and LLM-distilled facts that Callimachus injects into new
   sessions (hooks, `AGENTS.md` / `CLAUDE.md`) are labelled as notes from past
   sessions, not instructions. Review a repo's memory (`cal memory`, or the

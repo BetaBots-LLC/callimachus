@@ -1,11 +1,12 @@
 import type { ReactNode } from "react";
-import { useUi } from "../store/ui";
-import { Button } from "@/components/ui/button";
+import { MemorySetupCard } from "./MemorySetupCard";
 
 /**
- * Gate for the knowledge-powered views (Knowledge / Ask / Projects). When distillation is
- * off, the tab stays visible but shows a teaser + a CTA into Settings, so the feature is
- * discoverable instead of hidden behind a flag.
+ * Gate for a view that only works with LLM distillation on (Ask). When it is off, the tab
+ * stays visible and shows what it does plus the one-click memory card, so the feature is
+ * discoverable instead of hidden behind a flag. Projects and the Knowledge tab are not
+ * gated: TODOs, Remember and harvested memory work without an engine, so they show the
+ * card inline instead.
  */
 export function KnowledgeGate({
   enabled,
@@ -18,19 +19,17 @@ export function KnowledgeGate({
   blurb: string;
   children: ReactNode;
 }) {
-  const openSettings = useUi((s) => s.openSettings);
   if (enabled) return <>{children}</>;
   return (
-    <div className="mx-auto flex h-full w-full max-w-md flex-col items-center justify-center gap-3 p-6 text-center">
-      <h2 className="text-lg font-semibold tracking-tight">{feature}</h2>
-      <p className="text-sm text-muted-foreground">{blurb}</p>
-      <p className="text-xs text-muted-foreground">
-        Turn on the Knowledge layer to use it. Free heuristic TODOs need no key; decisions, gotchas,
-        and summaries use local Ollama or your own API key.
-      </p>
-      <Button className="mt-1" onClick={() => openSettings("knowledge")}>
-        Enable in Settings
-      </Button>
+    // m-auto rather than justify-center: a tall card then scrolls instead of losing its top.
+    <div className="flex h-full overflow-y-auto p-6">
+      <div className="m-auto flex w-full max-w-lg flex-col items-center gap-4 text-center">
+        <div className="space-y-1.5">
+          <h2 className="text-lg font-semibold tracking-tight">{feature}</h2>
+          <p className="text-sm text-muted-foreground">{blurb}</p>
+        </div>
+        <MemorySetupCard whenDismissed="button" className="w-full" />
+      </div>
     </div>
   );
 }

@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useLayoutEffect, useRef, useState } from "react";
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { useDebouncedCallback } from "@tanstack/react-pacer";
@@ -6,11 +6,19 @@ import { Check } from "lucide-react";
 import { api, SOURCE_LABELS, type SourceKind, type TodoFact } from "../lib/api";
 import { useUi } from "../store/ui";
 import { shortPath } from "../lib/format";
+import {
+  embedStatusQuery,
+  useBuildSemanticIndex,
+  useBuildStarting,
+  useIndexRewriting,
+} from "../lib/queries";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Item, ItemActions, ItemContent, ItemDescription, ItemTitle } from "@/components/ui/item";
+import { Spinner } from "@/components/ui/spinner";
 import { Loading } from "./Loading";
+import { MemorySetupCard } from "./MemorySetupCard";
 
 type Mode = "todos" | "decision" | "gotcha";
 const MODES: { id: Mode; label: string }[] = [
@@ -33,6 +41,9 @@ type RowItem = {
  * Knowledge tab. TODOs mode filters your open TODOs (free tier, client-side). Decisions
  * /Gotchas modes semantically recall distilled facts across every thread. Header (search
  * + mode + count) is sticky; the list below is virtualized so it scales to any size.
+ * Not gated: TODOs need no engine, and recall still finds Remember notes and harvested
+ * Claude Code memory while distillation is off, so the recall modes show the memory card
+ * above their results instead of hiding them.
  */
 export function KnowledgeView() {
   const [query, setQuery] = useState("");
@@ -43,6 +54,8 @@ export function KnowledgeView() {
   // Recall embeds the query (model inference), so debounce it.
   const commit = useDebouncedCallback((v: string) => setCommitted(v.trim()), { wait: 350 });
   const qc = useQueryClient();
+  const knowledge = useQuery({ queryKey: ["knowledge_config"], queryFn: api.knowledgeConfig });
+  const distillOff = knowledge.data?.enabled === false;
   // Optimistically drop the todo so the check feels instant (no spinner waiting on
   // the write + refetch); roll back if the write fails.
   const markDone = useMutation({
@@ -99,11 +112,28 @@ export function KnowledgeView() {
         }));
 
   const parentRef = useRef<HTMLDivElement>(null);
+  // The memory card scrolls with the results (in the sticky header it could fill a short
+  // window and leave the list zero height), so the virtualizer offsets rows by its height.
+  const showCard = mode !== "todos" && distillOff;
+  const cardRef = useRef<HTMLDivElement>(null);
+  const [cardHeight, setCardHeight] = useState(0);
+  useLayoutEffect(() => {
+    const el = cardRef.current;
+    if (!showCard || !el) {
+      setCardHeight(0);
+      return;
+    }
+    const ro = new ResizeObserver(() => setCardHeight(el.offsetHeight));
+    ro.observe(el);
+    setCardHeight(el.offsetHeight);
+    return () => ro.disconnect();
+  }, [showCard]);
   const virtualizer = useVirtualizer({
     count: items.length,
     getScrollElement: () => parentRef.current,
     estimateSize: () => 70,
     overscan: 8,
+    scrollMargin: cardHeight,
   });
 
   const open = (threadId: number) => {
@@ -152,6 +182,12 @@ export function KnowledgeView() {
       </div>
 
       <div ref={parentRef} className="min-h-0 flex-1 overflow-y-auto">
+        {showCard && (
+          // The card renders nothing once dismissed, so the gap applies only while it shows.
+          <div ref={cardRef} className="has-[section]:pb-3">
+            <MemorySetupCard />
+          </div>
+        )}
         {loading ? (
           <Loading label={mode === "todos" ? "Loading…" : "Recalling…"} />
         ) : mode !== "todos" && !committed ? (
@@ -159,7 +195,7 @@ export function KnowledgeView() {
             Type to recall {mode === "decision" ? "decisions" : "gotchas"} across every thread.
           </p>
         ) : items.length === 0 ? (
-          <Empty mode={mode} filtering={committed.length > 0} />
+          <Empty mode={mode} filtering={committed.length > 0} distillOff={distillOff} />
         ) : (
           <div className="relative w-full" style={{ height: virtualizer.getTotalSize() }}>
             {virtualizer.getVirtualItems().map((vrow) => {
@@ -170,7 +206,9 @@ export function KnowledgeView() {
                   data-index={vrow.index}
                   ref={virtualizer.measureElement}
                   className="absolute left-0 top-0 w-full pb-2"
-                  style={{ transform: `translateY(${vrow.start}px)` }}
+                  style={{
+                    transform: `translateY(${vrow.start - virtualizer.options.scrollMargin}px)`,
+                  }}
                 >
                   <Row
                     item={item}
@@ -187,7 +225,15 @@ export function KnowledgeView() {
   );
 }
 
-function Empty({ mode, filtering }: { mode: Mode; filtering: boolean }) {
+function Empty({
+  mode,
+  filtering,
+  distillOff,
+}: {
+  mode: Mode;
+  filtering: boolean;
+  distillOff: boolean;
+}) {
   if (mode === "todos") {
     return filtering ? (
       <p className="px-1 text-sm text-muted-foreground">No TODOs match.</p>
@@ -200,10 +246,48 @@ function Empty({ mode, filtering }: { mode: Mode; filtering: boolean }) {
       </div>
     );
   }
+  return <RecallEmpty distillOff={distillOff} />;
+}
+
+/** No recall hits. Recall embeds the query, and with no embedding model on disk it returns
+ *  nothing at all (and imported notes are never embedded), so "nothing recalled" would
+ *  imply the notes do not exist. An index with nothing embedded stands in for "no model":
+ *  building the semantic index is what downloads it. */
+function RecallEmpty({ distillOff }: { distillOff: boolean }) {
+  const embed = useQuery(embedStatusQuery);
+  const build = useBuildSemanticIndex();
+  const starting = useBuildStarting();
+  const rewriting = useIndexRewriting();
+  const running = embed.data?.running === true;
+  if (embed.data && (embed.data.done === 0 || running)) {
+    return (
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-2 px-1">
+        <p className="text-sm text-muted-foreground">
+          Recall searches by meaning, so it needs the semantic index. Build it, then search again.
+        </p>
+        <Button
+          size="sm"
+          variant="outline"
+          onClick={() => build.mutate()}
+          disabled={running || starting || rewriting}
+        >
+          {running ? (
+            <>
+              <Spinner /> Building…
+            </>
+          ) : (
+            "Build semantic index"
+          )}
+        </Button>
+      </div>
+    );
+  }
+  // The memory card above already explains what turning distillation on adds.
   return (
     <p className="px-1 text-sm text-muted-foreground">
-      Nothing recalled. Distillation must be on and some threads distilled (open a thread →
-      Distill).
+      {distillOff
+        ? "Nothing recalled from your Remember notes or Claude Code memory."
+        : "Nothing recalled. Distill more threads (open a thread, then Distill) or build a project's memory in Projects."}
     </p>
   );
 }

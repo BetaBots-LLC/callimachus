@@ -29,11 +29,16 @@ import { Item } from "@/components/ui/item";
 import { cn } from "@/lib/utils";
 import { Loading } from "./Loading";
 import { Markdown } from "./Markdown";
+import { MemorySetupCard } from "./MemorySetupCard";
 
 /**
  * Project Memory: the decisions / gotchas / open TODOs distilled across ALL of a project's
  * threads, with a coverage chip + a background "Build memory" distill, an LLM brief, and a
  * "Write memory file" action that drops a `.callimachus/memory.md` agents can read.
+ *
+ * Never gated: TODOs, Remember and harvested Claude Code memory need no engine. While LLM
+ * distillation is off the memory card sits above the list and the LLM-only actions (Build
+ * memory, brief, conflicts) are hidden or disabled, since they would only fail.
  */
 export function ProjectMemoryView() {
   const qc = useQueryClient();
@@ -49,6 +54,10 @@ export function ProjectMemoryView() {
     staleTime: AGGREGATE_STALE_MS,
   });
   const project = selectedProject ?? projects.data?.[0]?.project ?? null;
+
+  const knowledge = useQuery({ queryKey: ["knowledge_config"], queryFn: api.knowledgeConfig });
+  // Unknown while loading: treat as on, so a distilled user never sees the card flash.
+  const distillOn = knowledge.data?.enabled ?? true;
 
   const memory = useQuery({
     queryKey: ["project_memory", project],
@@ -222,7 +231,7 @@ export function ProjectMemoryView() {
             <Button size="sm" variant="secondary" onClick={() => cancel.mutate()}>
               Cancel distill
             </Button>
-          ) : (
+          ) : !distillOn ? null : (
             <Button
               size="sm"
               onClick={() => build.mutate()}
@@ -261,13 +270,15 @@ export function ProjectMemoryView() {
             <DropdownMenuContent align="start" className="min-w-48">
               <DropdownMenuItem
                 onClick={() => brief.mutate()}
-                disabled={!project || brief.isPending || !!empty || isDistilling}
+                disabled={!project || brief.isPending || !!empty || isDistilling || !distillOn}
               >
                 Synthesize brief
               </DropdownMenuItem>
               <DropdownMenuItem
                 onClick={() => conflicts.mutate()}
-                disabled={!project || conflicts.isPending || !mem || mem.decisions.length < 2}
+                disabled={
+                  !project || conflicts.isPending || !mem || mem.decisions.length < 2 || !distillOn
+                }
               >
                 Review conflicts
               </DropdownMenuItem>
@@ -318,6 +329,7 @@ export function ProjectMemoryView() {
             {remembering === project && (
               <RememberForm project={project} onClose={() => setRemembering(null)} />
             )}
+            {!distillOn && <MemorySetupCard />}
             {brief.data && (
               <div className="rounded-lg border p-3">
                 <Markdown>{brief.data}</Markdown>
@@ -359,10 +371,17 @@ export function ProjectMemoryView() {
                 </p>
               ))}
             {empty ? (
-              <p className="px-1 text-sm text-muted-foreground">
-                Nothing distilled for this project yet. Click <b>Build memory</b> to distill its{" "}
-                {mem?.pendingCount ?? 0} thread(s) into decisions, gotchas, and TODOs.
-              </p>
+              distillOn ? (
+                <p className="px-1 text-sm text-muted-foreground">
+                  Nothing distilled for this project yet. Click <b>Build memory</b> to distill its{" "}
+                  {mem?.pendingCount ?? 0} thread(s) into decisions, gotchas, and TODOs.
+                </p>
+              ) : (
+                <p className="px-1 text-sm text-muted-foreground">
+                  No decisions, gotchas or open TODOs for this project yet. Click <b>Remember</b> to
+                  record one yourself.
+                </p>
+              )
             ) : (
               <>
                 <Section title="Decisions" facts={mem.decisions} actions={factActions} />
@@ -485,6 +504,9 @@ function Section({
 /** One fact: click to open its thread; hover reveals pin / edit / delete; inline edit. */
 function FactRow({ fact, actions }: { fact: MemoryFact; actions: FactActions }) {
   const [editing, setEditing] = useState(false);
+  // Harvested from Claude Code's auto memory (originRef "claude-memory:<slug>/<file>").
+  const harvested = fact.extractor === "claude-memory";
+  const memoryFile = harvested ? (fact.originRef?.split("/").pop() ?? null) : null;
   const [draft, setDraft] = useState(fact.text);
 
   if (editing) {
@@ -553,8 +575,19 @@ function FactRow({ fact, actions }: { fact: MemoryFact; actions: FactActions }) 
           )}
           {fact.text}
         </p>
-        {fact.title && (
-          <p className="mt-0.5 line-clamp-1 text-[13px] text-muted-foreground">{fact.title}</p>
+        {harvested ? (
+          <p className="mt-0.5 flex min-w-0 items-center gap-2 text-[13px] text-muted-foreground">
+            <Badge variant="outline" className="shrink-0 text-[0.65rem]">
+              Claude Code memory
+            </Badge>
+            {/* The fact's thread is the project's "Recorded memory" notes thread, so name
+                the memory file it came from instead. */}
+            {memoryFile && <span className="truncate font-mono text-xs">{memoryFile}</span>}
+          </p>
+        ) : (
+          fact.title && (
+            <p className="mt-0.5 line-clamp-1 text-[13px] text-muted-foreground">{fact.title}</p>
+          )
         )}
       </div>
       {/* Reserved width + invisible→visible keeps the row from reflowing and the
