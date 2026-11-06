@@ -12,7 +12,7 @@ This extension is a thin client over the **`cal`** CLI, so it shares the exact s
 
 ## Requirements
 
-- The **Callimachus desktop app** installed and run at least once: it builds the index, and its **`cal`** CLI is what this extension shells out to. The extension finds it without `PATH`: it checks the `~/.local/bin/cal` link that **Settings → Claude Code → Enable for Claude Code** adds and, on macOS and Windows, the installed app itself, which answers `cal` commands too (this also covers a per-machine Windows install that can't write `cal.exe`). On Linux, enable that integration or set `callimachus.calPath`. (Building `cal` yourself from a checkout: `cargo install --locked --path apps/desktop/src-tauri --bin cal`, then set `callimachus.calPath` if it isn't on your `PATH`.)
+- The **Callimachus desktop app** installed and run at least once: it builds the index, and its **`cal`** CLI is what this extension shells out to. The extension finds it without `PATH`: it checks the `~/.local/bin/cal` link that **Settings → Claude Code → Enable for Claude Code** adds and the installed app itself (on macOS, Windows, and the deb or rpm `/usr/bin/callimachus` on Linux), which answers `cal` commands too (this also covers a per-machine Windows install that can't write `cal.exe`). With the Linux AppImage, enable that integration or set `callimachus.calPath`. (Building `cal` yourself from a checkout: `cargo install --locked --path apps/desktop/src-tauri/standalone --bin cal`, adding `--force` over a source install from an earlier version, then set `callimachus.calPath` if it isn't on your `PATH`.)
 
 ## Sidebar
 

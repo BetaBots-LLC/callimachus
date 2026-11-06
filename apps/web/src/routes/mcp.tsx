@@ -94,8 +94,10 @@ function McpPage() {
           />
           <p className="cat-label pt-2">Or build from source</p>
           <CommandBlock
-            label="from a checkout of the repo"
-            lines={["cargo install --locked --path apps/desktop/src-tauri --bin callimachus-mcp"]}
+            label="from a checkout of the repo (add --force over an earlier source install)"
+            lines={[
+              "cargo install --locked --path apps/desktop/src-tauri/standalone --bin callimachus-mcp",
+            ]}
           />
           <p className="text-sm leading-relaxed text-muted-foreground">
             Reads the same local index as the app — no separate database, no extra indexing. Ships a{" "}

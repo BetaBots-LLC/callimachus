@@ -69,7 +69,7 @@ const BUILD_FROM_SOURCE =
   `  git clone --depth 1 --branch v${version} https://github.com/${REPO}\n` +
   `  cd callimachus/apps/desktop\n` +
   `  mkdir dist\n` +
-  `  cargo build --release --locked --manifest-path src-tauri/Cargo.toml --bin callimachus-mcp\n` +
+  `  cargo build --release --locked --manifest-path src-tauri/Cargo.toml -p callimachus-standalone --bin callimachus-mcp\n` +
   `then set CALLIMACHUS_MCP_BIN to the built src-tauri/target/release/callimachus-mcp. ` +
   `Or point CALLIMACHUS_MCP_BIN at a binary you already have.`;
 

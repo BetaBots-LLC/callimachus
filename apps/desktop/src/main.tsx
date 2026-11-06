@@ -232,9 +232,11 @@ document.addEventListener("visibilitychange", () => {
   }
 });
 void listen<string | null>("index:updated", (e) => {
-  // No source kind: startup housekeeping rewrote rows (re-keyed projects), not a scan. It
-  // fires at most once per launch, so refresh what groups by project now, including an
-  // open Project Memory list, which would otherwise keep showing keys that no longer exist.
+  // No source kind: startup housekeeping rewrote rows (re-keyed projects), or the
+  // background tool-output trim freed pages (db_stats' Reclaimable, via the live refresh
+  // below), not a scan. Both are rare (once per launch, a few passes once per index), so
+  // refresh what groups by project now, including an open Project Memory list, which would
+  // otherwise keep showing keys that no longer exist.
   if (e.payload == null) {
     invalidateIndexDerived(); // ["projects"] and the other aggregates, refetched if mounted
     void queryClient.invalidateQueries({ queryKey: ["project_memory"], refetchType: "active" });

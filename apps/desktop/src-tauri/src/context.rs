@@ -4,8 +4,10 @@
 //!
 //! Budget ladder (char-based; ~4 chars/token):
 //!   1. full transcript            (if it fits)
-//!   2. drop tool calls / output   (keep just user+assistant)
-//!   3. head/tail elision          (keep the first/last N turns, mark the gap)
+//!   2. shorten tool turns         (all talk in full; tool calls and output share the rest)
+//!   3. thin out tool output       (all talk, call previews, an even spread of result previews)
+//!   4. thin out tool calls        (all talk in full; evenly spread call previews that fit)
+//!   5. head/tail elision          (talk only: first/last turns, as many as fit, gap marked)
 //!
 //! `pack_thread_around` is the retrieval variant: it keeps the turns around specific
 //! matched messages (plus the outcome) instead of the head of the thread.
@@ -26,6 +28,17 @@ pub const DEFAULT_BUDGET_CHARS: usize = 48_000;
 /// Smallest useful slice of one turn when eliding. Below this a turn is just a stub, so we
 /// show fewer turns instead of more, shorter ones.
 const MIN_TURN_CHARS: usize = 300;
+
+/// When eliding, keep adding turns while each kept one could show up to this many chars:
+/// past it, a further turn is worth more than a longer one.
+const EXTEND_TURN_CHARS: usize = 2_000;
+
+/// Preview a tool call keeps when tool turns are shortened: its name (the heading) plus the
+/// start of its input, enough for a command line or a file path.
+const TOOL_CALL_CHARS: usize = 200;
+
+/// Preview a tool result keeps when tool turns are shortened.
+const TOOL_RESULT_CHARS: usize = 300;
 
 /// Smallest slice of a turn kept by `pack_thread_around`.
 const MIN_AROUND_CHARS: usize = 200;
@@ -381,6 +394,24 @@ impl Turn<'_> {
         self.tool.is_some() || self.role == "tool"
     }
 
+    /// An assistant tool call (`tool_name` set; the text is the call's input).
+    fn is_tool_call(&self) -> bool {
+        self.tool.is_some() && self.role != "tool"
+    }
+
+    fn is_tool_result(&self) -> bool {
+        self.role == "tool"
+    }
+
+    /// Chars this turn keeps at the least when tool turns are shortened.
+    fn preview_chars(&self) -> usize {
+        if self.is_tool_result() {
+            TOOL_RESULT_CHARS
+        } else {
+            TOOL_CALL_CHARS
+        }
+    }
+
     fn heading(&self) -> String {
         match (self.tool, self.role) {
             (Some(tool), _) => format!("### tool: {tool}"),
@@ -466,34 +497,247 @@ pub fn pack_thread(
 }
 
 /// The budget ladder over prepared turns (shared by `pack_thread` and the no-focus
-/// fallback of `pack_thread_around`).
+/// fallback of `pack_thread_around`). Every size here is in chars, the unit of the budget.
 fn pack_turns(detail: &search::ThreadDetail, turns: &[Turn<'_>], budget_chars: usize) -> String {
+    let lens: Vec<usize> = turns.iter().map(|t| t.text.chars().count()).collect();
+    let pick = |pred: fn(&Turn) -> bool| -> Vec<usize> {
+        (0..turns.len()).filter(|&i| pred(&turns[i])).collect()
+    };
+    let talk = pick(|t| !t.is_tool());
+    let calls = pick(|t| t.is_tool_call());
+    let results = pick(|t| t.is_tool_result());
+    let talk_cost: usize = talk
+        .iter()
+        .map(|&i| turn_cost(turns, &lens, i, usize::MAX))
+        .sum();
+
     // 1. Full.
-    let full = turns
-        .iter()
-        .map(Turn::render)
-        .collect::<Vec<_>>()
-        .join("\n");
-    let out = envelope(detail, &full, None);
-    if out.len() <= budget_chars {
+    let all: Vec<(usize, usize)> = (0..turns.len()).map(|i| (i, usize::MAX)).collect();
+    if let Some(out) = fit_whole(detail, turns, &all, None, budget_chars) {
         return out;
     }
 
-    // 2. Drop tool noise.
-    let talk: Vec<&Turn> = turns.iter().filter(|t| !t.is_tool()).collect();
-    let note = "tool calls/output omitted";
-    let body = talk
-        .iter()
-        .map(|t| t.render())
-        .collect::<Vec<_>>()
-        .join("\n");
-    let out = envelope(detail, &body, Some(note));
-    if out.len() <= budget_chars {
+    // 2. Every turn, with the tool turns sharing what the talk leaves over: each gets at least
+    //    a preview (a call's name plus the start of its input, the start of a result), more
+    //    while room remains. Subagent-style threads do their work in tool turns (one measured
+    //    thread: 2 talk turns, 112 tool turns), so dropping them all at once left most of the
+    //    budget unused.
+    let tool: Vec<usize> = pick(|t| t.is_tool());
+    if let Some(out) = share_tools(detail, turns, &lens, &talk, &tool, talk_cost, budget_chars)
+        .and_then(|picks| {
+            fit_whole(
+                detail,
+                turns,
+                &picks,
+                Some("tool calls/output shortened"),
+                budget_chars,
+            )
+        })
+    {
         return out;
     }
 
-    // 3. Head/tail elision.
-    elide_head_tail(detail, &talk, budget_chars)
+    // 3. Every call's preview plus an even spread of result previews, as many as fit; with
+    //    no room for even one result, drop the output and share the room among the calls.
+    let call_previews: Vec<(usize, usize)> = talk
+        .iter()
+        .map(|&i| (i, usize::MAX))
+        .chain(calls.iter().map(|&i| (i, TOOL_CALL_CHARS)))
+        .collect();
+    let results_note = |k: usize| {
+        format!(
+            "tool calls shortened; {k} of {} tool results shown, shortened",
+            results.len()
+        )
+    };
+    let spread_results = spread_fit(
+        detail,
+        turns,
+        &lens,
+        &call_previews,
+        &results,
+        TOOL_RESULT_CHARS,
+        &results_note,
+        budget_chars,
+    );
+    if let Some((k, picks)) = spread_results.filter(|(k, _)| *k > 0) {
+        return envelope(detail, &render_picks(turns, &picks), Some(&results_note(k)));
+    }
+    if !results.is_empty() {
+        if let Some(out) = share_tools(detail, turns, &lens, &talk, &calls, talk_cost, budget_chars)
+            .and_then(|picks| {
+                fit_whole(
+                    detail,
+                    turns,
+                    &picks,
+                    Some("tool output omitted, tool calls shortened"),
+                    budget_chars,
+                )
+            })
+        {
+            return out;
+        }
+    }
+
+    // 4. All the talk plus as many call previews as still fit, spread evenly over the thread
+    //    (none at all is the old talk-only step).
+    let talk_only: Vec<(usize, usize)> = talk.iter().map(|&i| (i, usize::MAX)).collect();
+    let calls_note = |k: usize| {
+        if k == 0 {
+            "tool calls/output omitted".to_string()
+        } else {
+            format!(
+                "tool output omitted; {k} of {} tool calls shown, shortened",
+                calls.len()
+            )
+        }
+    };
+    if let Some((k, picks)) = spread_fit(
+        detail,
+        turns,
+        &lens,
+        &talk_only,
+        &calls,
+        TOOL_CALL_CHARS,
+        &calls_note,
+        budget_chars,
+    ) {
+        return envelope(detail, &render_picks(turns, &picks), Some(&calls_note(k)));
+    }
+
+    // 5. Head/tail elision.
+    let talk_turns: Vec<&Turn> = talk.iter().map(|&i| &turns[i]).collect();
+    elide_head_tail(detail, &talk_turns, budget_chars)
+}
+
+/// Chars a turn adds to the body when its text is cut to `cap`: heading, two newlines and
+/// the blank line that joins it to the next turn (one more than the last turn needs).
+fn turn_cost(turns: &[Turn<'_>], lens: &[usize], i: usize, cap: usize) -> usize {
+    turns[i].heading().chars().count() + 3 + lens[i].min(cap)
+}
+
+fn picks_cost(turns: &[Turn<'_>], lens: &[usize], picks: &[(usize, usize)]) -> usize {
+    picks
+        .iter()
+        .map(|&(i, cap)| turn_cost(turns, lens, i, cap))
+        .sum()
+}
+
+/// Envelope size with an empty body.
+fn envelope_chars(detail: &search::ThreadDetail, note: Option<&str>) -> usize {
+    envelope(detail, "", note).chars().count()
+}
+
+/// `(turn index, text cap)` pairs, in thread order, rendered like the full transcript.
+fn render_picks(turns: &[Turn<'_>], picks: &[(usize, usize)]) -> String {
+    picks
+        .iter()
+        .map(|&(i, cap)| {
+            if cap == usize::MAX {
+                turns[i].render()
+            } else {
+                turns[i].render_capped(cap.max(1))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Render `picks` if the result fits the budget.
+fn fit_whole(
+    detail: &search::ThreadDetail,
+    turns: &[Turn<'_>],
+    picks: &[(usize, usize)],
+    note: Option<&str>,
+    budget_chars: usize,
+) -> Option<String> {
+    let out = envelope(detail, &render_picks(turns, picks), note);
+    (out.chars().count() <= budget_chars).then_some(out)
+}
+
+/// All of `talk` in full plus every turn in `tool`, the tools water-filling what the talk
+/// leaves over. `None` when that room cannot give each tool turn its preview.
+fn share_tools(
+    detail: &search::ThreadDetail,
+    turns: &[Turn<'_>],
+    lens: &[usize],
+    talk: &[usize],
+    tool: &[usize],
+    talk_cost: usize,
+    budget_chars: usize,
+) -> Option<Vec<(usize, usize)>> {
+    if tool.is_empty() {
+        return None;
+    }
+    // The longest note this step can carry, so the check never under-counts.
+    let overhead = envelope_chars(detail, Some("tool output omitted, tool calls shortened"));
+    let framing: usize = tool.iter().map(|&i| turn_cost(turns, lens, i, 0)).sum();
+    let room = budget_chars.checked_sub(overhead + talk_cost + framing)?;
+    let previews: usize = tool
+        .iter()
+        .map(|&i| lens[i].min(turns[i].preview_chars()))
+        .sum();
+    if previews > room {
+        return None;
+    }
+    let wants: Vec<usize> = tool.iter().map(|&i| lens[i]).collect();
+    let alloc = water_fill(&wants, room);
+    let mut picks: Vec<(usize, usize)> = talk.iter().map(|&i| (i, usize::MAX)).collect();
+    picks.extend(tool.iter().zip(alloc).map(|(&i, a)| (i, a)));
+    picks.sort_unstable();
+    Some(picks)
+}
+
+/// `base` plus the largest even spread of `extra` turns, each cut to `cap`, that fits with
+/// the note `note_for(k)`: `Some((k, picks))`, or `None` when `base` alone does not fit.
+#[allow(clippy::too_many_arguments)]
+fn spread_fit(
+    detail: &search::ThreadDetail,
+    turns: &[Turn<'_>],
+    lens: &[usize],
+    base: &[(usize, usize)],
+    extra: &[usize],
+    cap: usize,
+    note_for: &dyn Fn(usize) -> String,
+    budget_chars: usize,
+) -> Option<(usize, Vec<(usize, usize)>)> {
+    let base_cost = picks_cost(turns, lens, base);
+    let picks_for = |k: usize| -> Vec<(usize, usize)> {
+        let mut picks = base.to_vec();
+        picks.extend(spread(extra.len(), k).map(|j| (extra[j], cap)));
+        picks.sort_unstable();
+        picks
+    };
+    let fits = |k: usize| {
+        let extra_cost: usize = spread(extra.len(), k)
+            .map(|j| turn_cost(turns, lens, extra[j], cap))
+            .sum();
+        envelope_chars(detail, Some(&note_for(k))) + base_cost + extra_cost <= budget_chars
+    };
+    if !fits(0) {
+        return None;
+    }
+    // Largest k that fits: binary search (cost grows with k), then step down in case the
+    // spread picked a longer turn at the boundary.
+    let (mut lo, mut hi) = (0, extra.len());
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if fits(mid) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    let mut k = lo;
+    while k > 0 && !fits(k) {
+        k -= 1;
+    }
+    Some((k, picks_for(k)))
+}
+
+/// `k` indices spread evenly over `0..m`, each at the middle of its stretch.
+fn spread(m: usize, k: usize) -> impl Iterator<Item = usize> {
+    (0..k).map(move |j| (2 * j + 1) * m / (2 * k))
 }
 
 /// Keep the opening turns (the task) and, with more of the budget, the closing turns (the
@@ -503,20 +747,57 @@ fn pack_turns(detail: &search::ThreadDetail, turns: &[Turn<'_>], budget_chars: u
 fn elide_head_tail(detail: &search::ThreadDetail, talk: &[&Turn], budget_chars: usize) -> String {
     let n = talk.len();
     let note_for = |elided: usize| {
-        format!("trimmed to fit budget; {elided} middle turns elided, tools omitted")
+        if elided == 0 {
+            "trimmed to fit budget; long turns shortened, tools omitted".to_string()
+        } else {
+            format!("trimmed to fit budget; {elided} middle turns elided, tools omitted")
+        }
     };
     let marker_for = |elided: usize| format!("\n\n### … {elided} turns elided …\n\n");
     // Conservative overhead: digit counts for `n` cover any real elided count.
     let overhead =
         envelope(detail, "", Some(&note_for(n))).chars().count() + marker_for(n).chars().count();
     let available = budget_chars.saturating_sub(overhead);
+    let lens: Vec<usize> = talk.iter().map(|t| t.text.chars().count()).collect();
+    let framing_of = |i: usize| talk[i].heading().chars().count() + 3;
 
-    // Fewer, fuller turns beat many stubs: show as many as fit at MIN_TURN_CHARS each
-    // (2..=12), about 40% from the head and the rest from the tail.
+    // Start from as many turns as fit at MIN_TURN_CHARS each (2..=12), about 40% from the
+    // head and the rest from the tail.
     let fit = (available / MIN_TURN_CHARS).clamp(2, 12).min(n);
-    let head_keep = (fit * 2 / 5).max(1).min(fit);
-    let tail_keep = fit - head_keep;
-    let (head, tail): (&[&Turn], &[&Turn]) = if n > fit {
+    let mut head_keep = (fit * 2 / 5).max(1).min(fit);
+    let mut tail_keep = fit - head_keep;
+    // Then spend the rest: keep adding turns, tail first, while every kept turn could still
+    // show up to EXTEND_TURN_CHARS. Stopping at 12 left most of the budget unused on threads
+    // of short turns (40 large threads averaged 19 KB of a 48 KB budget).
+    let extend_cost = |i: usize| framing_of(i) + lens[i].min(EXTEND_TURN_CHARS);
+    let mut used: usize = (0..head_keep)
+        .chain(n - tail_keep..n)
+        .map(extend_cost)
+        .sum();
+    while head_keep + tail_keep < n {
+        let next_tail = n - tail_keep - 1;
+        let next_head = head_keep;
+        // Hold the tail at about 60% of the kept turns.
+        let tail_first = tail_keep * 2 <= head_keep * 3;
+        let order = if tail_first {
+            [(true, next_tail), (false, next_head)]
+        } else {
+            [(false, next_head), (true, next_tail)]
+        };
+        let Some((is_tail, i)) = order
+            .into_iter()
+            .find(|&(_, i)| used + extend_cost(i) <= available)
+        else {
+            break;
+        };
+        used += extend_cost(i);
+        if is_tail {
+            tail_keep += 1;
+        } else {
+            head_keep += 1;
+        }
+    }
+    let (head, tail): (&[&Turn], &[&Turn]) = if head_keep + tail_keep < n {
         (&talk[..head_keep], &talk[n - tail_keep..])
     } else {
         (talk, &[])
@@ -589,7 +870,9 @@ pub fn pack_thread_around(
         .collect::<Vec<_>>()
         .join("\n");
     let out = envelope(&detail, &full, None);
-    if out.len() <= budget_chars {
+    // Chars, as `fit_whole` and the `pack_turns` fallback count: a multi-byte thread that
+    // fits in chars but not in bytes was cut to a focus excerpt here and packed whole there.
+    if out.chars().count() <= budget_chars {
         return Ok(Some(out));
     }
 
@@ -838,6 +1121,206 @@ mod tests {
         assert!(out.chars().count() <= 2_500, "len {}", out.chars().count());
         assert!(out.contains("FINAL-RESOLUTION"), "tail turn was cut: {out}");
         assert!(out.ends_with("</reference_thread>"));
+    }
+
+    /// A thread of `(role, tool_name, text)` rows in order.
+    fn seed_rows(conn: &Connection, rows: &[(&str, Option<&str>, String)]) -> i64 {
+        conn.execute(
+            "INSERT INTO threads (source_id, external_id, title, project_path)
+             SELECT 1, 'rows-' || (count(*) + 1), 'Rows', '/p' FROM threads",
+            [],
+        )
+        .unwrap();
+        let tid = conn.last_insert_rowid();
+        for (seq, (role, tool, text)) in rows.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO messages (thread_id, seq, role, tool_name, text) VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![tid, seq as i64, role, tool, text],
+            )
+            .unwrap();
+        }
+        tid
+    }
+
+    /// The shape of a subagent run: one request, one reply, then the work as `pairs` tool
+    /// calls (~470 chars) and results (~3.6k chars), and a closing summary.
+    fn tool_heavy_rows(pairs: usize) -> Vec<(&'static str, Option<&'static str>, String)> {
+        let mut rows = vec![
+            (
+                "user",
+                None,
+                format!("OPENING-TASK map the delivery paths {}", "u".repeat(700)),
+            ),
+            (
+                "assistant",
+                None,
+                "I'll start by reading the named files.".to_string(),
+            ),
+        ];
+        for i in 0..pairs {
+            rows.push((
+                "assistant",
+                Some("Bash"),
+                format!(
+                    "Bash: {{\"command\":\"CALL-{i} ls packages/email\"}} {}",
+                    "c".repeat(440)
+                ),
+            ));
+            rows.push(("tool", None, format!("RESULT-{i} {}", "r".repeat(3600))));
+        }
+        rows.push((
+            "assistant",
+            None,
+            format!("CLOSING-SUMMARY {}", "s".repeat(1500)),
+        ));
+        rows
+    }
+
+    fn chars(s: &str) -> usize {
+        s.chars().count()
+    }
+
+    #[test]
+    fn tool_heavy_thread_keeps_its_tool_turns() {
+        // 56 pairs is about 230k chars, the size of the thread that used to pack to 1 KB
+        // because every tool turn was dropped at once.
+        let conn = crate::db::open(std::path::Path::new(":memory:")).unwrap();
+        let tid = seed_rows(&conn, &tool_heavy_rows(56));
+        let out = pack_thread(&conn, tid, DEFAULT_BUDGET_CHARS)
+            .unwrap()
+            .unwrap();
+        assert!(chars(&out) <= DEFAULT_BUDGET_CHARS, "len {}", chars(&out));
+        assert!(
+            chars(&out) >= DEFAULT_BUDGET_CHARS * 9 / 10,
+            "len {}",
+            chars(&out)
+        );
+        assert!(
+            out.contains("tool calls/output shortened"),
+            "{}",
+            &out[..300]
+        );
+        assert!(out.contains("OPENING-TASK") && out.contains("CLOSING-SUMMARY"));
+        // Every call and every result is there, in order, each at least a preview.
+        for i in [0, 27, 55] {
+            assert!(out.contains(&format!("CALL-{i} ls")), "call {i}");
+            assert!(out.contains(&format!("RESULT-{i} ")), "result {i}");
+        }
+        assert!(out.find("CALL-0 ").unwrap() < out.find("RESULT-0 ").unwrap());
+        assert!(out.find("RESULT-55 ").unwrap() < out.find("CLOSING-SUMMARY").unwrap());
+
+        // Too many results for a preview each: every call, and an even spread of results.
+        let tid = seed_rows(&conn, &tool_heavy_rows(150));
+        let out = pack_thread(&conn, tid, DEFAULT_BUDGET_CHARS)
+            .unwrap()
+            .unwrap();
+        assert!(chars(&out) <= DEFAULT_BUDGET_CHARS, "len {}", chars(&out));
+        assert!(
+            chars(&out) >= DEFAULT_BUDGET_CHARS * 9 / 10,
+            "len {}",
+            chars(&out)
+        );
+        assert!(out.contains("of 150 tool results shown"), "{}", &out[..300]);
+        assert!(out.contains("CALL-0 ls") && out.contains("CALL-149 ls"));
+        let results = out.matches("### tool result").count();
+        assert!((10..150).contains(&results), "results {results}");
+
+        // Too many calls to show them all: an even spread of previews, plus all the talk.
+        let tid = seed_rows(&conn, &tool_heavy_rows(400));
+        let out = pack_thread(&conn, tid, DEFAULT_BUDGET_CHARS)
+            .unwrap()
+            .unwrap();
+        assert!(chars(&out) <= DEFAULT_BUDGET_CHARS, "len {}", chars(&out));
+        assert!(
+            chars(&out) >= DEFAULT_BUDGET_CHARS * 9 / 10,
+            "len {}",
+            chars(&out)
+        );
+        assert!(out.contains("of 400 tool calls shown"), "{}", &out[..300]);
+        assert!(out.contains("OPENING-TASK") && out.contains("CLOSING-SUMMARY"));
+        let shown = out.matches("### tool: Bash").count();
+        assert!((100..400).contains(&shown), "shown {shown}");
+    }
+
+    #[test]
+    fn a_thread_that_exactly_fits_is_packed_whole() {
+        let conn = crate::db::open(std::path::Path::new(":memory:")).unwrap();
+        // Multi-byte text, so a byte-based check would wrongly call this over budget.
+        let mut rows = tool_heavy_rows(3);
+        rows.push(("user", None, "café ünïcödé ✓".repeat(50)));
+        let tid = seed_rows(&conn, &rows);
+        let full = pack_thread(&conn, tid, usize::MAX).unwrap().unwrap();
+        assert!(!full.contains("<!--"), "nothing trimmed");
+        let exact = chars(&full);
+        assert!(full.len() > exact, "the fixture must be multi-byte");
+        assert_eq!(pack_thread(&conn, tid, exact).unwrap().unwrap(), full);
+        // The retrieval variant agrees on the same input.
+        let around = pack_thread_around(&conn, tid, exact, &[]).unwrap().unwrap();
+        assert_eq!(around, full);
+        // One char less and the ladder starts: shortened tools, within budget.
+        let short = pack_thread(&conn, tid, exact - 1).unwrap().unwrap();
+        assert!(chars(&short) < exact, "len {}", chars(&short));
+        assert!(short.contains("tool calls/output shortened"));
+        assert!(short.contains("CLOSING-SUMMARY"));
+    }
+
+    #[test]
+    fn packs_spend_most_of_the_budget() {
+        // Whenever the thread is larger than the budget, the pack uses at least 80% of it,
+        // whatever the shape. Before, 20 of 40 large real threads packed to under 12 KB of
+        // a 48 KB budget.
+        let conn = crate::db::open(std::path::Path::new(":memory:")).unwrap();
+        let alternate =
+            |n: usize, len: usize| -> Vec<(&'static str, Option<&'static str>, String)> {
+                (0..n)
+                    .map(|i| {
+                        let role = if i % 2 == 0 { "user" } else { "assistant" };
+                        (role, None, format!("T{i} {}", "w".repeat(len)))
+                    })
+                    .collect()
+            };
+        let mut talk_and_tools = alternate(300, 400);
+        for i in 0..300 {
+            talk_and_tools.insert(i * 2, ("tool", None, "o".repeat(2000)));
+        }
+        let shapes = [
+            ("short turns", alternate(2_000, 120)),
+            ("long turns", alternate(40, 5_000)),
+            (
+                "mixed turns",
+                alternate(500, 30)
+                    .into_iter()
+                    .chain(alternate(30, 6_000))
+                    .collect(),
+            ),
+            ("talk and tools", talk_and_tools),
+            ("tool heavy", tool_heavy_rows(56)),
+            ("very tool heavy", tool_heavy_rows(1_000)),
+        ];
+        for budget in [DEFAULT_BUDGET_CHARS, 12_000] {
+            for (name, rows) in &shapes {
+                let tid = seed_rows(&conn, rows);
+                let full = pack_thread(&conn, tid, usize::MAX).unwrap().unwrap();
+                assert!(
+                    chars(&full) > budget,
+                    "{name}: fixture must exceed the budget"
+                );
+                let out = pack_thread(&conn, tid, budget).unwrap().unwrap();
+                let n = chars(&out);
+                assert!(n <= budget, "{name} at {budget}: {n} over budget");
+                assert!(n >= budget * 4 / 5, "{name} at {budget}: only {n} chars");
+                assert!(out.ends_with("</reference_thread>"), "{name}");
+            }
+        }
+        // Short turns: far more than the old fixed 12 turns survive the elision.
+        let tid = seed_rows(&conn, &shapes[0].1);
+        let out = pack_thread(&conn, tid, DEFAULT_BUDGET_CHARS)
+            .unwrap()
+            .unwrap();
+        assert!(out.contains("turns elided"));
+        let kept = out.matches("\n### user\n").count() + out.matches("\n### assistant\n").count();
+        assert!(kept > 200, "kept {kept}");
+        assert!(out.contains("T0 ") && out.contains("T1999 "));
     }
 
     #[test]

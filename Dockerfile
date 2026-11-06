@@ -41,7 +41,7 @@ COPY apps/desktop/src-tauri/ ./
 # the MCP server never serves it, so an empty placeholder is enough.
 # --locked: build exactly the dependency versions in Cargo.lock.
 RUN mkdir -p /dist \
-  && cargo build --release --locked --bin callimachus-mcp
+  && cargo build --release --locked -p callimachus-standalone --bin callimachus-mcp
 
 FROM debian:trixie-slim
 

@@ -99,7 +99,7 @@ the MCP server never uses:
 git clone --depth 1 --branch v<version> https://github.com/BetaBots-LLC/callimachus
 cd callimachus/apps/desktop
 mkdir dist
-cargo build --release --locked --manifest-path src-tauri/Cargo.toml --bin callimachus-mcp
+cargo build --release --locked --manifest-path src-tauri/Cargo.toml -p callimachus-standalone --bin callimachus-mcp
 ```
 
 Then point the launcher at it with

@@ -214,16 +214,59 @@ struct SetupFlags {
     /// Set once the splash closed and main was shown, so later calls (the frontend's own
     /// fallback timer, the backend backstop) are no-ops.
     revealed: bool,
+    /// When [`show_splash`] put the splash up, for [`SPLASH_MIN_VISIBLE`].
+    splash_shown: Option<std::time::Instant>,
 }
 
 /// How long after the main window is created the backend reveals it even if the frontend
 /// never reported ready (a bundle that failed to load, a render that threw before mount).
 const REVEAL_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How long a launch may take before the splash appears. A normal launch reveals the main
+/// window in about 300 ms (backend ready in 77-93 ms, the frontend's first data 191-214 ms
+/// later), and a splash shown for that long and then replaced by a second window read as a
+/// flicker; so the splash is created hidden and only a slower launch (a cold cache, a slow
+/// machine) or a migration shows it.
+const SPLASH_DELAY: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// Shortest time a splash that did appear stays up. A launch that reveals just after
+/// [`SPLASH_DELAY`] (about 450 ms on a slower machine) showed the splash for 50 ms and then
+/// the main window: the same flash the delay removes.
+const SPLASH_MIN_VISIBLE: std::time::Duration = std::time::Duration::from_millis(600);
+
+/// How much longer a splash shown at `shown` must stay up at `now` (zero if never shown).
+fn splash_hold(shown: Option<std::time::Instant>, now: std::time::Instant) -> std::time::Duration {
+    shown.map_or(std::time::Duration::ZERO, |t| {
+        SPLASH_MIN_VISIBLE.saturating_sub(now.saturating_duration_since(t))
+    })
+}
+
+/// Show the (hidden) splash unless the main window was already revealed. Decided under the
+/// SetupState lock, which `complete_setup` takes to set `revealed` before it closes the
+/// splash, so a splash shown here is always closed by the reveal, never shown after it.
+/// `show` only posts to the event loop, so holding the lock across it can't deadlock the
+/// main thread's `set_complete`.
+fn show_splash(app: &AppHandle) {
+    let Some(state) = app.try_state::<SetupState>() else {
+        return;
+    };
+    let Ok(mut flags) = state.0.lock() else {
+        return;
+    };
+    if flags.revealed || flags.splash_shown.is_some() {
+        return;
+    }
+    if let Some(splash) = app.get_webview_window("splashscreen") {
+        let _ = splash.show();
+        flags.splash_shown = Some(std::time::Instant::now());
+    }
+}
+
 /// Mark a startup task done; when BOTH frontend and backend are ready, close the splash
-/// window and reveal the main window. Idempotent.
+/// window and reveal the main window, once the splash (if it appeared) has been up for
+/// [`SPLASH_MIN_VISIBLE`]. Idempotent.
 fn complete_setup(app: &AppHandle, task: &str) {
-    let reveal = {
+    let (reveal, shown) = {
         let Some(state) = app.try_state::<SetupState>() else {
             return;
         };
@@ -239,9 +282,12 @@ fn complete_setup(app: &AppHandle, task: &str) {
         if ready {
             flags.revealed = true;
         }
-        ready
+        (ready, flags.splash_shown)
     };
-    if reveal {
+    if !reveal {
+        return;
+    }
+    let finish = |app: &AppHandle| {
         if let Some(splash) = app.get_webview_window("splashscreen") {
             let _ = splash.close();
         }
@@ -249,6 +295,18 @@ fn complete_setup(app: &AppHandle, task: &str) {
             let _ = main.show();
             let _ = main.set_focus();
         }
+    };
+    let hold = splash_hold(shown, std::time::Instant::now());
+    if hold.is_zero() {
+        finish(app);
+    } else {
+        // `set_complete` runs on the main thread: wait on another one. `revealed` is
+        // already set, so nothing shows the splash again meanwhile.
+        let app = app.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(hold);
+            finish(&app);
+        });
     }
 }
 
@@ -489,6 +547,9 @@ pub struct DbStats {
     pub threads: i64,
     pub messages: i64,
     pub sources: i64,
+    /// Free space inside the file, for Settings' Reclaim disk space row (null if the
+    /// PRAGMAs failed; the counts still answer).
+    pub reclaimable: Option<cleanup::Reclaimable>,
 }
 
 fn lock<'a>(db: &'a db::Db) -> AppResult<std::sync::MutexGuard<'a, rusqlite::Connection>> {
@@ -530,6 +591,8 @@ fn db_counts(conn: &rusqlite::Connection) -> rusqlite::Result<DbStats> {
         threads,
         messages,
         sources,
+        // Header PRAGMAs, microseconds: fine on the path to the first reveal.
+        reclaimable: cleanup::reclaimable(conn).ok(),
     })
 }
 
@@ -638,8 +701,9 @@ async fn delete_threads(app: AppHandle, ids: Vec<i64>) -> AppResult<usize> {
 /// rewrites the whole file and would otherwise hold the shared mutex for the entire
 /// (multi-second) rewrite, freezing every other command. On its own connection it still
 /// takes SQLite's write lock but never the Rust mutex, so the rest of the UI stays live.
+/// Returns without writing when too little is free (`cleanup::RECLAIM_MIN_BYTES`).
 #[tauri::command]
-async fn vacuum_db(app: AppHandle) -> AppResult<()> {
+async fn vacuum_db(app: AppHandle) -> AppResult<cleanup::VacuumReport> {
     let job = claim_rewrite(&app).await?;
     let result = blocking(|| {
         let conn = db::open(&db::default_index_path())?;
@@ -728,10 +792,17 @@ fn jobs_status(app: AppHandle) -> JobsStatus {
 struct CompactSummary {
     rows: usize,
     bytes_saved: i64,
+    /// The closing [`cleanup::vacuum`], once the trim is done (absent from the progress
+    /// events). `ran: false` means the saved space stays inside the file, for later
+    /// inserts to reuse, until enough is free for Reclaim space.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vacuum: Option<cleanup::VacuumReport>,
 }
 
 /// "Shrink index": cap tool output that was indexed before the per-row cap existed (in
-/// batches, so other writers get turns), then VACUUM to hand the space back. Dedicated
+/// batches, so other writers get turns), every source's threads including those whose
+/// transcript is gone (the automatic pass leaves those alone), then VACUUM when enough is
+/// free, by the same rule as Reclaim space ([`cleanup::RECLAIM_MIN_BYTES`]). Dedicated
 /// connection for the same reason as `vacuum_db`. Emits `compact:progress`.
 #[tauri::command]
 async fn compact_index(app: AppHandle) -> AppResult<CompactSummary> {
@@ -740,8 +811,10 @@ async fn compact_index(app: AppHandle) -> AppResult<CompactSummary> {
     let result = blocking(move || {
         let mut conn = db::open(&db::default_index_path())?;
         let mut summary = CompactSummary::default();
+        let mut after = 0i64;
         loop {
-            let r = cleanup::compact_tool_output(&mut conn, 2_000)?;
+            let r = cleanup::compact_tool_output_after(&mut conn, after, 2_000)?;
+            after = r.last_id;
             summary.rows += r.rows;
             summary.bytes_saved += r.bytes_saved;
             let _ = progress.emit("compact:progress", &summary);
@@ -749,7 +822,12 @@ async fn compact_index(app: AppHandle) -> AppResult<CompactSummary> {
                 break;
             }
         }
-        cleanup::vacuum(&conn)?;
+        // A superset of the background pass, so that pass has nothing left on later
+        // launches and needn't rescan the table.
+        if let Err(e) = cleanup::mark_tool_output_compacted(&conn) {
+            app_log!("[cleanup] shrink index: {e:#}");
+        }
+        summary.vacuum = Some(cleanup::vacuum(&conn)?);
         Ok(summary)
     })
     .await;
@@ -3251,6 +3329,22 @@ fn reveal_main_window(app: &AppHandle) {
     }
 }
 
+/// A Dock click with no window showing. Main is also hidden on purpose during startup
+/// (until both halves are ready, with the splash itself held back by [`SPLASH_DELAY`]), and
+/// revealing it there showed an unloaded main window next to the splash. So before the
+/// reveal the click brings up the splash, and after it main comes back from the tray.
+#[cfg(target_os = "macos")]
+fn reopen_from_dock(app: &AppHandle) {
+    let revealed = app
+        .try_state::<SetupState>()
+        .is_none_or(|s| s.0.lock().map_or(true, |f| f.revealed));
+    if revealed {
+        reveal_main_window(app);
+    } else {
+        show_splash(app);
+    }
+}
+
 /// Put the tray icon up (idempotent): a Show / Quit menu, with a left-click restoring the
 /// window. Present only while close-to-tray is enabled.
 fn show_tray(app: &AppHandle) -> tauri::Result<()> {
@@ -3352,14 +3446,14 @@ fn set_close_to_tray(app: AppHandle, on: bool) -> AppResult<()> {
 
 // ---- startup ----
 //
-// Tauri creates the config windows (the splash) and then runs `setup` ON THE MAIN THREAD,
-// before the event loop paints anything. Opening the index there (migrations, which on an
-// upgrade can rebuild indexes over a multi-GB messages table, plus the backfills) froze the
-// splash into a beachball / "Not Responding". So `setup` only manages cheap state and hands
-// the rest to a background thread. The main window is created by that thread once the
-// database state is managed (it is `"create": false` in tauri.conf.json), so no command can
-// run before the state it needs exists. A failure to open the index shows an error screen
-// in the splash window instead of a panic that made the app vanish.
+// Tauri creates the config windows (the splash, hidden until SPLASH_DELAY) and then runs
+// `setup` ON THE MAIN THREAD, before the event loop paints anything. Opening the index there
+// (migrations, which on an upgrade can rebuild indexes over a multi-GB messages table, plus the
+// backfills) froze the splash into a beachball / "Not Responding". So `setup` only manages
+// cheap state and hands the rest to a background thread. The main window is created by that
+// thread once the database state is managed (it is `"create": false` in tauri.conf.json), so no
+// command can run before the state it needs exists. A failure to open the index shows an error
+// screen in the splash window instead of a panic that made the app vanish.
 
 /// Why the backend could not start, for the error screen.
 #[derive(Debug, PartialEq)]
@@ -3517,6 +3611,8 @@ fn show_startup_error(app: &AppHandle, kind: StartupFailure, e: &anyhow::Error) 
     let Some(window) = window else {
         return; // nothing to render into; the log has the error
     };
+    // The splash is created hidden (SPLASH_DELAY), and a failure can come sooner.
+    let _ = window.show();
     let _ = window.set_decorations(true);
     let _ = window.set_resizable(true);
     let _ = window.set_size(tauri::LogicalSize::new(600.0, 440.0));
@@ -3582,6 +3678,7 @@ fn init_backend(app: &AppHandle) -> anyhow::Result<()> {
                 app,
                 "Upgrading your index (one time, this can take a minute)…",
             );
+            show_splash(app); // no waiting for SPLASH_DELAY: this launch is a slow one
         }
     }
     let conn = db::open(&db_path)?; // single WRITER; also runs migrations
@@ -3661,6 +3758,13 @@ fn create_main_window(app: &AppHandle) -> anyhow::Result<()> {
 /// database. Any failure before the window exists ends on the error screen.
 fn start_backend(app: AppHandle) {
     let started = std::time::Instant::now();
+    {
+        let app = app.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(SPLASH_DELAY);
+            show_splash(&app);
+        });
+    }
     if let Err(e) = init_backend(&app) {
         show_startup_error(&app, classify_startup_error(&e), &e);
         return;
@@ -3723,6 +3827,8 @@ fn spawn_background_jobs(app: &AppHandle) {
         }
     });
 
+    spawn_tool_output_compaction(app);
+
     let app = app.clone();
     std::thread::spawn(move || {
         // Housekeeping first, so the distill catch-up below sees re-keyed projects. Own
@@ -3770,6 +3876,118 @@ fn spawn_background_jobs(app: &AppHandle) {
         // Then catch up on any auto-distillation owed (no-op unless enabled). Usually the
         // watcher's catch-up still holds CatchUpJob here; it kicks again when it finishes.
         auto_distill_kick(&app);
+    });
+}
+
+/// Rows per background tool-output compaction pass ([`spawn_tool_output_compaction`]).
+const BACKGROUND_COMPACT_ROWS: usize = 2_000;
+/// How long after launch the compaction starts. The watcher's catch-up claims the writer
+/// within moments of launch and takes 0.1-2 s (measured), so by then it is done and the
+/// window has its first data; a catch-up deferred by a reindex is waited out below anyway.
+const BACKGROUND_COMPACT_DELAY: std::time::Duration = std::time::Duration::from_secs(20);
+/// Pause between passes, so the watcher and distill get the writer in between.
+const BACKGROUND_COMPACT_GAP: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Trim tool output indexed before the per-row cap existed, in the background after the
+/// launch catch-up, so it no longer waits for a Shrink index click. Only threads whose
+/// transcript is still on disk ([`cleanup::compact_tool_output_on_disk`]): a re-index of
+/// those stores the same capped text anyway. For a thread whose transcript the agent has
+/// since deleted, the index holds the only copy, and the cap would drop its middle for
+/// good, so those wait for an explicit Shrink index, the user's choice. On a measured
+/// 5.1 GB index the full trim was 22,619 rows and 245 MB of text, most of it from such
+/// deleted transcripts; it took 11 passes of 2-11 s (62 s in all).
+///
+/// Passes of [`BACKGROUND_COMPACT_ROWS`] in short transactions, one log line each, until a
+/// pass reaches the end of the table; then a marker in app_config skips it on later
+/// launches. Each pass holds [`CompactJob`] like a Shrink index, so a rewrite never starts
+/// alongside it and `jobs_status` reports it, and no pass starts while a reindex, the
+/// catch-up, a semantic build or a whole-file rewrite holds the writer. A pass that trimmed
+/// rows emits `index:updated` with no source kind (main.tsx refetches db_stats, so the
+/// Reclaim row sees the freed pages). No VACUUM: later inserts reuse the freed pages, and
+/// Reclaim space hands them back to the disk when the user wants that.
+fn spawn_tool_output_compaction(app: &AppHandle) {
+    let app = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(BACKGROUND_COMPACT_DELAY);
+        let mut conn = match db::open(&db::default_index_path()) {
+            Ok(c) => c,
+            Err(e) => {
+                app_log!("[cleanup] tool output compaction: {e:#}");
+                return;
+            }
+        };
+        match cleanup::tool_output_compaction_pending(&conn) {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(e) => {
+                app_log!("[cleanup] tool output compaction: {e:#}");
+                return;
+            }
+        }
+        let mut on_disk = match cleanup::TranscriptsOnDisk::load(&conn) {
+            Ok(t) => t,
+            Err(e) => {
+                app_log!("[cleanup] tool output compaction: {e:#}");
+                return;
+            }
+        };
+        app_log!(
+            "[cleanup] tool output compaction: {} transcripts still on disk",
+            on_disk.files()
+        );
+        let other_writer = |app: &AppHandle| {
+            app.state::<IndexJob>().0.is_set()
+                || app.state::<CatchUpJob>().0.is_set()
+                || app.state::<EmbedJob>().is_running()
+        };
+        let mut after = 0i64;
+        for pass in 1.. {
+            // Claim first, then check, as claim_rewrite does: a reindex or build that
+            // started in between holds its own flag, and the claim is given back for it.
+            let job = loop {
+                if let Some(job) = JobGuard::try_acquire(&app.state::<CompactJob>().0) {
+                    if !other_writer(&app) {
+                        break job;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            };
+            let clock = jobclock::JobClock::start();
+            let r = match cleanup::compact_tool_output_on_disk(
+                &mut conn,
+                after,
+                BACKGROUND_COMPACT_ROWS,
+                &mut on_disk,
+            ) {
+                Ok(r) => r,
+                // Busy behind another process's long write, or a real error: stop for this
+                // launch; the next one resumes (the marker is not set).
+                Err(e) => {
+                    app_log!("[cleanup] tool output compaction pass {pass}: {e:#}");
+                    return;
+                }
+            };
+            drop(job);
+            app_log!(
+                "[cleanup] tool output compaction pass {pass}: {} rows, {:.1} MB trimmed in {}{}",
+                r.rows,
+                r.bytes_saved as f64 / 1_048_576.0,
+                clock.thread_summary(),
+                if r.done { " (done)" } else { "" }
+            );
+            if r.rows > 0 || r.done {
+                let _ = app.emit("index:updated", ());
+            }
+            if r.done {
+                if let Err(e) = cleanup::mark_tool_output_compacted(&conn) {
+                    app_log!("[cleanup] tool output compaction: {e:#}");
+                }
+                break;
+            }
+            after = r.last_id;
+            std::thread::sleep(BACKGROUND_COMPACT_GAP);
+        }
+        db::shrink_memory(&conn);
     });
 }
 
@@ -4007,7 +4225,7 @@ pub fn run() {
         tauri::RunEvent::Reopen {
             has_visible_windows: false,
             ..
-        } => reveal_main_window(app),
+        } => reopen_from_dock(app),
         _ => {}
     });
 }
@@ -4022,6 +4240,20 @@ mod startup_tests {
             let _ = std::fs::remove_file(p.with_extension(ext));
         }
         p
+    }
+
+    /// A splash that appeared stays up for SPLASH_MIN_VISIBLE in all; one that never
+    /// appeared holds nothing back.
+    #[test]
+    fn a_shown_splash_is_held_for_its_minimum_time() {
+        use std::time::{Duration, Instant};
+        let now = Instant::now();
+        assert_eq!(splash_hold(None, now), Duration::ZERO);
+        assert_eq!(splash_hold(Some(now), now), SPLASH_MIN_VISIBLE);
+        let shown = now - Duration::from_millis(50); // a reveal just after SPLASH_DELAY
+        assert_eq!(splash_hold(Some(shown), now), Duration::from_millis(550));
+        let shown = now - Duration::from_secs(2); // a slow launch: no extra wait
+        assert_eq!(splash_hold(Some(shown), now), Duration::ZERO);
     }
 
     #[test]

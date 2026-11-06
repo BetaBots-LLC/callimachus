@@ -69,7 +69,10 @@ function calCandidates(): string[] {
     if (pf) dirs.push(path.join(pf, "Callimachus"));
     for (const dir of dirs) c.push(path.join(dir, exe), path.join(dir, "callimachus.exe"));
   } else {
-    c.push("/usr/local/bin/cal");
+    // The deb and rpm app binary, which runs every cal subcommand itself. Those packages no
+    // longer install /usr/bin/cal (it collided with the system calendar), so a user who never
+    // enabled the integration would otherwise find nothing. isCallimachusCal accepts it by path.
+    c.push("/usr/local/bin/cal", "/usr/bin/callimachus");
   }
   return c;
 }

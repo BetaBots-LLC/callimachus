@@ -39,6 +39,26 @@ export interface DbStats {
   threads: number;
   messages: number;
   sources: number;
+  /** Free space inside the index file (null if it couldn't be read). */
+  reclaimable: Reclaimable | null;
+}
+
+/** What Reclaim space would give back. `worthwhile`: at least 50 MB and 1% of the file are
+ *  free, the backend's rule for running the rewrite at all (`cleanup::RECLAIM_MIN_BYTES`). */
+export interface Reclaimable {
+  bytes: number;
+  fileBytes: number;
+  worthwhile: boolean;
+}
+
+/** What a Reclaim space run did. `ran` is false when too little was free to rewrite. */
+export interface VacuumReport {
+  ran: boolean;
+  freedBytes: number; // file size before minus after
+  reclaimableBytes: number;
+  // The closing checkpoint was held back by a reader, so the file has not shrunk yet:
+  // reclaimableBytes comes back to disk at a later checkpoint. Absent from older backends.
+  pending?: boolean;
 }
 
 export interface IndexReport {
@@ -355,6 +375,9 @@ export interface Spend {
 export interface CompactSummary {
   rows: number; // tool-output rows trimmed
   bytesSaved: number;
+  // The closing Reclaim space step, once the trim is done (absent in progress events and
+  // from older backends). `ran: false` means the saved space stays inside the file.
+  vacuum?: VacuumReport | null;
 }
 
 /** Overrides for relocated Claude Code / Codex data, plus what is in effect right now. */
@@ -418,8 +441,9 @@ export const api = {
       limit: opts?.limit ?? null,
     }),
   deleteThreads: (ids: number[]) => invoke<number>("delete_threads", { ids }),
-  vacuumDb: () => invoke<void>("vacuum_db"),
-  // "Shrink index": trim tool output indexed before the per-row cap existed, then VACUUM.
+  vacuumDb: () => invoke<VacuumReport>("vacuum_db"),
+  // "Shrink index": trim tool output indexed before the per-row cap existed, then VACUUM
+  // when enough is free (the same rule as Reclaim space).
   // onProgress receives running totals while it works (the `compact:progress` event).
   compactIndex: async (onProgress?: (p: CompactSummary) => void) => {
     const unlisten = onProgress
@@ -561,8 +585,9 @@ export const api = {
   // terminal emulator is on PATH). Gates Resume / Open-in-CLI; fixed for the session.
   cliLaunchSupported: () => invoke<boolean>("cli_launch_supported"),
   // Packed context for a thread. `budgetChars` asks the backend for a smaller pack (its
-  // budget ladder drops tool output first, then elides the middle); omitted = the
-  // backend default (~48k chars). A backend without the parameter ignores it.
+  // budget ladder shortens tool calls/output, then thins them, then elides the middle of
+  // the talk); omitted = the backend default (~48k chars). A backend without the
+  // parameter ignores it.
   threadContext: (threadId: number, budgetChars?: number) =>
     invoke<string>("thread_context", { threadId, budgetChars: budgetChars ?? null }),
   openThreadInCli: (threadId: number, program?: string) =>

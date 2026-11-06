@@ -309,6 +309,20 @@ git tag v0.5.0 && git push origin v0.5.0    # → build.yml + publish-extension.
   (glibc must stay >= 2.38 for ONNX Runtime). If the server starts linking a new
   shared library, the runtime stage's `ldd` check fails the build: add the
   library's package to that stage's `apt-get install` line.
+- **What each installer holds.** `tauri build` bundles every bin of the app crate,
+  so the app crate has one (`callimachus`, which also serves `cal` and `--mcp`).
+  The standalone `cal` and `callimachus-mcp` are the `callimachus-standalone`
+  workspace member (`apps/desktop/src-tauri/standalone`, built with
+  `cargo build --release -p callimachus-standalone`), so the macOS `.app` and the
+  Linux packages carry only the app binary. Windows installs still put `cal.exe`
+  and `callimachus-mcp.exe` next to the app: `build.yml` builds the standalone
+  bins first, copies them to `src-tauri/binaries/<name>-<triple>.exe`, and passes
+  the CI-only `tauri.windows-sidecars.conf.json` overlay (`bundle.externalBin`;
+  not in `tauri.conf.json`, because tauri-build fails any Windows `cargo build`
+  when an externalBin file is missing). To check a macOS bundle locally:
+  `pnpm -C apps/desktop tauri build --debug --bundles app`, then
+  `ls apps/desktop/src-tauri/target/debug/bundle/macos/Callimachus.app/Contents/MacOS` lists
+  only `callimachus`.
 - **Windows uninstaller.** `bundle.windows.nsis.installerHooks` runs
   `windows/hooks.nsh`: before an uninstall it runs
   `callimachus.exe --uninstall-integration` (removing the `/recall` skill, MCP

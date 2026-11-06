@@ -1413,18 +1413,35 @@ fn mcp_registered_json(cfg: &Path, exe: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// An entry this app registered (an absolute app path run with exactly `--mcp`) whose binary no
-/// longer exists. Anything else under our name, such as `npx -y callimachus-mcp` or a path that
-/// still exists, is the user's choice and is left alone.
-fn is_dead_app_registration<'a>(
+/// A `callimachus` MCP entry whose absolute command no longer exists and that `refresh_installed`
+/// re-points at the app.
+#[derive(Debug, PartialEq)]
+enum DeadRegistration {
+    /// One this app registered: an app path run with exactly `--mcp`. Only the command changes.
+    App,
+    /// A formerly bundled `callimachus-mcp` binary run with no args, typically added by hand
+    /// (the deb/rpm `/usr/bin/callimachus-mcp`, or the copy in the macOS .app's MacOS dir).
+    /// Those packages no longer ship it, so the entry gains `--mcp` along with the app path.
+    StandaloneServer,
+}
+
+/// Classify an MCP entry under our name. Anything that is not dead and recognizably ours, such
+/// as `npx -y callimachus-mcp` or a path that still exists, is the user's choice and is left alone.
+fn dead_registration<'a>(
     command: Option<&str>,
     mut args: impl Iterator<Item = Option<&'a str>>,
-) -> bool {
-    let is_mcp_args = args.next() == Some(Some("--mcp")) && args.next().is_none();
-    command.is_some_and(|c| {
-        let p = Path::new(c);
-        p.is_absolute() && !p.exists()
-    }) && is_mcp_args
+) -> Option<DeadRegistration> {
+    let p = Path::new(command?);
+    if !p.is_absolute() || p.exists() {
+        return None;
+    }
+    match (args.next(), args.next()) {
+        (Some(Some("--mcp")), None) => Some(DeadRegistration::App),
+        (None, _) if p.file_stem() == Some("callimachus-mcp".as_ref()) => {
+            Some(DeadRegistration::StandaloneServer)
+        }
+        _ => None,
+    }
 }
 
 /// Re-point a dead `mcpServers.callimachus` command at `exe`. Never creates the entry.
@@ -1442,12 +1459,15 @@ fn refresh_mcp_json(cfg: &Path, exe: &Path) -> Result<bool> {
             .and_then(Value::as_array)
             .map(|a| a.iter().map(Value::as_str).collect())
             .unwrap_or_default();
-        let dead = is_dead_app_registration(
+        let dead = dead_registration(
             entry.get("command").and_then(Value::as_str),
             args.into_iter(),
         );
-        if dead {
+        if let Some(kind) = dead {
             entry.insert("command".into(), json!(exe.to_string_lossy()));
+            if kind == DeadRegistration::StandaloneServer {
+                entry.insert("args".into(), json!(["--mcp"]));
+            }
         }
         Ok(())
     })
@@ -1520,15 +1540,20 @@ fn refresh_mcp_toml(cfg: &Path, exe: &Path) -> Result<bool> {
             .and_then(|a| a.as_array())
             .map(|a| a.iter().map(|v| v.as_str()).collect())
             .unwrap_or_default();
-        let dead = is_dead_app_registration(
+        let dead = dead_registration(
             entry.get("command").and_then(|c| c.as_str()),
             args.into_iter(),
         );
-        if dead {
+        if let Some(kind) = dead {
             entry.insert(
                 "command",
                 toml_edit::value(exe.to_string_lossy().to_string()),
             );
+            if kind == DeadRegistration::StandaloneServer {
+                let mut args = toml_edit::Array::new();
+                args.push("--mcp");
+                entry.insert("args", toml_edit::value(args));
+            }
         }
         Ok(())
     })
@@ -2704,6 +2729,67 @@ mod tests {
         let text = std::fs::read_to_string(&toml).unwrap();
         assert!(text.starts_with("# my codex\n"));
         assert!(mcp_registered_toml(&toml, &exe));
+    }
+
+    /// The deb, rpm and macOS .app used to ship `callimachus-mcp`; a client entry pointed at it
+    /// by hand would go dead on upgrade and the server would vanish from that client.
+    #[cfg(unix)] // Unix path semantics
+    #[test]
+    fn refresh_repoints_a_dead_standalone_server_with_mcp_args() {
+        let tmp = TempDir::new("refresh_standalone");
+        let exe = tmp.path().join("callimachus");
+        std::fs::write(&exe, "").unwrap();
+        let cfg = tmp.path().join(".claude.json");
+
+        std::fs::write(
+            &cfg,
+            r#"{"mcpServers":{"callimachus":{"command":"/gone/usr/bin/callimachus-mcp","env":{"K":"V"}}}}"#,
+        )
+        .unwrap();
+        assert!(refresh_mcp_json(&cfg, &exe).unwrap());
+        let back = read_json(&cfg);
+        let entry = &back["mcpServers"]["callimachus"];
+        assert_eq!(entry["command"], exe.to_string_lossy().as_ref());
+        assert_eq!(entry["args"], json!(["--mcp"]));
+        assert_eq!(entry["env"]["K"], "V");
+        assert!(!refresh_mcp_json(&cfg, &exe).unwrap(), "idempotent");
+
+        // A dead standalone path with args of its own, or another dead binary run without
+        // args, is not recognizably ours: left alone.
+        for unknown in [
+            r#"{"mcpServers":{"callimachus":{"command":"/gone/callimachus-mcp","args":["--db","x"]}}}"#,
+            r#"{"mcpServers":{"callimachus":{"command":"/gone/other-server"}}}"#,
+        ] {
+            std::fs::write(&cfg, unknown).unwrap();
+            assert!(!refresh_mcp_json(&cfg, &exe).unwrap(), "{unknown}");
+            assert_eq!(std::fs::read_to_string(&cfg).unwrap(), unknown);
+        }
+
+        // A standalone binary that still exists (a cargo or Releases install) is the user's.
+        let live = tmp.path().join("callimachus-mcp");
+        std::fs::write(&live, "").unwrap();
+        let kept =
+            json!({"mcpServers": {"callimachus": {"command": live.to_string_lossy()}}}).to_string();
+        std::fs::write(&cfg, &kept).unwrap();
+        assert!(!refresh_mcp_json(&cfg, &exe).unwrap());
+
+        // Codex TOML gains the args too.
+        let toml = tmp.path().join("config.toml");
+        std::fs::write(
+            &toml,
+            "[mcp_servers.callimachus]\ncommand = \"/Applications/Gone.app/Contents/MacOS/callimachus-mcp\"\n",
+        )
+        .unwrap();
+        assert!(refresh_mcp_toml(&toml, &exe).unwrap());
+        assert!(mcp_registered_toml(&toml, &exe));
+        let back = std::fs::read_to_string(&toml)
+            .unwrap()
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        assert_eq!(
+            back["mcp_servers"]["callimachus"]["args"][0].as_str(),
+            Some("--mcp")
+        );
     }
 
     #[test]

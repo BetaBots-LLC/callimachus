@@ -4,7 +4,9 @@
 //! (Optionally set CALLIMACHUS_DB to point at a specific index.db.)
 //!
 //! The desktop app runs the same server via `--mcp`, so the in-app installer registers the
-//! app itself; no separate binary required.
+//! app itself; this binary is for MCP-only installs and isn't bundled into the macOS or Linux
+//! app. Windows installs ship it as a sidecar next to the app (build.yml,
+//! tauri.windows-sidecars.conf.json).
 
 fn main() {
     // This binary never indexes; only the desktop app does. serve_stdio says so in the

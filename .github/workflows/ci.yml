@@ -79,13 +79,14 @@ jobs:
         run: cargo fmt --check
 
       # --locked: fail if Cargo.lock is out of date instead of silently re-resolving.
+      # --workspace: the standalone cal/callimachus-mcp crate is not a default member.
       - name: Rust clippy
         working-directory: apps/desktop/src-tauri
-        run: cargo clippy --locked --lib --bins --tests -- -D warnings
+        run: cargo clippy --locked --workspace --lib --bins --tests -- -D warnings
 
       - name: Rust tests
         working-directory: apps/desktop/src-tauri
-        run: cargo test --locked
+        run: cargo test --locked --workspace
 
       # Tauri refuses to build when a tauri crate and its npm package drift apart by a minor
       # version (tauri 2.12 vs @tauri-apps/api 2.11, the plugins likewise). Build the app the
@@ -127,9 +128,32 @@ jobs:
         shell: bash
         run: mkdir -p apps/desktop/dist
 
+      # --workspace also compiles the standalone crate's Windows resource build script.
       - name: cargo check --all-targets
         working-directory: apps/desktop/src-tauri
-        run: cargo check --locked --all-targets
+        run: cargo check --locked --workspace --all-targets
+
+      # The standalone Windows exes ship as release assets and installer sidecars, and only a
+      # release tag links them otherwise. Their build.rs links the VC runtime statically (an
+      # app-crate build script's link args never reach another package's bins), so a missing
+      # static_vcruntime call would ship exes that fail on machines without VCRUNTIME140.dll.
+      - name: Standalone Windows exes link the VC runtime statically
+        if: runner.os == 'Windows'
+        working-directory: apps/desktop/src-tauri
+        shell: pwsh
+        run: |
+          cargo build --locked -p callimachus-standalone
+          & target\debug\cal.exe --version
+          if ($LASTEXITCODE -ne 0) { throw "cal.exe --version exited $LASTEXITCODE" }
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $dumpbin = & $vswhere -latest -products '*' -find 'VC\Tools\MSVC\**\bin\Hostx64\x64\dumpbin.exe' |
+            Select-Object -First 1
+          if (-not $dumpbin) { throw "dumpbin.exe not found" }
+          foreach ($bin in 'cal', 'callimachus-mcp') {
+            $deps = & $dumpbin /dependents "target\debug\$bin.exe" | Out-String
+            Write-Output $deps
+            if ($deps -match 'VCRUNTIME140') { throw "$bin.exe imports the VC runtime DLL" }
+          }
 
   lint:
     name: Biome

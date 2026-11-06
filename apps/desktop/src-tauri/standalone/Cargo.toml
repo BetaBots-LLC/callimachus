@@ -1,0 +1,42 @@
+[package]
+# The standalone `cal` and `callimachus-mcp` binaries, for CLI/MCP-only installs (Releases, the
+# `callimachus-mcp` npm launcher, the Docker image). They live in their own workspace member
+# because `tauri build` bundles every [[bin]] of the app crate: as app bins they put two unused
+# 27-29 MB copies of the backend into the macOS .app and the Linux packages (about 23 MB of
+# every compressed update), and a deb `/usr/bin/cal` that collides with the system calendar.
+# The app binary already acts as `cal` (argv0 or a cal subcommand) and as the MCP server
+# (`--mcp`). Windows installs still ship both as sidecars (build.yml, tauri.windows-sidecars).
+name = "callimachus-standalone"
+# Never published or synced: `cal --version` and the MCP server report callimachus_lib's
+# version (CARGO_PKG_VERSION is expanded inside the lib), and build.rs stamps the Windows
+# version resource from the app crate's Cargo.toml.
+version = "0.0.0"
+publish = false
+description = "Standalone cal CLI and callimachus-mcp server for Callimachus"
+authors = ["Ari Shaller"]
+license = "AGPL-3.0-or-later"
+edition = "2021"
+
+# Companion terminal CLI: search / read indexed threads from the shell.
+[[bin]]
+name = "cal"
+path = "src/cli.rs"
+
+# Standalone MCP server: exposes the index as tools for any LLM/agent over stdio.
+[[bin]]
+name = "callimachus-mcp"
+path = "src/mcp.rs"
+
+[dependencies]
+callimachus = { path = ".." }
+
+# Windows: the icon, version info and Common-Controls v6 manifest that tauri-build gave these
+# bins while they were app bins (the manifest keeps comctl32 imports pulled in through tauri
+# resolvable, or the exe fails to start with STATUS_ENTRYPOINT_NOT_FOUND). static_vcruntime
+# links the VC runtime statically, as tauri-build does for app bins (staticVCRuntime defaults
+# on): its link args reach only the emitting package's targets, so without it these exes need
+# VCRUNTIME140.dll, which a clean Windows install lacks. Same crates and versions tauri-build
+# already uses, so the lock gains no new package.
+[target.'cfg(windows)'.build-dependencies]
+static_vcruntime = "3"
+tauri-winres = "0.3"

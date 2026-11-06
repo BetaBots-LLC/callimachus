@@ -77,6 +77,17 @@ function fmtBytes(n: number): string {
   return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+/** "Saved 30 MB.", saying when the file itself has not shrunk (yet): Shrink index only
+ *  rewrites the file once Reclaim space's 50 MB / 1% rule is met. */
+function savedNote(s: CompactSummary): string {
+  const saved = `Saved ${fmtBytes(s.bytesSaved)}`;
+  if (s.vacuum && !s.vacuum.ran) {
+    return `${saved} inside the index; the file shrinks once 50 MB is free.`;
+  }
+  if (s.vacuum?.pending) return `${saved}; the file shrinks shortly.`;
+  return `${saved}.`;
+}
+
 /** The semantic index, and the disk space the history takes: shrink, reclaim, delete. */
 export function IndexSection() {
   return (
@@ -254,9 +265,20 @@ function StorageGroup() {
     mutationKey: VACUUM_KEY,
     mutationFn: api.vacuumDb,
     onMutate: () => setErr(null),
-    onSuccess: () => {
+    onSuccess: (report) => {
       invalidateAll();
-      notify.success("Space reclaimed");
+      if (!report.ran) {
+        notify.info("Nothing to reclaim", {
+          description: `Only ${fmtBytes(report.reclaimableBytes)} is free inside the index.`,
+        });
+      } else if (report.pending) {
+        // A reader held the closing checkpoint back: the file shrinks at the next one.
+        notify.success("Index rewritten", {
+          description: `${fmtBytes(report.reclaimableBytes)} will be returned to disk shortly.`,
+        });
+      } else {
+        notify.success(`Reclaimed ${fmtBytes(report.freedBytes)}`);
+      }
     },
     onError: (e) => {
       setErr(String(e));
@@ -278,9 +300,7 @@ function StorageGroup() {
         summary.rows > 0
           ? `Trimmed ${summary.rows.toLocaleString()} tool outputs`
           : "Nothing to trim",
-        summary.bytesSaved > 0
-          ? { description: `Saved ${fmtBytes(summary.bytesSaved)}.` }
-          : undefined,
+        summary.bytesSaved > 0 ? { description: savedNote(summary) } : undefined,
       );
     },
     onError: (e) => {
@@ -298,6 +318,10 @@ function StorageGroup() {
   const lastCompact = compactRuns.length > 0 ? compactRuns[compactRuns.length - 1] : null;
   const shrinking = lastCompact?.status === "pending";
   const reclaiming = useIsMutating({ mutationKey: VACUUM_KEY }) > 0;
+  // The shared header stats (refetched on index changes) carry the index's free pages.
+  const reclaimable = useQuery({ queryKey: ["db_stats"], queryFn: api.dbStats }).data?.reclaimable;
+  // Unknown (an older backend): leave it enabled, the backend applies the same rule.
+  const nothingToReclaim = reclaimable != null && !reclaimable.worthwhile;
   // A rewrite must not overlap another rewrite, or a reindex / semantic build / distill
   // writing to the same file: it would wait out the lock and fail, or redo the work.
   const rewriteRunning = useIsMutating({ mutationKey: REWRITE_KEY }) > 0;
@@ -356,7 +380,7 @@ function StorageGroup() {
         {jobBusy && !rewriteRunning && (
           <Note>
             Shrink index and Reclaim space are available again once the background job that is
-            running now (a reindex, semantic build or distill) finishes.
+            running now (a reindex, semantic build, distill or tool output trim) finishes.
           </Note>
         )}
         {(shrinking || lastCompact?.data) && (
@@ -366,7 +390,7 @@ function StorageGroup() {
                 ? `Trimmed ${compactProgress.rows.toLocaleString()} tool outputs so far…`
                 : "Looking for oversized tool output…"
               : lastCompact?.data && lastCompact.data.rows > 0
-                ? `Trimmed ${lastCompact.data.rows.toLocaleString()} tool outputs and saved ${fmtBytes(lastCompact.data.bytesSaved)}.`
+                ? `Trimmed ${lastCompact.data.rows.toLocaleString()} tool outputs. ${savedNote(lastCompact.data)}`
                 : "Nothing to trim: the index is already compact."}
           </Note>
         )}
@@ -374,19 +398,21 @@ function StorageGroup() {
 
       <SettingRow
         title="Reclaim disk space"
-        description="Rewrite the database to return freed space to disk."
+        description="Rewrite the database to return freed space to disk. Available once at least 50 MB and 1% of the index are free."
         control={
           <Button
             size="sm"
             variant="outline"
             onClick={() => void startRewrite(() => vacuum.mutate())}
-            disabled={rewriting}
+            disabled={rewriting || nothingToReclaim}
           >
             {reclaiming && <Spinner data-icon="inline-start" />}
             {reclaiming ? "Reclaiming…" : "Reclaim space"}
           </Button>
         }
-      />
+      >
+        {reclaimable != null && <Note>Reclaimable: {fmtBytes(reclaimable.bytes)}</Note>}
+      </SettingRow>
 
       <SettingRow
         title="Delete old threads"

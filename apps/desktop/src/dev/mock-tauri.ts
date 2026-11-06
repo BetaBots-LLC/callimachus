@@ -277,8 +277,21 @@ const SOURCE_COUNTS: [SourceKind, number, number][] = [
   ["gemini", 23, 527],
 ];
 
+// Free pages inside the mock index: under the 50 MB floor until threads are deleted.
+let freeBytes = 248 * 1024;
+const FILE_BYTES = 412_000_000;
+
 function dbStats(): DbStats {
-  return { threads: 1_284 - (24 - cleanupRows.length), messages: 48_213, sources: 4 };
+  return {
+    threads: 1_284 - (24 - cleanupRows.length),
+    messages: 48_213,
+    sources: 4,
+    reclaimable: {
+      bytes: freeBytes,
+      fileBytes: FILE_BYTES,
+      worthwhile: freeBytes >= 50 * 1024 * 1024 && freeBytes * 100 >= FILE_BYTES,
+    },
+  };
 }
 
 function stats(): Stats {
@@ -781,16 +794,31 @@ const handlers: Record<string, Handler> = {
     const ids = new Set(Array.isArray(a.ids) ? (a.ids as number[]) : []);
     cleanupRows = cleanupRows.filter((r) => !ids.has(r.id));
     threads = threads.filter((t) => !ids.has(t.id));
+    freeBytes += ids.size * 30_000_000;
     return ids.size;
   },
-  vacuum_db: () => sleep(1_200).then(ok),
+  vacuum_db: async () => {
+    const before = dbStats().reclaimable;
+    if (!before?.worthwhile)
+      return { ran: false, freedBytes: 0, reclaimableBytes: freeBytes, pending: false };
+    await sleep(1_200);
+    const freed = freeBytes;
+    freeBytes = 0;
+    return { ran: true, freedBytes: freed, reclaimableBytes: freed, pending: false };
+  },
   compact_index: async (): Promise<CompactSummary> => {
     jobs.rewrite = true;
     await sleep(600);
     emit("compact:progress", { rows: 140, bytesSaved: 21_000_000 });
     await sleep(600);
     jobs.rewrite = false;
-    return { rows: 312, bytesSaved: 48_000_000 };
+    // Under the 50 MB rule, as on a real index: the space stays inside the file.
+    freeBytes += 48_000_000;
+    return {
+      rows: 312,
+      bytesSaved: 48_000_000,
+      vacuum: { ran: false, freedBytes: 0, reclaimableBytes: freeBytes, pending: false },
+    };
   },
   get_data_roots: () => ({ ...dataRoots }),
   set_data_roots: (a) => {
