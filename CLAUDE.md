@@ -17,12 +17,15 @@ and PR checks; this file is what an agent needs on top of that.
 - `apps/vscode/`: VS Code / Cursor extension; runs `cal ... --json` (`src/cal.ts`), a contract.
 - `apps/web/`: callimachus.app (TanStack Start). The privacy policy is `src/content/legal.ts`.
 - `packages/callimachus-mcp/`: npm launcher; downloads the release binary, checks `SHA256SUMS`.
+- `plugins/claude-code/`: the Claude Code plugin (catalog: `.claude-plugin/marketplace.json`).
+  While it is enabled the app installs only `cal` (`integration::claude_plugin_managed`).
 
 ## Commands
 
 ```bash
 pnpm turbo run typecheck build lint                    # JS side, as CI runs it
 node --test packages/callimachus-mcp/test/*.test.mjs   # npm launcher
+node --test plugins/test/*.test.mjs                    # Claude Code plugin
 cd apps/desktop/src-tauri
 cargo fmt --check && cargo clippy --locked --workspace --lib --bins --tests -- -D warnings
 cargo test --locked --workspace
@@ -87,6 +90,8 @@ env -u CLAUDE_CONFIG_DIR -u CODEX_HOME HOME="$S/home" CALLIMACHUS_DB="$S/index.d
   `apps/web/src/routes/{cli,index,desktop}.tsx` is in `COMMANDS` (`USAGE` must list it too).
 - `integration::every_shipped_skill_is_recognized`: an edit to `resources/recall/SKILL.md` needs
   its printed hash in `SHIPPED_SKILL_HASHES`.
+- `integration::claude_plugin_mirrors_the_app_install`: the plugin's skill is a byte copy of
+  that file, and its `hooks/hooks.json` matches the base `HookSpec`s and the app's version.
 - `command_surface_tests` (lib.rs): `generate_handler!` matches the `invoke` calls in `api.ts`.
 - `telemetry::privacy_policy_names_every_event` (reads `legal.ts`),
   `sidecar_entry_points_never_touch_telemetry`, and in `indexer/mod.rs`

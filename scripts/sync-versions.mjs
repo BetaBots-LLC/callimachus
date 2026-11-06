@@ -8,6 +8,9 @@
 //   apps/desktop/src-tauri/Cargo.toml        [package] version
 //   apps/desktop/src-tauri/Cargo.lock        the root `callimachus` package entry
 //   server.json                              registry manifest + pinned npm version
+//   plugins/claude-code/.claude-plugin/plugin.json  Claude Code plugin "version"
+//   plugins/claude-code/.mcp.json            pinned `callimachus-mcp@<version>`
+//   .claude-plugin/marketplace.json          plugin source `ref` = the `v<version>` tag
 //
 // Run automatically by the `version-packages` script. Safe to run by hand, and
 // idempotent: running it twice with the same version changes nothing.
@@ -24,6 +27,9 @@ const confPath = join(desktop, "src-tauri", "tauri.conf.json");
 const cargoPath = join(desktop, "src-tauri", "Cargo.toml");
 const lockPath = join(desktop, "src-tauri", "Cargo.lock");
 const serverPath = join(root, "server.json");
+const pluginPath = join(root, "plugins", "claude-code", ".claude-plugin", "plugin.json");
+const pluginMcpPath = join(root, "plugins", "claude-code", ".mcp.json");
+const marketPath = join(root, ".claude-plugin", "marketplace.json");
 
 function fail(message) {
   console.error(`sync-versions: ${message}`);
@@ -78,11 +84,41 @@ server.version = version;
 for (const pkg of server.packages ?? []) pkg.version = version;
 writeFileSync(serverPath, `${JSON.stringify(server, null, 2)}\n`);
 
+// plugin.json: Claude Code pins a plugin with a `version` to it until the field changes, so a
+// stale value would keep plugin users on the previous release's hooks and skill. Swap the
+// top-level value in place, like tauri.conf.json, so the file keeps its formatting.
+const pluginText = readFileSync(pluginPath, "utf8");
+const pluginBefore = JSON.parse(pluginText).version;
+if (!topLevelVersion.test(pluginText)) fail('no top-level "version" in plugin.json');
+writeFileSync(pluginPath, pluginText.replace(topLevelVersion, `  "version": "${version}"`));
+
+// .mcp.json and marketplace.json: the plugin must match the app release the user installed,
+// not the tip of main. A plugin from main runs `cal` subcommands an older app does not have
+// yet, and an unpinned `npx callimachus-mcp` runs whatever npm calls latest, which can be
+// ahead of the index's schema. So the marketplace fetches the plugin from the release tag and
+// the plugin pins the MCP launcher to the same release. Both swaps are in place, keeping the
+// files' formatting.
+const pluginMcpText = readFileSync(pluginMcpPath, "utf8");
+const npxPin = /"callimachus-mcp@[^"]*"/;
+const mcpBefore = pluginMcpText.match(npxPin)?.[0].slice(17, -1);
+if (mcpBefore === undefined)
+  fail('no "callimachus-mcp@<version>" argument in plugins/claude-code/.mcp.json');
+writeFileSync(pluginMcpPath, pluginMcpText.replace(npxPin, `"callimachus-mcp@${version}"`));
+
+const marketText = readFileSync(marketPath, "utf8");
+const tagRef = /"ref": "v[^"]*"/;
+const marketBefore = marketText.match(tagRef)?.[0].slice(9, -1);
+if (marketBefore === undefined) fail('no "ref": "v<version>" in .claude-plugin/marketplace.json');
+writeFileSync(marketPath, marketText.replace(tagRef, `"ref": "v${version}"`));
+
 console.log(`sync-versions: ${version}`);
 console.log(`  tauri.conf.json  ${confBefore} -> ${version}`);
 console.log(`  Cargo.toml       ${cargoBefore} -> ${version}`);
 console.log(`  Cargo.lock       ${lockBefore} -> ${version}`);
 console.log(`  server.json      ${serverBefore} -> ${version}`);
+console.log(`  plugin.json      ${pluginBefore} -> ${version}`);
+console.log(`  .mcp.json        ${mcpBefore} -> ${version}`);
+console.log(`  marketplace.json v${marketBefore} -> v${version}`);
 
 /**
  * Sets the version of the local (path) package `name` in a Cargo.lock and

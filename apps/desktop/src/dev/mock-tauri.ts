@@ -1,9 +1,10 @@
 // Browser-only fake of the Tauri runtime, so the UI runs (and can be screenshotted) without Rust.
 // Use: `pnpm --filter callimachus dev`, then open
 //   http://localhost:1420/mock.html?view=settings&section=providers&theme=light
-// Params: theme, consent, memory (alias: knowledge), engines, agents, keys, update, jobs,
-// semantic, searchMs (see SCENARIO below). Dev-only.
+// Params: theme, consent, memory (alias: knowledge), engines, agents, agenthooks, plugin, claude, keys,
+// update, jobs, semantic, searchMs, onboarding (see SCENARIO below). Dev-only.
 import type {
+  AgentHooksStatus,
   AgentIntegration,
   AutoDistillBudget,
   CleanupRow,
@@ -14,6 +15,7 @@ import type {
   EmbedStatus,
   IndexReport,
   HarvestSettings,
+  HookAgentId,
   HookSettings,
   IntegrationStatus,
   JobsStatus,
@@ -21,6 +23,7 @@ import type {
   MemoryEngine,
   MemoryFact,
   MemorySetup,
+  OnboardingSteps,
   ProjectInfo,
   ProjectMemory,
   SearchFilters,
@@ -30,6 +33,7 @@ import type {
   ThreadDetail,
   ThreadKnowledge,
   ThreadSummary,
+  ValueLedger,
 } from "../lib/api";
 import type { TelemetryStatus } from "../lib/telemetry";
 
@@ -43,11 +47,26 @@ function pick<T extends string>(name: string, allowed: readonly T[], fallback: T
   return v && (allowed as readonly string[]).includes(v) ? (v as T) : fallback;
 }
 
+// The setup checklist: `fresh` is a first launch (empty index until Index my history runs,
+// nothing connected, memory off, no semantic index); `partial` reopens it with the index
+// built, Claude Code connected and semantic search skipped; `done` with every step done.
+// The other params still override what they name.
+const ONBOARDING = pick("onboarding", ["none", "fresh", "partial", "done"] as const, "none");
+
 const SCENARIO = {
   theme: pick("theme", ["light", "dark"] as const, "dark"),
   consent: pick("consent", ["unset", "granted", "denied"] as const, "unset"),
+  onboarding: ONBOARDING,
   // LLM distillation on or off. `knowledge` is the older name for the same switch.
-  memory: pick("memory", ["on", "off"] as const, pick("knowledge", ["on", "off"] as const, "on")),
+  memory: pick(
+    "memory",
+    ["on", "off"] as const,
+    pick(
+      "knowledge",
+      ["on", "off"] as const,
+      ONBOARDING === "fresh" || ONBOARDING === "partial" ? "off" : "on",
+    ),
+  ),
   // Which engines memory_setup detects: the claude / codex CLIs, only a saved API key, none,
   // or only Ollama: on localhost with models, on another host, or running with none pulled.
   engines: pick(
@@ -55,16 +74,33 @@ const SCENARIO = {
     ["cli", "key", "none", "ollama", "ollama-remote", "ollama-empty"] as const,
     "cli",
   ),
-  agents: pick("agents", ["connected", "partial", "none"] as const, "partial"),
+  agents: pick(
+    "agents",
+    ["connected", "partial", "none"] as const,
+    ONBOARDING === "fresh" ? "none" : "partial",
+  ),
+  // `approve`: installed, but Codex wants them approved again in /hooks (after an update).
+  agenthooks: pick("agenthooks", ["off", "on", "blocked", "approve"] as const, "off"),
+  // The Callimachus Claude Code plugin is enabled, so the app installs only `cal`.
+  plugin: pick("plugin", ["on", "off"] as const, "off"),
+  // `absent`: no Claude Code config dir, so the checklist does not offer Claude Code.
+  claude: pick("claude", ["present", "absent"] as const, "present"),
   keys: pick("keys", ["none", "some"] as const, "some"),
   update: pick("update", ["available", "fail", "none"] as const, "none"),
   jobs: pick("jobs", ["idle", "indexing"] as const, "idle"),
   // What a hybrid search reports as `semanticSkipped`: the model is ready (null), still
   // loading, or not cached at all.
-  semantic: pick("semantic", ["ready", "loading", "unavailable"] as const, "ready"),
+  semantic: pick(
+    "semantic",
+    ["ready", "loading", "unavailable"] as const,
+    ONBOARDING === "fresh" || ONBOARDING === "partial" ? "unavailable" : "ready",
+  ),
   // How long a search takes. Above 0, a search still running when the next one starts
   // comes back superseded (empty), as the backend's cancellation does.
   searchMs: Math.max(0, Number(params.get("searchMs")) || 0),
+  // The Stats value card: a week of hook and MCP activity with 312 sessions Claude Code
+  // deleted (default), a fresh install with nothing yet, or retention already at a year.
+  ledger: pick("ledger", ["active", "empty", "kept"] as const, "active"),
 };
 
 // The theme store reads this at module load, which happens after this file runs.
@@ -228,6 +264,28 @@ const hookSettings: HookSettings = {
   digestEnabled: true,
   mutedProjects: [`${HOME}/code/infra`],
 };
+// The retention setting persists for the page's lifetime, like set_claude_cleanup_days.
+const retention: { days: number | null; previous: { days: number | null } | null } = {
+  days: SCENARIO.ledger === "kept" ? 365 : null,
+  previous: SCENARIO.ledger === "kept" ? { days: null } : null,
+};
+function valueLedger(): ValueLedger {
+  const empty = SCENARIO.ledger === "empty";
+  return {
+    week: empty
+      ? { hook: 0, mcp: 0, recall: 0, digest: 0 }
+      : { hook: 23, mcp: 141, recall: 6, digest: 9 },
+    allTime: empty ? 0 : 1874,
+    preserved: {
+      threads: empty ? 0 : 312,
+      source: "claude_code",
+      cleanupPeriodDays: retention.days,
+      effectiveDays: retention.days ?? 30,
+      previousCleanupDays: retention.previous?.days ?? null,
+      canRestore: retention.previous !== null,
+    },
+  };
+}
 // Two imported facts, the two claude-memory rows projectMemory shows.
 const harvest: HarvestSettings = { claudeMemory: true, importedFacts: 2 };
 const CLI_ENGINES = [
@@ -311,11 +369,14 @@ const jobs: JobsStatus = {
 };
 
 function recallStatus(installed: boolean): IntegrationStatus {
+  const managed = SCENARIO.plugin === "on";
   return {
-    skillInstalled: installed,
+    present: SCENARIO.claude === "present",
+    pluginManaged: managed,
+    skillInstalled: installed && !managed,
     skillOutdated: false,
-    mcpRegistered: installed,
-    hookInstalled: installed,
+    mcpRegistered: installed && !managed,
+    hookInstalled: installed && !managed,
     proactiveRecallInstalled: false,
     calInstalled: installed,
     exeStable: true,
@@ -326,7 +387,7 @@ function recallStatus(installed: boolean): IntegrationStatus {
     configPath: `${HOME}/.claude.json`,
   };
 }
-let recall = recallStatus(SCENARIO.agents !== "none");
+let recall = recallStatus(SCENARIO.agents !== "none" && SCENARIO.claude === "present");
 
 function agentList(mode: "connected" | "partial" | "none"): AgentIntegration[] {
   return [
@@ -347,13 +408,35 @@ function agentList(mode: "connected" | "partial" | "none"): AgentIntegration[] {
     {
       id: "gemini",
       label: "Gemini CLI",
-      present: false,
-      registered: false,
+      // Detected only in the fully connected scenario, so its hooks row can be checked too.
+      present: mode === "connected",
+      registered: mode === "connected",
       configPath: `${HOME}/.gemini/settings.json`,
     },
   ];
 }
 let agents = agentList(SCENARIO.agents);
+
+/** `agenthooks=off|on|blocked|approve`: the Codex / Gemini CLI memory hooks. */
+function agentHookRows(mode: "off" | "on" | "blocked" | "approve"): AgentHooksStatus[] {
+  const present = (id: string) => agents.find((a) => a.id === id)?.present ?? false;
+  const row = (agent: HookAgentId, configPath: string, dir: string): AgentHooksStatus => ({
+    agent,
+    configPath,
+    installed: (mode === "on" || mode === "approve") && present(agent),
+    needsApproval: mode === "approve" && agent === "codex" && present(agent),
+    blocked: !present(agent)
+      ? `${agent === "codex" ? "Codex" : "Gemini CLI"} is not set up on this machine (no ${dir})`
+      : mode === "blocked" && agent === "codex"
+        ? "hooks are disabled in config.toml"
+        : null,
+  });
+  return [
+    row("codex", `${HOME}/.codex/hooks.json`, `${HOME}/.codex`),
+    row("gemini", `${HOME}/.gemini/settings.json`, `${HOME}/.gemini`),
+  ];
+}
+const agentHooks = agentHookRows(SCENARIO.agenthooks);
 
 const SOURCE_COUNTS: [SourceKind, number, number][] = [
   ["claude_code", 842, 33_904],
@@ -366,10 +449,21 @@ const SOURCE_COUNTS: [SourceKind, number, number][] = [
 let freeBytes = 248 * 1024;
 const FILE_BYTES = 412_000_000;
 
+// onboarding=fresh: nothing is indexed until index_all runs.
+let indexed = SCENARIO.onboarding !== "fresh";
+
+let onboardingSteps: OnboardingSteps = {
+  index: SCENARIO.onboarding === "partial" || SCENARIO.onboarding === "done" ? "done" : null,
+  agents: SCENARIO.onboarding === "partial" || SCENARIO.onboarding === "done" ? "done" : null,
+  memory: SCENARIO.onboarding === "done" ? "done" : null,
+  semantic:
+    SCENARIO.onboarding === "partial" ? "skipped" : SCENARIO.onboarding === "done" ? "done" : null,
+};
+
 function dbStats(): DbStats {
   return {
-    threads: 1_284 - (24 - cleanupRows.length),
-    messages: 48_213,
+    threads: indexed ? 1_284 - (24 - cleanupRows.length) : 0,
+    messages: indexed ? 48_213 : 0,
     sources: 4,
     reclaimable: {
       bytes: freeBytes,
@@ -583,7 +677,7 @@ const EMPTY_INDEX = params.get("index") === "empty";
 
 function searchHits(query: string, filters?: SearchFilters): SearchHit[] {
   const q = query.trim() || "retry";
-  if (EMPTY_INDEX || /nomatch|kubernetes/i.test(q)) return [];
+  if (EMPTY_INDEX || !indexed || /nomatch|kubernetes/i.test(q)) return [];
   const pool = filterThreads(filters).slice(0, 6);
   return HIT_PLAN.filter(([t]) => t < pool.length).map(([t, role, n, text]) => {
     const thread = pool[t];
@@ -709,6 +803,7 @@ async function runIndexAll(): Promise<void> {
     await sleep(500);
   }
   jobs.index = false;
+  indexed = true;
   const report: IndexReport = {
     threadsIndexed: 12,
     threadsSkipped: 1_272,
@@ -972,7 +1067,8 @@ const handlers: Record<string, Handler> = {
     };
   },
   warm_semantic: ok,
-  recent_threads: (a) => (EMPTY_INDEX ? [] : filterThreads(a.filters as SearchFilters | undefined)),
+  recent_threads: (a) =>
+    EMPTY_INDEX || !indexed ? [] : filterThreads(a.filters as SearchFilters | undefined),
   search_by_file: () => threads.slice(0, 3),
   get_thread: (a) => {
     const d = threadDetail(Number(a.threadId));
@@ -1083,10 +1179,32 @@ const handlers: Record<string, Handler> = {
     knowledge.autoDistill = true;
     return sleep(400).then(() => ({ ...knowledge }));
   },
+  onboarding_state: () => ({ ...onboardingSteps }),
+  set_onboarding_step: (a) => {
+    const step = String(a.step);
+    const state = a.state === "done" || a.state === "skipped" ? a.state : null;
+    if (!(step in onboardingSteps)) throw new Error(`unknown checklist step "${step}"`);
+    if (step === "index" && state === "skipped")
+      throw new Error("indexing can't be skipped: the other steps need an index");
+    onboardingSteps = { ...onboardingSteps, [step]: state };
+    return { ...onboardingSteps };
+  },
   hook_settings: () => ({ ...hookSettings, mutedProjects: [...hookSettings.mutedProjects] }),
   set_hook_digest: (a) => {
     hookSettings.digestEnabled = Boolean(a.on);
     return null;
+  },
+  value_ledger: () => valueLedger(),
+  // As lib.rs: remembers the replaced value once; setting it back is the restore.
+  set_claude_cleanup_days: (a) => {
+    const days = typeof a.days === "number" ? a.days : null;
+    if (days !== null && days < 1)
+      throw new Error(`Transcript retention must be at least 1 day (Claude Code rejects ${days})`);
+    if (days === retention.days) return null;
+    if (retention.previous && retention.previous.days === days) retention.previous = null;
+    else if (!retention.previous) retention.previous = { days: retention.days };
+    retention.days = days;
+    return sleep(300).then(() => null);
   },
   harvest_settings: () => ({ ...harvest }),
   set_harvest_claude_memory: (a) => {
@@ -1173,6 +1291,20 @@ const handlers: Record<string, Handler> = {
   uninstall_agent_integrations: () => {
     agents = agents.map((x) => ({ ...x, registered: false }));
     return null;
+  },
+  agent_hooks_status: () => agentHooks.map((x) => ({ ...x })),
+  install_agent_hooks: (a) => {
+    const row = agentHooks.find((x) => x.agent === a.agent);
+    if (!row) throw new Error(`memory hooks are available for codex and gemini, not '${a.agent}'`);
+    if (row.blocked) throw new Error(`Can't add memory hooks: ${row.blocked}`);
+    row.installed = true;
+    return { ...row };
+  },
+  uninstall_agent_hooks: (a) => {
+    const row = agentHooks.find((x) => x.agent === a.agent);
+    if (!row) throw new Error(`memory hooks are available for codex and gemini, not '${a.agent}'`);
+    row.installed = false;
+    return { ...row };
   },
 };
 

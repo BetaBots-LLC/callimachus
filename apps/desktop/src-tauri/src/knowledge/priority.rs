@@ -1,12 +1,14 @@
 //! The auto-distill priority queue: sessions that just ended, distilled ahead of the
-//! recent-and-idle worklist. Claude Code's SessionEnd hook (`cal session-end`) adds the
-//! session; `auto_distill_worklist` drains it first. A session that ended is done, so the
+//! recent-and-idle worklist. The SessionEnd hooks of Claude Code, Codex and Gemini CLI
+//! (`cal session-end [--for codex|gemini]`) add the session; `auto_distill_worklist` drains
+//! it first. A session that ended is done, so the
 //! idle wait (which only guards against distilling a live session) and the 30-day window do
 //! not apply, but each entry still counts against the daily cap.
 //!
 //! Stored in `app_config` under [`PRIORITY_KEY`] as a JSON array of `{ "ref", "ts" }`,
 //! newest first, so the hook (a separate process) and the app share it without a schema
-//! change. References are `claude:<session_id>` or `thread:<id>`.
+//! change. References are `claude:<session_id>`, `codex:<session_id>`,
+//! `gemini:<session_id>` or `thread:<id>`.
 
 use super::app_config;
 use anyhow::Result;
@@ -66,8 +68,9 @@ fn update<T>(conn: &Connection, f: impl FnOnce(&mut Vec<Entry>) -> Result<T>) ->
     Ok(out)
 }
 
-/// A Claude Code session id as it appears in a transcript file name. Anything else (empty,
-/// a path, LIKE wildcards) is refused, since the id ends up in a LIKE pattern.
+/// An agent session id as it appears in a transcript file name (Claude Code, Gemini CLI) or
+/// as the thread's external id (Codex). Anything else (empty, a path, LIKE wildcards) is
+/// refused, since the id ends up in a LIKE pattern.
 fn valid_session_id(sid: &str) -> bool {
     !sid.is_empty()
         && sid.len() <= 128
@@ -76,8 +79,15 @@ fn valid_session_id(sid: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
+/// The agent prefixes a session reference can carry, each resolved against its own
+/// source's threads (see [`resolve`]).
+const SESSION_PREFIXES: [&str; 3] = ["claude:", "codex:", "gemini:"];
+
 fn valid_reference(reference: &str) -> bool {
-    if let Some(sid) = reference.strip_prefix("claude:") {
+    if let Some(sid) = SESSION_PREFIXES
+        .iter()
+        .find_map(|p| reference.strip_prefix(p))
+    {
         return valid_session_id(sid);
     }
     reference
@@ -85,7 +95,7 @@ fn valid_reference(reference: &str) -> bool {
         .is_some_and(|id| id.parse::<i64>().is_ok())
 }
 
-/// Put `reference` (`claude:<session_id>` or `thread:<id>`) at the front of the priority
+/// Put `reference` (`claude:` / `codex:` / `gemini:<session_id>` or `thread:<id>`) at the front of the priority
 /// queue, dropping an older copy of it, entries past a week, and anything past
 /// [`PRIORITY_MAX`]. One small `app_config` write: cheap enough for a SessionEnd hook.
 pub fn enqueue_distill_priority(conn: &Connection, reference: &str, now: i64) -> Result<()> {
@@ -115,8 +125,93 @@ const CLAUDE_SESSION_SQL: &str = "SELECT t.id FROM threads t
        AND (t.external_id = ?1 OR t.external_id LIKE ?2 ESCAPE '\\')
      ORDER BY t.id LIMIT 1";
 
+/// The indexed Codex thread for a session id. Codex keys a thread by its session id (the
+/// state DB's `threads.id`, the `session_meta` id of a loose rollout, and the uuid at the end
+/// of the rollout file name are the same value), so this is one seek on the
+/// (source_id, external_id) unique index.
+const CODEX_SESSION_SQL: &str = "SELECT t.id FROM threads t
+     WHERE t.source_id = (SELECT id FROM sources WHERE kind = 'codex')
+       AND t.external_id = ?1";
+
+/// Gemini CLI top-level chat files are `<project>/chats/session-<YYYY-MM-DDTHH-MM>-<first 8
+/// chars of the session id>.jsonl` (chatRecordingService.ts; subagent files nest one level
+/// deeper as `<parent id>/<id>.jsonl` and are never queued), so a session id only narrows to
+/// its 8-char prefix here; [`gemini_session_matches`] confirms against the file's own
+/// `sessionId`. Like the Claude lookup, the suffix match walks the gemini range of the
+/// covering unique index.
+const GEMINI_SESSION_SQL: &str = "SELECT t.id, t.external_id FROM threads t
+     WHERE t.source_id = (SELECT id FROM sources WHERE kind = 'gemini')
+       AND t.external_id LIKE ?1 ESCAPE '\\'
+     ORDER BY t.id LIMIT 16";
+
+/// The thread a Codex session id names, if it is indexed (also what `cal snapshot-hook --for
+/// codex` snapshots).
+pub fn codex_thread_for_session(conn: &Connection, sid: &str) -> Result<Option<i64>> {
+    if !valid_session_id(sid) {
+        return Ok(None);
+    }
+    Ok(conn
+        .prepare_cached(CODEX_SESSION_SQL)?
+        .query_row([sid], |r| r.get(0))
+        .optional()?)
+}
+
+/// The thread a Gemini CLI session id names, if it is indexed. `root` is Gemini's `tmp` dir
+/// (the external ids are relative to it), read to tell apart two sessions that share an
+/// 8-char prefix. A single candidate whose file is gone (deleted after indexing) still counts:
+/// the prefix is 32 bits of a random uuid.
+fn gemini_thread_for_session(
+    conn: &Connection,
+    sid: &str,
+    root: Option<&std::path::Path>,
+) -> Result<Option<i64>> {
+    if !valid_session_id(sid) {
+        return Ok(None);
+    }
+    let short: String = sid.chars().take(8).collect();
+    let pattern = format!("%/chats/session-%-{}.jsonl", short.replace('_', "\\_"));
+    let candidates: Vec<(i64, String)> = conn
+        .prepare_cached(GEMINI_SESSION_SQL)?
+        .query_map([pattern], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let lone = candidates.len() == 1;
+    for (id, external_id) in candidates {
+        match root.map(|r| gemini_session_matches(&r.join(&external_id), sid)) {
+            Some(Some(true)) => return Ok(Some(id)),
+            Some(Some(false)) => continue,
+            // Unreadable file or no root: trust a lone candidate only.
+            _ if lone => return Ok(Some(id)),
+            _ => continue,
+        }
+    }
+    Ok(None)
+}
+
+/// Whether the Gemini chat file at `path` records session `sid` in its first-line metadata
+/// (`sessionId`); None when the file or that line can't be read.
+fn gemini_session_matches(path: &std::path::Path, sid: &str) -> Option<bool> {
+    use std::io::{BufRead, Read};
+    let file = std::fs::File::open(path).ok()?;
+    let mut first = String::new();
+    // The metadata record is a few hundred bytes; cap the read so a corrupt file without
+    // newlines is not slurped whole.
+    std::io::BufReader::new(file)
+        .take(64 * 1024)
+        .read_line(&mut first)
+        .ok()?;
+    let meta: serde_json::Value = serde_json::from_str(first.trim()).ok()?;
+    Some(meta.get("sessionId")?.as_str()? == sid)
+}
+
 /// The thread `reference` names, if it is indexed.
 fn resolve(conn: &Connection, reference: &str) -> Result<Option<i64>> {
+    if let Some(sid) = reference.strip_prefix("codex:") {
+        return codex_thread_for_session(conn, sid);
+    }
+    if let Some(sid) = reference.strip_prefix("gemini:") {
+        let root = crate::indexer::gemini::tmp_root();
+        return gemini_thread_for_session(conn, sid, root.as_deref());
+    }
     if let Some(sid) = reference.strip_prefix("claude:") {
         if !valid_session_id(sid) {
             return Ok(None);
@@ -271,13 +366,25 @@ mod tests {
     /// A claude_code thread `<slug>/<sid>.jsonl` with `n` user/assistant turns, updated at
     /// `at`.
     fn session(conn: &mut Connection, sid: &str, n: usize, at: i64) -> i64 {
+        thread_in(
+            conn,
+            "claude_code",
+            &format!("-Users-me-proj/{sid}.jsonl"),
+            n,
+            at,
+        )
+    }
+
+    /// A thread of source `kind` keyed `external_id`, with `n` turns updated at `at`.
+    fn thread_in(conn: &mut Connection, kind: &str, external_id: &str, n: usize, at: i64) -> i64 {
         use crate::indexer::{source_id, upsert_thread, ParsedMessage, ParsedThread};
-        let src = source_id(conn, "claude_code").unwrap();
+        let sid = external_id;
+        let src = source_id(conn, kind).unwrap();
         upsert_thread(
             conn,
             src,
             &ParsedThread {
-                external_id: format!("-Users-me-proj/{sid}.jsonl"),
+                external_id: external_id.to_string(),
                 title: Some(sid.into()),
                 project_path: Some("/Users/me/proj".into()),
                 created_at: Some(at),
@@ -296,10 +403,125 @@ mod tests {
         .unwrap();
         conn.query_row(
             "SELECT id FROM threads WHERE external_id = ?1",
-            [format!("-Users-me-proj/{sid}.jsonl")],
+            [external_id],
             |r| r.get(0),
         )
         .unwrap()
+    }
+
+    fn plan(conn: &Connection, sql: &str, params: impl rusqlite::Params) -> String {
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        stmt.query_map(params, |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join(" | ")
+    }
+
+    #[test]
+    fn codex_and_gemini_lookups_use_the_unique_index() {
+        let conn = temp_db();
+        let codex = plan(&conn, CODEX_SESSION_SQL, ["019dc6b0-998d"]);
+        assert!(
+            codex.contains(
+                "COVERING INDEX sqlite_autoindex_threads_1 (source_id=? AND external_id=?)"
+            ),
+            "{codex}"
+        );
+        let gemini = plan(
+            &conn,
+            GEMINI_SESSION_SQL,
+            ["%/chats/session-%-abcd1234.jsonl"],
+        );
+        assert!(
+            gemini.contains("COVERING INDEX sqlite_autoindex_threads_1 (source_id=?)"),
+            "{gemini}"
+        );
+    }
+
+    /// `codex:<sid>` resolves to the codex thread keyed by that id, never a claude one.
+    #[test]
+    fn codex_sessions_resolve_by_external_id() {
+        let mut conn = temp_db();
+        let sid = "019dc6b0-998d-7a31-a39d-1229e6b38072";
+        let id = thread_in(&mut conn, "codex", sid, 4, 1_000);
+        thread_in(
+            &mut conn,
+            "claude_code",
+            &format!("p/{sid}.jsonl"),
+            4,
+            1_000,
+        );
+        assert_eq!(resolve(&conn, &format!("codex:{sid}")).unwrap(), Some(id));
+        assert_eq!(resolve(&conn, "codex:019dc6b0").unwrap(), None);
+        enqueue_distill_priority(&conn, &format!("codex:{sid}"), 5).unwrap();
+        enqueue_distill_priority(&conn, &format!("gemini:{sid}"), 6).unwrap();
+        assert!(enqueue_distill_priority(&conn, "codex:a%b", 7).is_err());
+    }
+
+    /// `gemini:<sid>` narrows by the 8-char prefix in the chat file name, then the file's
+    /// own `sessionId` picks between sessions sharing it; a lone candidate whose file is
+    /// gone still resolves.
+    #[test]
+    fn gemini_sessions_resolve_through_the_chat_file() {
+        let mut conn = temp_db();
+        let root = std::env::temp_dir().join(format!("calli_prio_gem_{}", std::process::id()));
+        let chats = root.join("proj").join("chats");
+        std::fs::create_dir_all(&chats).unwrap();
+        let a = "abcd1234-0000-4000-8000-00000000000a";
+        let b = "abcd1234-0000-4000-8000-00000000000b";
+        let file_a = "proj/chats/session-2026-11-06T10-00-abcd1234.jsonl";
+        let file_b = "proj/chats/session-2026-11-06T11-00-abcd1234.jsonl";
+        for (file, sid) in [(file_a, a), (file_b, b)] {
+            std::fs::write(
+                root.join(file),
+                format!(
+                    "{{\"sessionId\":\"{sid}\",\"startTime\":\"2026-11-06T10:00:00Z\"}}\n{{}}\n"
+                ),
+            )
+            .unwrap();
+        }
+        let ta = thread_in(&mut conn, "gemini", file_a, 4, 1_000);
+        let tb = thread_in(&mut conn, "gemini", file_b, 4, 1_000);
+        // A subagent file never matches the top-level name shape.
+        thread_in(
+            &mut conn,
+            "gemini",
+            &format!("proj/chats/{a}/{a}.jsonl"),
+            4,
+            1_000,
+        );
+        assert_eq!(
+            gemini_thread_for_session(&conn, a, Some(&root)).unwrap(),
+            Some(ta)
+        );
+        assert_eq!(
+            gemini_thread_for_session(&conn, b, Some(&root)).unwrap(),
+            Some(tb)
+        );
+        assert_eq!(
+            gemini_thread_for_session(&conn, a, None).unwrap(),
+            None,
+            "two candidates and no file to tell them apart"
+        );
+        assert_eq!(
+            gemini_thread_for_session(&conn, "ffff0000-1", Some(&root)).unwrap(),
+            None
+        );
+        let gone = "cccc5678-0000-4000-8000-00000000000c";
+        let tc = thread_in(
+            &mut conn,
+            "gemini",
+            "proj/chats/session-2026-11-05T09-00-cccc5678.jsonl",
+            4,
+            1_000,
+        );
+        assert_eq!(
+            gemini_thread_for_session(&conn, gone, Some(&root)).unwrap(),
+            Some(tc),
+            "a lone candidate whose file is gone"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn queue(conn: &Connection) -> Vec<String> {

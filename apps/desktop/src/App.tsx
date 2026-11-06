@@ -14,6 +14,7 @@ import { Kbd, KbdGroup } from "@/components/ui/kbd";
 import { api } from "./lib/api";
 import { MOD_KEY } from "./lib/platform";
 import { prefetchOnIntent, warm, whenIdle } from "./lib/prefetch";
+import { useChecklist } from "./store/checklist";
 import { useUi, type View } from "./store/ui";
 import { useTheme } from "./store/theme";
 
@@ -39,8 +40,8 @@ const SettingsView = lazy(() => loadSettings().then((m) => ({ default: m.Setting
 
 // Parts of the Search view that first paint never shows also stay out of the entry: the
 // thread pane (with its tag combobox and knowledge sheet) until a thread is opened, the
-// command palette (cmdk plus a Radix dialog stack) until Cmd/Ctrl-K, and onboarding
-// unless the index is empty.
+// command palette (cmdk plus a Radix dialog stack) until Cmd/Ctrl-K, and the setup
+// checklist unless the index is empty or the user opens it.
 const loadThreadView = () => import("./components/ThreadView");
 const loadCommandPalette = () => import("./components/CommandPalette");
 const ThreadView = lazy(() => loadThreadView().then((m) => ({ default: m.ThreadView })));
@@ -189,6 +190,15 @@ function App() {
   const theme = useTheme((s) => s.resolved);
   const toggleTheme = useTheme((s) => s.toggle);
   const { data: stats } = useQuery({ queryKey: ["db_stats"], queryFn: api.dbStats });
+  // An empty index opens the setup checklist, which then stays open until the user closes it
+  // or opens a thread or a search (store/checklist.ts): the index step finishing must not
+  // pull the other three steps away mid-setup.
+  const indexEmpty = !!stats && stats.threads === 0;
+  const checklistOpen = useChecklist((s) => s.open);
+  const openFirstRun = useChecklist((s) => s.openFirstRun);
+  useEffect(() => {
+    if (indexEmpty) openFirstRun();
+  }, [indexEmpty, openFirstRun]);
   // LLM distillation gates Ask only. Knowledge and Projects always render (TODOs, Remember
   // and harvested memory need no engine) and show the memory card inline while it is off.
   const knowledge = useQuery({ queryKey: ["knowledge_config"], queryFn: api.knowledgeConfig });
@@ -294,7 +304,7 @@ function App() {
         <ErrorBoundary scope="view" resetOn={view}>
           <Suspense fallback={<Loading label="Loading…" className="flex-1" />}>
             <div className="flex min-h-0 flex-1 flex-col">
-              {(stats && stats.threads === 0) || forceOnboard ? (
+              {indexEmpty || checklistOpen || forceOnboard ? (
                 <Onboarding />
               ) : (
                 <>
@@ -346,10 +356,11 @@ function App() {
 
       <RetainOpenThread />
       <CommandPaletteHost />
-      {/* App-level, not inside a view: upgraded users with an existing index never see
-          Onboarding, so the one-time analytics question has to live here. It sits
-          bottom-left so it never covers the toasts (bottom-right), including the one
-          that announces an update. */}
+      {/* App-level, not inside a view: upgraded users with an existing index never see the
+          setup checklist unless they open it, so the one-time analytics question has to
+          live here too. While the checklist is open it asks in the checklist's footer
+          instead. It sits bottom-left so it never covers the toasts (bottom-right),
+          including the one that announces an update. */}
       <TelemetryConsent />
     </div>
   );

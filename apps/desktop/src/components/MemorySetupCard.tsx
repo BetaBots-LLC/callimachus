@@ -1,9 +1,10 @@
 import { useId, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { create } from "zustand";
-import { Sparkles } from "lucide-react";
+import { ListChecks, Sparkles } from "lucide-react";
 import { api, PROVIDERS, type MemoryEngine } from "../lib/api";
 import { errorText, notify } from "../lib/toast";
+import { useChecklist } from "../store/checklist";
 import { useUi } from "../store/ui";
 import { Button } from "@/components/ui/button";
 import {
@@ -93,17 +94,31 @@ function providerName(e: MemoryEngine): string {
  *
  * `whenDismissed`: "hide" removes it after Not now; "button" leaves a small button that
  * brings it back (for a view that has nothing else to show while memory is off).
+ * `embedded`: the setup checklist's memory step, which carries the title and the unlock line
+ * itself and records Not now as a skipped step (`onSkip`) instead of a session dismissal.
+ * `checklistLink`: while the setup checklist is open, point at its memory step instead of
+ * offering a second copy of the same choice (Ask and Projects).
  */
 export function MemorySetupCard({
   whenDismissed = "hide",
+  embedded = false,
+  onSkip,
+  checklistLink = false,
   className,
 }: {
   whenDismissed?: "hide" | "button";
+  embedded?: boolean;
+  onSkip?: () => void;
+  checklistLink?: boolean;
   className?: string;
 }) {
   const qc = useQueryClient();
   const openSettings = useUi((s) => s.openSettings);
-  const dismissed = useCardDismissed((s) => s.dismissed);
+  const checklistOpen = useChecklist((s) => s.open);
+  const showChecklist = useChecklist((s) => s.show);
+  const sessionDismissed = useCardDismissed((s) => s.dismissed);
+  // The checklist's own copy answers Not now as a skipped step, so it never hides itself.
+  const dismissed = sessionDismissed && !embedded;
   const setDismissed = useCardDismissed((s) => s.set);
   const name = useId();
   const setup = useQuery({ queryKey: ["memory_setup"], queryFn: api.memorySetup });
@@ -164,6 +179,24 @@ export function MemorySetupCard({
   });
 
   if (cfg.data?.enabled) return null;
+  if (checklistLink && checklistOpen) {
+    return (
+      <section
+        aria-label="Turn on memory"
+        className={cn(
+          "flex flex-wrap items-center gap-x-3 gap-y-2 rounded-xl border bg-card p-4 text-left text-sm",
+          className,
+        )}
+      >
+        <p className="min-w-0 flex-1 text-[13px] leading-normal text-muted-foreground">
+          Memory is off. Turn it on in step 3 of the setup checklist, where you pick the engine.
+        </p>
+        <Button size="sm" variant="outline" onClick={() => showChecklist("memory")}>
+          <ListChecks /> Go to the memory step
+        </Button>
+      </section>
+    );
+  }
   if (dismissed) {
     return whenDismissed === "button" ? (
       <Button size="sm" variant="outline" onClick={() => setDismissed(false)}>
@@ -190,19 +223,25 @@ export function MemorySetupCard({
   return (
     <section
       aria-label="Turn on memory"
-      className={cn("space-y-3 rounded-xl border bg-card p-4 text-left text-sm", className)}
+      className={cn(
+        "space-y-3 text-left text-sm",
+        !embedded && "rounded-xl border bg-card p-4",
+        className,
+      )}
     >
-      <div className="space-y-1">
-        <h3 className="flex items-center gap-1.5 font-semibold">
-          <Sparkles className="size-4 text-muted-foreground" aria-hidden="true" />
-          Turn on memory
-        </h3>
-        <p className="text-[13px] leading-normal text-muted-foreground">
-          An LLM reads your past sessions and keeps each repo's decisions, gotchas and summaries, so
-          Ask, recall, Projects and your agents' session hooks have something to say. TODOs and
-          Remember work without it.
-        </p>
-      </div>
+      {!embedded && (
+        <div className="space-y-1">
+          <h3 className="flex items-center gap-1.5 font-semibold">
+            <Sparkles className="size-4 text-muted-foreground" aria-hidden="true" />
+            Turn on memory
+          </h3>
+          <p className="text-[13px] leading-normal text-muted-foreground">
+            An LLM reads your past sessions and keeps each repo's decisions, gotchas and summaries,
+            so Ask, recall, Projects and your agents' session hooks have something to say. TODOs and
+            Remember work without it.
+          </p>
+        </div>
+      )}
 
       {setup.isPending ? (
         <p className="flex items-center gap-2 text-[13px] text-muted-foreground">
@@ -331,14 +370,17 @@ export function MemorySetupCard({
             Check again
           </Button>
         ) : null}
-        <Button
-          size="sm"
-          variant="ghost"
-          onClick={() => setDismissed(true)}
-          disabled={enable.isPending}
-        >
-          Not now
-        </Button>
+        {/* Embedded with no onSkip: the step is already answered, so nothing to skip. */}
+        {(!embedded || onSkip) && (
+          <Button
+            size="sm"
+            variant="ghost"
+            onClick={() => (onSkip ? onSkip() : setDismissed(true))}
+            disabled={enable.isPending}
+          >
+            {onSkip ? "Skip for now" : "Not now"}
+          </Button>
+        )}
       </div>
     </section>
   );

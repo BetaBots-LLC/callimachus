@@ -1,0 +1,39 @@
+{
+  "description": "Callimachus memory hooks: inject the repo's memory at session start, keep the compaction summary, and queue an ended session for distillation. Each one exits quietly when the cal CLI is not installed.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ ! -x \"$HOME/.local/bin/cal\" ] || \"$HOME/.local/bin/cal\" hook",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ ! -x \"$HOME/.local/bin/cal\" ] || \"$HOME/.local/bin/cal\" snapshot-hook",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ ! -x \"$HOME/.local/bin/cal\" ] || \"$HOME/.local/bin/cal\" session-end",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

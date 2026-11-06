@@ -13,7 +13,7 @@ export const FAQ: { q: string; a: string }[] = [
   },
   {
     q: "What do I actually need to run it?",
-    a: "The desktop app on macOS (Apple Silicon), Windows, or Linux (glibc 2.38 or newer, such as Ubuntu 24.04+ or Debian 13+). That's it: it builds the index and can install the cal CLI. The editor extension and MCP server both read the same local index, so run the app once and everything else just works. TODOs, Remember and per-project memory work with no key. Memory that distills decisions and gotchas from your sessions takes one click, in the Turn on memory card in Projects or Ask or in Settings > Knowledge, on the engine you pick: your logged-in Claude Code or Codex CLI, local Ollama, or a saved API key.",
+    a: "The desktop app on macOS (Apple Silicon), Windows, or Linux (glibc 2.38 or newer, such as Ubuntu 24.04+ or Debian 13+). That's it: it builds the index and can install the cal CLI. The editor extension and MCP server both read the same local index, so run the app once and everything else just works. TODOs, Remember and per-project memory work with no key. The first-run setup checklist walks you through indexing, connecting your agents, memory and semantic search. Memory that distills decisions and gotchas from your sessions takes one click there, in the Turn on memory card in Projects or Ask, or in Settings > Knowledge, on the engine you pick: your logged-in Claude Code or Codex CLI, local Ollama, or a saved API key.",
   },
   {
     q: "Can it summarize decisions or answer questions about my history?",

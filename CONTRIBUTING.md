@@ -65,6 +65,7 @@ pnpm check                             # Biome lint + format check
 pnpm typecheck                         # all apps (tsc)
 pnpm build                             # all apps; also creates apps/desktop/dist, which the Rust crate needs to compile
 node --test packages/callimachus-mcp/test/*.test.mjs   # npm launcher tests
+node --test plugins/test/*.test.mjs                    # Claude Code plugin manifests
 cd apps/desktop/src-tauri
 cargo fmt --check
 cargo clippy --workspace --locked --lib --bins --tests -- -D warnings

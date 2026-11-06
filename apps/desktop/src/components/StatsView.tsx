@@ -1,8 +1,12 @@
-import { useQuery } from "@tanstack/react-query";
-import { api, SOURCE_LABELS, type SourceKind } from "../lib/api";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useState } from "react";
+import { api, SOURCE_LABELS, type SourceKind, type ValueLedger } from "../lib/api";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Spinner } from "@/components/ui/spinner";
 import { formatUsd, shortPath } from "../lib/format";
 import { AGGREGATE_STALE_MS } from "../lib/queryClient";
+import { errorText, notify } from "../lib/toast";
 import { cn } from "@/lib/utils";
 import { Loading } from "./Loading";
 
@@ -40,6 +44,8 @@ export function StatsView() {
         />
         <Stat label="Span" value={spanLabel(data.earliest, data.latest)} />
       </dl>
+
+      <ValueCard />
 
       <Card>
         <CardHeader>
@@ -104,6 +110,163 @@ export function StatsView() {
           </CardContent>
         </Card>
       </div>
+    </div>
+  );
+}
+
+/** Retention "Keep for a year" sets: long enough that the sweep rarely reaches a session
+ *  someone still looks for, and a round number the confirm can name. (Claude Code documents
+ *  only a minimum, 1 day.) */
+const KEEP_DAYS = 365;
+
+const plural = (n: number, one: string, many = `${one}s`) =>
+  `${n.toLocaleString()} ${n === 1 ? one : many}`;
+
+/** What the hooks and the MCP server did this week (the local ledger), and the Claude Code
+ *  sessions the index still holds after Claude Code deleted their transcripts. */
+function ValueCard() {
+  const { data } = useQuery({
+    queryKey: ["value_ledger"],
+    queryFn: api.valueLedger,
+    // One stat per Claude Code session; the counts move by the minute at most.
+    staleTime: 60_000,
+  });
+  if (!data) return null;
+
+  const { week, allTime } = data;
+  const weekTotal = week.hook + week.digest + week.recall + week.mcp;
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>What Callimachus did for your agents this week</CardTitle>
+        <CardDescription>
+          {allTime === 0
+            ? "Nothing yet. Counts start when an agent opens a session with the hooks or the MCP server connected (Settings > Agents)."
+            : `Helped ${plural(weekTotal, "time")} in the last 7 days, ${allTime.toLocaleString()} in all. Counted on this machine only, never sent anywhere.`}
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-5">
+        <dl className="grid grid-cols-2 gap-px overflow-hidden rounded-lg border bg-border sm:grid-cols-4">
+          <Stat
+            label="Memory injected"
+            value={week.hook.toLocaleString()}
+            title="Sessions that started with this repo's decisions and gotchas"
+          />
+          <Stat
+            label="Session digests"
+            value={week.digest.toLocaleString()}
+            title="Sessions in a repo with no memory yet that started with its recent sessions"
+          />
+          <Stat
+            label="Recall hits"
+            value={week.recall.toLocaleString()}
+            title="Prompts where related past work was surfaced before the agent redid it"
+          />
+          <Stat
+            label="MCP tool calls"
+            value={week.mcp.toLocaleString()}
+            title="Searches, memory lookups and thread reads answered for an agent"
+          />
+        </dl>
+        <RetentionGuard preserved={data.preserved} />
+      </CardContent>
+    </Card>
+  );
+}
+
+/** "N sessions preserved that Claude Code deleted", the retention behind it, and a
+ *  reversible "keep for a year" that edits Claude Code's settings.json after a confirm. */
+function RetentionGuard({ preserved }: { preserved: ValueLedger["preserved"] }) {
+  const queryClient = useQueryClient();
+  const [confirming, setConfirming] = useState<"keep" | "restore" | null>(null);
+  const restoreTo = preserved.previousCleanupDays;
+  const restoreLabel =
+    restoreTo === null ? "Claude Code's 30-day default" : plural(restoreTo, "day");
+
+  const change = useMutation({
+    mutationFn: (days: number | null) => api.setClaudeCleanupDays(days),
+    onSuccess: (_, days) => {
+      setConfirming(null);
+      queryClient.invalidateQueries({ queryKey: ["value_ledger"] });
+      notify.success(
+        // Names the edit, not the outcome: managed settings (an organization's policy) outrank
+        // the user's settings.json, and this card reads only the user file.
+        days === KEEP_DAYS
+          ? `Set cleanupPeriodDays to ${KEEP_DAYS} in your Claude Code settings.json`
+          : days === null
+            ? "Removed cleanupPeriodDays from your Claude Code settings.json (30-day default)"
+            : `Set cleanupPeriodDays back to ${days} in your Claude Code settings.json`,
+      );
+    },
+    onError: (e) => {
+      setConfirming(null);
+      notify.error("Couldn't change Claude Code's retention", {
+        description: `${errorText(e)}. Fix settings.json, or set cleanupPeriodDays there yourself.`,
+      });
+    },
+  });
+
+  const retention =
+    preserved.cleanupPeriodDays === null
+      ? `Claude Code deletes transcripts after ${plural(preserved.effectiveDays, "day")} by default; your settings.json does not change that.`
+      : `Your settings.json has Claude Code delete transcripts after ${plural(preserved.effectiveDays, "day")} (cleanupPeriodDays).`;
+
+  let action: React.ReactNode = null;
+  if (confirming) {
+    const keep = confirming === "keep";
+    action = (
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="text-[13px] text-muted-foreground">
+          {keep
+            ? `Set cleanupPeriodDays to ${KEEP_DAYS} in Claude Code's settings.json?`
+            : restoreTo === null
+              ? "Remove cleanupPeriodDays from Claude Code's settings.json?"
+              : `Set cleanupPeriodDays back to ${restoreTo}?`}
+        </span>
+        {!change.isPending && (
+          <Button size="xs" variant="ghost" type="button" onClick={() => setConfirming(null)}>
+            Cancel
+          </Button>
+        )}
+        <Button
+          size="xs"
+          type="button"
+          disabled={change.isPending}
+          onClick={() => change.mutate(keep ? KEEP_DAYS : restoreTo)}
+        >
+          {change.isPending && <Spinner data-icon="inline-start" />}
+          {keep ? "Keep for a year" : "Restore"}
+        </Button>
+      </div>
+    );
+  } else if (preserved.canRestore && preserved.cleanupPeriodDays === KEEP_DAYS) {
+    action = (
+      <Button size="sm" variant="ghost" type="button" onClick={() => setConfirming("restore")}>
+        Restore {restoreLabel}
+      </Button>
+    );
+  } else if (preserved.effectiveDays < KEEP_DAYS) {
+    action = (
+      <Button size="sm" variant="outline" type="button" onClick={() => setConfirming("keep")}>
+        Keep transcripts for a year
+      </Button>
+    );
+  }
+
+  return (
+    <div className="flex flex-wrap items-center justify-between gap-3 border-t pt-4">
+      <div className="min-w-0 space-y-0.5">
+        <p className="text-sm font-medium">
+          {preserved.threads > 0
+            ? `${plural(preserved.threads, "session")} preserved that Claude Code deleted`
+            : "No indexed Claude Code session has been deleted yet"}
+        </p>
+        <p className="text-[13px] text-muted-foreground">
+          {retention} Managed settings from your organization, if any, take precedence. Callimachus
+          keeps its indexed copy either way.
+        </p>
+      </div>
+      {action}
     </div>
   );
 }

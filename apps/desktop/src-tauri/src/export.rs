@@ -458,6 +458,9 @@ pub struct DigestOpts {
 /// More than five sessions stops being a digest: each one costs ~300 chars of context.
 pub const DIGEST_MAX_SESSIONS: usize = 5;
 
+/// The digest's first line; `cal hook` tells a digest-only injection from memory by it.
+pub const DIGEST_HEADING: &str = "## Recent sessions in this repo";
+
 /// The digest's trust line. Unlike [`MEMORY_TRUST_LINE`] it says the text is raw activity:
 /// a gist is often the user's own last prompt, not anything distilled.
 pub const DIGEST_TRUST_LINE: &str =
@@ -774,7 +777,7 @@ pub fn session_digest(
         return Ok(None);
     }
     let now = chrono::Utc::now().timestamp();
-    let head = format!("## Recent sessions in this repo\n\n{DIGEST_TRUST_LINE}\n\n");
+    let head = format!("{DIGEST_HEADING}\n\n{DIGEST_TRUST_LINE}\n\n");
     use rusqlite::OptionalExtension;
     // Matched on the exact project key, not `snapshot::list`'s substring: `/x/app` must not
     // offer a snapshot from `/x/app-web`. A snapshot whose thread was pruned still matches on

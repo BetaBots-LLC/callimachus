@@ -6,7 +6,7 @@ import { MemorySetupCard } from "./MemorySetupCard";
  * stays visible and shows what it does plus the one-click memory card, so the feature is
  * discoverable instead of hidden behind a flag. Projects and the Knowledge tab are not
  * gated: TODOs, Remember and harvested memory work without an engine, so they show the
- * card inline instead.
+ * card inline instead. While the setup checklist is open the card links to its memory step.
  */
 export function KnowledgeGate({
   enabled,
@@ -28,7 +28,7 @@ export function KnowledgeGate({
           <h2 className="text-lg font-semibold tracking-tight">{feature}</h2>
           <p className="text-sm text-muted-foreground">{blurb}</p>
         </div>
-        <MemorySetupCard whenDismissed="button" className="w-full" />
+        <MemorySetupCard whenDismissed="button" checklistLink className="w-full" />
       </div>
     </div>
   );

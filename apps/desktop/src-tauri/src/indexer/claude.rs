@@ -227,7 +227,11 @@ pub fn scan(conn: &mut Connection, tick: &mut dyn FnMut()) -> Result<IndexReport
 }
 
 /// [`scan`] over one projects root, with the writes grouped into [`Batch`]es.
-fn scan_root(conn: &mut Connection, root: &Path, tick: &mut dyn FnMut()) -> Result<IndexReport> {
+pub(crate) fn scan_root(
+    conn: &mut Connection,
+    root: &Path,
+    tick: &mut dyn FnMut(),
+) -> Result<IndexReport> {
     let mut report = IndexReport::default();
     if !root.is_dir() {
         return Ok(report);

@@ -466,6 +466,37 @@ export interface HarvestSettings {
   importedFacts: number;
 }
 
+/** Events per kind in the value ledger (`ledger.rs`). */
+export interface LedgerCounts {
+  /** SessionStart injections of project memory. */
+  hook: number;
+  /** MCP tool calls answered. */
+  mcp: number;
+  /** Prompt-time recall hits (`recall-now`). */
+  recall: number;
+  /** SessionStart injections of the recent-sessions digest (repo with no memory yet). */
+  digest: number;
+}
+
+/** What Callimachus did for the user's agents, and what it kept (`value_ledger`). */
+export interface ValueLedger {
+  /** The last 7 local days, today included. */
+  week: LedgerCounts;
+  allTime: number;
+  preserved: {
+    /** Indexed Claude Code sessions whose transcript Claude Code has since deleted. */
+    threads: number;
+    source: "claude_code";
+    /** The user-level `cleanupPeriodDays`, null when unset. */
+    cleanupPeriodDays: number | null;
+    /** What Claude Code applies: the setting, else its 30-day default. */
+    effectiveDays: number;
+    /** The value Callimachus replaced (null: it was unset); meaningful when canRestore. */
+    previousCleanupDays: number | null;
+    canRestore: boolean;
+  };
+}
+
 export const api = {
   dbStats: () => invoke<DbStats>("db_stats"),
   indexStats: () => invoke<Stats>("index_stats"),
@@ -602,8 +633,16 @@ export const api = {
   enableMemory: (provider: string, model?: string | null) =>
     invoke<KnowledgeConfig>("enable_memory", { provider, model: model ?? null }),
   // The SessionStart hook's recent-sessions digest for repos with no memory yet.
+  // The first-run setup checklist's saved step states (app_config `onboarding.steps`).
+  onboardingState: () => invoke<OnboardingSteps>("onboarding_state"),
+  setOnboardingStep: (step: OnboardingStep, state: OnboardingStepState) =>
+    invoke<OnboardingSteps>("set_onboarding_step", { step, state }),
   hookSettings: () => invoke<HookSettings>("hook_settings"),
   setHookDigest: (on: boolean) => invoke<void>("set_hook_digest", { on }),
+  // Local counts of hook injections, recall hits and MCP calls, plus the retention guard.
+  valueLedger: () => invoke<ValueLedger>("value_ledger"),
+  // Claude Code's transcript retention in days; null removes the key (its 30-day default).
+  setClaudeCleanupDays: (days: number | null) => invoke<void>("set_claude_cleanup_days", { days }),
   // Harvest Claude Code's own auto-memory files into project memory.
   harvestSettings: () => invoke<HarvestSettings>("harvest_settings"),
   setHarvestClaudeMemory: (on: boolean) => invoke<void>("set_harvest_claude_memory", { on }),
@@ -681,10 +720,24 @@ export const api = {
   agentIntegrationsStatus: () => invoke<AgentIntegration[]>("agent_integrations_status"),
   installAgentIntegrations: () => invoke<AgentIntegration[]>("install_agent_integrations"),
   uninstallAgentIntegrations: () => invoke<void>("uninstall_agent_integrations"),
+  // Memory hooks for Codex and Gemini CLI (SessionStart injection, SessionEnd queueing).
+  agentHooksStatus: () => invoke<AgentHooksStatus[]>("agent_hooks_status"),
+  installAgentHooks: (agent: HookAgentId) =>
+    invoke<AgentHooksStatus>("install_agent_hooks", { agent }),
+  uninstallAgentHooks: (agent: HookAgentId) =>
+    invoke<AgentHooksStatus>("uninstall_agent_hooks", { agent }),
   // Opt-in usage analytics: consent state + whether this build can send at all.
   telemetryState,
   setTelemetry,
 };
+
+/** The first-run checklist steps, in display order. */
+export const ONBOARDING_STEPS = ["index", "agents", "memory", "semantic"] as const;
+export type OnboardingStep = (typeof ONBOARDING_STEPS)[number];
+/** A step's saved answer; null = not answered. "done" sticks once recorded, so a step the
+ *  user finished stays finished when its live state later changes. Indexing can't be skipped. */
+export type OnboardingStepState = "done" | "skipped" | null;
+export type OnboardingSteps = Record<OnboardingStep, OnboardingStepState>;
 
 // State of the Claude Code integration (the `/recall` skill + `callimachus` MCP server).
 export interface IntegrationStatus {
@@ -707,6 +760,14 @@ export interface IntegrationStatus {
   pathHint: string | null;
   skillPath: string;
   configPath: string;
+  /** The Callimachus Claude Code plugin is enabled (macOS and Linux), so it provides the
+   *  skill, the MCP server and the hooks, and the app installs only `cal` for its hooks.
+   *  Optional: an older backend doesn't send it. */
+  pluginManaged?: boolean;
+  /** Claude Code is set up on this machine (its config dir exists), like
+   *  `AgentIntegration.present`. Optional: an older backend doesn't send it, and then the
+   *  checklist offers Claude Code as before. */
+  present?: boolean;
 }
 
 // A CLI LLM backend (Claude Code / Codex) usable for keyless distillation, with install state.
@@ -725,6 +786,24 @@ export interface AgentIntegration {
   present: boolean; // the agent's config dir exists (the user uses it)
   registered: boolean;
   configPath: string;
+}
+
+/** An agent whose own hook system Callimachus can install memory hooks into. */
+export type HookAgentId = "codex" | "gemini";
+
+// One agent's memory-hook state (`agent_hooks_status`).
+export interface AgentHooksStatus {
+  agent: HookAgentId;
+  /** The file the hooks live in: `~/.codex/hooks.json` or `~/.gemini/settings.json`. */
+  configPath: string;
+  installed: boolean;
+  /** Why installing would do nothing (hooks turned off in the agent's config, or the agent
+   *  is not set up here); the install command refuses with it. */
+  blocked: string | null;
+  /** Codex only: the hooks are installed but Codex will not run them until the user
+   *  approves them again in /hooks (Codex re-asks when a hook's command changes, as it does
+   *  after an app update or move). Optional: an older backend doesn't send it. */
+  needsApproval?: boolean;
 }
 
 export interface ChatMessage {

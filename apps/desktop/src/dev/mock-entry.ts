@@ -36,3 +36,9 @@ if (section && (SECTIONS as readonly string[]).includes(section)) {
 } else if (view && (VIEWS as readonly string[]).includes(view)) {
   ui.setView(view as View);
 }
+// onboarding=partial|done: the index is built, so the checklist only shows when opened.
+const onboarding = params.get("onboarding");
+if (onboarding === "partial" || onboarding === "done") {
+  const { useChecklist } = await import("../store/checklist");
+  useChecklist.getState().show();
+}

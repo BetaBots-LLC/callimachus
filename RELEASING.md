@@ -22,7 +22,7 @@ PR with a changeset ─┐
                                             callimachus-vscode and callimachus-mcp
                                             (one Changesets fixed group)
                        sync-versions.mjs  → tauri.conf.json, Cargo.toml, Cargo.lock,
-                                            server.json
+                                            server.json, the Claude Code plugin.json
                        release-tag.mjs    → one tag: v<ver>
                                                        │
               ┌────────────────────────────────────── ┴ v<ver> ─────────────────────────┐
@@ -45,8 +45,18 @@ that bumps one package bumps all three, so every release pushes exactly one
 `v<ver>` tag that fans out to **both** `build.yml` and `publish-extension.yml`.
 `scripts/sync-versions.mjs` then copies the version from `apps/desktop/package.json`
 into `tauri.conf.json`, `Cargo.toml`, the root `callimachus` entry in `Cargo.lock`,
-and `server.json` (the MCP registry manifest), so the installer, the updater
-manifest, the registry entry and the git tag never drift.
+`server.json` (the MCP registry manifest) and `plugins/claude-code/.claude-plugin/plugin.json`
+(Claude Code keeps plugin users on a plugin's `version` until it changes), so the installer,
+the updater manifest, the registry entry, the plugin and the git tag never drift. It also
+rewrites the plugin's pinned `npx -y callimachus-mcp@<ver>` in `plugins/claude-code/.mcp.json`
+and the `"ref": "v<ver>"` of the plugin's `git-subdir` source in `.claude-plugin/marketplace.json`.
+
+**The plugin follows the release, not main.** Claude Code reads the marketplace catalog from
+the default branch but fetches the plugin itself from the `v<ver>` tag the catalog names. Once
+the version PR merges, the catalog on main names a tag that does not exist until the release
+workflow pushes it, so a `/plugin install` or update in that window fails to fetch; it resolves
+as soon as the tag exists. Users on the previous version keep it until then. The pinned
+`callimachus-mcp@<ver>` likewise resolves once the npm publish of that release lands.
 
 **Nothing is public until it is complete.** The release starts as a draft. Every
 platform uploads into that draft, and `finalize` publishes it only after all
