@@ -74,7 +74,6 @@ export function ChatView() {
 
   const setProvider = useChat((s) => s.setProvider);
   const setModel = useChat((s) => s.setModel);
-  const newChat = useChat((s) => s.newChat);
 
   const [draft, setDraft] = useState("");
   const [keyDraft, setKeyDraft] = useState("");
@@ -108,7 +107,7 @@ export function ChatView() {
   const hasKey = useQuery({
     queryKey: ["hasKey", provider],
     queryFn: () => api.providerHasKey(provider),
-    // Keyless engines (Ollama, CLI) never need a key — skip the probe so the keychain stays quiet.
+    // Keyless engines (Ollama, CLI) never need a key, so skip the probe so the keychain stays quiet.
     enabled: provider !== "ollama" && !provider.endsWith("-cli"),
   });
   const saveKey = useMutation({
@@ -120,11 +119,11 @@ export function ChatView() {
     },
   });
 
-  // CLI backends (claude-cli / codex-cli) use their own logged-in auth — no API key.
+  // CLI backends (claude-cli / codex-cli) use their own logged-in auth: no API key.
   const isCli = provider.endsWith("-cli");
   const needsKey = provider !== "ollama" && !isCli;
 
-  // Offer installed CLI backends alongside the keyed providers (CLI has no default model — the
+  // Offer installed CLI backends alongside the keyed providers (CLI has no default model; the
   // CLI picks one when model is empty).
   const cliEngines = useQuery({ queryKey: ["cli_engines"], queryFn: api.cliEngines });
   const providerOptions = [
@@ -135,7 +134,7 @@ export function ChatView() {
   ];
 
   // Live model list from the provider API, cached in localStorage so the dropdown
-  // is instant and self-refreshes (TTL / version) — banned models drop off.
+  // is instant and self-refreshes (TTL / version), so banned models drop off.
   // Only fetch once we can (key present, or providers that don't need one).
   const canList =
     provider === "ollama" || provider === "openrouter" || isCli || hasKey.data === true;
@@ -210,7 +209,7 @@ export function ChatView() {
           {isOllamaLike && (
             <Input
               // Controlled: show the saved URL, but a local draft overrides it while editing so an
-              // async query result never clobbers in-progress typing. Persist on blur — which fires
+              // async query result never clobbers in-progress typing. Persist on blur, which fires
               // before a provider switch, so it always writes under the correct provider.
               value={urlEdit ?? baseUrl}
               onChange={(e) => setUrlEdit(e.currentTarget.value)}
@@ -224,9 +223,6 @@ export function ChatView() {
               }
             />
           )}
-          <Button size="sm" variant="outline" onClick={newChat}>
-            New chat
-          </Button>
         </div>
 
         {needsKey && !hasKey.data && (
@@ -291,7 +287,7 @@ export function ChatView() {
                     // The live reply must never be paint-deferred. The base MessageScrollerItem
                     // sets content-visibility:auto (+ contain-intrinsic-size), which lets the
                     // browser skip rendering the growing reply while it sits a hair below the
-                    // fold — and report a stale placeholder size, so the scroller's
+                    // fold, and report a stale placeholder size, so the scroller's
                     // ResizeObserver never sees the growth, autoScroll doesn't follow, and
                     // streamed text "pops in" in chunks when it finally scrolls into view.
                     // Force it visible so tokens paint as they arrive and the scroller stays
@@ -338,6 +334,8 @@ export function ChatView() {
         >
           <div className="relative flex items-end rounded-2xl border border-input bg-card shadow-sm transition-all focus-within:border-ring focus-within:shadow-md focus-within:ring-4 focus-within:ring-ring/15">
             <Textarea
+              // The composer is the view's only job, so opening Chat lands in it.
+              autoFocus
               className="max-h-48 min-h-13 flex-1 resize-none border-0 bg-transparent py-3.5 pl-4 pr-14 shadow-none focus-visible:border-0 focus-visible:ring-0 dark:bg-transparent"
               rows={1}
               value={draft}
@@ -491,7 +489,7 @@ function ContextChip({
 }
 
 /** Subscribes to the live stream state itself, so per-frame token updates re-render
- *  only this subtree — not the composer, header, or committed message list. */
+ *  only this subtree, not the composer, header, or committed message list. */
 function StreamingArea() {
   const reasoning = useChat((s) => s.reasoning);
   const parts = useChat((s) => s.parts);
@@ -538,7 +536,7 @@ function ToolIcon({ name }: { name: string }) {
 }
 
 /** One live tool step: read-only tools auto-run; run_shell asks for approval.
- *  Memoized — the parts array replaces a step only via mapTool, so unchanged steps
+ *  Memoized: the parts array replaces a step only via mapTool, so unchanged steps
  *  keep referential identity and skip re-render. */
 const ToolStepView = memo(function ToolStepView({ step: s }: { step: ToolStep }) {
   const setStepStatus = useChat((st) => st.setStepStatus);

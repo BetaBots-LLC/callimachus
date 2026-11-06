@@ -1,8 +1,9 @@
 import { useQuery } from "@tanstack/react-query";
 import { api, SOURCE_LABELS, type SourceKind } from "../lib/api";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { formatTime, formatUsd, shortPath } from "../lib/format";
+import { formatUsd, shortPath } from "../lib/format";
 import { AGGREGATE_STALE_MS } from "../lib/queryClient";
+import { cn } from "@/lib/utils";
 import { Loading } from "./Loading";
 
 export function StatsView() {
@@ -25,20 +26,20 @@ export function StatsView() {
 
   return (
     <div className="mx-auto w-full max-w-4xl space-y-6 overflow-y-auto p-6">
-      <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+      {/* One row of label/value pairs, like the Settings rows, rather than hero tiles. It
+          wraps to two columns below sm (the window has no minimum width); the 1px gaps over
+          the border color draw the hairlines in either layout. */}
+      <dl className="grid grid-cols-2 gap-px overflow-hidden rounded-lg border bg-border sm:grid-cols-[repeat(3,minmax(0,1fr))_minmax(0,1.6fr)]">
         <Stat label="Threads" value={data.threads.toLocaleString()} />
         <Stat label="Messages" value={data.messages.toLocaleString()} />
         <Stat
           label="Semantic coverage"
           value={`${Math.round(coverage * 100)}%`}
-          sub={`${data.embedded.toLocaleString()} / ${data.embeddable.toLocaleString()} embedded`}
+          detail={`${data.embedded.toLocaleString()} of ${data.embeddable.toLocaleString()}`}
+          title={`${Math.round(coverage * 100)}%: ${data.embedded.toLocaleString()} of ${data.embeddable.toLocaleString()} messages embedded`}
         />
-        <Stat
-          label="Span"
-          value={data.earliest ? formatTime(data.earliest) : "—"}
-          sub={data.latest ? `→ ${formatTime(data.latest)}` : undefined}
-        />
-      </div>
+        <Stat label="Span" value={spanLabel(data.earliest, data.latest)} />
+      </dl>
 
       <Card>
         <CardHeader>
@@ -126,7 +127,7 @@ function SpendCard() {
           <p className="text-sm text-muted-foreground">
             No token usage captured yet. Hit{" "}
             <span className="font-medium text-foreground">Reindex</span> to read it from your source
-            files — then this shows your estimated AI spend by model and your priciest threads.
+            files. Then this shows your estimated AI spend by model and your priciest threads.
           </p>
         </CardContent>
       </Card>
@@ -184,16 +185,47 @@ function SpendCard() {
   );
 }
 
-function Stat({ label, value, sub }: { label: string; value: string; sub?: string }) {
+/** A label/value cell. `title` (the value by default) keeps a truncated value readable;
+ *  `detail` sits inline after the value as a muted suffix, so it never needs a hover. */
+function Stat({
+  label,
+  value,
+  detail,
+  title = value,
+  className,
+}: {
+  label: string;
+  value: string;
+  detail?: string;
+  title?: string;
+  className?: string;
+}) {
   return (
-    <Card>
-      <CardContent className="p-4">
-        <div className="text-xs uppercase tracking-wide text-muted-foreground">{label}</div>
-        <div className="mt-1 text-2xl font-semibold tabular-nums">{value}</div>
-        {sub && <div className="mt-0.5 text-xs text-muted-foreground">{sub}</div>}
-      </CardContent>
-    </Card>
+    <div className={cn("min-w-0 bg-background px-4 py-3", className)} title={title}>
+      <dt className="truncate text-[13px] text-muted-foreground">{label}</dt>
+      <dd className="mt-0.5 truncate text-base font-semibold tabular-nums">
+        {value}
+        {detail && (
+          <span className="ml-1.5 text-[13px] font-normal text-muted-foreground">{detail}</span>
+        )}
+      </dd>
+    </div>
   );
+}
+
+const SPAN_DATE: Intl.DateTimeFormatOptions = { year: "numeric", month: "short", day: "numeric" };
+
+/** "Oct 30, 2025 to today": whole dates, since a clock time says nothing about a span. */
+function spanLabel(earliest: number | null, latest: number | null): string {
+  if (!earliest) return "No history yet";
+  const day = (s: number) => new Date(s * 1000).toDateString();
+  const start = new Date(earliest * 1000).toLocaleDateString(undefined, SPAN_DATE);
+  if (!latest) return start;
+  const end =
+    day(latest) === new Date().toDateString()
+      ? "today"
+      : new Date(latest * 1000).toLocaleDateString(undefined, SPAN_DATE);
+  return start === end ? start : `${start} to ${end}`;
 }
 
 function Centered({ children }: { children: React.ReactNode }) {

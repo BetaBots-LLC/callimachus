@@ -299,7 +299,7 @@ function App() {
               ) : (
                 <>
                   <SearchBar />
-                  <main className="grid min-h-0 flex-1 grid-cols-[minmax(340px,420px)_1fr]">
+                  <main className="grid min-h-0 flex-1 grid-cols-[minmax(300px,min(420px,40%))_minmax(0,1fr)]">
                     {/* biome-ignore lint/a11y/noStaticElementInteractions: not interactive; hovering or focusing a result is the cue a thread is about to open, so it only warms the ThreadView chunk */}
                     <section
                       className="min-h-0 border-r"
@@ -308,7 +308,7 @@ function App() {
                     >
                       <ResultsList />
                     </section>
-                    <section className="min-h-0">
+                    <section className="min-h-0 min-w-0">
                       <ThreadPane />
                     </section>
                   </main>

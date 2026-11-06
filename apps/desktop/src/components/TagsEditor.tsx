@@ -2,6 +2,8 @@ import { useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, type ThreadDetail } from "../lib/api";
 import { isImeComposing } from "../lib/keyboard";
+import { focusSearch } from "../store/ui";
+import { Plus } from "lucide-react";
 import {
   Combobox,
   ComboboxChip,
@@ -18,8 +20,10 @@ import {
 /**
  * Free-form tag editor as a multi-select combobox: chips for applied tags, a
  * dropdown of corpus-wide suggestions (so the user converges on a vocabulary),
- * and Enter to create a brand-new tag. Replace-set semantics — every change
- * persists the whole list via `set_thread_tags`.
+ * and Enter to create a brand-new tag. Replace-set semantics: every change
+ * persists the whole list via `set_thread_tags`. Drawn inline (no boxed field) so it
+ * sits on the thread header's tags row: the chips, then an "Add tag" input that widens
+ * while focused.
  */
 export function TagsEditor({ threadId, tags }: { threadId: number; tags: string[] }) {
   const [query, setQuery] = useState("");
@@ -57,7 +61,7 @@ export function TagsEditor({ threadId, tags }: { threadId: number; tags: string[
     },
   });
 
-  // Everything the dropdown can offer: known tags ∪ currently-applied (so chips
+  // Everything the dropdown can offer: known tags plus the applied ones (so chips
   // and checkmarks resolve). Base UI filters this by the typed query.
   const known = Array.from(new Set([...(suggestions.data ?? []).map(([t]) => t), ...tags]));
 
@@ -79,20 +83,38 @@ export function TagsEditor({ threadId, tags }: { threadId: number; tags: string[
         highlighted.current = item;
       }}
     >
-      <ComboboxChips className="mt-2">
+      <ComboboxChips className="group/tags min-h-0 w-auto gap-1 rounded-none border-0 bg-transparent p-0 focus-within:ring-0">
         <ComboboxValue>
           {(selected: string[]) =>
             selected.map((t) => (
-              <ComboboxChip key={t} aria-label={t}>
+              <ComboboxChip key={t} aria-label={t} className="py-0 font-normal">
                 #{t}
                 <ComboboxChipRemove aria-label={`Remove ${t}`} />
               </ComboboxChip>
             ))
           }
         </ComboboxValue>
+        {!query && (
+          <Plus
+            className="pointer-events-none -mr-1 size-3 shrink-0 text-muted-foreground group-focus-within/tags:hidden"
+            aria-hidden="true"
+          />
+        )}
         <ComboboxInput
-          placeholder={tags.length ? "" : "add tags…"}
+          placeholder="Add tag"
+          aria-label="Add a tag"
+          className="h-5 w-14 min-w-0 flex-none rounded-md px-1 text-xs transition-[width] placeholder:text-muted-foreground hover:placeholder:text-foreground focus:w-28 focus:bg-muted focus:placeholder:text-transparent focus-visible:ring-2 focus-visible:ring-ring/50"
           onKeyDown={(e) => {
+            // Esc with the suggestions closed: Base UI would clear the whole selection,
+            // removing every tag from the thread, so it is stopped here. It clears a
+            // half-typed tag instead, and with nothing typed goes back to the search box
+            // (the thread pane's own Esc handler can't: the combobox marks Esc handled).
+            if (e.key === "Escape" && e.currentTarget.getAttribute("aria-expanded") !== "true") {
+              e.preventBaseUIHandler();
+              if (query) setQuery("");
+              else if (focusSearch()) e.preventDefault();
+              return;
+            }
             if (e.key !== "Enter" || highlighted.current || isImeComposing(e)) return;
             const t = query.trim();
             if (!t) return;
