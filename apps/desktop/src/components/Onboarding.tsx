@@ -6,9 +6,10 @@ import { Progress, ProgressLabel } from "@/components/ui/progress";
 
 /**
  * First-run experience. Shown on the Search landing while the index is empty, so a fresh
- * install isn't a blank screen — one click indexes the user's local agent history. Once
- * threads exist this unmounts and the normal app takes over. Semantic search + the
- * Knowledge layer are opt-in follow-ups (the search header + the Knowledge tab guide there).
+ * install isn't a blank screen: one click indexes the user's local agent history. Once
+ * threads exist this unmounts and the normal app takes over. Semantic search and memory
+ * (LLM distillation) are opt-in follow-ups (the search header and the Turn on memory card
+ * guide there).
  */
 export function Onboarding() {
   const qc = useQueryClient();
@@ -63,7 +64,7 @@ export function Onboarding() {
           {failed
             ? "The scan stopped before it could index anything, so your history may well be there. Your agents' files were only read, never changed. Try again, and if it keeps failing, the reason below says what to fix."
             : emptyAfterRun
-              ? "Callimachus scanned this machine for Claude Code, Codex, Cursor, and 8 more agents but found no history to index. If you just used one, reindex to pick it up."
+              ? "Callimachus scanned this machine for Claude Code, Codex, Cursor, and 9 more agents but found no history to index. If you just used one, reindex to pick it up."
               : "One local, searchable index of every AI coding-agent conversation you've had. Let's build it from your history on this machine."}
         </p>
         {failed && (
@@ -87,7 +88,7 @@ export function Onboarding() {
             </span>
           </Progress>
           <p className="text-xs text-muted-foreground">
-            Scanning Claude Code, Codex, Cursor, and 8 more — read-only.
+            Scanning Claude Code, Codex, Cursor, and 9 more. Read-only.
           </p>
         </div>
       ) : (
@@ -98,7 +99,7 @@ export function Onboarding() {
 
       <p className="text-xs text-muted-foreground">
         Your history stays on your machine. After indexing, add semantic search from the header and
-        the Knowledge layer in Settings.
+        turn on memory in Settings &gt; Knowledge.
       </p>
     </div>
   );

@@ -47,9 +47,11 @@ which holds the user's whole history and their Settings (`app_config`).
 - Opening it writable runs pending migrations, after which the older installed app can no longer
   open it (0.11.0 then crashed at launch; 0.11.1+ shows an error screen). `pnpm desktop:dev`
   therefore points `CALLIMACHUS_DB` at `index.dev.db` next to it (`scripts/desktop-dev.mjs`);
-  only a raw `tauri dev` or an explicit `CALLIMACHUS_DB` opens the real index. Other writers: the MCP server, the PreCompact hook and the
+  only a raw `tauri dev` or an explicit `CALLIMACHUS_DB` opens the real index. Other writers: the MCP server, the
   `cal` write commands (`star`, `tag`, `distill`, `done`, `remember`, `snapshot`, `commits`,
-  `audit-pr`). `cal hook`, `memory`, `stats`, `search` and the other queries open read-only.
+  `audit-pr`), and the PreCompact and SessionEnd hooks, which open with `db::open_sidecar_current`
+  and never migrate (they skip until the app or a `cal` command has upgraded the index). `cal
+  hook`, `memory`, `stats`, `search` and the other queries open read-only.
 - A dev app launch also runs `integration::refresh_installed`, which can rewrite the installed
   skill and re-point dangling hooks, MCP entries and the `cal` link at the dev binary.
 - Smoke-test built binaries on an APFS clone with a throwaway HOME (never `cargo` or `pnpm`
@@ -65,11 +67,12 @@ env -u CLAUDE_CONFIG_DIR -u CODEX_HOME HOME="$S/home" CALLIMACHUS_DB="$S/index.d
 
 ## Migrations
 
-- Add `migrations/00NN_<name>.sql` with the next number (0032) and register it in
-  `db/migrations.rs`. Never edit a committed migration (0001-0031): `rusqlite_migration` tracks
+- Add `migrations/00NN_<name>.sql` with the next number (0033) and register it in
+  `db/migrations.rs`. Never edit a committed migration (0001-0032): `rusqlite_migration` tracks
   only `user_version`, so an edited file never re-runs on an index that already applied it.
 - An upgrade runs in whichever process opens the index first and holds the write lock, so time
-  it on a large index (`db::migrate` pre-reads big files sequentially first).
+  it on a large index (`db::migrate` pre-reads big files sequentially first, unless every pending
+  migration is in `SCAN_FREE_MIGRATIONS`: list one there only when it touches no large table).
 - Pin query plans in tests with `EXPLAIN QUERY PLAN` (helpers in `db/migrations.rs`, `search/`).
 - Never use `INDEXED BY` without a `db::has_index` fallback (see `search::fts_message_join`):
   read-only sidecars and pooled readers never migrate, and `INDEXED BY` a missing index is an
@@ -97,7 +100,8 @@ hook output cap), `COMPACT` (after compaction, snapshot carry), `AGENTS_FILE` (t
 AGENTS.md / CLAUDE.md block) and `MCP` (`project_memory`). Change sizes there, not at call sites.
 MCP transcript tools take a `budget` (`TRANSCRIPT_BUDGET_*` in `mcp_server.rs`, default 24k).
 Hook events, matchers and timeouts are the `HookSpec` consts in `integration.rs`. Hook commands
-(`hook`, `snapshot-hook`, `recall-now`) exit 0 silently on any error and never create an index;
+(`hook`, `snapshot-hook`, `session-end`, `recall-now`) exit 0 silently on any error, never create
+an index and never migrate one;
 `cal`, hooks and the MCP server never download the model (`embed::Embedder::cached_only`). Text
 that leaves the machine (LLM prompts, MCP results, exports) goes through `context::redact_secrets`.
 

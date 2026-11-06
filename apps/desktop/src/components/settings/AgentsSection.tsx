@@ -3,7 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { Switch } from "@/components/ui/switch";
-import { api } from "../../lib/api";
+import { api, type HarvestSettings, type HookSettings } from "../../lib/api";
 import { track } from "../../lib/telemetry";
 import { errorText, notify } from "../../lib/toast";
 import {
@@ -106,7 +106,8 @@ function ClaudeCodeRows() {
           <>
             Installs the <code>/recall</code> skill, registers Callimachus as an MCP server, and
             adds the <code>cal</code> CLI the VS Code extension uses. Hooks inject each repo's
-            memory when a session starts and snapshot a session before its context is compacted.
+            memory when a session starts, snapshot a session before its context is compacted, and,
+            when auto-distill is on, queue a session that ends for distillation.
           </>
         }
         control={
@@ -199,7 +200,101 @@ function ClaudeCodeRows() {
           )}
         </SettingRow>
       )}
+      {connected && <DigestRow />}
+      <HarvestRow />
     </>
+  );
+}
+
+/** The SessionStart hook's recent-sessions digest, for repos nothing has been distilled
+ *  for yet. Only meaningful once the hook is installed, so it shows with the other
+ *  connected-only rows. */
+function DigestRow() {
+  const id = useId();
+  const qc = useQueryClient();
+  const hook = useQuery({ queryKey: ["hook_settings"], queryFn: api.hookSettings });
+  const set = useMutation({
+    mutationFn: api.setHookDigest,
+    onMutate: (on: boolean) =>
+      qc.setQueryData<HookSettings>(["hook_settings"], (prev) =>
+        prev ? { ...prev, digestEnabled: on } : prev,
+      ),
+    onSettled: () => qc.invalidateQueries({ queryKey: ["hook_settings"] }),
+  });
+  const muted = hook.data?.mutedProjects.length ?? 0;
+  return (
+    <SettingRow
+      htmlFor={id}
+      title="Session digest"
+      description="Inject a recent-sessions digest when a repo has no memory yet: the last few sessions' titles, branches, prompts and files, marked as notes rather than instructions. It draws on sessions from every agent that worked in the repo (Codex, Cursor and the rest), so their prompts reach Claude Code too."
+      control={
+        <Switch
+          id={id}
+          checked={!!hook.data?.digestEnabled}
+          disabled={hook.isPending || set.isPending}
+          onCheckedChange={(v) => set.mutate(v)}
+        />
+      }
+    >
+      <Note>
+        Mute one repo with <code>cal hook --mute</code> from inside it.
+        {muted > 0 && ` ${muted} ${muted === 1 ? "repo is" : "repos are"} muted.`}
+      </Note>
+      {hook.isError && (
+        <InlineError>Couldn't load the digest setting: {errorText(hook.error)}</InlineError>
+      )}
+      {set.isError && (
+        <InlineError>Couldn't change the session digest: {errorText(set.error)}</InlineError>
+      )}
+    </SettingRow>
+  );
+}
+
+/** Harvest Claude Code's own auto-memory files into project memory. Runs in the app, not
+ *  the hooks, so it does not depend on the integration being installed. */
+function HarvestRow() {
+  const id = useId();
+  const qc = useQueryClient();
+  const harvest = useQuery({ queryKey: ["harvest_settings"], queryFn: api.harvestSettings });
+  const set = useMutation({
+    mutationFn: api.setHarvestClaudeMemory,
+    onMutate: (on: boolean) =>
+      qc.setQueryData<HarvestSettings>(["harvest_settings"], (prev) =>
+        prev ? { ...prev, claudeMemory: on } : prev,
+      ),
+    onSettled: () => {
+      void qc.invalidateQueries({ queryKey: ["harvest_settings"] });
+      // Turning it off removes the imported facts; on imports them again.
+      void qc.invalidateQueries({ queryKey: ["project_memory"] });
+    },
+  });
+  const h = harvest.data;
+  return (
+    <SettingRow
+      htmlFor={id}
+      title="Import Claude Code memory"
+      description="Import Claude Code auto memory into project memory: its feedback memories become gotchas and its project memories become decisions. The session hook leaves them out, since Claude Code already loads its own."
+      control={
+        <Switch
+          id={id}
+          checked={!!h?.claudeMemory}
+          disabled={harvest.isPending || set.isPending}
+          onCheckedChange={(v) => set.mutate(v)}
+        />
+      }
+    >
+      {h?.claudeMemory && (
+        <Note>
+          {h.importedFacts === 0
+            ? "No Claude Code memories imported yet."
+            : `${h.importedFacts.toLocaleString()} ${h.importedFacts === 1 ? "memory" : "memories"} imported.`}
+        </Note>
+      )}
+      {harvest.isError && (
+        <InlineError>Couldn't load the import setting: {errorText(harvest.error)}</InlineError>
+      )}
+      {set.isError && <InlineError>Couldn't change the import: {errorText(set.error)}</InlineError>}
+    </SettingRow>
   );
 }
 

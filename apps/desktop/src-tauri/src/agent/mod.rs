@@ -203,6 +203,8 @@ pub struct CliEngine {
     pub bin: &'static str,
     /// The binary resolves on the user's PATH (via their login shell).
     pub installed: bool,
+    /// Where it resolved, shown as the engine's detail in the memory setup card.
+    pub path: Option<String>,
 }
 
 /// The supported CLI backends, each marked installed/not based on a login-shell PATH lookup.
@@ -212,14 +214,31 @@ pub async fn cli_engines() -> Vec<CliEngine> {
         ("claude-cli", "Claude Code CLI", "claude"),
         ("codex-cli", "Codex CLI", "codex"),
     ] {
+        let path = resolve_cli_bin(bin).await;
         out.push(CliEngine {
             id,
             label,
             bin,
-            installed: resolve_cli_bin(bin).await.is_some(),
+            installed: path.is_some(),
+            path: path.map(|p| p.display().to_string()),
         });
     }
     out
+}
+
+/// How long the memory setup card waits for a local Ollama server. A running server answers
+/// `/api/tags` in a few ms; a closed port fails at once, but a firewalled or sleeping remote
+/// host would hang the card's first paint without a cap.
+pub const OLLAMA_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// The models a local Ollama server lists, or None when it does not answer within
+/// [`OLLAMA_PROBE_TIMEOUT`]. The same `/api/tags` probe [`list_models`] runs, at the saved
+/// custom base URL if any. A server with no models pulled yet still counts as running.
+pub async fn probe_ollama(base_url: Option<&str>) -> Option<Vec<String>> {
+    tokio::time::timeout(OLLAMA_PROBE_TIMEOUT, list_models("ollama", base_url, None))
+        .await
+        .ok()?
+        .ok()
 }
 
 /// Suggested model names for a CLI backend (free-text still works). Empty = let the CLI pick its

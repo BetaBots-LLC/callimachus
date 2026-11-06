@@ -1871,6 +1871,71 @@ async fn auto_distill_budget(pool: tauri::State<'_, db::ReadPool>) -> AppResult<
     read_blocking(&pool, auto_distill_budget_now).await
 }
 
+/// Settings > Agents: whether Claude Code auto memory is imported into project memory
+/// (`knowledge::harvest`), and how many visible facts it contributed.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HarvestSettings {
+    claude_memory: bool,
+    imported_facts: i64,
+}
+
+#[tauri::command]
+async fn harvest_settings(pool: tauri::State<'_, db::ReadPool>) -> AppResult<HarvestSettings> {
+    read_blocking(&pool, |conn| {
+        Ok(HarvestSettings {
+            claude_memory: knowledge::harvest::claude_memory_enabled(conn)?,
+            imported_facts: knowledge::harvest::imported_count(conn)?,
+        })
+    })
+    .await
+}
+
+/// Turn Claude Code auto-memory import on (imports now) or off (removes every imported fact).
+#[tauri::command]
+async fn set_harvest_claude_memory(app: AppHandle, on: bool) -> AppResult<()> {
+    let now = chrono::Utc::now().timestamp();
+    let report = write_blocking(&app, move |conn| {
+        knowledge::harvest::set_claude_memory_enabled(conn, on, now)
+    })
+    .await?;
+    harvest_landed(&app, report);
+    Ok(())
+}
+
+/// Import Claude Code auto memory on `conn` (the watcher's writer: after its launch
+/// catch-up, then on its minute tick). Cheap when no topic file changed: a stat per file
+/// and no write. A busy index waits for the next tick.
+pub(crate) fn harvest_claude_memory_tick(app: &AppHandle, conn: &rusqlite::Connection) {
+    let now = chrono::Utc::now().timestamp();
+    match knowledge::harvest::harvest_claude_memory(conn, now) {
+        Ok(report) => harvest_landed(app, report),
+        Err(e) if db::is_busy(&e) => {}
+        Err(e) => app_log!("[harvest] claude memory: {e:#}"),
+    }
+}
+
+/// After a harvest pass changed facts: log it, have open views refetch project memory (the
+/// null `index:updated` payload is main.tsx's housekeeping contract), and embed the new
+/// facts for recall when the model is on disk. The embed runs on its own thread because it
+/// takes the writer and may load the model, and callers are the watcher loop and an async
+/// command.
+fn harvest_landed(app: &AppHandle, report: knowledge::harvest::HarvestReport) {
+    if !report.changed() {
+        return;
+    }
+    app_log!(
+        "[harvest] claude memory: {} imported, {} removed",
+        report.imported,
+        report.removed
+    );
+    let _ = app.emit("index:updated", ());
+    if report.imported > 0 {
+        let app = app.clone();
+        std::thread::spawn(move || embed_facts_if_model_ready(&app, "harvest"));
+    }
+}
+
 /// Set the per-day auto-distill allowance (0 pauses auto-distill without turning it off).
 #[tauri::command]
 async fn set_auto_distill_daily_cap(app: AppHandle, cap: i64) -> AppResult<AutoDistillBudget> {
@@ -1887,7 +1952,10 @@ async fn set_auto_distill_daily_cap(app: AppHandle, cap: i64) -> AppResult<AutoD
     Ok(budget)
 }
 
-/// Enable/disable distillation and pick the engine. Enabling is the user's consent.
+/// Enable/disable LLM distillation and pick the engine (Settings). Enabling is the user's
+/// consent. Heuristic TODOs are not touched either way: they are always on now, so turning
+/// distillation off no longer clears them and turning it on no longer backfills them (the
+/// one-time backfill runs after the launch catch-up, `knowledge::backfill_todos_once`).
 #[tauri::command]
 async fn set_knowledge_config(
     app: AppHandle,
@@ -1895,19 +1963,13 @@ async fn set_knowledge_config(
     provider: Option<String>,
     model: Option<String>,
 ) -> AppResult<()> {
-    // Quick: write the config; clearing on OFF is one fast statement.
     let engine = provider.clone();
     let was_enabled = write_blocking(&app, move |conn| {
         let prev = knowledge::get_config(conn)?.enabled;
         knowledge::set_config(conn, enabled, provider.as_deref(), model.as_deref())?;
-        if !enabled {
-            knowledge::clear_heuristic(conn)?;
-        }
         Ok(prev)
     })
     .await?;
-    // Turning ON backfills todos from already-indexed text — in the BACKGROUND, in
-    // short batches, so the toggle returns instantly and the UI stays snappy.
     if enabled && !was_enabled {
         track(
             &app,
@@ -1915,17 +1977,169 @@ async fn set_knowledge_config(
                 engine: engine.unwrap_or_else(|| "auto".into()),
             },
         );
-        let app = app.clone();
-        std::thread::spawn(move || {
-            let db = app.state::<db::Db>();
-            let now = chrono::Utc::now().timestamp();
-            if let Err(e) = knowledge::backfill_todos(&db, now) {
-                app_log!("[knowledge] backfill: {e}");
-            }
-            let _ = app.emit("knowledge:todos-ready", ());
-        });
     }
     Ok(())
+}
+
+/// Cloud providers the memory setup card offers when their API key is saved, in the order
+/// the legacy "first saved API key" engine picks them ([`SYNTH_MODELS`] minus keyless Ollama).
+const KEY_ENGINES: &[(&str, &str)] = &[
+    ("anthropic", "Anthropic"),
+    ("openai", "OpenAI"),
+    ("gemini", "Gemini"),
+    ("openrouter", "OpenRouter"),
+    ("ollama_cloud", "Ollama Cloud"),
+];
+
+const OLLAMA_DEFAULT_BASE: &str = "http://localhost:11434";
+
+/// The memory setup card's engine list: both CLIs (detected or not), local Ollama, then one
+/// entry per saved key. `ollama_models` is the probe's answer (None = no server answered).
+fn memory_engines(
+    cli: &[agent::CliEngine],
+    ollama_models: Option<&[String]>,
+    ollama_base: Option<&str>,
+    keyed: &[&str],
+) -> Vec<knowledge::MemoryEngine> {
+    let mut out: Vec<knowledge::MemoryEngine> = cli
+        .iter()
+        .map(|c| knowledge::MemoryEngine {
+            id: c.id.to_string(),
+            label: c.label.to_string(),
+            kind: "cli",
+            detected: c.installed,
+            detail: c.path.clone().unwrap_or_else(|| "not found".into()),
+        })
+        .collect();
+    let base = ollama_base
+        .map(str::trim)
+        .filter(|b| !b.is_empty())
+        .unwrap_or(OLLAMA_DEFAULT_BASE);
+    out.push(knowledge::MemoryEngine {
+        id: "ollama".into(),
+        label: "Ollama".into(),
+        kind: "ollama",
+        detected: ollama_models.is_some(),
+        detail: match ollama_models {
+            Some(m) if m.len() == 1 => format!("Running at {base}, 1 model"),
+            Some(m) => format!("Running at {base}, {} models", m.len()),
+            None => format!("Not running at {base}"),
+        },
+    });
+    out.extend(
+        KEY_ENGINES
+            .iter()
+            .filter(|(id, _)| keyed.contains(id))
+            .map(|(id, label)| knowledge::MemoryEngine {
+                id: id.to_string(),
+                label: label.to_string(),
+                kind: "key",
+                detected: true,
+                detail: "API key saved".into(),
+            }),
+    );
+    out
+}
+
+/// Whether `provider` is an engine the memory setup card lists: a CLI or local Ollama
+/// (listed even when not detected), or a cloud provider with a saved key.
+fn memory_engine_listed(provider: &str) -> bool {
+    agent::is_cli_provider(provider)
+        || provider == "ollama"
+        || KEY_ENGINES
+            .iter()
+            .any(|(id, _)| *id == provider && secrets::has_key(id))
+}
+
+/// The memory setup card: current config, the detected engines (CLIs on PATH, a local
+/// Ollama answering within 500 ms, saved keys), the one to preselect, and the auto-distill
+/// budget. The three probes run concurrently, so the card waits for the slowest, usually the
+/// login-shell PATH lookup: `agent::resolve_cli_bin` caches a binary it found, but not a miss,
+/// so on a machine with neither CLI every call runs the lookup again.
+#[tauri::command]
+async fn memory_setup(pool: tauri::State<'_, db::ReadPool>) -> AppResult<knowledge::MemorySetup> {
+    let (cfg, ollama_base, eligible_threads, daily_cap) = read_blocking(&pool, |conn| {
+        let now = chrono::Utc::now().timestamp();
+        Ok((
+            knowledge::get_config(conn)?,
+            knowledge::get_provider_base_url(conn, "ollama")?,
+            knowledge::auto_distill_eligible_count(conn, now)?,
+            knowledge::auto_distill_daily_cap(conn)?,
+        ))
+    })
+    .await?;
+    // Keychain reads block (and may prompt once on macOS), so they leave the async runtime.
+    let keyed = blocking(|| {
+        Ok(KEY_ENGINES
+            .iter()
+            .map(|(id, _)| *id)
+            .filter(|id| secrets::has_key(id))
+            .collect::<Vec<&'static str>>())
+    });
+    let (cli, ollama, keyed) = tokio::join!(
+        agent::cli_engines(),
+        agent::probe_ollama(ollama_base.as_deref()),
+        keyed
+    );
+    let engines = memory_engines(&cli, ollama.as_deref(), ollama_base.as_deref(), &keyed?);
+    Ok(knowledge::MemorySetup {
+        enabled: cfg.enabled,
+        provider: cfg.provider,
+        model: cfg.model,
+        recommended: knowledge::recommended_engine(&engines),
+        engines,
+        eligible_threads,
+        daily_cap,
+    })
+}
+
+/// One-click memory consent from the setup card: stores the named engine (never the legacy
+/// "first saved API key" None), turns distillation and auto-distill on, and kicks the drain
+/// the way the Settings auto-distill switch does. Settings keeps `set_knowledge_config`.
+/// Already on with this same engine and model, it changes nothing: a stale card (or a
+/// second click) must not turn back on an auto-distill the user switched off. Any other
+/// choice is the user's explicit pick, so it is applied, a legacy enabled config included.
+#[tauri::command]
+async fn enable_memory(
+    app: AppHandle,
+    provider: String,
+    model: Option<String>,
+) -> AppResult<knowledge::KnowledgeConfig> {
+    let check = provider.clone();
+    if !blocking(move || Ok(memory_engine_listed(&check))).await? {
+        return Err(anyhow::anyhow!(
+            "{provider} is not an available memory engine: pick one the card lists, or save its API key in Settings > Providers"
+        )
+        .into());
+    }
+    let engine = provider.clone();
+    let (was_enabled, applied, cfg) = write_blocking(&app, move |conn| {
+        let prev = knowledge::get_config(conn)?;
+        let model = model.as_deref().map(str::trim).filter(|m| !m.is_empty());
+        if enable_memory_is_noop(&prev, &provider, model) {
+            return Ok((true, false, prev));
+        }
+        knowledge::enable_memory(conn, &provider, model)?;
+        Ok((prev.enabled, true, knowledge::get_config(conn)?))
+    })
+    .await?;
+    if !was_enabled {
+        track(&app, telemetry::Event::KnowledgeEnabled { engine });
+    }
+    if applied {
+        auto_distill_kick(&app);
+    }
+    Ok(cfg)
+}
+
+/// Whether [`enable_memory`] has nothing to do: distillation is on with exactly this engine
+/// and model.
+fn enable_memory_is_noop(
+    cfg: &knowledge::KnowledgeConfig,
+    provider: &str,
+    model: Option<&str>,
+) -> bool {
+    cfg.enabled && cfg.provider.as_deref() == Some(provider) && cfg.model.as_deref() == model
 }
 
 /// Cached distilled knowledge (summary/decisions/gotchas/todos) for one thread.
@@ -2211,7 +2425,9 @@ async fn project_brief(pool: tauri::State<'_, db::ReadPool>, project: String) ->
 }
 
 /// Write a project's memory (optionally with an LLM brief) to `<project>/.callimachus/
-/// memory.md` so agents can be pointed at it. Returns the written path.
+/// memory.md` so agents can be pointed at it. Returns the written path. Imported Claude Code
+/// auto memory is left out: it is private to `~/.claude` and often about the user ("User
+/// dislikes ..."), while this file sits in the repo where it can be committed and pushed.
 #[tauri::command]
 async fn write_project_memory_file(
     pool: tauri::State<'_, db::ReadPool>,
@@ -2220,7 +2436,12 @@ async fn write_project_memory_file(
 ) -> AppResult<String> {
     let key_project = project.clone();
     let (mem, engine) = read_blocking(&pool, move |conn| {
-        let mem = knowledge::get_project_memory(conn, &key_project, 200)?;
+        let mem = knowledge::get_project_memory_excluding(
+            conn,
+            &key_project,
+            200,
+            knowledge::harvest::EXTRACTOR_CLAUDE_MEMORY,
+        )?;
         let engine = if with_brief {
             resolve_distill_engine(conn).ok()
         } else {
@@ -2275,7 +2496,13 @@ async fn write_agent_memory_file(
 ) -> AppResult<String> {
     read_blocking(&pool, move |conn| {
         let budget = export::MemoryBudget::AGENTS_FILE;
-        let mem = knowledge::get_project_memory_facts(conn, &project, budget.fetch_limit())?;
+        // Claude Code loads its own auto memory and reads this file too: no second copy.
+        let mem = knowledge::get_project_memory_facts_excluding(
+            conn,
+            &project,
+            budget.fetch_limit(),
+            knowledge::harvest::EXTRACTOR_CLAUDE_MEMORY,
+        )?;
         let body = export::agent_memory_md_budgeted(&project, &mem, None, &budget);
         let path = std::path::Path::new(&project).join(&filename);
         export::write_managed_block_file(&path, &body)?;
@@ -3033,7 +3260,9 @@ fn resolve_synth(provider: Option<&str>, model: Option<&str>) -> AppResult<(Stri
         }
         None => {
             let (p, m) = pick_synth_provider().ok_or_else(|| {
-                anyhow::anyhow!("no API key set — add one in Settings to synthesize")
+                anyhow::anyhow!(
+                    "the engine is the first saved API key, and none is saved: add one in Settings > Providers or pick an engine"
+                )
             })?;
             Ok((p.to_string(), m.to_string()))
         }
@@ -3062,7 +3291,9 @@ pub fn resolve_distill_engine(
 ) -> anyhow::Result<(String, String, Option<String>, Option<String>)> {
     let cfg = knowledge::get_config(conn)?;
     if !cfg.enabled {
-        anyhow::bail!("distillation is off — enable it in Settings (local Ollama or an API key)");
+        anyhow::bail!(
+            "LLM distillation is off: turn on memory in Settings > Knowledge (a CLI subscription, local Ollama or an API key)"
+        );
     }
     let (provider, model) = resolve_synth(cfg.provider.as_deref(), cfg.model.as_deref())
         .map_err(error::AppError::into_inner)?;
@@ -3125,6 +3356,12 @@ async fn open_thread_in_cli(
     thread_id: i64,
     program: Option<String>,
 ) -> AppResult<String> {
+    let program = program.unwrap_or_else(|| "claude".into());
+    // Claude Code loads its own auto memory into the session, so for it the block leaves the
+    // imported copy out, as `cal hook` does; another agent never sees that memory otherwise.
+    let is_claude = std::path::Path::new(&program)
+        .file_stem()
+        .is_some_and(|s| s.eq_ignore_ascii_case("claude"));
     read_blocking(&pool, move |conn| {
         let packed = context::pack_thread(conn, thread_id, context::DEFAULT_BUDGET_CHARS)?
             .ok_or_else(|| anyhow::anyhow!("thread not found"))?;
@@ -3143,8 +3380,17 @@ async fn open_thread_in_cli(
             .and_then(|proj| {
                 let key = knowledge::project_key(proj);
                 let budget = export::MemoryBudget::COMPACT;
-                let m =
-                    knowledge::get_project_memory_facts(conn, &key, budget.fetch_limit()).ok()?;
+                let m = if is_claude {
+                    knowledge::get_project_memory_facts_excluding(
+                        conn,
+                        &key,
+                        budget.fetch_limit(),
+                        knowledge::harvest::EXTRACTOR_CLAUDE_MEMORY,
+                    )
+                } else {
+                    knowledge::get_project_memory_facts(conn, &key, budget.fetch_limit())
+                }
+                .ok()?;
                 let pinned_todo = m.open_todos.iter().any(|t| t.pinned);
                 if m.decisions.is_empty() && m.gotchas.is_empty() && !pinned_todo {
                     return None;
@@ -3159,7 +3405,6 @@ async fn open_thread_in_cli(
             Some(block) => format!("{block}\n\n{packed}"),
             None => packed,
         };
-        let program = program.unwrap_or_else(|| "claude".into());
         agent::cli_resume::launch_with_context_memory(
             &program,
             &packed,
@@ -3264,6 +3509,24 @@ async fn install_agent_integrations(
 #[tauri::command]
 async fn uninstall_agent_integrations() -> AppResult<()> {
     blocking(integration::uninstall_agents).await
+}
+
+/// The SessionStart hook's settings: whether it injects the recent-sessions digest for a
+/// repo with no memory yet, and the repos muted with `cal hook --mute`.
+#[tauri::command]
+async fn hook_settings(
+    pool: tauri::State<'_, db::ReadPool>,
+) -> AppResult<export::hook_settings::HookSettings> {
+    read_blocking(&pool, export::hook_settings::get).await
+}
+
+/// Turn the SessionStart hook's recent-sessions digest on or off for every repo.
+#[tauri::command]
+async fn set_hook_digest(app: AppHandle, on: bool) -> AppResult<()> {
+    write_blocking(&app, move |conn| {
+        export::hook_settings::set_digest_enabled(conn, on)
+    })
+    .await
 }
 
 // ---- telemetry (opt-in analytics; see telemetry.rs) ----
@@ -3879,6 +4142,28 @@ fn spawn_background_jobs(app: &AppHandle) {
     });
 }
 
+/// One-time TODO backfill for indexes from before TODOs were always on (guarded by
+/// `knowledge.todos_backfilled`, so later launches return at once). The watcher calls this
+/// once its launch catch-up is done, so the two never compete for the writer; the backfill
+/// then pauses between batches while a reindex, catch-up, semantic build or rewrite runs, as
+/// a distill drain does.
+pub(crate) fn todo_backfill_kick(app: &AppHandle) {
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let db = app.state::<db::Db>();
+        let clock = jobclock::JobClock::start();
+        let pause = || writer_job_running(&app);
+        match knowledge::backfill_todos_once(&db, chrono::Utc::now().timestamp(), &pause) {
+            Ok(true) => {
+                app_log!("[knowledge] todo backfill in {}", clock.thread_summary());
+                let _ = app.emit("knowledge:todos-ready", ());
+            }
+            Ok(false) => {}
+            Err(e) => app_log!("[knowledge] todo backfill: {e}"),
+        }
+    });
+}
+
 /// Rows per background tool-output compaction pass ([`spawn_tool_output_compaction`]).
 const BACKGROUND_COMPACT_ROWS: usize = 2_000;
 /// How long after launch the compaction starts. The watcher's catch-up claims the writer
@@ -4159,9 +4444,13 @@ pub fn run() {
             uninstall_recall_integration,
             set_proactive_recall,
             cli_engines,
+            memory_setup,
+            enable_memory,
             agent_integrations_status,
             install_agent_integrations,
             uninstall_agent_integrations,
+            hook_settings,
+            set_hook_digest,
             set_star,
             set_thread_tags,
             list_tags,
@@ -4175,6 +4464,8 @@ pub fn run() {
             set_auto_distill,
             auto_distill_budget,
             set_auto_distill_daily_cap,
+            harvest_settings,
+            set_harvest_claude_memory,
             thread_knowledge,
             thread_commits,
             link_thread_commits,
@@ -4590,6 +4881,122 @@ mod redaction_tests {
             .iter()
             .any(|t| t == "call the billing API with [REDACTED]"));
         assert!(texts.iter().any(|t| t == "keep sqlite"));
+    }
+}
+
+#[cfg(test)]
+mod memory_setup_tests {
+    use super::*;
+
+    fn cli(id: &'static str, path: Option<&str>) -> agent::CliEngine {
+        agent::CliEngine {
+            id,
+            label: id,
+            bin: id,
+            installed: path.is_some(),
+            path: path.map(str::to_string),
+        }
+    }
+
+    /// Both CLIs are always listed (with "not found" when missing), then Ollama, then only
+    /// the keyed providers that have a key, in the legacy first-key order.
+    #[test]
+    fn engine_list_shape_and_details() {
+        let models = vec!["llama3.1".to_string(), "qwen3".to_string()];
+        let e = memory_engines(
+            &[
+                cli("claude-cli", Some("/usr/local/bin/claude")),
+                cli("codex-cli", None),
+            ],
+            Some(&models),
+            None,
+            &["openrouter", "anthropic"],
+        );
+        let ids: Vec<&str> = e.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "claude-cli",
+                "codex-cli",
+                "ollama",
+                "anthropic",
+                "openrouter"
+            ]
+        );
+        assert_eq!(e[0].detail, "/usr/local/bin/claude");
+        assert!(e[0].detected && !e[1].detected);
+        assert_eq!(e[1].detail, "not found");
+        assert_eq!(e[2].kind, "ollama");
+        assert_eq!(e[2].detail, "Running at http://localhost:11434, 2 models");
+        assert!(e[3..]
+            .iter()
+            .all(|k| k.kind == "key" && k.detected && k.detail == "API key saved"));
+        assert_eq!(
+            knowledge::recommended_engine(&e).as_deref(),
+            Some("claude-cli")
+        );
+
+        let e = memory_engines(
+            &[cli("claude-cli", None), cli("codex-cli", None)],
+            None,
+            Some("http://gpu-box:11434 "),
+            &[],
+        );
+        assert_eq!(e.len(), 3);
+        assert_eq!(e[2].detail, "Not running at http://gpu-box:11434");
+        assert_eq!(knowledge::recommended_engine(&e), None);
+    }
+
+    /// enable_memory accepts the CLIs and local Ollama even before they are detected (the
+    /// card lists them), and refuses names it never lists. No keychain read for these.
+    #[test]
+    fn enable_memory_accepts_only_listed_engines() {
+        assert!(memory_engine_listed("claude-cli"));
+        assert!(memory_engine_listed("codex-cli"));
+        assert!(memory_engine_listed("ollama"));
+        assert!(!memory_engine_listed("auto"));
+        assert!(!memory_engine_listed(""));
+        assert!(!memory_engine_listed("bogus"));
+    }
+
+    /// A repeat of the current choice changes nothing (a stale card must not turn
+    /// auto-distill back on); a different engine or model, or a legacy enabled config with
+    /// no provider, is applied as the user's explicit pick.
+    #[test]
+    fn enable_memory_repeat_is_a_noop() {
+        let cfg = |enabled: bool, provider: Option<&str>, model: Option<&str>| {
+            knowledge::KnowledgeConfig {
+                enabled,
+                provider: provider.map(str::to_string),
+                model: model.map(str::to_string),
+                auto_distill: false,
+            }
+        };
+        assert!(enable_memory_is_noop(
+            &cfg(true, Some("claude-cli"), None),
+            "claude-cli",
+            None
+        ));
+        assert!(enable_memory_is_noop(
+            &cfg(true, Some("ollama"), Some("qwen3")),
+            "ollama",
+            Some("qwen3")
+        ));
+        assert!(!enable_memory_is_noop(
+            &cfg(true, Some("ollama"), Some("qwen3")),
+            "ollama",
+            Some("llama3.1")
+        ));
+        assert!(!enable_memory_is_noop(
+            &cfg(true, None, None),
+            "claude-cli",
+            None
+        ));
+        assert!(!enable_memory_is_noop(
+            &cfg(false, Some("claude-cli"), None),
+            "claude-cli",
+            None
+        ));
     }
 }
 

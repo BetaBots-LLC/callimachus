@@ -134,6 +134,14 @@ function McpPage() {
             <code className="font-mono">snapshot_session</code>) that update Callimachus's own
             memory — never your project files.
           </p>
+          <p className="text-sm leading-relaxed text-muted-foreground">
+            It also offers <code className="font-mono">recall</code>,{" "}
+            <code className="font-mono">check_decision</code> and{" "}
+            <code className="font-mono">prior_work</code> as prompts (slash commands in Claude Code)
+            and project memory as the <code className="font-mono">callimachus://memory</code>{" "}
+            resource, and when a repo isn't distilled yet it answers with its closest past sessions
+            instead of an empty list.
+          </p>
         </div>
       </div>
     </ProductLayout>

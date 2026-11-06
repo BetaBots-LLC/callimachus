@@ -1,8 +1,8 @@
 // Browser-only fake of the Tauri runtime, so the UI runs (and can be screenshotted) without Rust.
 // Use: `pnpm --filter callimachus dev`, then open
 //   http://localhost:1420/mock.html?view=settings&section=providers&theme=light
-// Params: theme, consent, knowledge, agents, keys, update, jobs, semantic, searchMs (see
-// SCENARIO below). Dev-only.
+// Params: theme, consent, memory (alias: knowledge), engines, agents, keys, update, jobs,
+// semantic, searchMs (see SCENARIO below). Dev-only.
 import type {
   AgentIntegration,
   AutoDistillBudget,
@@ -13,9 +13,14 @@ import type {
   DbStats,
   EmbedStatus,
   IndexReport,
+  HarvestSettings,
+  HookSettings,
   IntegrationStatus,
   JobsStatus,
   KnowledgeConfig,
+  MemoryEngine,
+  MemoryFact,
+  MemorySetup,
   ProjectInfo,
   ProjectMemory,
   SearchFilters,
@@ -41,7 +46,15 @@ function pick<T extends string>(name: string, allowed: readonly T[], fallback: T
 const SCENARIO = {
   theme: pick("theme", ["light", "dark"] as const, "dark"),
   consent: pick("consent", ["unset", "granted", "denied"] as const, "unset"),
-  knowledge: pick("knowledge", ["on", "off"] as const, "on"),
+  // LLM distillation on or off. `knowledge` is the older name for the same switch.
+  memory: pick("memory", ["on", "off"] as const, pick("knowledge", ["on", "off"] as const, "on")),
+  // Which engines memory_setup detects: the claude / codex CLIs, only a saved API key, none,
+  // or only Ollama: on localhost with models, on another host, or running with none pulled.
+  engines: pick(
+    "engines",
+    ["cli", "key", "none", "ollama", "ollama-remote", "ollama-empty"] as const,
+    "cli",
+  ),
   agents: pick("agents", ["connected", "partial", "none"] as const, "partial"),
   keys: pick("keys", ["none", "some"] as const, "some"),
   update: pick("update", ["available", "fail", "none"] as const, "none"),
@@ -183,26 +196,98 @@ let cleanupRows: CleanupRow[] = Array.from({ length: 24 }, (_, i) => ({
   updatedAt: NOW - (330 - i * 9) * DAY,
 }));
 
-const embed: EmbedStatus = { done: 46_120, total: 48_213, running: false };
+// semantic=unavailable means no model is cached, so nothing was ever embedded either.
+const embed: EmbedStatus = {
+  done: SCENARIO.semantic === "unavailable" ? 0 : 46_120,
+  total: 48_213,
+  running: false,
+};
 let closeToTray = false;
 const keys = new Map<string, boolean>(
   ["anthropic", "openai", "gemini", "openrouter", "ollama", "ollama_cloud"].map((p) => [
     p,
-    SCENARIO.keys === "some" && p === "anthropic",
+    // engines=key needs a saved key whatever `keys` says; engines=none and the Ollama-only
+    // scenarios need none.
+    SCENARIO.engines === "key"
+      ? p === "anthropic"
+      : SCENARIO.engines !== "none" &&
+        !SCENARIO.engines.startsWith("ollama") &&
+        SCENARIO.keys === "some" &&
+        p === "anthropic",
   ]),
 );
 const baseUrls = new Map<string, string>();
 const knowledge: KnowledgeConfig = {
-  enabled: SCENARIO.knowledge === "on",
-  provider: SCENARIO.knowledge === "on" ? "claude-cli" : null,
-  model: SCENARIO.knowledge === "on" ? "claude-sonnet-4-6" : null,
-  autoDistill: SCENARIO.knowledge === "on",
+  enabled: SCENARIO.memory === "on",
+  provider: SCENARIO.memory === "on" ? "claude-cli" : null,
+  model: SCENARIO.memory === "on" ? "claude-sonnet-4-6" : null,
+  autoDistill: SCENARIO.memory === "on",
 };
+// The hook digest and harvest toggles persist for the page's lifetime.
+const hookSettings: HookSettings = {
+  digestEnabled: true,
+  mutedProjects: [`${HOME}/code/infra`],
+};
+// Two imported facts, the two claude-memory rows projectMemory shows.
+const harvest: HarvestSettings = { claudeMemory: true, importedFacts: 2 };
+const CLI_ENGINES = [
+  { id: "claude-cli", label: "Claude Code CLI", bin: "claude", path: "/opt/homebrew/bin/claude" },
+  { id: "codex-cli", label: "Codex CLI", bin: "codex", path: "/opt/homebrew/bin/codex" },
+];
+const cliDetected = SCENARIO.engines === "cli";
+const ollamaRunning = SCENARIO.engines.startsWith("ollama");
+const ollamaBase =
+  SCENARIO.engines === "ollama-remote" ? "http://gpu-box:11434" : "http://localhost:11434";
+const ollamaPulled =
+  SCENARIO.engines === "ollama-empty" ? [] : ["llama3.1:8b", "qwen2.5-coder:14b"];
+function memoryEngines(): MemoryEngine[] {
+  const engines: MemoryEngine[] = CLI_ENGINES.map((e) => ({
+    id: e.id,
+    label: e.label,
+    kind: "cli",
+    detected: cliDetected,
+    detail: cliDetected ? e.path : "not found",
+  }));
+  // Labels and details as lib.rs `memory_engines` writes them.
+  const n = ollamaPulled.length;
+  engines.push({
+    id: "ollama",
+    label: "Ollama (local)",
+    kind: "ollama",
+    detected: ollamaRunning,
+    detail: ollamaRunning
+      ? `Running at ${ollamaBase}, ${n === 1 ? "1 model" : `${n} models`}`
+      : `Not running at ${ollamaBase}`,
+  });
+  for (const [id, label] of [
+    ["anthropic", "Anthropic"],
+    ["openai", "OpenAI"],
+    ["gemini", "Gemini"],
+    ["openrouter", "OpenRouter"],
+    ["ollama_cloud", "Ollama Cloud"],
+  ] as const) {
+    if (keys.get(id))
+      engines.push({ id, label, kind: "key", detected: true, detail: "API key saved" });
+  }
+  return engines;
+}
+function memorySetup(): MemorySetup {
+  const engines = memoryEngines();
+  return {
+    enabled: knowledge.enabled,
+    provider: knowledge.provider,
+    model: knowledge.model,
+    engines,
+    recommended: engines.find((e) => e.detected)?.id ?? null,
+    eligibleThreads: budget.eligibleThreads,
+    dailyCap: budget.dailyCap,
+  };
+}
 const budget: AutoDistillBudget = {
   eligibleThreads: 37,
   dailyCap: 25,
   remainingToday: 18,
-  recentDays: 14,
+  recentDays: 30, // knowledge::AUTO_DISTILL_RECENT_DAYS
 };
 let telemetry: TelemetryStatus = {
   available: true,
@@ -529,24 +614,56 @@ const projectInfos = (): ProjectInfo[] =>
   }));
 
 function projectMemory(project: string): ProjectMemory {
-  const fact = (id: number, text: string, daysAgo: number, pinned = false) => ({
+  const fact = (
+    id: number,
+    text: string,
+    daysAgo: number,
+    extractor: MemoryFact["extractor"],
+    pinned = false,
+  ): MemoryFact => ({
     id,
     threadId: threads[id % threads.length].id,
     text,
-    title: threads[id % threads.length].title,
+    title: extractor === "claude-memory" ? "Recorded memory" : threads[id % threads.length].title,
     createdAt: NOW - daysAgo * DAY,
     pinned,
+    extractor,
+    originRef:
+      extractor === "claude-memory"
+        ? `claude-memory:-Users-dev-code-payments-api/${id === 5 ? "project_ledger.md" : "feedback_tests.md"}`
+        : null,
   });
+  // With distillation off only the engine-free facts exist: Remember, TODO heuristics and
+  // harvested Claude Code memory.
+  const on = knowledge.enabled;
+  const harvested = harvest.claudeMemory;
+  const keep = (f: MemoryFact | false): f is MemoryFact => !!f;
   return {
     project,
     decisions: [
-      fact(1, "Use idempotency keys on every POST that moves money.", 3, true),
-      fact(2, "Retries use exponential backoff capped at 5 minutes.", 12),
-    ],
-    gotchas: [fact(3, "Fake timers must be advanced after `scheduler.flush()`.", 1)],
-    openTodos: [fact(4, "Backfill idempotency keys for legacy refunds.", 5)],
+      fact(1, "Use idempotency keys on every POST that moves money.", 3, "user", true),
+      on && fact(2, "Retries use exponential backoff capped at 5 minutes.", 12, "llm"),
+      harvested &&
+        fact(
+          5,
+          "Ledger writes go through the outbox table, never straight to Postgres.",
+          2,
+          "claude-memory",
+        ),
+    ].filter(keep),
+    gotchas: [
+      on && fact(3, "Fake timers must be advanced after `scheduler.flush()`.", 1, "llm"),
+      harvested &&
+        fact(
+          6,
+          "Run the webhook tests with --test-threads=1; they share a port.",
+          4,
+          "claude-memory",
+        ),
+    ].filter(keep),
+    openTodos: [fact(4, "Backfill idempotency keys for legacy refunds.", 5, "heuristic")],
     threadCount: 412,
-    distilledCount: 230,
+    distilledCount: on ? 230 : 0,
     pendingCount: 182,
   };
 }
@@ -947,6 +1064,36 @@ const handlers: Record<string, Handler> = {
     budget.remainingToday = Math.min(budget.remainingToday, budget.dailyCap);
     return { ...budget };
   },
+  memory_setup: memorySetup,
+  enable_memory: (a) => {
+    const provider = String(a.provider);
+    // As lib.rs `memory_engine_listed`: a CLI or Ollama even when not detected, a cloud
+    // provider only with a saved key.
+    const listed =
+      provider.endsWith("-cli") ||
+      provider === "ollama" ||
+      memoryEngines().some((e) => e.id === provider && e.kind === "key");
+    if (!listed)
+      throw new Error(
+        `${provider} is not an available memory engine: pick one the card lists, or save its API key in Settings > Providers`,
+      );
+    knowledge.enabled = true;
+    knowledge.provider = provider;
+    knowledge.model = typeof a.model === "string" ? a.model : null;
+    knowledge.autoDistill = true;
+    return sleep(400).then(() => ({ ...knowledge }));
+  },
+  hook_settings: () => ({ ...hookSettings, mutedProjects: [...hookSettings.mutedProjects] }),
+  set_hook_digest: (a) => {
+    hookSettings.digestEnabled = Boolean(a.on);
+    return null;
+  },
+  harvest_settings: () => ({ ...harvest }),
+  set_harvest_claude_memory: (a) => {
+    harvest.claudeMemory = Boolean(a.on);
+    harvest.importedFacts = harvest.claudeMemory ? 2 : 0;
+    return null;
+  },
   thread_knowledge: threadKnowledge,
   distill_thread: () => sleep(900).then(threadKnowledge),
   recall_decisions: () => [],
@@ -996,15 +1143,13 @@ const handlers: Record<string, Handler> = {
         case "openai":
           return ["gpt-4o", "gpt-4.1", "o3", "o4-mini"];
         case "ollama":
-          return ["llama3.1:8b", "qwen2.5-coder:14b"];
+          return ollamaPulled;
         default:
           return [];
       }
     }),
-  cli_engines: (): CliEngine[] => [
-    { id: "claude-cli", label: "Claude Code", bin: "claude", installed: true },
-    { id: "codex-cli", label: "Codex", bin: "codex", installed: true },
-  ],
+  cli_engines: (): CliEngine[] =>
+    CLI_ENGINES.map((e) => ({ id: e.id, label: e.label, bin: e.bin, installed: cliDetected })),
 
   // Agent integrations ------------------------------------------------------
   recall_integration_status: () => ({ ...recall }),

@@ -189,8 +189,8 @@ function App() {
   const theme = useTheme((s) => s.resolved);
   const toggleTheme = useTheme((s) => s.toggle);
   const { data: stats } = useQuery({ queryKey: ["db_stats"], queryFn: api.dbStats });
-  // Knowledge powers these three views. The tabs stay visible even when it's off (each
-  // shows a teaser + Enable CTA) so the features are discoverable, not hidden behind a flag.
+  // LLM distillation gates Ask only. Knowledge and Projects always render (TODOs, Remember
+  // and harvested memory need no engine) and show the memory card inline while it is off.
   const knowledge = useQuery({ queryKey: ["knowledge_config"], queryFn: api.knowledgeConfig });
   const on = !!knowledge.data?.enabled;
   // DEV-only preview of the first-run screen on a populated index:
@@ -326,15 +326,7 @@ function App() {
             <div className="flex min-h-0 flex-1 flex-col">
               {view === "chat" && <ChatView />}
               {view === "coach" && <CoachView />}
-              {view === "knowledge" && (
-                <KnowledgeGate
-                  enabled={on}
-                  feature="Knowledge"
-                  blurb="Decisions, gotchas, and open TODOs distilled from your past sessions, with cross-thread recall."
-                >
-                  <KnowledgeView />
-                </KnowledgeGate>
-              )}
+              {view === "knowledge" && <KnowledgeView />}
               {view === "ask" && (
                 <KnowledgeGate
                   enabled={on}
@@ -344,15 +336,7 @@ function App() {
                   <AskView />
                 </KnowledgeGate>
               )}
-              {view === "projects" && (
-                <KnowledgeGate
-                  enabled={on}
-                  feature="Project Memory"
-                  blurb="Each repo's decisions, gotchas, and TODOs aggregated into durable memory you (and your agents) can reuse."
-                >
-                  <ProjectMemoryView />
-                </KnowledgeGate>
-              )}
+              {view === "projects" && <ProjectMemoryView />}
               {view === "stats" && <StatsView />}
               {view === "settings" && <SettingsView />}
             </div>

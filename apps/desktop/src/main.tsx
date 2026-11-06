@@ -58,9 +58,11 @@ void listen("embed:done", () => {
     });
   }
 });
-// Background todo backfill (after enabling the Knowledge feature) finished.
+// The one-time TODO backfill finished (at launch on an upgraded index, or after enabling
+// distillation). Projects shows those TODOs too, so a user sitting there sees them now.
 void listen("knowledge:todos-ready", () => {
-  void queryClient.invalidateQueries({ queryKey: ["open_todos"] });
+  for (const key of ["open_todos", "project_memory", "projects"])
+    void queryClient.invalidateQueries({ queryKey: [key] });
 });
 // Per-source reindex progress → drives the progress bar (JobProgress). A reindex emits
 // after each of the first 50 threads and then every 10, about 2,100 events for 21k

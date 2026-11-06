@@ -338,14 +338,14 @@ export function CoachView() {
               </>
             ) : (
               <>
-                Decisions and gotchas appear here once your sessions are distilled. That needs the
-                Knowledge layer.{" "}
+                Decisions and gotchas appear here once your sessions are distilled, which needs
+                memory (LLM distillation) turned on.{" "}
                 <Button
                   variant="link"
                   className="h-auto p-0 text-[13px]"
                   onClick={() => openSettings("knowledge")}
                 >
-                  Turn it on in Settings
+                  Turn on memory in Settings
                 </Button>
               </>
             )}
