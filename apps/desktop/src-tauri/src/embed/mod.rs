@@ -33,8 +33,38 @@ pub const DIM: usize = 384;
 
 /// Cosine-similarity floor for the semantic arm: KNN always returns its k-nearest, so a
 /// query with no good match would otherwise inject noise. Anything below this is dropped.
-/// Shared so the hybrid fusion can weight by similarity over the same [floor, 1.0] range.
-pub(crate) const SEM_SIMILARITY_FLOOR: f32 = 0.35;
+/// Shared so the hybrid fusion can weight by similarity over the same range.
+///
+/// bge-small scores everything high, so the old 0.35 never dropped a single hit: gibberish
+/// came back with 180+ "matches". Calibrated on the 317k-vector index (Nov 2026) with 20
+/// labeled queries, 10 real topics from recent thread titles and 10 nonsense strings:
+/// - real: best hit 0.756-0.830; the labeled thread's hits at 0.728-0.830, in the top 5
+///   for 8 of the 10 (the other two have no labeled hit in the top 15 at all, just closer
+///   threads on the same topic);
+/// - nonsense: best hit 0.571-0.648, except 'zzqxjvkw' at 0.728 and 0.707 (it lands on
+///   `<task-notification>` and `z`-import rows), 0.60-0.68 down to the 15th.
+///
+/// At 0.70 the nonsense queries return 0 semantic hits (2 for 'zzqxjvkw') and every real
+/// query keeps its top results. A single rare token ('notarytool', best 0.686) gets no
+/// semantic hits, which is right: the keyword arm already finds it exactly.
+pub(crate) const SEM_SIMILARITY_FLOOR: f32 = 0.70;
+
+/// The floor for `search::related` (`cal related`, the VS Code panel, MCP): its input is a
+/// code selection, an error or a long context, not a search-box query, and such text scores
+/// lower against prose. SEM_SIMILARITY_FLOOR was calibrated only on short queries, and the
+/// audit put related's at 0.62-0.65; 0.60 errs toward keeping a weak real match, and the
+/// relative cutoff (applied there too) sheds the filler under a strong best hit.
+pub(crate) const SEM_RELATED_FLOOR: f32 = 0.60;
+
+/// Hybrid search drops semantic hits this far below the query's best one. On the same 20
+/// queries each labeled thread's best hit was within 0.025 of the query's best, while a
+/// query with a strong best hit sheds the 0.70-0.75 filler under it.
+pub(crate) const SEM_RELATIVE_CUTOFF: f32 = 0.08;
+
+/// The similarity at which a semantic hit keeps its full RRF weight in hybrid fusion: just
+/// above the best hits real queries reach (0.83). Scaled to 1.0, even a query's best hit
+/// kept only about three quarters of its weight.
+pub(crate) const SEM_FULL_WEIGHT_SIM: f32 = 0.85;
 
 /// bge retrieval works best with an instruction prefix on the QUERY only.
 const QUERY_PREFIX: &str = "Represent this sentence for searching relevant passages: ";
@@ -297,6 +327,23 @@ const MAX_BULK_YIELD: Duration = Duration::from_secs(2);
 /// also spares each hook and MCP process ~18 idle ORT pool threads.
 const QUERY_INTRA_THREADS: usize = 4;
 
+/// ONNX intra-op threads for a background top-up build (the watcher's auto-embed after
+/// agent activity). Measured 63 chunks/s at 8 threads against 88 at 22 on a 24-core
+/// machine: a top-up of a few hundred messages takes seconds either way, and 8 keeps the
+/// fans quiet while the user works.
+const BACKGROUND_INTRA_THREADS: usize = 8;
+
+/// How long the app's shared (query) model stays loaded with nothing using it. Reloading
+/// from the cache costs about 150 ms on the next query, while a loaded model holds about
+/// 130 MB of weights plus ONNX Runtime working memory and its thread pool (the installed
+/// app sat at a 1.6 GB footprint after 46 h because the model could never be dropped).
+pub const APP_IDLE_UNLOAD: Duration = Duration::from_secs(10 * 60);
+
+/// The same for `cached_only` sidecars (the MCP server). One semantic tool call took an
+/// MCP process from about 30 MB to about 390 MB for the rest of the agent session, times
+/// every concurrent session; a 150 ms reload is small next to an agent's think time.
+pub const SIDECAR_IDLE_UNLOAD: Duration = Duration::from_secs(60);
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum LoadMode {
     /// `ensure_loaded`: always attempts (ignores the failure cooldown); downloads if the
@@ -310,6 +357,16 @@ enum LoadMode {
     CachedNoWait,
 }
 
+/// A loaded model. Every caller clones the `Arc` for the length of one call, so a strong
+/// count of 1 (only the slot's own reference) means nobody is using it right now.
+type Model = std::sync::Arc<Mutex<TextEmbedding>>;
+
+/// The model in its slot, with when a caller last asked for it.
+struct Loaded {
+    model: Model,
+    last_used: Instant,
+}
+
 /// Lazily-loaded embedding model, held in Tauri managed state (and owned directly by the
 /// `cal` / MCP sidecars).
 ///
@@ -317,14 +374,18 @@ enum LoadMode {
 /// but that lock is only ever held for ONE short sub-batch of inference, and queries take
 /// priority over the bulk build between sub-batches (`interactive`). Loading has its own
 /// lock so a slow first download never blocks a caller that already has a model.
+///
+/// Lifetime: the model can be dropped again (`unload_if_idle`) once nothing has used it
+/// for `idle_unload`; the next call reloads it from the cache.
 pub struct Embedder {
-    /// Set exactly once, after a successful load.
-    model: OnceLock<Mutex<TextEmbedding>>,
+    /// The loaded model, if any.
+    slot: Mutex<Option<Loaded>>,
     /// Serializes loading; holds the last load failure (when, why) for the cooldown.
     init: Mutex<Option<(Instant, String)>>,
     /// Interactive callers (queries) waiting for or using the model. The bulk path yields
-    /// between sub-batches while this is non-zero.
-    interactive: AtomicUsize,
+    /// between sub-batches while this is non-zero. Shared with `bulk_build` embedders, so
+    /// a build on its own model still steps aside for a query on this one.
+    interactive: std::sync::Arc<AtomicUsize>,
     /// False for sidecars (hooks, MCP, CLI): load only from the cache, never download.
     allow_download: bool,
     /// Test-only cache root override: the only root looked in and downloaded into. `None`
@@ -333,25 +394,38 @@ pub struct Embedder {
     /// ONNX intra-op threads the model is loaded with (`bulk_intra_threads` or
     /// `query_intra_threads`). Thread count does not change the vectors.
     intra_threads: usize,
+    /// Drop the model after this long unused (`unload_if_idle`); `None` keeps it.
+    idle_unload: Option<Duration>,
+    /// Log loads and unloads to the app log (the GUI's embedders only: a sidecar's stderr
+    /// is the agent's MCP log or terminal).
+    log: bool,
 }
 
 impl Default for Embedder {
-    /// The app's embedder: downloads the model on first use if it isn't cached yet, and
-    /// uses the bulk thread count since it runs the semantic-index build.
+    /// The app's shared embedder, for queries, recall and fact embeds: downloads the model
+    /// on first use if it isn't cached yet, uses the small query thread pool (a one-text
+    /// query is faster on 4 threads than on 22, see `QUERY_INTRA_THREADS`), and unloads
+    /// after `APP_IDLE_UNLOAD`. The semantic-index build runs on its own `bulk_build`
+    /// embedder.
     fn default() -> Self {
-        Self::new(true, None, bulk_intra_threads())
+        let mut e = Self::new(true, None, query_intra_threads());
+        e.idle_unload = Some(APP_IDLE_UNLOAD);
+        e.log = true;
+        e
     }
 }
 
 impl Embedder {
     fn new(allow_download: bool, cache_root: Option<PathBuf>, intra_threads: usize) -> Self {
         Self {
-            model: OnceLock::new(),
+            slot: Mutex::new(None),
             init: Mutex::new(None),
-            interactive: AtomicUsize::new(0),
+            interactive: std::sync::Arc::new(AtomicUsize::new(0)),
             allow_download,
             cache_root,
             intra_threads,
+            idle_unload: None,
+            log: false,
         }
     }
 
@@ -362,14 +436,34 @@ impl Embedder {
     /// `ensure_loaded` return `EmbedError::ModelNotCached`.
     ///
     /// Every caller embeds only queries and a handful of facts, so it loads with the small
-    /// `query_intra_threads` pool instead of the app's bulk-build setting.
+    /// `query_intra_threads` pool instead of the app's bulk-build setting, and it may be
+    /// unloaded `SIDECAR_IDLE_UNLOAD` after its last query (the MCP server's reaper).
     pub fn cached_only() -> Self {
-        Self::new(false, None, query_intra_threads())
+        let mut e = Self::new(false, None, query_intra_threads());
+        e.idle_unload = Some(SIDECAR_IDLE_UNLOAD);
+        e
+    }
+
+    /// A separate embedder for one semantic-index build, dropped when the build ends so the
+    /// bulk session's thread pool and the working memory its padded sub-batches grew go
+    /// with it. `background` (the watcher's auto top-up) uses fewer threads. It downloads
+    /// only if this one may, and shares this one's interactive counter so the build keeps
+    /// yielding to queries. Never idle-unloaded: the build owns it.
+    pub fn bulk_build(&self, background: bool) -> Self {
+        let threads = if background {
+            bulk_intra_threads().min(BACKGROUND_INTRA_THREADS)
+        } else {
+            bulk_intra_threads()
+        };
+        let mut e = Self::new(self.allow_download, self.cache_root.clone(), threads);
+        e.interactive = std::sync::Arc::clone(&self.interactive);
+        e.log = self.log;
+        e
     }
 
     /// True once the model is loaded in this process.
     pub fn is_loaded(&self) -> bool {
-        self.model.get().is_some()
+        self.lock_slot().is_some()
     }
 
     /// Load the model now (downloading it if this embedder allows that and it isn't
@@ -378,6 +472,45 @@ impl Embedder {
     /// background thread to prefetch the model.
     pub fn ensure_loaded(&self) -> Result<(), EmbedError> {
         self.load(LoadMode::Explicit).map(|_| ())
+    }
+
+    /// Drop the model if it has been unused for this embedder's idle limit, no query is
+    /// waiting for it and no call holds it. Returns whether it unloaded. Cheap when there is
+    /// nothing to do, so a periodic tick can call it. A semantic build does not keep it:
+    /// the build has its own model (`bulk_build`).
+    pub fn unload_if_idle(&self) -> bool {
+        let Some(limit) = self.idle_unload else {
+            return false;
+        };
+        self.unload_idle_for(limit)
+    }
+
+    fn unload_idle_for(&self, limit: Duration) -> bool {
+        if self.interactive.load(Ordering::Acquire) > 0 {
+            return false;
+        }
+        let taken = {
+            let mut slot = self.lock_slot();
+            let idle = slot.as_ref().is_some_and(|l| {
+                std::sync::Arc::strong_count(&l.model) == 1 && l.last_used.elapsed() >= limit
+            });
+            if !idle {
+                return false;
+            }
+            slot.take()
+        };
+        // Dropped outside the slot lock: freeing the session and joining its thread pool
+        // takes a few ms, and a query arriving meanwhile should go straight to its reload.
+        if let Some(loaded) = taken {
+            let idle_for = loaded.last_used.elapsed();
+            drop(loaded);
+            // Freed is not returned: malloc keeps the session's large buffers cached.
+            crate::memtrim::release_freed_memory();
+            if self.log {
+                app_log!("[embed] model unloaded after {} s idle", idle_for.as_secs());
+            }
+        }
+        true
     }
 
     /// Embed a batch of texts, loading the model on first call. Bulk-priority: runs in
@@ -393,7 +526,7 @@ impl Embedder {
             return Ok(Vec::new());
         }
         let model = self.load(LoadMode::Implicit)?;
-        self.infer_bulk(model, texts)
+        self.infer_bulk(&model, texts)
     }
 
     /// Where a cached model is looked for.
@@ -409,10 +542,22 @@ impl Embedder {
         self.cache_root.clone().unwrap_or_else(model_cache_dir)
     }
 
+    fn lock_slot(&self) -> MutexGuard<'_, Option<Loaded>> {
+        self.slot.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The loaded model, marked used now, if there is one.
+    fn loaded(&self) -> Option<Model> {
+        let mut slot = self.lock_slot();
+        let loaded = slot.as_mut()?;
+        loaded.last_used = Instant::now();
+        Some(std::sync::Arc::clone(&loaded.model))
+    }
+
     /// Return the loaded model, loading it first if needed (subject to `mode` and
     /// `allow_download`).
-    fn load(&self, mode: LoadMode) -> Result<&Mutex<TextEmbedding>, EmbedError> {
-        if let Some(model) = self.model.get() {
+    fn load(&self, mode: LoadMode) -> Result<Model, EmbedError> {
+        if let Some(model) = self.loaded() {
             return Ok(model);
         }
         let mut last_failure = match mode {
@@ -426,7 +571,7 @@ impl Embedder {
             }
         };
         // Another thread may have finished loading while we waited for the init lock.
-        if let Some(model) = self.model.get() {
+        if let Some(model) = self.loaded() {
             return Ok(model);
         }
         if mode != LoadMode::Explicit {
@@ -438,6 +583,7 @@ impl Embedder {
         }
         let may_download = self.allow_download && mode != LoadMode::CachedNoWait;
         let roots = self.lookup_roots();
+        let clock = crate::jobclock::JobClock::start();
         let loaded = match find_snapshot(&roots) {
             Some(snapshot) => load_snapshot(&snapshot, self.intra_threads),
             None if may_download => download_model(&self.download_root(), self.intra_threads),
@@ -447,7 +593,19 @@ impl Embedder {
         match loaded {
             Ok(model) => {
                 *last_failure = None;
-                Ok(self.model.get_or_init(|| Mutex::new(model)))
+                if self.log {
+                    app_log!(
+                        "[embed] model loaded in {} ({} threads)",
+                        clock.process_summary(),
+                        self.intra_threads
+                    );
+                }
+                let model: Model = std::sync::Arc::new(Mutex::new(model));
+                *self.lock_slot() = Some(Loaded {
+                    model: std::sync::Arc::clone(&model),
+                    last_used: Instant::now(),
+                });
+                Ok(model)
             }
             Err(e) => {
                 let why = format!("{e:#}");
@@ -971,6 +1129,22 @@ pub fn embed_query_cached_only(embedder: &Embedder, query: &str) -> Result<Optio
     query_vector(embedder, query, LoadMode::CachedNoWait)
 }
 
+/// [`embed_query_cached_only`] that says why there is no vector, for the app's search box:
+/// it retries soon on `EmbedError::ModelLoading` and shows "unavailable" for the rest.
+/// `Ok(None)` only for an empty query.
+pub fn embed_query_no_wait(
+    embedder: &Embedder,
+    query: &str,
+) -> std::result::Result<Option<Vec<f32>>, EmbedError> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Ok(None);
+    }
+    let model = embedder.load(LoadMode::CachedNoWait)?;
+    let qv = embedder.infer_interactive(&model, &[format!("{QUERY_PREFIX}{query}")])?;
+    Ok(qv.into_iter().next())
+}
+
 fn query_vector(embedder: &Embedder, query: &str, mode: LoadMode) -> Result<Option<Vec<f32>>> {
     let query = query.trim();
     if query.is_empty() {
@@ -982,7 +1156,7 @@ fn query_vector(embedder: &Embedder, query: &str, mode: LoadMode) -> Result<Opti
         Err(e) if mode == LoadMode::CachedNoWait && e.is_model_unavailable() => return Ok(None),
         Err(e) => return Err(e.into()),
     };
-    let qv = embedder.infer_interactive(model, &[format!("{QUERY_PREFIX}{query}")])?;
+    let qv = embedder.infer_interactive(&model, &[format!("{QUERY_PREFIX}{query}")])?;
     Ok(qv.into_iter().next())
 }
 
@@ -1015,9 +1189,91 @@ pub fn semantic_search_vec(
     project: Option<&str>,
     k: usize,
 ) -> Result<Vec<(i64, f32)>> {
-    let filtered = !sources.is_empty() || project.is_some_and(|p| !p.is_empty());
-    let prefilter = filtered && owner_prefilter_usable(conn);
-    let (sql, args) = semantic_knn_sql(qv, include_subagents, sources, project, k, prefilter);
+    let scope = KnnScope {
+        include_subagents,
+        sources,
+        project,
+        ..KnnScope::default()
+    };
+    semantic_search_scoped(conn, qv, &scope, k)
+}
+
+/// The thread and message filters a semantic KNN honors: every `SearchFilters` field that
+/// narrows the result set. Hybrid search passes all of them, so Starred, a tag chip or a
+/// date range scopes the semantic arm the same way it scopes the keyword arm (it used to
+/// apply only project, sources and subagents: `--starred` hybrid returned 24 of 30 hits
+/// from unstarred threads).
+#[derive(Debug, Clone, Copy)]
+pub struct KnnScope<'a> {
+    /// Hits below this cosine similarity are dropped: [`SEM_SIMILARITY_FLOOR`] by default
+    /// (the search box), [`SEM_RELATED_FLOOR`] for related's code and error context.
+    pub floor: f32,
+    pub include_subagents: bool,
+    pub sources: &'a [String],
+    pub project: Option<&'a str>,
+    /// Some(true) = only starred threads, Some(false) = only unstarred.
+    pub starred: Option<bool>,
+    /// Threads having ANY of these tags; empty = all.
+    pub tags: &'a [String],
+    /// Message timestamp range, epoch seconds, inclusive.
+    pub after: Option<i64>,
+    pub before: Option<i64>,
+}
+
+impl Default for KnnScope<'_> {
+    fn default() -> Self {
+        Self {
+            floor: SEM_SIMILARITY_FLOOR,
+            include_subagents: false,
+            sources: &[],
+            project: None,
+            starred: None,
+            tags: &[],
+            after: None,
+            before: None,
+        }
+    }
+}
+
+impl<'a> KnnScope<'a> {
+    /// The scope for a search's filters, at the default floor.
+    pub fn of(filters: &'a crate::search::SearchFilters) -> Self {
+        Self {
+            floor: SEM_SIMILARITY_FLOOR,
+            include_subagents: filters.include_subagents,
+            sources: &filters.sources,
+            project: filters.project.as_deref(),
+            starred: filters.starred,
+            tags: &filters.tags,
+            after: filters.after,
+            before: filters.before,
+        }
+    }
+
+    fn project(&self) -> Option<&'a str> {
+        self.project.filter(|p| !p.is_empty())
+    }
+
+    /// Whether anything narrows the KNN beyond the subagent rule.
+    fn is_filtered(&self) -> bool {
+        self.project().is_some()
+            || !self.sources.is_empty()
+            || self.starred.is_some()
+            || !self.tags.is_empty()
+            || self.after.is_some()
+            || self.before.is_some()
+    }
+}
+
+/// [`semantic_search_vec`] with the full filter scope.
+pub fn semantic_search_scoped(
+    conn: &Connection,
+    qv: &[f32],
+    scope: &KnnScope<'_>,
+    k: usize,
+) -> Result<Vec<(i64, f32)>> {
+    let prefilter = scope.is_filtered() && owner_prefilter_usable(conn);
+    let (sql, args) = semantic_knn_sql(qv, scope, k, prefilter);
     let arg_refs: Vec<&dyn ToSql> = args.iter().map(|b| b.as_ref()).collect();
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(arg_refs.as_slice(), |r| {
@@ -1046,43 +1302,71 @@ fn owner_prefilter_usable(conn: &Connection) -> bool {
 }
 
 /// The statement and bind values behind `semantic_search_vec`, split out so tests can
-/// check its query plan. `owner_prefilter` pushes the project/source filters into the KNN
+/// check its query plan. `owner_prefilter` pushes the thread/message filters into the KNN
 /// (see [`owner_prefilter_usable`]); without it they only post-filter an over-fetch.
 fn semantic_knn_sql(
     qv: &[f32],
-    include_subagents: bool,
-    sources: &[String],
-    project: Option<&str>,
+    scope: &KnnScope<'_>,
     k: usize,
     owner_prefilter: bool,
 ) -> (String, Vec<Box<dyn ToSql>>) {
-    let project = project.filter(|p| !p.is_empty());
-    // Bind order: ?1 the query vector, then the project pattern, then the source kinds.
-    // Each is bound once and referenced by number from both the pre-filter and the outer
-    // query.
+    let project = scope.project();
+    let sources = scope.sources;
+    // Bind order: ?1 the query vector, then each filter's values. Each is bound once and
+    // referenced by number from both the pre-filter and the outer query.
     let mut args: Vec<Box<dyn ToSql>> = vec![Box::new(vec_to_bytes(qv))];
-    let project_ph = project.map(|p| {
-        args.push(Box::new(format!("%{p}%")));
+    let mut bind = |v: Box<dyn ToSql>| {
+        args.push(v);
         args.len()
-    });
-    let first_source_ph = args.len() + 1;
-    for s in sources {
-        args.push(Box::new(s.clone()));
-    }
-    let source_list = (first_source_ph..first_source_ph + sources.len())
-        .map(|i| format!("?{i}"))
+    };
+    let project_ph = project.map(|p| bind(Box::new(format!("%{p}%"))));
+    let source_list = sources
+        .iter()
+        .map(|s| format!("?{}", bind(Box::new(s.clone()))))
         .collect::<Vec<_>>()
         .join(", ");
+    let starred_ph = scope.starred.map(|s| bind(Box::new(i64::from(s))));
+    let tag_list = scope
+        .tags
+        .iter()
+        .map(|t| format!("?{}", bind(Box::new(t.clone()))))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let after_ph = scope.after.map(|a| bind(Box::new(a)));
+    let before_ph = scope.before.map(|b| bind(Box::new(b)));
 
-    // Project and source filters are pushed INTO the KNN as a `rowid IN (...)` pre-filter
-    // over the matching threads' chunks, which vec0 serves by skipping every vector outside
-    // the list. Post-filtering a global top-k instead starved narrow filters (a project with
+    // The thread and message conditions (threads `t`, messages `m`), shared by the
+    // pre-filter and the outer query. Sources are added per query: they need `sources s`.
+    let mut conds = Vec::new();
+    if let Some(ph) = project_ph {
+        conds.push(format!(
+            "COALESCE(t.project_key, t.project_path) LIKE ?{ph}"
+        ));
+    }
+    if let Some(ph) = starred_ph {
+        conds.push(format!("t.starred = ?{ph}"));
+    }
+    if !tag_list.is_empty() {
+        conds.push(format!(
+            "EXISTS (SELECT 1 FROM thread_tags tt WHERE tt.thread_id = t.id AND tt.tag IN ({tag_list}))"
+        ));
+    }
+    if let Some(ph) = after_ph {
+        conds.push(format!("m.ts >= ?{ph}"));
+    }
+    if let Some(ph) = before_ph {
+        conds.push(format!("m.ts <= ?{ph}"));
+    }
+
+    // The filters are pushed INTO the KNN as a `rowid IN (...)` pre-filter over the
+    // matching threads' chunks, which vec0 serves by skipping every vector outside the
+    // list. Post-filtering a global top-k instead starved narrow filters (a project with
     // 0.6% of the vectors got 4-11 of 100 hits; codex, with 3 vectors, got none) despite a
     // 2000-chunk over-fetch. Measured on a 117k-vector index: one project 160 -> 27 ms, a
     // source holding half the vectors 160 -> 80 ms, and every filter gets its full k. A
     // vector with no vec_chunk_owner row would be left out, so the caller only asks for the
     // pre-filter when every vector has one (store_batch writes one per vector).
-    let filtered = project_ph.is_some() || !sources.is_empty();
+    let filtered = scope.is_filtered();
     let pushed_down = filtered && owner_prefilter;
     let prefilter = if pushed_down {
         let mut joins = String::from(
@@ -1090,22 +1374,17 @@ fn semantic_knn_sql(
              JOIN messages m ON m.id = o.message_id
              JOIN threads t ON t.id = m.thread_id",
         );
-        let mut conds = Vec::new();
-        if let Some(ph) = project_ph {
-            conds.push(format!(
-                "COALESCE(t.project_key, t.project_path) LIKE ?{ph}"
-            ));
-        }
+        let mut pre = conds.clone();
         if !sources.is_empty() {
             joins.push_str(" JOIN sources s ON s.id = t.source_id");
-            conds.push(format!("s.kind IN ({source_list})"));
+            pre.push(format!("s.kind IN ({source_list})"));
         }
         // Matches the outer filter, shrinks the list, and lets the planner build it from
         // idx_threads_subagent (a few ms per thousand chunks) instead of every owner row.
-        if !include_subagents {
-            conds.push("t.is_subagent = 0".to_string());
+        if !scope.include_subagents {
+            pre.push("t.is_subagent = 0".to_string());
         }
-        format!(" AND rowid IN ({joins} WHERE {})", conds.join(" AND "))
+        format!(" AND rowid IN ({joins} WHERE {})", pre.join(" AND "))
     } else {
         String::new()
     };
@@ -1139,23 +1418,20 @@ fn semantic_knn_sql(
          JOIN sources s ON s.id = t.source_id
          WHERE {EMBEDDABLE_SQL}"
     );
-    if !include_subagents {
+    if !scope.include_subagents {
         sql.push_str(" AND t.is_subagent = 0");
     }
     if !sources.is_empty() {
         sql.push_str(&format!(" AND s.kind IN ({source_list})"));
     }
-    // Scope the semantic arm to the project too (was previously ignored, leaking cross-
-    // project hits into a project-scoped hybrid search). Match how facts/threads aggregate.
-    if let Some(ph) = project_ph {
-        sql.push_str(&format!(
-            " AND COALESCE(t.project_key, t.project_path) LIKE ?{ph}"
-        ));
+    for c in &conds {
+        sql.push_str(" AND ");
+        sql.push_str(c);
     }
     // Similarity floor: KNN always returns its k-nearest, so a query with no good semantic
     // match would otherwise inject irrelevant chunks that RRF then promotes. Drop anything
-    // below SEM_SIMILARITY_FLOOR (distance = 1 - cosine). Conservative so real matches survive.
-    args.push(Box::new(1.0_f64 - SEM_SIMILARITY_FLOOR as f64));
+    // below the scope's floor (distance = 1 - cosine).
+    args.push(Box::new(1.0_f64 - f64::from(scope.floor)));
     let dist_ph = args.len();
     args.push(Box::new(k as i64));
     let limit_ph = args.len();
@@ -1406,7 +1682,7 @@ mod tests {
     fn bulk_length_sort_keeps_input_order() {
         let e = Embedder::cached_only();
         e.ensure_loaded().unwrap();
-        let model = e.model.get().unwrap();
+        let model = e.loaded().unwrap();
         let texts: Vec<String> = (0..(BULK_SUB_BATCH * 2 + 5))
             .map(|i| {
                 // Lengths deliberately out of order: long, short, medium, ...
@@ -1418,7 +1694,7 @@ mod tests {
         assert_eq!(bulk.len(), texts.len());
         for (text, got) in texts.iter().zip(&bulk) {
             let alone = e
-                .infer_interactive(model, std::slice::from_ref(text))
+                .infer_interactive(&model, std::slice::from_ref(text))
                 .unwrap();
             let c = cosine(got, &alone[0]);
             assert!(c > 0.99999, "{text:?}: cosine {c}");
@@ -1606,8 +1882,52 @@ mod tests {
             sidecar.intra_threads,
             available_cores().min(QUERY_INTRA_THREADS)
         );
-        // The app's embedder runs the bulk build and keeps n-2.
-        assert_eq!(Embedder::default().intra_threads, bulk_intra_threads());
+        // The app's shared embedder serves queries too; only its build embedder is bulk.
+        let app = Embedder::default();
+        assert_eq!(app.intra_threads, query_intra_threads());
+        assert_eq!(app.bulk_build(false).intra_threads, bulk_intra_threads());
+        let background = app.bulk_build(true).intra_threads;
+        assert!((1..=BACKGROUND_INTRA_THREADS).contains(&background));
+    }
+
+    #[test]
+    fn idle_unload_policy_per_embedder() {
+        assert_eq!(Embedder::default().idle_unload, Some(APP_IDLE_UNLOAD));
+        assert_eq!(
+            Embedder::cached_only().idle_unload,
+            Some(SIDECAR_IDLE_UNLOAD)
+        );
+        let app = Embedder::default();
+        let build = app.bulk_build(false);
+        // The build owns its model; nothing reaps it mid-build.
+        assert_eq!(build.idle_unload, None);
+        assert!(!build.unload_if_idle());
+        // A query on the shared embedder still makes the build's bulk loop step aside.
+        let _ticket = InteractiveTicket::enter(&app.interactive);
+        assert_eq!(build.interactive.load(Ordering::Acquire), 1);
+        // Nothing loaded: nothing to unload.
+        assert!(!app.unload_if_idle());
+        assert!(!app.is_loaded());
+    }
+
+    /// Needs a downloaded model. The model unloads only once idle past the limit and only
+    /// while no call holds it, and the next query reloads it.
+    #[test]
+    #[ignore]
+    fn idle_model_unloads_and_reloads() {
+        let e = Embedder::cached_only();
+        e.ensure_loaded().unwrap();
+        assert!(!e.unload_if_idle(), "used just now");
+        let held = e.loaded().unwrap();
+        assert!(!e.unload_idle_for(Duration::ZERO), "a call still holds it");
+        drop(held);
+        let started = Instant::now();
+        assert!(e.unload_idle_for(Duration::ZERO));
+        assert!(!e.is_loaded());
+        let qv = embed_query_cached_only(&e, "sqlite vector index").unwrap();
+        assert_eq!(qv.map(|v| v.len()), Some(DIM));
+        assert!(e.is_loaded());
+        eprintln!("unload + reload + one query: {:?}", started.elapsed());
     }
 
     #[test]
@@ -1879,14 +2199,13 @@ mod tests {
         project: Option<&str>,
         owner_prefilter: bool,
     ) -> Vec<String> {
-        let (sql, args) = semantic_knn_sql(
-            &direction(0.0),
+        let scope = KnnScope {
             include_subagents,
             sources,
             project,
-            10,
-            owner_prefilter,
-        );
+            ..KnnScope::default()
+        };
+        let (sql, args) = semantic_knn_sql(&direction(0.0), &scope, 10, owner_prefilter);
         let refs: Vec<&dyn ToSql> = args.iter().map(|b| b.as_ref()).collect();
         let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
         stmt.query_map(refs.as_slice(), |r| r.get::<_, String>(3))
@@ -1931,12 +2250,60 @@ mod tests {
         }
     }
 
+    /// Starred, tag and date scopes ride the same `rowid IN` pre-filter, and building
+    /// their list never walks the messages table either.
+    #[test]
+    fn collection_and_date_filters_prefilter_the_knn() {
+        let db = temp_db("semplan2");
+        let tags = vec!["infra".to_string()];
+        let scopes = [
+            KnnScope {
+                starred: Some(true),
+                ..KnnScope::default()
+            },
+            KnnScope {
+                tags: &tags,
+                ..KnnScope::default()
+            },
+            KnnScope {
+                after: Some(1),
+                before: Some(2),
+                ..KnnScope::default()
+            },
+        ];
+        for scope in &scopes {
+            let (sql, args) = semantic_knn_sql(&direction(0.0), scope, 10, true);
+            let refs: Vec<&dyn ToSql> = args.iter().map(|b| b.as_ref()).collect();
+            let plan: Vec<String> = db
+                .conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap()
+                .query_map(refs.as_slice(), |r| r.get::<_, String>(3))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert!(
+                plan.iter()
+                    .any(|l| l.contains("VIRTUAL TABLE INDEX") && l.contains('[')),
+                "{scope:?}: {plan:#?}"
+            );
+            assert!(
+                !plan.iter().any(|l| l.starts_with("SCAN m")),
+                "{scope:?}: {plan:#?}"
+            );
+        }
+    }
+
     #[test]
     fn knn_k_fits_vec0_and_over_fetches_without_the_prefilter() {
         let q = direction(0.0);
         let codex = vec!["codex".to_string()];
         let knn_k = |sources: &[String], prefilter: bool, k: usize| {
-            let (sql, _) = semantic_knn_sql(&q, false, sources, None, k, prefilter);
+            let scope = KnnScope {
+                sources,
+                ..KnnScope::default()
+            };
+            let (sql, _) = semantic_knn_sql(&q, &scope, k, prefilter);
             let tail = &sql[sql.find("AND k = ").unwrap() + "AND k = ".len()..];
             tail.split(|c: char| !c.is_ascii_digit())
                 .next()

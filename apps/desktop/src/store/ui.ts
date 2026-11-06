@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import type { SourceKind } from "../lib/api";
+import { api, type SourceKind } from "../lib/api";
 
 export type View =
   | "search"
@@ -48,10 +48,14 @@ interface UiState {
   toggleTag: (t: string) => void;
   clearCollectionFilters: () => void;
   selectThread: (id: number | null, messageId?: number | null) => void;
+  // When the watcher last reported new transcripts that an on-screen search was NOT
+  // refetched for (main.tsx). ResultsList offers a refresh while its data is older.
+  searchActivityAt: number;
+  noteSearchActivity: () => void;
 }
 
 // Subscribe with selectors (e.g. useUi((s) => s.query)) — never the whole store.
-export const useUi = create<UiState>((set) => ({
+export const useUi = create<UiState>((set, get) => ({
   view: "search",
   setView: (view) => set({ view }),
   settingsSection: "general",
@@ -78,7 +82,14 @@ export const useUi = create<UiState>((set) => ({
         : [...state.sources, s],
     })),
   toggleSubagents: () => set((state) => ({ includeSubagents: !state.includeSubagents })),
-  toggleHybrid: () => set((state) => ({ hybrid: !state.hybrid })),
+  toggleHybrid: () => {
+    const hybrid = !get().hybrid;
+    // Turning semantic on: load the model now, in the background, so the first hybrid
+    // query does not pay the ONNX load (or fall back to keyword-only while it runs).
+    // An older backend without the command just rejects; nothing depends on it.
+    if (hybrid) api.warmSemantic().catch(() => {});
+    set({ hybrid });
+  },
   toggleStarredOnly: () => set((state) => ({ starredOnly: !state.starredOnly })),
   toggleTag: (t) =>
     set((state) => ({
@@ -89,4 +100,6 @@ export const useUi = create<UiState>((set) => ({
   clearCollectionFilters: () => set({ starredOnly: false, selectedTags: [] }),
   selectThread: (id, messageId) =>
     set({ selectedThreadId: id, targetMessageId: messageId ?? null }),
+  searchActivityAt: 0,
+  noteSearchActivity: () => set({ searchActivityAt: Date.now() }),
 }));

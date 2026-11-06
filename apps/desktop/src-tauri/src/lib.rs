@@ -1,6 +1,8 @@
 // First, so `app_log!` is in scope for every module declared after it.
 #[macro_use]
 mod applog;
+pub(crate) mod jobclock;
+pub(crate) mod memtrim;
 
 pub mod agent;
 mod error;
@@ -26,7 +28,7 @@ pub mod snapshot;
 pub mod telemetry;
 
 use error::AppResult;
-use search::{SearchFilters, SearchHit, ThreadDetail, ThreadSummary};
+use search::{SearchFilters, ThreadDetail, ThreadSummary};
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -42,7 +44,21 @@ struct EmbedJob {
     running: Arc<JobFlag>,
     done: AtomicI64,
     total: AtomicI64,
+    /// The user asked for the running build: it was started by a Build click, or one landed
+    /// during a capped background top-up, which then hands over to a full build so the
+    /// click's "up to date" toast is true. Such a build is never cancelled. Cleared when
+    /// the build releases `running`.
+    user_requested: AtomicBool,
+    /// A reindex or an index rewrite asked the running background top-up to stop after its
+    /// current batch (see [`request_embed_yield`]). Reset when a build starts.
+    cancel: AtomicBool,
+    /// Background top-ups stay off until then after one stopped because the model would
+    /// not load (a corrupt cache): retrying every quiet minute would only repeat it.
+    auto_paused_until: Mutex<Option<std::time::Instant>>,
 }
+
+/// How long background top-ups pause after the model failed to load in one.
+const AUTO_EMBED_FAILURE_PAUSE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
 impl EmbedJob {
     fn is_running(&self) -> bool {
@@ -50,9 +66,56 @@ impl EmbedJob {
     }
 }
 
-/// Guards against more than one background re-index running at a time.
+/// Longest a reindex or an index rewrite waits for a background top-up to stop. It stops
+/// after its current batch: 128 messages at about 1.7 vectors each (317k vectors for 190k
+/// embedded messages on the measured index), about 3.5 s at the background model's 63
+/// chunks/s on a 24-core machine, longer on a smaller one.
+const EMBED_YIELD_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Ask a running background top-up to stop after its current batch, so a reindex or an
+/// index rewrite gets the writer instead of being refused for a build the user never
+/// started. False when the user asked for the running build (never cancelled). Call it
+/// holding the caller's own flag (IndexJob / CompactJob): a build claims EmbedJob and then
+/// checks those, so no new build starts after this, and a build that claimed first is the
+/// one this sees and stops.
+fn request_embed_yield(app: &AppHandle) -> bool {
+    let job = app.state::<EmbedJob>();
+    if !job.is_running() {
+        return true;
+    }
+    if job.user_requested.load(Ordering::SeqCst) {
+        return false;
+    }
+    job.cancel.store(true, Ordering::SeqCst);
+    true
+}
+
+/// Block until the semantic build releases EmbedJob, at most [`EMBED_YIELD_WAIT`]. Returns
+/// whether it did. Call it off the main thread, after [`request_embed_yield`].
+fn wait_for_embed_yield(app: &AppHandle) -> bool {
+    let deadline = std::time::Instant::now() + EMBED_YIELD_WAIT;
+    let job = app.state::<EmbedJob>();
+    while job.is_running() {
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    true
+}
+
+/// Guards against more than one user-started re-index (Reindex, a single source) running
+/// at a time. The watcher's launch catch-up holds [`CatchUpJob`] instead, so the search bar
+/// and the Reindex button only report reindexes the user started.
 #[derive(Default)]
 struct IndexJob(Arc<JobFlag>);
+
+/// Held while the watcher's launch catch-up rescans every source. It holds the write lock
+/// like a reindex, so every gate that waits for [`IndexJob`] waits for this too, but it is
+/// reported apart (`JobsStatus::catch_up`): it runs on every launch, takes 0.1-2 s, and
+/// showing it as "Indexing..." flashed a 0% bar and a disabled Reindex button each time.
+#[derive(Default)]
+pub(crate) struct CatchUpJob(pub(crate) Arc<JobFlag>);
 
 /// Guards against more than one project-distill running at a time; clearing it mid-run
 /// (via `cancel_distill`) also signals the running job to stop.
@@ -67,10 +130,10 @@ struct CompactJob(Arc<JobFlag>);
 /// One background job's busy flag: the token of the [`JobGuard`] holding it, 0 when free.
 /// Tokens are never reused, so a guard can tell its own claim from a newer job's.
 #[derive(Default)]
-struct JobFlag(AtomicU64);
+pub(crate) struct JobFlag(AtomicU64);
 
 impl JobFlag {
-    fn is_set(&self) -> bool {
+    pub(crate) fn is_set(&self) -> bool {
         self.0.load(Ordering::SeqCst) != 0
     }
 
@@ -84,19 +147,19 @@ impl JobFlag {
 /// Source of [`JobGuard`] tokens; starts at 1 because 0 means "free".
 static NEXT_JOB_TOKEN: AtomicU64 = AtomicU64::new(1);
 
-/// A claimed background-job flag (IndexJob / EmbedJob / DistillJob / CompactJob), released
-/// when dropped. The release profile keeps panic=unwind, so a panic in a scan parser or in
-/// ort inference unwinds through this guard instead of skipping a hand-written release. The
-/// flags gate each other, so one stuck flag used to make Reindex, the semantic build and
-/// distill silently do nothing until the app restarted.
-struct JobGuard {
+/// A claimed background-job flag (IndexJob / CatchUpJob / EmbedJob / DistillJob /
+/// CompactJob), released when dropped. The release profile keeps panic=unwind, so a panic
+/// in a scan parser or in ort inference unwinds through this guard instead of skipping a
+/// hand-written release. The flags gate each other, so one stuck flag used to make
+/// Reindex, the semantic build and distill silently do nothing until the app restarted.
+pub(crate) struct JobGuard {
     flag: Arc<JobFlag>,
     token: u64,
 }
 
 impl JobGuard {
     /// Claim `flag`, or None if a job already holds it.
-    fn try_acquire(flag: &Arc<JobFlag>) -> Option<Self> {
+    pub(crate) fn try_acquire(flag: &Arc<JobFlag>) -> Option<Self> {
         let token = NEXT_JOB_TOKEN.fetch_add(1, Ordering::Relaxed);
         flag.0
             .compare_exchange(0, token, Ordering::SeqCst, Ordering::SeqCst)
@@ -577,7 +640,7 @@ async fn delete_threads(app: AppHandle, ids: Vec<i64>) -> AppResult<usize> {
 /// takes SQLite's write lock but never the Rust mutex, so the rest of the UI stays live.
 #[tauri::command]
 async fn vacuum_db(app: AppHandle) -> AppResult<()> {
-    let job = claim_rewrite(&app)?;
+    let job = claim_rewrite(&app).await?;
     let result = blocking(|| {
         let conn = db::open(&db::default_index_path())?;
         cleanup::vacuum(&conn)
@@ -589,23 +652,35 @@ async fn vacuum_db(app: AppHandle) -> AppResult<()> {
 
 /// Claim [`CompactJob`] for a whole-file rewrite, or say why it can't start. VACUUM holds
 /// the write lock for the whole rewrite, so a reindex or semantic build running alongside
-/// stalls on it, and a second rewrite fails with "database is locked".
-fn claim_rewrite(app: &AppHandle) -> anyhow::Result<JobGuard> {
+/// stalls on it, and a second rewrite fails with "database is locked". A background
+/// top-up is asked to stop and waited for (at most [`EMBED_YIELD_WAIT`]), since the watcher
+/// starts one after most quiet minutes of agent activity.
+async fn claim_rewrite(app: &AppHandle) -> anyhow::Result<JobGuard> {
     // Claim first, then check: a job that starts after this sees CompactJob and waits.
     let Some(job) = JobGuard::try_acquire(&app.state::<CompactJob>().0) else {
         anyhow::bail!("The index is already being rewritten. Try again when that finishes.");
     };
+    const EMBED_BUSY: &str = "The semantic index is being built";
     let busy = if app.state::<IndexJob>().0.is_set() {
         Some("A reindex is running")
-    } else if app.state::<EmbedJob>().is_running() {
-        Some("The semantic index is being built")
+    } else if app.state::<CatchUpJob>().0.is_set() {
+        Some("New sessions are being indexed")
     } else if app.state::<DistillJob>().0.is_set() {
         Some("Project memory is being distilled")
+    } else if !request_embed_yield(app) {
+        Some(EMBED_BUSY)
     } else {
         None
     };
     if let Some(busy) = busy {
         anyhow::bail!("{busy}. Try again when it finishes."); // `job` drops: released
+    }
+    let deadline = std::time::Instant::now() + EMBED_YIELD_WAIT;
+    while app.state::<EmbedJob>().is_running() {
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!("{EMBED_BUSY}. Try again when it finishes.");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     Ok(job)
 }
@@ -621,8 +696,12 @@ fn release_rewrite(app: &AppHandle, job: JobGuard) {
 /// match `JobsStatus` in api.ts.
 #[derive(Debug, Serialize)]
 struct JobsStatus {
-    /// A full or single-source reindex, or the watcher's launch catch-up.
+    /// A full or single-source reindex the user started.
     index: bool,
+    /// The watcher's launch catch-up (see [`CatchUpJob`]): it blocks a whole-file rewrite
+    /// like a reindex, but the search bar stays quiet for it.
+    #[serde(rename = "catchUp")]
+    catch_up: bool,
     /// A semantic-index build, including its closing vector compaction.
     embed: bool,
     /// A project distill or an auto-distill batch.
@@ -636,6 +715,7 @@ struct JobsStatus {
 fn jobs_status(app: AppHandle) -> JobsStatus {
     JobsStatus {
         index: app.state::<IndexJob>().0.is_set(),
+        catch_up: app.state::<CatchUpJob>().0.is_set(),
         embed: app.state::<EmbedJob>().is_running(),
         distill: app.state::<DistillJob>().0.is_set(),
         rewrite: app.state::<CompactJob>().0.is_set(),
@@ -655,7 +735,7 @@ struct CompactSummary {
 /// connection for the same reason as `vacuum_db`. Emits `compact:progress`.
 #[tauri::command]
 async fn compact_index(app: AppHandle) -> AppResult<CompactSummary> {
-    let job = claim_rewrite(&app)?;
+    let job = claim_rewrite(&app).await?;
     let progress = app.clone();
     let result = blocking(move || {
         let mut conn = db::open(&db::default_index_path())?;
@@ -761,15 +841,24 @@ async fn set_data_roots(
 /// already running.
 #[tauri::command]
 fn index_all(app: AppHandle) -> AppResult<()> {
-    if app.state::<EmbedJob>().is_running() || app.state::<CompactJob>().0.is_set() {
-        return Ok(()); // a semantic build or a VACUUM is writing: don't fight for the lock
-    }
     // Note: a running distill does NOT block reindex — the distill loop yields to us.
     let Some(job) = JobGuard::try_acquire(&app.state::<IndexJob>().0) else {
         return Ok(()); // already running
     };
+    // Claim first, then check, so a semantic build starting meanwhile sees IndexJob and
+    // backs off. A VACUUM or a build the user started is writing: don't fight it for the
+    // lock (`job` drops). A background top-up stops after its batch instead: before, a
+    // Reindex during one silently did nothing.
+    if app.state::<CompactJob>().0.is_set() || !request_embed_yield(&app) {
+        return Ok(());
+    }
     std::thread::spawn(move || {
+        if !wait_for_embed_yield(&app) {
+            app_log!("[index] the semantic top-up is still running after 10 s; reindexing anyway");
+        }
+        wait_for_catch_up(&app);
         let started = std::time::Instant::now();
+        let clock = jobclock::JobClock::start();
         // Dedicated connection (not the shared Mutex<Connection>): the scan never holds
         // the lock every other UI query needs — WAL lets readers proceed while we write.
         let prog = app.clone();
@@ -809,6 +898,13 @@ fn index_all(app: AppHandle) -> AppResult<()> {
         drop(job);
         let report = match report {
             Ok((r, (sources, threads))) => {
+                app_log!(
+                    "[index] reindex: {} threads indexed, {} unchanged, {} errors in {}",
+                    r.threads_indexed,
+                    r.threads_skipped,
+                    r.errors,
+                    clock.thread_summary()
+                );
                 track(
                     &app,
                     telemetry::Event::index_completed(
@@ -839,10 +935,31 @@ fn index_all(app: AppHandle) -> AppResult<()> {
     Ok(())
 }
 
-/// Whether a background re-index is in progress (for the Reindex button state).
+/// Whether a user-started re-index is in progress (for the Reindex button state). The
+/// launch catch-up is not one (see [`CatchUpJob`]): a Reindex clicked during it waits for it.
 #[tauri::command]
 fn indexing_status(job: tauri::State<'_, IndexJob>) -> bool {
     job.0.is_set()
+}
+
+/// How long a user-started reindex waits for the launch catch-up before scanning anyway.
+/// The catch-up measured 0.1-0.2 s warm and about 2 s with a changed Cursor DB; the scans
+/// are idempotent, so going ahead past a stuck one only repeats work.
+const CATCH_UP_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Block until the watcher's launch catch-up releases [`CatchUpJob`]. Call it holding
+/// [`IndexJob`]: the catch-up claims its flag and then checks IndexJob, so once this claim
+/// is visible no new catch-up starts, and only one already past that check is waited for.
+fn wait_for_catch_up(app: &AppHandle) {
+    let deadline = std::time::Instant::now() + CATCH_UP_WAIT;
+    let catch_up = app.state::<CatchUpJob>();
+    while catch_up.0.is_set() {
+        if std::time::Instant::now() >= deadline {
+            app_log!("[index] the launch catch-up is still running after 30 s; reindexing anyway");
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
 }
 
 /// Index a single source by kind ("claude_code" | "codex" | "cursor" | ...). Runs off the
@@ -860,7 +977,9 @@ async fn index_source(app: AppHandle, kind: String) -> AppResult<indexer::IndexR
             anyhow::anyhow!("A re-index is already running. Try again when it finishes.").into(),
         );
     };
+    let waiter = app.clone();
     let result = blocking(move || {
+        wait_for_catch_up(&waiter);
         // The shared source registry, so a new or renamed source kind can't miss this command.
         let scan = indexer::scanner_for(&kind)
             .ok_or_else(|| anyhow::anyhow!("unknown source kind: {kind}"))?;
@@ -877,29 +996,42 @@ async fn index_source(app: AppHandle, kind: String) -> AppResult<indexer::IndexR
 #[tauri::command]
 async fn search_threads(
     pool: tauri::State<'_, db::ReadPool>,
+    gens: tauri::State<'_, search::SearchGen>,
     app: AppHandle,
     query: String,
     filters: Option<SearchFilters>,
-) -> AppResult<Vec<SearchHit>> {
+) -> AppResult<search::SearchResponse> {
     let filters = filters.unwrap_or_default();
+    // Taken in invocation order, before the blocking pool: this interrupts the searches
+    // that this keystroke made stale.
+    let gen = gens.begin();
     let pool = pool.0.clone();
     blocking(move || {
-        let hits = if filters.hybrid {
-            // Embed the query BEFORE touching the DB so inference never pins a
-            // connection. Cached-only: a keystroke must never wait on (or start) a model
-            // download; without a usable model the search is keyword-only.
-            let embedder = app.state::<embed::Embedder>();
-            let qv = embed::embed_query_cached_only(&embedder, &query).unwrap_or_else(|e| {
-                app_log!("[search] semantic arm skipped: {e}");
-                None
-            });
-            let conn = pool.get().map_err(|e| anyhow::anyhow!("read pool: {e}"))?;
-            search::hybrid_vec(&conn, &query, qv.as_deref(), &filters)?
-        } else {
-            let conn = pool.get().map_err(|e| anyhow::anyhow!("read pool: {e}"))?;
-            search::search(&conn, &query, &filters)?
-        };
-        Ok(hits)
+        let pool = db::ReadPool(pool);
+        let gens = app.state::<search::SearchGen>();
+        let embedder = app.state::<embed::Embedder>();
+        search::ui_search(&pool, &gens, gen, &embedder, &query, &filters)
+    })
+    .await
+}
+
+/// Fire-and-forget: the user turned semantic search on, so load the model (from the cache
+/// only) and pull the vector pages in before their first hybrid query. Returns at once.
+#[tauri::command]
+fn warm_semantic(app: AppHandle) {
+    tauri::async_runtime::spawn_blocking(move || {
+        let embedder = app.state::<embed::Embedder>();
+        if let Err(e) = search::warm_semantic(&embedder, &db::default_index_path()) {
+            app_log!("[search] warm: {e:#}");
+        }
+    });
+}
+
+/// One message's full text: a tool row the thread viewer got as a preview (`get_thread`).
+#[tauri::command]
+async fn message_text(pool: tauri::State<'_, db::ReadPool>, id: i64) -> AppResult<String> {
+    read_blocking(&pool, move |conn| {
+        search::message_text(conn, id)?.ok_or_else(|| anyhow::anyhow!("message not found"))
     })
     .await
 }
@@ -1018,36 +1150,231 @@ fn embed_facts_if_model_ready(app: &AppHandle, tag: &str) {
 /// `embed:progress`, `embed:error` (model unavailable / systemic failure) and `embed:done`.
 #[tauri::command]
 fn build_embeddings(app: AppHandle) -> AppResult<()> {
-    if app.state::<IndexJob>().0.is_set() || app.state::<CompactJob>().0.is_set() {
-        return Ok(()); // a reindex or a VACUUM is writing: don't fight it for the lock
-    }
+    start_embed_build(&app, EmbedTrigger::User);
+    Ok(())
+}
+
+/// Who started a semantic-index build.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EmbedTrigger {
+    /// A Build button (Search bar, palette, Settings): the whole backlog on the bulk pool.
+    User,
+    /// The watcher's top-up after agent activity (`embed_kick`): capped, on fewer threads.
+    Background,
+}
+
+/// Most messages one background top-up embeds. About 46 h of one heavy user's sessions
+/// came to 975 prose messages (about 13 s of CPU). A bigger backlog means a build that was
+/// never finished, which is the Build button's job; the next top-up continues meanwhile.
+const AUTO_EMBED_MAX_MESSAGES: i64 = 2_000;
+
+/// Start a semantic-index build unless a writer job holds the lock or a build is running.
+/// Returns whether it started.
+fn start_embed_build(app: &AppHandle, trigger: EmbedTrigger) -> bool {
     // Note: a running distill does NOT block the embed build — the distill loop yields.
     let job = app.state::<EmbedJob>();
     let Some(running) = JobGuard::try_acquire(&job.running) else {
-        return Ok(()); // already running
+        if trigger == EmbedTrigger::User {
+            job.user_requested.store(true, Ordering::SeqCst);
+        }
+        return false; // already running
     };
+    job.cancel.store(false, Ordering::SeqCst);
+    if trigger == EmbedTrigger::User {
+        job.user_requested.store(true, Ordering::SeqCst);
+    }
+    // Claim first, then check, as the watcher's catch-up does: index_all and claim_rewrite
+    // claim their flag and then look at EmbedJob, so each side sees the other and a build
+    // never writes alongside a reindex it raced. (Checking first let both start.)
+    if app.state::<IndexJob>().0.is_set()
+        || app.state::<CatchUpJob>().0.is_set()
+        || app.state::<CompactJob>().0.is_set()
+    {
+        // A reindex or a VACUUM is writing: don't fight it for the lock (`running` drops).
+        job.user_requested.store(false, Ordering::SeqCst);
+        return false;
+    }
     // Fresh counters: embedding_status falls back to a live count until the job's
     // snapshot below lands.
     job.done.store(0, Ordering::Relaxed);
     job.total.store(0, Ordering::Relaxed);
+    let app = app.clone();
     std::thread::spawn(move || {
-        run_embed_job(&app);
-        // The model is loaded now (unless it failed to): embed any facts still waiting.
-        embed_facts_if_model_ready(&app, "embed");
-        // Still holding `running`: a vector compaction holds the write lock for seconds, and
-        // reindex, the watcher catch-up and distill must keep yielding to it (the status
-        // also keeps reporting a build, so Reindex stays disabled). Dedicated connection, as
-        // in vacuum_db, so UI commands don't queue behind the shared writer mutex meanwhile.
-        match db::open(&db::default_index_path()) {
-            Ok(mut conn) => finish_embed_build(&mut conn),
-            Err(e) => app_log!("[embed] post-build maintenance: {e:#}"),
+        let job = app.state::<EmbedJob>();
+        let mut background = trigger == EmbedTrigger::Background;
+        loop {
+            let clock = jobclock::JobClock::start();
+            // The build's own model (see `Embedder::bulk_build`), dropped below with its
+            // thread pool and the working memory its padded sub-batches grew. Queries keep
+            // the shared 4-thread model, which the watcher's reaper unloads once idle.
+            let bulk = app.state::<embed::Embedder>().bulk_build(background);
+            let stats = run_embed_job(&app, &bulk, background);
+            if background && stats.model_failed {
+                if let Ok(mut until) = job.auto_paused_until.lock() {
+                    *until = Some(std::time::Instant::now() + AUTO_EMBED_FAILURE_PAUSE);
+                }
+            }
+            if stats.end == EmbedEnd::HandedOff {
+                // A Build click mid top-up: finish the backlog on the full bulk pool, not
+                // the background model's threads (63 against 88 chunks/s measured on 24
+                // cores). The facts and the compaction run once, after the full pass.
+                drop(bulk);
+                app_log!(
+                    "[embed] background build: {} messages, then handed over to a user build",
+                    stats.messages
+                );
+                background = false;
+                continue;
+            }
+            let cancelled = stats.end == EmbedEnd::Cancelled;
+            // Embed any facts still waiting while the build's model is loaded, instead of
+            // loading the shared one for them.
+            if bulk.is_loaded() && !cancelled {
+                if let Err(e) = embed::embed_pending_facts(&app.state::<db::Db>(), &bulk) {
+                    app_log!("[embed] embed facts: {e}");
+                }
+            }
+            drop(bulk);
+            let secs = clock.wall().as_secs_f64().max(0.001);
+            app_log!(
+                "[embed] {} build{}: {} messages, {} chunks in {} ({:.0} chunks/s)",
+                if background { "background" } else { "user" },
+                if cancelled {
+                    " (stopped for a reindex or rewrite)"
+                } else {
+                    ""
+                },
+                stats.messages,
+                stats.chunks,
+                clock.process_summary(),
+                stats.chunks as f64 / secs
+            );
+            // Still holding `running`: a vector compaction holds the write lock for seconds,
+            // and reindex, the watcher catch-up and distill must keep yielding to it (the
+            // status also keeps reporting a build, so Reindex stays disabled). Dedicated
+            // connection, as in vacuum_db, so UI commands don't queue behind the shared
+            // writer mutex meanwhile. Skipped when a reindex or rewrite is waiting for the
+            // writer: the next build does it.
+            if !job.cancel.load(Ordering::SeqCst) {
+                let maintenance = jobclock::JobClock::start();
+                match db::open(&db::default_index_path()) {
+                    Ok(mut conn) => finish_embed_build(&mut conn),
+                    Err(e) => app_log!("[embed] post-build maintenance: {e:#}"),
+                }
+                if maintenance.wall() >= std::time::Duration::from_secs(1) {
+                    app_log!(
+                        "[embed] post-build maintenance: {}",
+                        maintenance.thread_summary()
+                    );
+                }
+            }
+            // A Build click in the tail above (facts, compaction) found `running` held and
+            // only set the flag, after the batch loop had stopped reading it: run the full
+            // build it asked for now, so its `embed:done` is not a capped top-up's.
+            if background
+                && !job.cancel.load(Ordering::SeqCst)
+                && owes_full_build(
+                    stats.end,
+                    stats.reported,
+                    job.user_requested.load(Ordering::SeqCst),
+                )
+            {
+                background = false;
+                continue;
+            }
+            break;
         }
+        // The build's batches went through the shared writer: hand back its page cache.
+        shrink_writer(&app);
+        // A click between this and the release below is the one left unserved (it only sets
+        // the flag); it makes the next top-up hand over to a full build at once.
+        job.user_requested.store(false, Ordering::SeqCst);
         drop(running);
         let _ = app.emit("embed:done", ());
         // Like index_all: a distill drain that yielded to the build resumes now.
         auto_distill_kick(&app);
     });
-    Ok(())
+    true
+}
+
+/// Release the shared writer's page cache (up to 64 MiB) after a burst of writes (an embed
+/// build, a distill drain); it refills on demand. Skipped if the writer is busy.
+fn shrink_writer(app: &AppHandle) {
+    if let Some(db) = app.try_state::<db::Db>() {
+        if let Ok(conn) = db.0.try_lock() {
+            db::shrink_memory(&conn);
+        }
+    }
+}
+
+/// The watcher's 60 s tick: unload the shared model once it has been idle for
+/// `embed::APP_IDLE_UNLOAD` (the next query reloads it in about 150 ms). Also during a
+/// semantic build: the build has its own model, and keeping the shared one through a build
+/// of hours held two models' weights, arenas and thread pools the whole time.
+pub(crate) fn embed_reap_tick(app: &AppHandle) {
+    app.state::<embed::Embedder>().unload_if_idle();
+}
+
+/// Whether any embeddable message is still waiting for vectors. One probe of 0026's
+/// covering (role, tool_name, embedded) index, so it is cheap on every watcher kick. Built
+/// from `EMBEDDABLE_SQL` verbatim so the planner keeps matching that index.
+fn messages_pending_embed_sql() -> String {
+    format!(
+        "SELECT EXISTS(SELECT 1 FROM messages m WHERE m.embedded = 0 AND {})",
+        embed::EMBEDDABLE_SQL
+    )
+}
+
+/// The watcher's auto-embed, after about a minute without new agent writes (and at the end
+/// of the launch catch-up): top up the semantic index with the new messages, so semantic,
+/// hybrid, related and Ask see them without a manual Build. Only for users who already
+/// built a semantic index and have the model on disk (never starts the 128 MB download),
+/// and only when something is pending.
+pub(crate) fn embed_kick(app: &AppHandle) -> EmbedKick {
+    let paused = app
+        .state::<EmbedJob>()
+        .auto_paused_until
+        .lock()
+        .is_ok_and(|until| until.is_some_and(|t| std::time::Instant::now() < t));
+    if paused || !embed::model_is_cached() {
+        return EmbedKick::NotNeeded;
+    }
+    let Some(pool) = app.try_state::<db::ReadPool>() else {
+        return EmbedKick::NotNeeded;
+    };
+    // Runs on the watcher thread: r2d2's default `get` waits up to 30 s when UI reads hold
+    // every reader, and file events, catch-up retries and the reaper tick would wait too.
+    // Busy re-arms the timer instead.
+    let (has_vectors, pending) = match pool.0.get_timeout(std::time::Duration::from_millis(100)) {
+        Ok(conn) => {
+            let exists = |sql: &str| {
+                conn.query_row(sql, [], |r| r.get::<_, bool>(0))
+                    .unwrap_or(false)
+            };
+            (
+                exists("SELECT EXISTS(SELECT 1 FROM vec_chunk_owner)"),
+                exists(&messages_pending_embed_sql()),
+            )
+        }
+        Err(_) => return EmbedKick::Busy,
+    };
+    if !(has_vectors && pending) {
+        EmbedKick::NotNeeded
+    } else if start_embed_build(app, EmbedTrigger::Background) {
+        EmbedKick::Started
+    } else {
+        EmbedKick::Busy
+    }
+}
+
+/// What `embed_kick` did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EmbedKick {
+    Started,
+    /// No semantic index yet, no model on disk, or nothing waiting for vectors.
+    NotNeeded,
+    /// A reindex, catch-up, VACUUM or build holds the writer: the watcher retries later.
+    Busy,
 }
 
 /// Index maintenance after a semantic build, on its own connection.
@@ -1072,17 +1399,97 @@ fn finish_embed_build(conn: &mut rusqlite::Connection) {
     let _ = conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);");
 }
 
-/// The body of the embedding job (see `build_embeddings`). Returns when the queue is
-/// empty, the model is unavailable, or the build had to stop; the caller does the cleanup.
-fn run_embed_job(app: &AppHandle) {
+/// How one build pass ended.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum EmbedEnd {
+    /// Nothing is left to embed.
+    Drained,
+    /// A background top-up embedded its [`AUTO_EMBED_MAX_MESSAGES`].
+    Capped,
+    /// A Build click landed during a background top-up: continue as a full build.
+    HandedOff,
+    /// A reindex or an index rewrite asked the background top-up to stop.
+    Cancelled,
+    /// The model could not load or went away, or the build had to stop (a lock standoff,
+    /// every message failing inference).
+    #[default]
+    Stopped,
+}
+
+/// What one build pass embedded, for its log line, and how it ended.
+#[derive(Default)]
+struct EmbedRunStats {
+    messages: i64,
+    chunks: usize,
+    end: EmbedEnd,
+    /// The build stopped because the model could not load or went away.
+    model_failed: bool,
+    /// It sent `embed:error`, so a Build click already learned why it stopped.
+    reported: bool,
+}
+
+/// Whether a background pass that ended with `end` owes a full build before the build sends
+/// `embed:done`. A Build click during the pass hands it over (`HandedOff`). One in the pass's
+/// tail (facts, the vector compaction) found the build running and only set
+/// `user_requested`, after the batch loop had stopped reading it, so the following
+/// `embed:done` read "Semantic index is up to date" over a capped or failed top-up. Not after
+/// a drained pass (that toast is true) or a cancel (a reindex or rewrite needs the writer),
+/// nor when the click already got this pass's `embed:error`.
+fn owes_full_build(end: EmbedEnd, reported: bool, user_requested: bool) -> bool {
+    match end {
+        EmbedEnd::HandedOff => true,
+        EmbedEnd::Drained | EmbedEnd::Cancelled => false,
+        EmbedEnd::Capped | EmbedEnd::Stopped => user_requested && !reported,
+    }
+}
+
+/// The body of the embedding job (see `start_embed_build`), on the build's own `embedder`.
+/// Returns when the queue is empty, a background pass is done (its cap, a Build click, a
+/// cancel), the model is unavailable, or the build had to stop; the caller does the cleanup.
+///
+/// Only a build the user asked for reports `embed:error` to the UI (and its telemetry): a
+/// background top-up that fails is logged, and the next Build click shows the reason.
+fn run_embed_job(app: &AppHandle, embedder: &embed::Embedder, background: bool) -> EmbedRunStats {
     // Smaller batches keep each locked write + each inference short, so the UI
     // (and ambient-recall) stay snappy while the job runs in the background. 128 also
     // widens embed::infer_bulk's length-sort window: +9-15% chunks/s over 64, for a
     // locked store_batch write about twice as long.
     const BATCH: usize = 128;
+    let limit = background.then_some(AUTO_EMBED_MAX_MESSAGES);
     let db = app.state::<db::Db>();
-    let embedder = app.state::<embed::Embedder>();
     let job = app.state::<EmbedJob>();
+    let mut stats = EmbedRunStats::default();
+    let reported = std::cell::Cell::new(false);
+    let report = |msg: String| {
+        if !background || job.user_requested.load(Ordering::SeqCst) {
+            let _ = app.emit("embed:error", msg);
+            reported.set(true);
+        }
+    };
+    // Checked before the model loads and before each batch: a background top-up stops for
+    // a reindex or a rewrite (request_embed_yield), and hands over to a full build when a
+    // Build click lands.
+    let interrupted = || -> Option<EmbedEnd> {
+        if !background {
+            return None;
+        }
+        if job.cancel.load(Ordering::SeqCst) {
+            report(
+                "The semantic build stopped for a reindex or an index rewrite. Click Build \
+                 when that finishes."
+                    .to_string(),
+            );
+            return Some(EmbedEnd::Cancelled);
+        }
+        job.user_requested
+            .load(Ordering::SeqCst)
+            .then_some(EmbedEnd::HandedOff)
+    };
+    if let Some(end) = interrupted() {
+        stats.end = end;
+        stats.reported = reported.get();
+        return stats;
+    }
 
     // Load (or first-download) the model BEFORE claiming any work. A load failure
     // (offline first run, proxy, full disk, unwritable cache dir) must stop the job with
@@ -1090,8 +1497,15 @@ fn run_embed_job(app: &AppHandle) {
     // batches and marked the whole corpus embedded with no vectors.
     if let Err(e) = embedder.ensure_loaded() {
         app_log!("[embed] model unavailable, build stopped: {e}");
-        let _ = app.emit("embed:error", e.to_string());
-        return;
+        report(e.to_string());
+        stats.model_failed = true;
+        stats.reported = reported.get();
+        return stats;
+    }
+    // The model works again (a repaired or re-downloaded cache): lift a pause a failed
+    // top-up set, whichever build got here, instead of leaving top-ups off for the hour.
+    if let Ok(mut until) = job.auto_paused_until.lock() {
+        *until = None;
     }
 
     // Snapshot totals ONCE; then increment a running counter per batch so progress
@@ -1116,6 +1530,10 @@ fn run_embed_job(app: &AppHandle) {
     // systemic, not one bad input, so stop instead of marking the corpus.
     let mut all_failed_streak = 0u32;
     loop {
+        if let Some(end) = interrupted() {
+            stats.end = end;
+            break;
+        }
         // 1. Locked, fast: claim the next batch of pending messages.
         let rows = {
             let Ok(conn) = db.0.lock() else { break };
@@ -1128,17 +1546,19 @@ fn run_embed_job(app: &AppHandle) {
             }
         };
         if rows.is_empty() {
+            stats.end = EmbedEnd::Drained;
             break;
         }
         // 2. UNLOCKED: inference. embed_rows retries a failing batch one message at a
         //    time, so only inputs that fail on their own land in `failed`; store_batch
         //    below marks them embedded without vectors (FTS still finds them).
-        let batch = match embed::embed_rows(&embedder, &rows) {
+        let batch = match embed::embed_rows(embedder, &rows) {
             Ok(b) => b,
             Err(e) => {
                 // The model itself became unavailable: stop and leave this batch pending.
                 app_log!("[embed] model unavailable, build stopped: {e}");
-                let _ = app.emit("embed:error", e.to_string());
+                report(e.to_string());
+                stats.model_failed = true;
                 break;
             }
         };
@@ -1147,7 +1567,7 @@ fn run_embed_job(app: &AppHandle) {
             if all_failed_streak >= 3 {
                 let msg = "embedding failed for every message; build stopped (nothing was marked)";
                 app_log!("[embed] {msg}");
-                let _ = app.emit("embed:error", msg);
+                report(msg.to_string());
                 break;
             }
             std::thread::sleep(std::time::Duration::from_secs(1));
@@ -1197,6 +1617,40 @@ fn run_embed_job(app: &AppHandle) {
         deferrals = 0;
         done += rows.len() as i64;
         progress(done);
+        stats.messages += rows.len() as i64;
+        stats.chunks += batch.owners.len();
+        if limit.is_some_and(|l| stats.messages >= l) {
+            stats.end = EmbedEnd::Capped;
+            break;
+        }
+    }
+    stats.reported = reported.get();
+    stats
+}
+
+#[cfg(test)]
+mod embed_build_tests {
+    use super::{owes_full_build, EmbedEnd};
+
+    /// The tail-window sequence: a capped top-up exits its batch loop, a Build click then
+    /// finds the build running and only sets `user_requested`, and the build reaches its
+    /// release. It must run the full build first, or the click's `embed:done` toasts "up to
+    /// date" over a capped backlog.
+    #[test]
+    fn a_click_in_a_top_ups_tail_gets_a_full_build() {
+        assert!(owes_full_build(EmbedEnd::Capped, false, true));
+        assert!(!owes_full_build(EmbedEnd::Capped, false, false), "no click");
+        // A failed top-up the click did not hear about: the full build reports the reason.
+        assert!(owes_full_build(EmbedEnd::Stopped, false, true));
+        assert!(
+            !owes_full_build(EmbedEnd::Stopped, true, true),
+            "already told"
+        );
+        // A click mid-pass always continues as a full build.
+        assert!(owes_full_build(EmbedEnd::HandedOff, false, true));
+        // The backlog is empty, so the toast is true; or a reindex is waiting for the writer.
+        assert!(!owes_full_build(EmbedEnd::Drained, false, true));
+        assert!(!owes_full_build(EmbedEnd::Cancelled, false, true));
     }
 }
 
@@ -1211,13 +1665,17 @@ async fn recent_threads(
     .await
 }
 
-/// Full thread detail. Off the main thread: a long session serializes to megabytes.
+/// Thread detail for the viewer, tool rows as previews (`message_text` has the rest). Off
+/// the main thread: a long session still serializes to a megabyte or more.
 #[tauri::command]
 async fn get_thread(
     pool: tauri::State<'_, db::ReadPool>,
     thread_id: i64,
 ) -> AppResult<Option<ThreadDetail>> {
-    read_blocking(&pool, move |conn| search::thread_detail(conn, thread_id)).await
+    read_blocking(&pool, move |conn| {
+        search::thread_detail_preview(conn, thread_id)
+    })
+    .await
 }
 
 /// Star or unstar a thread ("collections").
@@ -1308,7 +1766,8 @@ async fn set_auto_distill(app: AppHandle, on: bool) -> AppResult<()> {
 }
 
 /// The background auto-distill budget, for Settings / a confirm dialog before turning it on:
-/// how many threads are eligible (active in the last 30 days and not yet distilled), the
+/// how many threads are eligible (active in the last 30 days, idle for 30 minutes and not yet
+/// distilled), the
 /// per-day cap, and what is left of today's allowance.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1321,9 +1780,8 @@ struct AutoDistillBudget {
 
 fn auto_distill_budget_now(conn: &rusqlite::Connection) -> anyhow::Result<AutoDistillBudget> {
     let now = chrono::Utc::now().timestamp();
-    let since = now - knowledge::AUTO_DISTILL_RECENT_DAYS * 86_400;
     Ok(AutoDistillBudget {
-        eligible_threads: knowledge::pending_threads_since(conn, i64::MAX, Some(since))?.len(),
+        eligible_threads: knowledge::auto_distill_eligible_count(conn, now)?,
         daily_cap: knowledge::auto_distill_daily_cap(conn)?,
         remaining_today: knowledge::auto_distill_remaining_today(conn, now)?,
         recent_days: knowledge::AUTO_DISTILL_RECENT_DAYS,
@@ -1786,13 +2244,20 @@ fn distill_project(app: AppHandle, project: String) -> AppResult<()> {
         .await;
         match ids {
             Ok(ids) => {
-                if let Err(e) = run_distill(&app, &job, ids).await {
-                    app_log!("[distill] {e}");
+                let started = std::time::Instant::now();
+                let queued = ids.len();
+                match run_distill(&app, &job, ids).await {
+                    Ok(n) => app_log!(
+                        "[distill] project: {n} of {queued} threads distilled in {}",
+                        jobclock::fmt_duration(started.elapsed())
+                    ),
+                    Err(e) => app_log!("[distill] {e}"),
                 }
             }
             Err(e) => app_log!("[distill] worklist: {e}"),
         }
         drop(job);
+        shrink_writer(&app);
         let _ = app.emit("distill:done", ());
     });
     Ok(())
@@ -1802,6 +2267,7 @@ fn distill_project(app: AppHandle, project: String) -> AppResult<()> {
 /// watcher's catch-up), a semantic build, or a whole-file rewrite. Distill waits for these.
 fn writer_job_running(app: &AppHandle) -> bool {
     app.state::<IndexJob>().0.is_set()
+        || app.state::<CatchUpJob>().0.is_set()
         || app.state::<EmbedJob>().is_running()
         || app.state::<CompactJob>().0.is_set()
 }
@@ -1811,9 +2277,10 @@ fn writer_job_running(app: &AppHandle) -> bool {
 /// flag), and yields to a reindex / embed build / VACUUM. Shared by the project distill and
 /// the background auto-distill. The DB, keychain and embedding work runs on the blocking
 /// pool; only the LLM call is awaited on the async runtime.
-async fn run_distill(app: &AppHandle, job: &JobGuard, ids: Vec<i64>) -> anyhow::Result<()> {
+/// Returns how many threads it distilled.
+async fn run_distill(app: &AppHandle, job: &JobGuard, ids: Vec<i64>) -> anyhow::Result<usize> {
     if ids.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
     let to_anyhow = error::AppError::into_inner;
     let pool = app.state::<db::ReadPool>();
@@ -1887,7 +2354,7 @@ async fn run_distill(app: &AppHandle, job: &JobGuard, ids: Vec<i64>) -> anyhow::
     if distilled_count > 0 {
         track(app, telemetry::Event::distill_completed(distilled_count));
     }
-    Ok(())
+    Ok(distilled_count)
 }
 
 /// Kick a background auto-distill drain: distill pending threads corpus-wide so the
@@ -1901,16 +2368,16 @@ async fn run_distill(app: &AppHandle, job: &JobGuard, ids: Vec<i64>) -> anyhow::
 /// Returning early while a writer job runs loses nothing: every one of them kicks again
 /// once it releases its flag (index_all, index_source, the watcher's launch catch-up, the
 /// semantic build, Shrink index / Reclaim space), so the launch kick, which usually lands
-/// during the catch-up, runs when that pass ends.
-fn auto_distill_kick(app: &AppHandle) {
+/// during the catch-up, runs when that pass ends. Returns whether a round started.
+fn auto_distill_kick(app: &AppHandle) -> bool {
     if writer_job_running(app) {
-        return;
+        return false;
     }
     // Own the distill job BEFORE building the worklist: building it spends today's allowance,
     // so a kick that only then found a distill running (a manual "Build memory", an auto
     // batch in flight) burned up to a batch of the daily cap without distilling anything.
     let Some(job) = JobGuard::try_acquire(&app.state::<DistillJob>().0) else {
-        return; // a distill is already running
+        return false; // a distill is already running
     };
     let ids = (|| {
         let db = app.try_state::<db::Db>()?;
@@ -1925,12 +2392,20 @@ fn auto_distill_kick(app: &AppHandle) {
     })()
     .unwrap_or_default();
     if ids.is_empty() {
-        return; // `job` drops here, releasing the flag
+        return false; // `job` drops here, releasing the flag
     }
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
-        if let Err(e) = run_distill(&app, &job, ids).await {
-            app_log!("[auto-distill] {e}");
+        // Wall time only: the round is mostly waiting on the LLM, and its CPU (the local
+        // engine's process, the fact embeds) lands on other threads and processes.
+        let started = std::time::Instant::now();
+        let queued = ids.len();
+        match run_distill(&app, &job, ids).await {
+            Ok(n) => app_log!(
+                "[auto-distill] round: {n} of {queued} threads distilled in {}",
+                jobclock::fmt_duration(started.elapsed())
+            ),
+            Err(e) => app_log!("[auto-distill] {e}"),
         }
         // A Cancel ends the drain; re-kicking would start the next batch right away.
         let cancelled = !job.is_current();
@@ -1938,10 +2413,13 @@ fn auto_distill_kick(app: &AppHandle) {
         drop(job);
         let _ = app.emit("distill:done", ());
         // More may remain (and nothing preempted us) — drain the next batch.
-        if !cancelled {
-            auto_distill_kick(&app);
+        if cancelled || !auto_distill_kick(&app) {
+            // The drain ended (nothing left, the day's budget spent, a cancel, or a writer
+            // job preempted it): hand back the writer's page cache.
+            shrink_writer(&app);
         }
     });
+    true
 }
 
 /// Cross-thread semantic recall of distilled DECISIONS, matched to a query.
@@ -3137,6 +3615,7 @@ fn init_backend(app: &AppHandle) -> anyhow::Result<()> {
         .map(|n| n.get() as u32)
         .unwrap_or(4);
     app.manage(db::read_pool(&db_path, pool_size.clamp(2, 6))?);
+    app.manage(search::SearchGen::default());
 
     // Close-to-tray: bring the tray up if the pref is on. The cached flag reflects
     // whether it ACTUALLY came up, so a failed tray never leaves the window
@@ -3250,7 +3729,13 @@ fn spawn_background_jobs(app: &AppHandle) {
         // connection (the watcher's first write waits out a short overlap via BUSY_TIMEOUT).
         match db::open(&db::default_index_path()) {
             Ok(conn) => {
-                if startup_housekeeping(&conn) > 0 {
+                let clock = jobclock::JobClock::start();
+                let changed = startup_housekeeping(&conn);
+                app_log!(
+                    "[startup] housekeeping: {changed} rows changed in {}",
+                    clock.thread_summary()
+                );
+                if changed > 0 {
                     // Open views may be grouping by the old project keys. The null payload
                     // (no source kind: no scan wrote these rows) is the contract main.tsx
                     // reads as "housekeeping": it refetches what groups by project at once,
@@ -3283,7 +3768,7 @@ fn spawn_background_jobs(app: &AppHandle) {
             embed_facts_if_model_ready(&app, "knowledge");
         }
         // Then catch up on any auto-distillation owed (no-op unless enabled). Usually the
-        // watcher's catch-up still holds IndexJob here; it kicks again when it finishes.
+        // watcher's catch-up still holds CatchUpJob here; it kicks again when it finishes.
         auto_distill_kick(&app);
     });
 }
@@ -3386,6 +3871,7 @@ pub fn run() {
             app.manage(embed::Embedder::default());
             app.manage(EmbedJob::default());
             app.manage(IndexJob::default());
+            app.manage(CatchUpJob::default());
             app.manage(DistillJob::default());
             app.manage(CompactJob::default());
             app.manage(SetupState::default());
@@ -3429,8 +3915,10 @@ pub fn run() {
             indexing_status,
             index_source,
             search_threads,
+            warm_semantic,
             recent_threads,
             get_thread,
+            message_text,
             embedding_status,
             build_embeddings,
             send_chat,
@@ -3712,6 +4200,35 @@ mod startup_tests {
             "{plan:?}"
         );
         assert_eq!(startup_embed_state(&conn), (false, false));
+    }
+
+    /// The watcher's auto-embed probes this after every quiet minute of agent activity, so
+    /// it must stay an index probe on a 1.4M-message table.
+    #[test]
+    fn pending_messages_check_searches_an_index() {
+        let p = temp_db("msgs_pending_plan");
+        let conn = db::open(&p).unwrap();
+        let sql = messages_pending_embed_sql();
+        let plan: Vec<String> = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|d| d.starts_with("SEARCH m USING COVERING INDEX")),
+            "{plan:?}"
+        );
+        assert!(!plan.iter().any(|d| d.starts_with("SCAN m")), "{plan:?}");
+        let pending =
+            |c: &rusqlite::Connection| c.query_row(&sql, [], |r| r.get::<_, bool>(0)).unwrap();
+        assert!(!pending(&conn));
+        let mut conn = conn;
+        let sid = indexer::source_id(&conn, "codex").unwrap();
+        indexer::upsert_thread(&mut conn, sid, &thread("a", None, 2)).unwrap();
+        assert!(pending(&conn));
     }
 
     #[test]

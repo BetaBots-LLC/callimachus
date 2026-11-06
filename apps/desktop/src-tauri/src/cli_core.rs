@@ -690,8 +690,10 @@ fn cmd_knowledge(args: &[String]) -> anyhow::Result<()> {
         println!("{}", o.json(&k)?);
         return Ok(());
     }
-    if !k.extracted && k.todos.is_empty() {
-        eprintln!("no knowledge for thread {id} yet — run `cal distill {id}`");
+    // Judge by content, not `extracted`: a new turn clears the flag but keeps the facts, and
+    // `print_knowledge` flags them as stale.
+    if k.summary.is_none() && k.decisions.is_empty() && k.gotchas.is_empty() && k.todos.is_empty() {
+        eprintln!("no knowledge for thread {id} yet, run `cal distill {id}`");
         return Ok(());
     }
     print_knowledge(&k, &o);
@@ -1114,6 +1116,9 @@ fn audit_thread_knowledge(conn: &Connection, id: i64) -> serde_json::Value {
             "gotchas": k.gotchas.iter().map(|f| f.text.clone()).collect::<Vec<_>>(),
             "openTodos": k.todos.iter().map(|f| f.text.clone()).collect::<Vec<_>>(),
             "extracted": k.extracted,
+            // A changed thread keeps its old facts with `extracted: false`; `stale` says they
+            // predate the latest turns rather than being absent.
+            "stale": k.stale,
         }),
         Err(_) => serde_json::Value::Null,
     }

@@ -84,6 +84,18 @@ export interface SearchHit {
   ts: number | null;
 }
 
+/** search_threads' result. */
+export interface SearchResponse {
+  hits: SearchHit[];
+  /**
+   * A hybrid search ran keyword-only: "loading" while the embedding model loads (retry
+   * shortly), "unavailable" when it is not downloaded, failed to load, or no reader was free.
+   */
+  semanticSkipped: "loading" | "unavailable" | null;
+  /** A newer search started first, so this one was cut short (hits is empty). Ignore it. */
+  superseded: boolean;
+}
+
 export interface ThreadSummary {
   id: number;
   source: SourceKind;
@@ -101,6 +113,12 @@ export interface MessageRow {
   toolName: string | null;
   ts: number | null;
   model: string | null;
+  /**
+   * The full text's length (UTF-16 units, like `text.length`). get_thread sends tool rows
+   * (role "tool" or toolName set) cut to their first 300 characters, so a larger textLen
+   * means `text` is a preview: fetch the rest with `api.messageText(id)`.
+   */
+  textLen: number;
 }
 
 export interface ThreadDetail {
@@ -349,11 +367,13 @@ export interface DataRoots {
 }
 
 /** Which background jobs hold their run flags right now (`jobs_status`, answered from
- *  memory, so it is cheap to poll while one runs). `index` is a full or single-source
- *  reindex or the launch catch-up scan (`index_source` refuses while it is set), `rewrite`
- *  a Shrink index / Reclaim space pass. */
+ *  memory, so it is cheap to poll while one runs). `index` is a user-started full or
+ *  single-source reindex (`index_source` refuses while it is set), `catchUp` the watcher's
+ *  launch scan (a reindex started meanwhile waits for it; keep the search bar quiet for
+ *  it), `rewrite` a Shrink index / Reclaim space pass. */
 export interface JobsStatus {
   index: boolean;
+  catchUp: boolean;
   embed: boolean;
   distill: boolean;
   rewrite: boolean;
@@ -441,7 +461,10 @@ export const api = {
   indexSource: (kind: SourceKind) => invoke<IndexReport>("index_source", { kind }),
   jobsStatus: () => invoke<JobsStatus>("jobs_status"),
   searchThreads: (query: string, filters?: SearchFilters) =>
-    invoke<SearchHit[]>("search_threads", { query, filters }),
+    invoke<SearchResponse>("search_threads", { query, filters }),
+  // Fire-and-forget when semantic search is switched on: loads the model (from the cache
+  // only) and warms the vector index, so the first hybrid query isn't keyword-only.
+  warmSemantic: () => invoke<void>("warm_semantic"),
   recentThreads: (filters?: SearchFilters) =>
     invoke<ThreadSummary[]>("recent_threads", { filters }),
   // Code-aware search: threads that mention a file path (substring).
@@ -469,6 +492,8 @@ export const api = {
   remember: (project: string, kind: "decision" | "gotcha", text: string) =>
     invoke<void>("remember", { project, kind, text }),
   getThread: (threadId: number) => invoke<ThreadDetail | null>("get_thread", { threadId }),
+  // The full text of one message: a tool row's output, which get_thread cuts to a preview.
+  messageText: (id: number) => invoke<string>("message_text", { id }),
   // Stars & tags ("collections").
   setStar: (threadId: number, starred: boolean) => invoke<void>("set_star", { threadId, starred }),
   setThreadTags: (threadId: number, tags: string[]) =>
@@ -507,7 +532,6 @@ export const api = {
   askHistory: (question: string) => invoke<AskAnswer>("ask_history", { question }),
   embeddingStatus: () => invoke<EmbedStatus>("embedding_status"),
   buildEmbeddings: () => invoke<void>("build_embeddings"),
-
   // Stream a chat completion; onChunk fires per chunk (reasoning or answer text),
   // the promise resolves with the full reply (persisted as a searchable in_app thread).
   sendChat: (

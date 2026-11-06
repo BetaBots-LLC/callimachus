@@ -6,21 +6,39 @@ interface Props {
   children: ReactNode;
   /** "app" = full-window fallback (top level); "view" = inline fallback for one tab. */
   scope?: "app" | "view";
+  /** A change clears a caught error and renders the children again. For a boundary that
+   *  stays mounted across tab switches (the Search tab), where a `key` would remount it. */
+  resetOn?: unknown;
+  /** Shown instead of the crash screen, for a part whose failure should go unnoticed
+   *  (the command palette: a failed chunk load must not replace the window). */
+  fallback?: ReactNode;
 }
 
 interface State {
   error: Error | null;
   componentStack: string | null;
+  /** The `resetOn` the current error state belongs to. */
+  resetOn: unknown;
 }
 
 /**
  * Catches render errors so a bad payload or a webview incompatibility shows a
  * recoverable screen instead of unmounting the whole tree (a blank window, or at launch
  * a splash that never goes away). Wrap the app once at the top (`scope="app"`) and each
- * view (`scope="view"`, keyed by view) so one broken tab doesn't take down the rest.
+ * view (`scope="view"`) so one broken tab doesn't take down the rest: keyed by view for
+ * the tabs that unmount, `resetOn={view}` for the Search tab, which stays mounted.
  */
 export class ErrorBoundary extends Component<Props, State> {
-  state: State = { error: null, componentStack: null };
+  state: State = { error: null, componentStack: null, resetOn: this.props.resetOn };
+
+  // Reset during render, not in componentDidUpdate: the Search boundary sits in an
+  // Activity, and React runs no layout-phase lifecycles in a hidden one and only
+  // componentDidMount when it is shown again, so componentDidUpdate never saw the switch.
+  static getDerivedStateFromProps(props: Props, state: State): Partial<State> | null {
+    return props.resetOn !== state.resetOn
+      ? { resetOn: props.resetOn, error: null, componentStack: null }
+      : null;
+  }
 
   static getDerivedStateFromError(error: unknown): Partial<State> {
     return { error: error instanceof Error ? error : new Error(String(error)) };
@@ -36,6 +54,7 @@ export class ErrorBoundary extends Component<Props, State> {
   render() {
     const { error, componentStack } = this.state;
     if (!error) return this.props.children;
+    if (this.props.fallback !== undefined) return this.props.fallback;
     return (
       <CrashScreen
         error={error}

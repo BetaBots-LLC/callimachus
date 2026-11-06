@@ -1,24 +1,27 @@
-import { useState } from "react";
+import { useLayoutEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useDebouncedCallback } from "@tanstack/react-pacer";
 import {
   api,
+  type EmbedStatus,
   INDEXABLE_SOURCES,
-  type IndexProgress,
   SOURCE_LABELS,
   type SourceKind,
 } from "../lib/api";
 import { useUi } from "../store/ui";
 import {
-  EMBED_ERROR_KEY,
+  embedStatusQuery,
+  useBuildSemanticIndex,
   useEmbedError,
-  useEmbedStatus,
   useIndexError,
   useIndexRewriting,
+  useJobsStatus,
+  userReindexing,
   confirmUserStarted,
   markUserStarted,
   unmarkUserStarted,
 } from "../lib/queries";
+import { CatchUpNote, JobProgress } from "./JobProgress";
 import {
   InputGroup,
   InputGroupAddon,
@@ -28,7 +31,6 @@ import {
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { Spinner } from "@/components/ui/spinner";
-import { Progress, ProgressLabel, ProgressValue } from "@/components/ui/progress";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -41,6 +43,13 @@ import { cn } from "@/lib/utils";
 // The three most-used sources get top-level chips; the rest live under "More".
 const PRIMARY: SourceKind[] = ["claude_code", "codex", "cursor"];
 const MORE: SourceKind[] = [...INDEXABLE_SOURCES.filter((s) => !PRIMARY.includes(s)), "in_app"];
+
+// While a build runs this bar only needs `running` (the counts are JobProgress's), so the
+// running state collapses to one constant and structural sharing skips the re-render.
+const EMBED_RUNNING: EmbedStatus = { done: 0, total: 0, running: true };
+function embedSummary(s: EmbedStatus): EmbedStatus {
+  return s.running ? EMBED_RUNNING : s;
+}
 
 export function SearchBar() {
   const setQuery = useUi((s) => s.setQuery);
@@ -58,9 +67,17 @@ export function SearchBar() {
 
   const tags = useQuery({ queryKey: ["list_tags"], queryFn: api.listTags, staleTime: 60_000 });
 
-  // Seed from the committed query: this bar unmounts whenever another tab is shown, and
-  // the results list keeps filtering by the stored query, so the box must show it again.
+  // Seed from the committed query: this bar remounts after Onboarding gives way to the
+  // index, and the results list keeps filtering by the stored query, so the box must show
+  // it again.
   const [text, setText] = useState(() => useUi.getState().query);
+  // Focus the box on mount and each time the Search tab is shown again. autoFocus fires
+  // only on DOM insertion, and the tab now stays mounted (a hidden Activity) while another
+  // tab is open; layout effects re-run on reveal.
+  const inputRef = useRef<HTMLInputElement>(null);
+  useLayoutEffect(() => {
+    inputRef.current?.focus();
+  }, []);
   // Pacer handles the debounce (no manual timer / useEffect).
   const commitQuery = useDebouncedCallback((value: string) => setQuery(value.trim()), {
     wait: 260,
@@ -81,88 +98,33 @@ export function SearchBar() {
 
   // Reindex runs in the BACKGROUND now: the button just kicks it off and reflects the
   // job flag, so it never blocks the UI. main.tsx refreshes results/stats on index:done.
-  const indexing = useQuery({
-    queryKey: ["index_status"],
-    queryFn: api.indexingStatus,
-    refetchInterval: (q) => (q.state.data ? 1500 : false),
-  });
+  // Only a user-started reindex counts: the launch catch-up scan is its own job and stays
+  // quiet (CatchUpNote), so it no longer flashes "Indexing…" on every launch.
+  const indexing = userReindexing(useJobsStatus().data);
   const reindex = useMutation({
     mutationFn: api.indexAll,
     onMutate: () => markUserStarted("index"), // main.tsx toasts when it finishes
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["index_status"] });
+      // Also refreshes jobs_status, which then polls until the reindex ends.
       void confirmUserStarted(queryClient, "index"); // a no-op start (job busy) gets no toast
     },
     onError: () => unmarkUserStarted("index"),
   });
 
-  // Event-driven; never polls while idle (see lib/queries.ts).
-  const embed = useEmbedStatus();
+  // Event-driven; never polls while idle (see lib/queries.ts). Selected down to what this
+  // bar shows, so a running build's per-batch embed:progress (which only JobProgress
+  // draws) does not re-render the input and chips.
+  const embed = useQuery({ ...embedStatusQuery, select: embedSummary });
   const embedError = useEmbedError();
   // A failed full reindex otherwise ends with no visible change after clicking Reindex.
   const indexError = useIndexError();
   // Reindex and Build return without doing anything while Shrink index / Reclaim space runs.
   const rewriting = useIndexRewriting();
-  const buildIndex = useMutation({
-    mutationFn: api.buildEmbeddings,
-    // A retry starts clean; a new failure arrives as a fresh embed:error.
-    onMutate: () => {
-      queryClient.setQueryData(EMBED_ERROR_KEY, null);
-      markUserStarted("embed");
-    },
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["embed_status"] });
-      void confirmUserStarted(queryClient, "embed");
-    },
-    onError: () => unmarkUserStarted("embed"),
-  });
+  const buildIndex = useBuildSemanticIndex();
 
   const embedPct =
     embed.data && embed.data.total > 0 ? Math.round((embed.data.done / embed.data.total) * 100) : 0;
-
-  // Per-source reindex progress, pushed via the index:progress event (see main.tsx).
-  const indexProgress = useQuery<IndexProgress | null>({
-    queryKey: ["index_progress"],
-    queryFn: () => queryClient.getQueryData<IndexProgress>(["index_progress"]) ?? null,
-    staleTime: Number.POSITIVE_INFINITY,
-  });
-
-  // Background auto-distill: status flag + per-thread progress (distill:* events).
-  const distilling = useQuery({
-    queryKey: ["distill_status"],
-    queryFn: api.distillingStatus,
-    refetchInterval: (q) => (q.state.data ? 1500 : false),
-  });
-  const distillProgress = useQuery<{ done: number; total: number } | null>({
-    queryKey: ["distill_progress"],
-    queryFn: () =>
-      queryClient.getQueryData<{ done: number; total: number }>(["distill_progress"]) ?? null,
-    staleTime: Number.POSITIVE_INFINITY,
-  });
-
-  // One progress bar, whichever long job is active. Priority: index > embed > distill
-  // (distill is background and yields to the others).
-  const ip = indexProgress.data;
-  const dp = distillProgress.data;
-  const jobActive = embed.data?.running || indexing.data || distilling.data;
-  const jobPct = embed.data?.running
-    ? embedPct
-    : indexing.data
-      ? ip && ip.total > 0
-        ? Math.round((ip.done / ip.total) * 100)
-        : 0
-      : dp && dp.total > 0
-        ? Math.round((dp.done / dp.total) * 100)
-        : 0;
-  const jobLabel = embed.data?.running
-    ? `Building semantic index · ${embed.data.done.toLocaleString()} / ${embed.data.total.toLocaleString()} messages`
-    : indexing.data
-      ? ip?.current
-        ? `Indexing ${SOURCE_LABELS[ip.current as SourceKind] ?? ip.current}…`
-        : "Indexing…"
-      : dp
-        ? `Distilling knowledge · ${dp.done} / ${dp.total} threads`
-        : "Distilling knowledge…";
 
   // How many "More" sources are active — surfaced on the dropdown so a hidden
   // filter is never silently in effect.
@@ -174,8 +136,8 @@ export function SearchBar() {
         <InputGroup>
           <InputGroupInput
             placeholder="Search every thread…  (try file:embed/mod.rs)"
+            ref={inputRef}
             value={text}
-            autoFocus
             onChange={(e) => onChange(e.currentTarget.value)}
             onKeyDown={(e) => {
               if (e.key === "Escape" && text) {
@@ -195,9 +157,9 @@ export function SearchBar() {
         <Button
           variant="secondary"
           onClick={() => reindex.mutate()}
-          disabled={indexing.data || reindex.isPending || embed.data?.running || rewriting}
+          disabled={indexing || reindex.isPending || embed.data?.running || rewriting}
         >
-          {indexing.data ? (
+          {indexing ? (
             <>
               <Spinner /> Indexing…
             </>
@@ -272,7 +234,8 @@ export function SearchBar() {
         ))}
 
         <span className="ml-auto flex items-center gap-2 text-xs text-muted-foreground">
-          {indexError && !indexing.data && (
+          <CatchUpNote />
+          {indexError && !indexing && (
             <span
               role="status"
               className="max-w-[32ch] truncate text-destructive"
@@ -296,7 +259,7 @@ export function SearchBar() {
               size="xs"
               variant="outline"
               onClick={() => buildIndex.mutate()}
-              disabled={indexing.data || buildIndex.isPending || rewriting}
+              disabled={indexing || buildIndex.isPending || rewriting}
               title={`${embed.data.done}/${embed.data.total} messages embedded`}
             >
               Build semantic index ({embedPct}%)
@@ -307,30 +270,7 @@ export function SearchBar() {
         </span>
       </div>
 
-      {jobActive &&
-        (indexing.data ? (
-          // Reindex total is estimated from the existing thread count (accurate on a
-          // re-index, indeterminate on a first run). The live "N scanned" count keeps a
-          // long source (e.g. Claude Code) from ever looking stuck.
-          <Progress
-            value={ip && ip.total > 0 ? Math.min(99, Math.round((ip.done / ip.total) * 100)) : null}
-            className="gap-1.5"
-          >
-            <ProgressLabel className="text-xs font-normal text-muted-foreground">
-              {jobLabel}
-            </ProgressLabel>
-            <span className="ml-auto text-xs text-muted-foreground tabular-nums">
-              {(ip?.done ?? 0).toLocaleString()} scanned
-            </span>
-          </Progress>
-        ) : (
-          <Progress value={jobPct} className="gap-1.5">
-            <ProgressLabel className="text-xs font-normal text-muted-foreground">
-              {jobLabel}
-            </ProgressLabel>
-            <ProgressValue className="text-xs" />
-          </Progress>
-        ))}
+      <JobProgress />
     </div>
   );
 }

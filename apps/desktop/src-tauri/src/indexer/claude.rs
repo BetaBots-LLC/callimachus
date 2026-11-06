@@ -10,13 +10,14 @@
 //! cursor in `index_state` (`last_offset`, plus a fingerprint of the bytes around it in
 //! `hash`). When a file only grew, just the appended lines are read and parsed and the
 //! stored prefix is reused, instead of re-reading and re-parsing a transcript that can
-//! be tens of megabytes on every write of an active session. Anything that doesn't look
+//! be tens of megabytes on every write of an active session, and only the new rows are
+//! written (the stored messages are never read back). Anything that doesn't look
 //! like a pure append (shrink, rewrite, fingerprint mismatch, thread missing from the
 //! index) falls back to a full parse.
 
 use super::common::{join_text_parts, parse_rfc3339, push_message, truncate_title};
 use super::{
-    file_stamp, source_id, upsert_thread, IndexReport, MsgUsage, ParsedMessage, ParsedThread,
+    append_messages, file_stamp, source_id, upsert_thread, IndexReport, MsgUsage, ParsedThread,
 };
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -161,10 +162,12 @@ pub fn external_id_for(root: &Path, path: &Path) -> String {
 pub const TOOL_TEXT_CAP_CHARS: usize = 16_000;
 const TOOL_TEXT_TAIL_CHARS: usize = 4_000;
 
-/// Cap one (already trimmed) tool result at [`TOOL_TEXT_CAP_CHARS`]: head + an elision
-/// marker + tail. Deterministic, char-boundary safe, and idempotent (the result is never
-/// longer than the cap), so the incremental re-index prefix check stays stable and
-/// `cleanup::compact_tool_output` produces exactly what a fresh index would.
+/// Cap one (already trimmed) tool result, or one Claude Code tool call, at
+/// [`TOOL_TEXT_CAP_CHARS`]: head + an elision marker + tail. Deterministic, char-boundary
+/// safe, and idempotent (the result is never longer than the cap), so the incremental
+/// re-index prefix check stays stable and `cleanup::compact_tool_output` produces exactly
+/// what a fresh index would, for tool rows of every capping source and Claude Code's tool
+/// calls.
 pub fn cap_tool_text(text: &str) -> String {
     // Byte length bounds char count, so short text skips the char walk entirely.
     if text.len() <= TOOL_TEXT_CAP_CHARS {
@@ -429,8 +432,8 @@ pub fn index_paths(conn: &mut Connection, paths: &[PathBuf]) -> Result<IndexRepo
     Ok(report)
 }
 
-/// Index one thread file. Returns Some(message_count) if indexed, None if unchanged or
-/// deliberately skipped.
+/// Index one thread file. Returns Some(message rows written) if indexed, None if unchanged
+/// or deliberately skipped.
 fn index_file(conn: &mut Connection, sid: i64, root: &Path, path: &Path) -> Result<Option<usize>> {
     let path_str = path.to_string_lossy().to_string();
     let (mtime, size) = file_stamp(path)?;
@@ -615,7 +618,7 @@ fn fingerprint_file(file: &mut fs::File, offset: u64) -> std::io::Result<String>
 }
 
 enum Append {
-    /// The new lines were indexed; carries the thread's message count.
+    /// The new lines were indexed; carries the number of message rows inserted.
     Applied(usize),
     /// Only non-message lines were appended; the cursor advanced, the thread is unchanged.
     NoChange,
@@ -623,6 +626,13 @@ enum Append {
     Fallback,
 }
 
+/// The append fast path. Proof that the file only grew comes from the cursor alone: its
+/// byte fingerprint still matches and the stored thread still has the message count the
+/// cursor recorded. Given that, only the threads row is read (never a stored message), the
+/// tail is parsed onto it, and `indexer::append_messages` inserts just the tail rows. On a
+/// 17k-message session the old path read every stored text twice (once to rebuild the
+/// thread, once under the write lock to re-check the prefix), so a 1-line append cost
+/// 30-40 ms and a progress line that changed nothing still cost 25 ms.
 #[allow(clippy::too_many_arguments)] // all distinct; this is the one internal call site
 fn try_append(
     conn: &mut Connection,
@@ -643,14 +653,14 @@ fn try_append(
     if fingerprint_file(&mut file, offset)? != expected_fp {
         return Ok(Append::Fallback); // rewritten in place, not appended to
     }
-    let Some(mut thread) = load_stored_thread(conn, sid, external_id)? else {
+    let Some((mut thread, stored_count)) = load_thread_meta(conn, sid, external_id)? else {
         return Ok(Append::Fallback);
     };
-    // Outside a full scan's batch (the watcher path) the cursor and the upsert are separate
+    // Outside a full scan's batch (the watcher path) the cursor and the write are separate
     // commits. If the last pass stored the new messages but died (or lost a lock race)
     // before advancing the cursor, re-reading from the stale offset would append the same
     // lines twice; the count catches that.
-    if thread.messages.len() != expected_count {
+    if stored_count != expected_count {
         return Ok(Append::Fallback);
     }
 
@@ -659,28 +669,33 @@ fn try_append(
     file.read_to_end(&mut tail)?;
 
     let before = (
-        thread.messages.len(),
         thread.title.clone(),
         thread.project_path.clone(),
         thread.git_branch.clone(),
     );
+    // `thread` holds the stored metadata and no messages, so what ingest pushes (and the
+    // usage indices it records) is exactly the tail.
     let mut first_user_text = None;
     let consumed = ingest_jsonl(&mut thread, &tail, &mut first_user_text);
     finish_title(&mut thread, first_user_text);
     let new_offset = offset + consumed as u64;
     let tag = cursor_tag(
         &fingerprint_file(&mut file, new_offset)?,
-        thread.messages.len(),
+        stored_count + thread.messages.len(),
     );
 
-    // Re-upsert only when something the index stores changed. A lone timestamp bump (a
-    // progress line) isn't worth a threads-row rewrite plus the prefix check.
-    let changed = thread.messages.len() > before.0
-        || thread.title != before.1
-        || thread.project_path != before.2
-        || thread.git_branch != before.3;
+    // Write only when something the index stores changed. A lone timestamp bump (a
+    // progress line) isn't worth a threads-row rewrite.
+    let changed = !thread.messages.is_empty()
+        || thread.title != before.0
+        || thread.project_path != before.1
+        || thread.git_branch != before.2;
     let result = if changed {
-        Append::Applied(upsert_thread(conn, sid, &thread)?)
+        match append_messages(conn, sid, &thread, stored_count)? {
+            Some(n) => Append::Applied(n),
+            // Another writer moved the thread since the check above.
+            None => return Ok(Append::Fallback),
+        }
     } else {
         Append::NoChange
     };
@@ -699,97 +714,36 @@ fn split_tag(tag: &str) -> Option<(&str, usize)> {
     Some((fp, count.parse().ok()?))
 }
 
-/// Rebuild a thread from the index (metadata + stored messages) so new lines can be
-/// folded onto it exactly as a full parse would have produced them. None when the
-/// thread isn't stored, or its stored rows don't add up (then a full parse is safer).
-fn load_stored_thread(
+/// A stored thread's metadata (no messages) plus its stored message count, so new lines
+/// can be folded onto it exactly as a full parse would. None when the thread isn't stored.
+fn load_thread_meta(
     conn: &Connection,
     sid: i64,
     external_id: &str,
-) -> Result<Option<ParsedThread>> {
-    #[allow(clippy::type_complexity)]
-    let row: Option<(
-        i64,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<i64>,
-        Option<i64>,
-        i64,
-        i64,
-    )> = conn
+) -> Result<Option<(ParsedThread, usize)>> {
+    Ok(conn
         .query_row(
-            "SELECT id, title, project_path, git_branch, created_at, updated_at, message_count,
+            "SELECT title, project_path, git_branch, created_at, updated_at, message_count,
                     is_subagent
              FROM threads WHERE source_id = ?1 AND external_id = ?2",
             params![sid, external_id],
             |r| {
-                Ok((
-                    r.get(0)?,
-                    r.get(1)?,
-                    r.get(2)?,
-                    r.get(3)?,
-                    r.get(4)?,
-                    r.get(5)?,
-                    r.get(6)?,
-                    r.get(7)?,
-                ))
+                let thread = ParsedThread {
+                    external_id: external_id.to_string(),
+                    title: r.get(0)?,
+                    project_path: r.get(1)?,
+                    git_branch: r.get(2)?,
+                    created_at: r.get(3)?,
+                    updated_at: r.get(4)?,
+                    is_subagent: r.get::<_, i64>(6)? != 0,
+                    messages: Vec::new(),
+                    usage: Vec::new(),
+                };
+                Ok((thread, r.get::<_, i64>(5)?))
             },
         )
-        .optional()?;
-    let Some((id, title, project_path, git_branch, created_at, updated_at, count, is_subagent)) =
-        row
-    else {
-        return Ok(None);
-    };
-    // Token usage comes back too: if upsert_thread ends up full-replacing (a stored row
-    // changed between this read and its transaction), it re-inserts the prefix from this
-    // thread, and without usage every earlier turn would lose its model and token counts.
-    let mut messages = Vec::new();
-    let mut usage = Vec::new();
-    {
-        let mut stmt = conn.prepare(
-            "SELECT role, text, tool_name, ts,
-                    model, input_tokens, output_tokens, cache_write_tokens, cache_read_tokens
-             FROM messages WHERE thread_id = ?1 ORDER BY seq",
-        )?;
-        let mut rows = stmt.query([id])?;
-        while let Some(r) = rows.next()? {
-            if let Some(model) = r.get::<_, Option<String>>(4)? {
-                let tokens = |i: usize| r.get::<_, Option<i64>>(i).map(Option::unwrap_or_default);
-                usage.push((
-                    messages.len(),
-                    MsgUsage {
-                        model,
-                        input: tokens(5)?,
-                        output: tokens(6)?,
-                        cache_write: tokens(7)?,
-                        cache_read: tokens(8)?,
-                    },
-                ));
-            }
-            messages.push(ParsedMessage {
-                role: r.get(0)?,
-                text: r.get(1)?,
-                tool_name: r.get(2)?,
-                ts: r.get(3)?,
-            });
-        }
-    }
-    if messages.len() as i64 != count || messages.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(ParsedThread {
-        external_id: external_id.to_string(),
-        title,
-        project_path,
-        git_branch,
-        created_at,
-        updated_at,
-        is_subagent: is_subagent != 0,
-        messages,
-        usage,
-    }))
+        .optional()?
+        .and_then(|(t, n)| usize::try_from(n).ok().map(|n| (t, n))))
 }
 
 // ---------------------------------------------------------------------------------------
@@ -987,7 +941,11 @@ fn extract_messages(
                             .get("input")
                             .map(|v| v.to_string())
                             .unwrap_or_default();
-                        let text = format!("{name}: {input}");
+                        // Capped like tool output: a Write or StructuredOutput call carries
+                        // the whole payload (3,412 rows over the cap held 91 MB on a real
+                        // index), and these rows are FTS-only, never embedded or distilled
+                        // in full.
+                        let text = cap_tool_text(format!("{name}: {input}").trim());
                         push_message(out, "assistant", &text, Some(name), ts);
                     }
                     Some("tool_result") => {
@@ -1005,6 +963,7 @@ fn extract_messages(
 
 #[cfg(test)]
 mod tests {
+    use super::super::ParsedMessage;
     use super::*;
     use std::io::Write;
 
@@ -1174,6 +1133,32 @@ mod tests {
     }
 
     #[test]
+    fn tool_calls_are_capped_at_parse_time() {
+        let content = "fn main() {}\n".repeat(5_000);
+        let line = serde_json::json!({
+            "type": "assistant",
+            "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "name": "Write",
+                 "input": {"file_path": "/p/src/main.rs", "content": content}},
+                {"type": "tool_use", "name": "Bash", "input": {"command": "ls"}},
+            ]}
+        });
+        let path = temp_path("bigcall.jsonl");
+        std::fs::write(&path, format!("{line}\n")).unwrap();
+        let t = parse_file(&path, "x.jsonl", None).unwrap().unwrap();
+        assert_eq!(t.messages.len(), 2);
+        let write = &t.messages[0];
+        assert_eq!(write.tool_name.as_deref(), Some("Write"));
+        assert!(write.text.starts_with("Write: {"), "head keeps the call");
+        assert!(write.text.chars().count() <= TOOL_TEXT_CAP_CHARS);
+        assert_eq!(cap_tool_text(&write.text), write.text, "idempotent");
+        assert_eq!(
+            t.messages[1].text, r#"Bash: {"command":"ls"}"#,
+            "small calls as-is"
+        );
+    }
+
+    #[test]
     fn external_ids_always_use_forward_slashes() {
         let root = Path::new("/r");
         let p = root
@@ -1275,7 +1260,8 @@ mod tests {
         append(&f.path, &format!("{}\n", user_line("brand new question")));
         assert_eq!(
             index_file(&mut f.conn, f.sid, &f.root, &f.path).unwrap(),
-            Some(201)
+            Some(1),
+            "reports the rows written, not the thread size"
         );
         let t = texts(&f.conn);
         assert_eq!(t.len(), 201);
@@ -1299,9 +1285,27 @@ mod tests {
         append(&f.path, &format!("{rest}\n"));
         assert_eq!(
             index_file(&mut f.conn, f.sid, &f.root, &f.path).unwrap(),
-            Some(202)
+            Some(1)
         );
         assert_eq!(texts(&f.conn).last().unwrap(), "finished later");
+        let (count, bytes, distillable): (i64, i64, i64) = f
+            .conn
+            .query_row(
+                "SELECT message_count, bytes, distillable_count FROM threads",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((count, distillable), (202, 202));
+        let stored_bytes: i64 = f
+            .conn
+            .query_row(
+                "SELECT SUM(length(CAST(text AS BLOB))) FROM messages",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(bytes, stored_bytes, "the appended tail's bytes are added");
     }
 
     #[test]
@@ -1350,53 +1354,139 @@ mod tests {
         assert_eq!(texts(&f.conn), vec!["only one"]);
     }
 
-    /// The append path rebuilds the stored prefix from the index. If upsert_thread then has
-    /// to full-replace (a stored row changed underneath it), the earlier turns must keep
-    /// their model and token usage.
-    #[test]
-    fn a_full_replace_from_the_append_path_keeps_earlier_usage() {
-        let assistant = serde_json::json!({
+    fn assistant_line(text: &str, input_tokens: i64) -> String {
+        serde_json::json!({
             "type": "assistant",
             "cwd": "/Users/me/proj",
             "timestamp": "2026-06-01T10:00:01.000Z",
             "message": {
                 "role": "assistant",
                 "model": "claude-opus-4-8",
-                "content": [{"type": "text", "text": "the answer"}],
-                "usage": {"input_tokens": 10, "output_tokens": 5,
+                "content": [{"type": "text", "text": text}],
+                "usage": {"input_tokens": input_tokens, "output_tokens": 5,
                           "cache_creation_input_tokens": 2, "cache_read_input_tokens": 3},
             },
         })
-        .to_string();
-        let mut f = fixture(&[user_line("question"), assistant]);
-        index_file(&mut f.conn, f.sid, &f.root, &f.path).unwrap();
-        let ext = external_id_for(&f.root, &f.path);
-        let mut thread = load_stored_thread(&f.conn, f.sid, &ext).unwrap().unwrap();
-        assert_eq!(thread.usage.len(), 1);
-        assert_eq!(thread.usage[0].0, 1, "keyed by the assistant row's index");
+        .to_string()
+    }
 
-        // Another writer changes a stored row, so the prefix check fails: full replace.
-        f.conn
-            .execute("UPDATE messages SET text = 'QUESTION' WHERE seq = 0", [])
+    fn usage_at(conn: &Connection, seq: i64) -> Option<String> {
+        conn.query_row(
+            "SELECT model || ' ' || input_tokens || ' ' || output_tokens || ' '
+                    || cache_write_tokens || ' ' || cache_read_tokens
+             FROM messages WHERE seq = ?1",
+            [seq],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// The append path parses only the tail, so its usage indices are tail-relative: the
+    /// write must land them on the right absolute seq and keep the earlier turns' usage.
+    #[test]
+    fn appended_turns_keep_usage_on_the_right_rows() {
+        let mut f = fixture(&[user_line("question"), assistant_line("the answer", 10)]);
+        index_file(&mut f.conn, f.sid, &f.root, &f.path).unwrap();
+        append(
+            &f.path,
+            &format!(
+                "{}\n{}\n",
+                user_line("follow-up"),
+                assistant_line("more", 20)
+            ),
+        );
+        assert_eq!(
+            index_file(&mut f.conn, f.sid, &f.root, &f.path).unwrap(),
+            Some(2)
+        );
+        assert_eq!(
+            usage_at(&f.conn, 1).as_deref(),
+            Some("claude-opus-4-8 10 5 2 3")
+        );
+        assert_eq!(usage_at(&f.conn, 2), None);
+        assert_eq!(
+            usage_at(&f.conn, 3).as_deref(),
+            Some("claude-opus-4-8 20 5 2 3")
+        );
+    }
+
+    /// If another writer changed the stored thread between the cursor check and the write
+    /// (here: a stored row went missing), the append backs off and a full parse rebuilds the
+    /// thread from the file, usage included.
+    #[test]
+    fn an_append_that_loses_a_race_falls_back_to_a_full_parse() {
+        let mut f = fixture(&[user_line("question"), assistant_line("the answer", 10)]);
+        index_file(&mut f.conn, f.sid, &f.root, &f.path).unwrap();
+        let tid: i64 = f
+            .conn
+            .query_row("SELECT id FROM threads", [], |r| r.get(0))
             .unwrap();
+        // The rows no longer add up to the stored count the cursor agrees with.
+        f.conn
+            .execute("DELETE FROM messages WHERE seq = 1", [])
+            .unwrap();
+        let mut thread = ParsedThread {
+            external_id: external_id_for(&f.root, &f.path),
+            ..Default::default()
+        };
         thread.messages.push(ParsedMessage {
             role: "user".into(),
-            text: "follow-up".into(),
+            text: "x".into(),
             tool_name: None,
             ts: None,
         });
-        upsert_thread(&mut f.conn, f.sid, &thread).unwrap();
-        let usage: Option<String> = f
+        assert_eq!(
+            append_messages(&mut f.conn, f.sid, &thread, 2).unwrap(),
+            None,
+            "seq gap detected under the lock"
+        );
+        assert_eq!(
+            append_messages(&mut f.conn, f.sid, &thread, 1).unwrap(),
+            None,
+            "a start that disagrees with the stored count is refused"
+        );
+
+        append(&f.path, &format!("{}\n", user_line("follow-up")));
+        index_file(&mut f.conn, f.sid, &f.root, &f.path).unwrap();
+        assert_eq!(texts(&f.conn), vec!["question", "the answer", "follow-up"]);
+        assert_eq!(
+            usage_at(&f.conn, 1).as_deref(),
+            Some("claude-opus-4-8 10 5 2 3")
+        );
+        let count: i64 = f
             .conn
             .query_row(
-                "SELECT model || ' ' || input_tokens || ' ' || output_tokens || ' '
-                        || cache_write_tokens || ' ' || cache_read_tokens
-                 FROM messages WHERE seq = 1",
-                [],
+                "SELECT message_count FROM threads WHERE id = ?1",
+                [tid],
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(usage.as_deref(), Some("claude-opus-4-8 10 5 2 3"));
+        assert_eq!(count, 3);
+    }
+
+    /// A progress line (no message) must not touch the thread, and an append must never
+    /// read the stored message text: blank every stored text and the append still lands.
+    #[test]
+    fn the_append_path_never_reads_stored_messages() {
+        let mut f = fixture(&[user_line("one"), user_line("two")]);
+        index_file(&mut f.conn, f.sid, &f.root, &f.path).unwrap();
+        f.conn
+            .execute("UPDATE messages SET text = 'scrubbed'", [])
+            .unwrap();
+        append(
+            &f.path,
+            "{\"type\":\"progress\",\"timestamp\":\"2026-06-01T10:00:09Z\"}\n",
+        );
+        assert_eq!(
+            index_file(&mut f.conn, f.sid, &f.root, &f.path).unwrap(),
+            None
+        );
+        append(&f.path, &format!("{}\n", user_line("three")));
+        assert_eq!(
+            index_file(&mut f.conn, f.sid, &f.root, &f.path).unwrap(),
+            Some(1)
+        );
+        assert_eq!(texts(&f.conn), vec!["scrubbed", "scrubbed", "three"]);
     }
 
     #[test]

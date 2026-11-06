@@ -549,7 +549,7 @@ fn like_escape(s: &str) -> String {
 #[derive(Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CompactReport {
-    /// Tool rows rewritten in this call.
+    /// Tool output (and Claude Code tool-call) rows rewritten in this call.
     pub rows: usize,
     /// UTF-8 bytes of message text removed in this call.
     pub bytes_saved: i64,
@@ -574,23 +574,34 @@ fn compact_select_sql(batch: usize) -> String {
     // matches, so the whole run is one pass over the table. Left to itself the planner
     // drives from the role or thread index instead and then sorts: every batch re-read all
     // ~600k tool rows (5-10s per batch of 200 on a large index, so minutes per call).
+    //
+    // Claude Code also caps its tool calls (assistant rows with a tool_name, "Write: {json}").
+    // Only its calls: the other capping sources store calls in full, so compacting theirs
+    // would be undone by the next re-index.
+    let claude = crate::indexer::claude::KIND;
     format!(
         "SELECT m.id, m.thread_id, m.text FROM messages m
-         WHERE m.id > ?1 AND +m.role = 'tool' AND octet_length(m.text) > {TOOL_TEXT_CAP_CHARS}
-           AND +m.thread_id IN (
-               SELECT t.id FROM threads t JOIN sources s ON s.id = t.source_id
-               WHERE s.kind IN ({kinds}))
+         WHERE m.id > ?1 AND octet_length(m.text) > {TOOL_TEXT_CAP_CHARS}
+           AND ((+m.role = 'tool'
+                 AND +m.thread_id IN (
+                     SELECT t.id FROM threads t JOIN sources s ON s.id = t.source_id
+                     WHERE s.kind IN ({kinds})))
+                OR (+m.role = 'assistant' AND +m.tool_name IS NOT NULL
+                    AND +m.thread_id IN (
+                        SELECT t.id FROM threads t JOIN sources s ON s.id = t.source_id
+                        WHERE s.kind = '{claude}')))
          ORDER BY m.id LIMIT {batch}"
     )
 }
 
-/// Shrink tool-output rows indexed before the index-time cap existed down to the same
-/// head + tail form the indexer now stores, so old transcripts stop dominating disk and
+/// Shrink tool-output rows (and Claude Code tool calls) indexed before the index-time cap
+/// existed down to the same head + tail form the indexer now stores, so old transcripts
+/// stop dominating disk and
 /// FTS size. Processes at most `max_rows` rows per call (in short transactions) so the
 /// caller can loop from a background thread and release the write lock in between; FTS
 /// stays in sync through the update trigger. Run `vacuum` afterwards to return the space
 /// to the OS. Only touches the sources whose indexers cap tool output
-/// (`indexer::capped_tool_sources`).
+/// (`indexer::capped_tool_sources`), and tool calls only for Claude Code.
 pub fn compact_tool_output(conn: &mut Connection, max_rows: usize) -> Result<CompactReport> {
     use crate::indexer::claude::cap_tool_text;
     const BATCH: usize = 200;
@@ -826,6 +837,49 @@ mod tests {
         );
         // A second pass has nothing left to do.
         assert_eq!(compact_tool_output(&mut conn, 1000).unwrap().rows, 0);
+    }
+
+    /// Claude Code caps its tool calls at index time, so legacy uncapped ones are compacted
+    /// too; a prose assistant row and another source's (uncapped) tool calls are left alone.
+    #[test]
+    fn compact_tool_output_caps_claude_code_tool_calls_only() {
+        use crate::indexer::claude::cap_tool_text;
+        let mut conn = temp_db();
+        let big = format!("Write: {{\"content\":\"{}\"}}", "line ".repeat(10_000));
+        let call = |text: &str| ParsedMessage {
+            role: "assistant".into(),
+            text: text.into(),
+            tool_name: Some("Write".into()),
+            ts: Some(1),
+        };
+        let mk = |ext: &str| ParsedThread {
+            external_id: ext.into(),
+            messages: vec![
+                msg("user", "write it"),
+                call(&big),
+                msg("assistant", &"prose".repeat(5_000)),
+            ],
+            ..Default::default()
+        };
+        let claude = source_id(&conn, "claude_code").unwrap();
+        let codex = source_id(&conn, "codex").unwrap();
+        upsert_thread(&mut conn, claude, &mk("cc")).unwrap();
+        upsert_thread(&mut conn, codex, &mk("cx")).unwrap();
+
+        let r = compact_tool_output(&mut conn, 1000).unwrap();
+        assert_eq!(r.rows, 1, "only Claude Code's tool call is rewritten");
+        let text_of = |sid: i64, seq: i64| -> String {
+            conn.query_row(
+                "SELECT m.text FROM messages m JOIN threads t ON t.id = m.thread_id
+                 WHERE t.source_id = ?1 AND m.seq = ?2",
+                params![sid, seq],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(text_of(claude, 1), cap_tool_text(&big));
+        assert_eq!(text_of(claude, 2), "prose".repeat(5_000));
+        assert_eq!(text_of(codex, 1), big);
     }
 
     /// Each batch must resume a rowid range scan, not re-read every tool row and sort them.

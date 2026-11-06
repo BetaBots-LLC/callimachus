@@ -1,4 +1,4 @@
-import { type ComponentProps, memo, useState } from "react";
+import { type ComponentProps, memo, useContext, useEffect, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
@@ -11,6 +11,7 @@ import rehypeStringify from "rehype-stringify";
 import { rehypeSafeLinks } from "../lib/safeLinks";
 import { copyText } from "../lib/clipboard";
 import { Button } from "./ui/button";
+import { LargeMessageStates, MAX_MARKDOWN_CHARS } from "./largeMessageState";
 
 // Syntax-highlight fenced code: detect the language when unlabeled (assistant prose often
 // omits it), ignore unknown ones, and skip fences explicitly labeled as plain text. Tool
@@ -73,10 +74,6 @@ function mdToHtml(src: string): string {
 const PROSE =
   "prose prose-sm dark:prose-invert max-w-none break-words prose-p:my-2 prose-pre:my-3 prose-pre:overflow-x-auto prose-pre:rounded-md prose-pre:bg-muted prose-pre:text-foreground prose-pre:p-3 prose-code:rounded prose-code:bg-muted prose-code:px-1 prose-code:py-0.5 prose-code:before:content-none prose-code:after:content-none prose-pre:prose-code:bg-transparent prose-pre:prose-code:p-0";
 
-// Above this, parsing markdown synchronously can jank the main thread (e.g. a
-// pasted/packed-context message). Render those as plain, collapsed text instead.
-const MAX_MARKDOWN_CHARS = 16_000;
-
 // An expanded large message shows this much at a time. A pre-wrap block of a few hundred
 // KB lays out in well under a frame; the largest indexed messages are over 5 MB, which
 // would freeze WebKit's line breaking if mounted in one go.
@@ -98,10 +95,20 @@ function chunkEnd(text: string, from: number): number {
 /** A message too large for the markdown pipeline. Nothing is mounted until the first
  *  expand (most are never opened, and a virtualized thread remounts rows on scroll); then
  *  it reveals one chunk per "Show more", each its own block, so a reveal lays out only
- *  the new chunk. */
-function LargeMessage({ text }: { text: string }) {
-  const [ends, setEnds] = useState<number[]>([]);
+ *  the new chunk. With a `stateId` inside a LargeMessageStates provider, the open state
+ *  and reveal progress survive the row being unmounted and remounted. */
+function LargeMessage({ text, stateId }: { text: string; stateId?: number }) {
+  const store = useContext(LargeMessageStates);
+  const saved = stateId != null ? store?.get(stateId) : undefined;
+  // A saved state for a different text (the row now holds other content) is ignored.
+  const restore =
+    saved && (saved.ends[saved.ends.length - 1] ?? 0) <= text.length ? saved : undefined;
+  const [open, setOpen] = useState(restore?.open ?? false);
+  const [ends, setEnds] = useState<number[]>(restore?.ends ?? []);
   const [copy, setCopy] = useState<"idle" | "copied" | "failed">("idle");
+  useEffect(() => {
+    if (store && stateId != null) store.set(stateId, { open, ends });
+  }, [store, stateId, open, ends]);
   const shown = ends.length ? ends[ends.length - 1] : 0;
   const showMore = () =>
     setEnds((prev) => {
@@ -111,8 +118,11 @@ function LargeMessage({ text }: { text: string }) {
   return (
     <details
       className="rounded-md border bg-muted/30 px-3 py-2 text-sm"
+      open={open}
       onToggle={(e) => {
-        if (e.currentTarget.open && ends.length === 0) showMore();
+        const now = e.currentTarget.open;
+        if (now !== open) setOpen(now);
+        if (now && ends.length === 0) showMore();
       }}
     >
       <summary className="cursor-pointer select-none text-muted-foreground">
@@ -163,8 +173,16 @@ function LargeMessage({ text }: { text: string }) {
 /** Static markdown (committed messages). Memoized so a parent re-render that
  *  doesn't change `children` skips the (expensive) re-parse. Very large messages
  *  fall back to a collapsed plain block to avoid a parse freeze. */
-export const Markdown = memo(function Markdown({ children }: { children: string }) {
-  if (children.length > MAX_MARKDOWN_CHARS) return <LargeMessage text={children} />;
+export const Markdown = memo(function Markdown({
+  children,
+  stateId,
+}: {
+  children: string;
+  /** Keys a large message's expanded state in an enclosing LargeMessageStates. */
+  stateId?: number;
+}) {
+  if (children.length > MAX_MARKDOWN_CHARS)
+    return <LargeMessage text={children} stateId={stateId} />;
   return (
     <div
       className={PROSE}
