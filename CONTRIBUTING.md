@@ -67,13 +67,14 @@ pnpm build                             # all apps; also creates apps/desktop/dis
 node --test packages/callimachus-mcp/test/*.test.mjs   # npm launcher tests
 cd apps/desktop/src-tauri
 cargo fmt --check
-cargo clippy --locked --lib --bins --tests -- -D warnings
-cargo test --locked                    # Rust unit tests, plus the drift guards below
+cargo clippy --workspace --locked --lib --bins --tests -- -D warnings
+cargo test --workspace --locked        # Rust unit tests, plus the drift guards below
 ```
 
 CI runs the same checks (on macOS; the repo-wide Biome job runs on its own, see
 below), plus `pnpm lint`, `vsce ls` on the extension manifest,
-`cargo check --locked --all-targets` on Linux and Windows, and a debug
+`cargo check --locked --workspace --all-targets` on Linux and Windows (Windows also links
+the standalone `cal.exe` and checks it needs no VC runtime DLL), and a debug
 `tauri build --no-bundle`. That build fails when a tauri crate and its
 `@tauri-apps/*` npm package drift apart by a minor version, so after bumping
 either side run `pnpm --filter callimachus tauri build --debug --no-bundle`

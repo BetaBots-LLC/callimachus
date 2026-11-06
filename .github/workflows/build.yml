@@ -278,6 +278,56 @@ jobs:
           APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
         run: echo "$APPLE_API_KEY_BASE64" | base64 --decode > "$RUNNER_TEMP/apple_api_key.p8"
 
+      # Standalone `cal` + `callimachus-mcp` binaries for CLI/MCP-only users (no GUI
+      # app). They are the `callimachus-standalone` workspace member, not bins of the
+      # app crate, because `tauri build` bundles every bin of the app crate: that put
+      # two unused 27-29 MB copies of the backend into the macOS .app and the Linux
+      # packages (the app binary already serves `cal` and `--mcp`). Built before the
+      # app so the Windows leg can bundle them: Windows installs keep `cal.exe` (and
+      # `callimachus-mcp.exe`) next to the app as sidecars, through the CI-only
+      # src-tauri/tauri.windows-sidecars.conf.json overlay, which reads them from
+      # src-tauri/binaries/. The app build afterwards reuses the compiled deps. Each
+      # job uploads its own arch-suffixed names, so no collisions.
+      - name: Build standalone cal + callimachus-mcp
+        shell: bash
+        working-directory: apps/desktop/src-tauri
+        run: |
+          set -euo pipefail
+          # The lib embeds apps/desktop/dist at compile time and the frontend isn't
+          # built until tauri-action runs; these bins never serve it, so empty is fine.
+          mkdir -p ../dist
+          # A dispatched older tag (sources from the tag, this workflow from main) still
+          # has the two bins in the app crate, where the bundler picks them up itself.
+          PKG=(-p callimachus-standalone)
+          [ -f standalone/Cargo.toml ] || PKG=(--bin cal --bin callimachus-mcp)
+          TARGET="${{ matrix.rust_target }}"
+          if [ -n "$TARGET" ]; then
+            cargo build --release --locked --target "$TARGET" "${PKG[@]}"
+            OUT="target/$TARGET/release"
+            TRIPLE="$TARGET"
+          else
+            cargo build --release --locked "${PKG[@]}"
+            OUT="target/release"
+            TRIPLE="$(rustc -vV | sed -n 's/host: //p')"
+          fi
+          EXT=""
+          [ "${{ runner.os }}" = "Windows" ] && EXT=".exe"
+          STAGE="$RUNNER_TEMP/cli-bins"
+          mkdir -p "$STAGE"
+          cp "$OUT/cal$EXT"             "$STAGE/cal-$TRIPLE$EXT"
+          cp "$OUT/callimachus-mcp$EXT" "$STAGE/callimachus-mcp-$TRIPLE$EXT"
+          if [ "${{ runner.os }}" = "Windows" ] && [ -f tauri.windows-sidecars.conf.json ]; then
+            # bundle.externalBin names: <name>-<target triple>.exe, installed as <name>.exe.
+            mkdir -p binaries
+            cp "$OUT/cal$EXT"             "binaries/cal-$TRIPLE$EXT"
+            cp "$OUT/callimachus-mcp$EXT" "binaries/callimachus-mcp-$TRIPLE$EXT"
+          fi
+          {
+            echo "STAGE=$STAGE"
+            echo "TRIPLE=$TRIPLE"
+            echo "EXT=$EXT"
+          } >> "$GITHUB_ENV"
+
       - name: Build, sign & upload to the draft release
         # Held at 0.6.x on purpose: 1.0 writes API asset URLs into latest.json, which
         # puts every auto-update download under GitHub's unauthenticated API rate
@@ -291,7 +341,7 @@ jobs:
           # official release builds can send anything (forks and local builds have no
           # token). Repo *variables*, not secrets: a PostHog project token is a
           # write-only ingestion key. Deliberately step-scoped: the standalone
-          # cal/callimachus-mcp build below does not see it, and those never send
+          # cal/callimachus-mcp build above does not see it, and those never send
           # analytics.
           CALLIMACHUS_POSTHOG_TOKEN: ${{ vars.POSTHOG_PROJECT_TOKEN }}
           CALLIMACHUS_POSTHOG_HOST: ${{ vars.POSTHOG_HOST }}
@@ -336,38 +386,12 @@ jobs:
           # Each job appends its platform/arch entry to the release's latest.json.
           includeUpdaterJson: true
           # The Windows signCommand lives in a CI-only overlay so local and fork
-          # builds without artifact-signing-cli don't fail at bundle time.
-          args: ${{ matrix.args }}${{ runner.os == 'Windows' && env.HAS_AZURE == 'true' && ' --config src-tauri/tauri.windows-sign.conf.json' || '' }}
-
-      # Standalone `cal` + `callimachus-mcp` binaries for CLI/MCP-only users (no GUI
-      # app). Reuses the target dir from the app build, so it's a near-incremental
-      # compile. Each job uploads its own arch-suffixed names, so no collisions.
-      - name: Build standalone cal + callimachus-mcp
-        shell: bash
-        working-directory: apps/desktop/src-tauri
-        run: |
-          set -euo pipefail
-          TARGET="${{ matrix.rust_target }}"
-          if [ -n "$TARGET" ]; then
-            cargo build --release --locked --target "$TARGET" --bin cal --bin callimachus-mcp
-            OUT="target/$TARGET/release"
-            TRIPLE="$TARGET"
-          else
-            cargo build --release --locked --bin cal --bin callimachus-mcp
-            OUT="target/release"
-            TRIPLE="$(rustc -vV | sed -n 's/host: //p')"
-          fi
-          EXT=""
-          [ "${{ runner.os }}" = "Windows" ] && EXT=".exe"
-          STAGE="$RUNNER_TEMP/cli-bins"
-          mkdir -p "$STAGE"
-          cp "$OUT/cal$EXT"             "$STAGE/cal-$TRIPLE$EXT"
-          cp "$OUT/callimachus-mcp$EXT" "$STAGE/callimachus-mcp-$TRIPLE$EXT"
-          {
-            echo "STAGE=$STAGE"
-            echo "TRIPLE=$TRIPLE"
-            echo "EXT=$EXT"
-          } >> "$GITHUB_ENV"
+          # builds without artifact-signing-cli don't fail at bundle time. So does
+          # the Windows sidecar list (cal.exe, callimachus-mcp.exe): tauri-build
+          # requires every externalBin file to exist, which would break plain
+          # `cargo build` / `cargo check` on Windows. The bundler signs the
+          # sidecars with the same signCommand. hashFiles: an older tag has no overlay.
+          args: ${{ matrix.args }}${{ runner.os == 'Windows' && hashFiles('apps/desktop/src-tauri/tauri.windows-sidecars.conf.json') != '' && ' --config src-tauri/tauri.windows-sidecars.conf.json' || '' }}${{ runner.os == 'Windows' && env.HAS_AZURE == 'true' && ' --config src-tauri/tauri.windows-sign.conf.json' || '' }}
 
       # Authenticode-sign the staged Windows bins (matches the app's signCommand)
       # so they don't trip SmartScreen "Unknown publisher".

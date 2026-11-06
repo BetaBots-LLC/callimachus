@@ -1914,8 +1914,8 @@ mod tests {
         let sidecars = [
             ("cli_core.rs", include_str!("cli_core.rs")),
             ("mcp_server.rs", include_str!("mcp_server.rs")),
-            ("cli.rs", include_str!("cli.rs")),
-            ("mcp.rs", include_str!("mcp.rs")),
+            ("cli.rs", include_str!("../standalone/src/cli.rs")),
+            ("mcp.rs", include_str!("../standalone/src/mcp.rs")),
             ("main.rs", include_str!("main.rs")),
         ];
         for (file, src) in sidecars {

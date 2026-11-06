@@ -490,7 +490,17 @@ dependencies = [
  "tokio-util",
  "toml_edit 0.25.17+spec-1.1.0",
  "uuid",
+ "windows-sys 0.61.2",
  "zerocopy",
+]
+
+[[package]]
+name = "callimachus-standalone"
+version = "0.0.0"
+dependencies = [
+ "callimachus",
+ "static_vcruntime",
+ "tauri-winres",
 ]
 
 [[package]]

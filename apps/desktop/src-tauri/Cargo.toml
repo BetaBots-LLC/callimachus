@@ -5,8 +5,6 @@ description = "Local index & search for AI agent threads"
 authors = ["Ari Shaller"]
 license = "AGPL-3.0-or-later"
 edition = "2021"
-# Three binaries (the app, the MCP server and `cal`); make `cargo run` (tauri dev) pick the app.
-default-run = "callimachus"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -15,21 +13,18 @@ default-run = "callimachus"
 # to make the lib name unique and wouldn't conflict with the bin name.
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
 name = "callimachus_lib"
-# rlib only: the three bins link it, and desktop bundling ships the bins. The Tauri template's
+# rlib only: the app bin and the standalone bins link it. The Tauri template's
 # "staticlib" (iOS) and "cdylib" (Android) are mobile-only outputs; building them cost about
 # 20 s per release build plus about 1 GB of debug artifacts. Add them back, next to the
 # `cfg_attr(mobile, tauri::mobile_entry_point)` on `run()`, if a mobile target ever ships.
 crate-type = ["rlib"]
 
-# Standalone MCP server: exposes the index as tools for any LLM/agent over stdio.
-[[bin]]
-name = "callimachus-mcp"
-path = "src/mcp.rs"
-
-# Companion terminal CLI: search / read indexed threads from the shell.
-[[bin]]
-name = "cal"
-path = "src/cli.rs"
+# The app crate has exactly one bin (src/main.rs), because `tauri build` bundles every bin of
+# this package. The standalone `cal` and `callimachus-mcp` are the `standalone` member:
+# `cargo build --release -p callimachus-standalone`. Not a default member, so `cargo run`
+# (tauri dev) and `tauri build` stay on the app; CI lints and tests with `--workspace`.
+[workspace]
+members = ["standalone"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -94,6 +89,12 @@ uuid = { version = "1", features = ["v4"] }
 # on Windows). Used by db::default_index_path and the per-agent indexers.
 # 7 only moved `preference_dir` on Windows (unused here) and matches the copy tauri pulls in.
 dirs = "7"
+
+# Free-space probe before Reclaim space / Shrink index rewrites the file (cleanup.rs
+# `volume_space`). Already in the lock graph through tauri and keyring; this only turns on the
+# FileSystem bindings (GetDiskFreeSpaceExW, GetVolumePathNameW).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
 [profile.release]
 # Smaller, faster release binaries (the app, `cal` and `callimachus-mcp`) at the cost of longer

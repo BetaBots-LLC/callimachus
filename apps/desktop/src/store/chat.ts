@@ -110,18 +110,25 @@ export function contextTitle(content: string): string | null {
  * Trim a packed thread to `max` chars by eliding its middle, keeping the head (the
  * envelope and opening turns) and a larger tail (the latest turns and the closing
  * tag). Cuts snap to line breaks so a message isn't split mid-line where avoidable.
+ * Chars are code points, the unit the backend packs to (Rust `chars`): UTF-16 `length`
+ * counts an emoji as two, so a full 16,000-char pack with one emoji in it measured over
+ * budget and lost a middle chunk the backend had already fitted.
  */
 export function fitContext(text: string, max: number): { text: string; truncated: boolean } {
-  if (text.length <= max) return { text, truncated: false };
+  const cps = Array.from(text);
+  if (cps.length <= max) return { text, truncated: false };
   const marker = "\n\n[… middle of the thread omitted to fit the chat context budget …]\n\n";
-  const room = Math.max(0, max - marker.length);
+  const room = Math.max(0, max - Array.from(marker).length);
   let headEnd = Math.floor(room * 0.35);
-  let tailStart = text.length - (room - headEnd);
-  const nl = text.lastIndexOf("\n", headEnd);
+  let tailStart = cps.length - (room - headEnd);
+  const nl = cps.lastIndexOf("\n", headEnd);
   if (nl > headEnd * 0.8) headEnd = nl;
-  const nl2 = text.indexOf("\n", tailStart);
+  const nl2 = cps.indexOf("\n", tailStart);
   if (nl2 !== -1 && nl2 - tailStart < (room - headEnd) * 0.2) tailStart = nl2 + 1;
-  return { text: text.slice(0, headEnd) + marker + text.slice(tailStart), truncated: true };
+  return {
+    text: cps.slice(0, headEnd).join("") + marker + cps.slice(tailStart).join(""),
+    truncated: true,
+  };
 }
 
 // --- Stream bookkeeping (module scope: one chat stream per app) ---------------------
@@ -222,7 +229,7 @@ export const useChat = create<ChatState>((set, get) => {
             context: {
               threadId,
               title: source?.title ?? contextTitle(body),
-              chars: body.length,
+              chars: Array.from(body).length,
               truncated,
             },
           },

@@ -1,7 +1,9 @@
-//! `cal` — companion terminal CLI for Callimachus. A thin entry point around
+//! `cal`: companion terminal CLI for Callimachus. A thin entry point around
 //! `callimachus_lib::cli_core`. The desktop app can also act as `cal` (when its
 //! argv0 is `cal` or it's given a cal subcommand), so the installer can symlink
-//! the app to `~/.local/bin/cal` — no separate binary required.
+//! the app to `~/.local/bin/cal`; this binary is for CLI-only installs and isn't bundled
+//! into the macOS or Linux app. Windows installs ship it as a sidecar next to the app
+//! (build.yml, tauri.windows-sidecars.conf.json; see ../Cargo.toml).
 //!
 //!   cal search "vector index" -y   # keyword + semantic search
 //!   cal recent -n 10               # most recent threads

@@ -5,11 +5,14 @@ and PR checks; this file is what an agent needs on top of that.
 
 ## Repo map
 
-- `apps/desktop/src-tauri/`: one Rust crate (`callimachus_lib`), three binaries. `callimachus`
-  (`src/main.rs`) is the GUI, and also acts as `cal` when argv0 is `cal` or its first argument is
-  in `cli_core::COMMANDS` (how installed hooks call it), and as the MCP server with `--mcp`.
-  `cal` (`src/cli.rs` -> `cli_core.rs`) and `callimachus-mcp` (`src/mcp.rs` -> `mcp_server.rs`)
-  are thin entry points over the same code. Adding an agent source: `src/indexer/README.md`.
+- `apps/desktop/src-tauri/`: a Cargo workspace. The app crate (`callimachus_lib`) has one binary:
+  `callimachus` (`src/main.rs`) is the GUI, and also acts as `cal` when argv0 is `cal` or its
+  first argument is in `cli_core::COMMANDS` (how installed hooks call it), and as the MCP server
+  with `--mcp`. The `standalone/` member (`-p callimachus-standalone`) holds `cal`
+  (`standalone/src/cli.rs` -> `cli_core.rs`) and `callimachus-mcp` (`standalone/src/mcp.rs` ->
+  `mcp_server.rs`), thin entry points for the release's standalone downloads; keep them out of
+  the app crate, since `tauri build` bundles every app-crate bin (RELEASING.md). Adding an agent
+  source: `src/indexer/README.md`.
 - `apps/desktop/src/`: React frontend; Tauri commands go through typed wrappers in `src/lib/api.ts`.
 - `apps/vscode/`: VS Code / Cursor extension; runs `cal ... --json` (`src/cal.ts`), a contract.
 - `apps/web/`: callimachus.app (TanStack Start). The privacy policy is `src/content/legal.ts`.
@@ -21,8 +24,8 @@ and PR checks; this file is what an agent needs on top of that.
 pnpm turbo run typecheck build lint                    # JS side, as CI runs it
 node --test packages/callimachus-mcp/test/*.test.mjs   # npm launcher
 cd apps/desktop/src-tauri
-cargo fmt --check && cargo clippy --locked --lib --bins --tests -- -D warnings
-cargo test --locked
+cargo fmt --check && cargo clippy --locked --workspace --lib --bins --tests -- -D warnings
+cargo test --locked --workspace
 cargo test -- --ignored real_claude_index --nocapture  # real data: run #[ignore] tests by name
 ```
 
@@ -50,13 +53,14 @@ which holds the user's whole history and their Settings (`app_config`).
 - A dev app launch also runs `integration::refresh_installed`, which can rewrite the installed
   skill and re-point dangling hooks, MCP entries and the `cal` link at the dev binary.
 - Smoke-test built binaries on an APFS clone with a throwaway HOME (never `cargo` or `pnpm`
-  themselves: rustup and the pnpm store live under HOME):
+  themselves: rustup and the pnpm store live under HOME). The app binary answers cal subcommands;
+  `target/debug/cal` comes only from `cargo build -p callimachus-standalone` and may be stale:
 
 ```bash
 D="$HOME/Library/Application Support/dev.shaller.callimachus"; S=/tmp/cal-smoke
 mkdir -p "$S/home" && cp -c "$D"/index.db* "$S"/
 env -u CLAUDE_CONFIG_DIR -u CODEX_HOME HOME="$S/home" CALLIMACHUS_DB="$S/index.db" \
-  FASTEMBED_CACHE_DIR="$D/models" apps/desktop/src-tauri/target/debug/cal stats
+  FASTEMBED_CACHE_DIR="$D/models" apps/desktop/src-tauri/target/debug/callimachus stats
 ```
 
 ## Migrations
@@ -102,8 +106,8 @@ that leaves the machine (LLM prompts, MCP results, exports) goes through `contex
 GUI only and opt-in (rules in the `telemetry.rs` header). Events are a closed `Event` enum; each
 string property comes from an allowlist mirrored in `apps/desktop/src/lib/telemetry.ts`. A new
 event or property also updates `legal.ts` (bump `LEGAL_UPDATED`) and `SECURITY.md` in the same
-PR. Never reference telemetry from `cli_core.rs`, `mcp_server.rs`, `cli.rs`, `mcp.rs` or
-`main.rs`. Only the release workflow compiles in the PostHog token (`option_env!`, `build.yml`).
+PR. Never reference telemetry from `cli_core.rs`, `mcp_server.rs`, `standalone/src/cli.rs`,
+`standalone/src/mcp.rs` or `main.rs`. Only the release workflow compiles in the PostHog token (`option_env!`, `build.yml`).
 
 ## Releases and changesets
 

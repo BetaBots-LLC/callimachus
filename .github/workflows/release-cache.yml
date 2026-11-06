@@ -16,6 +16,7 @@ on:
     branches: [main]
     paths:
       - apps/desktop/src-tauri/Cargo.toml
+      - apps/desktop/src-tauri/standalone/Cargo.toml
       - apps/desktop/src-tauri/Cargo.lock
       - .github/workflows/release-cache.yml
   schedule:
@@ -102,4 +103,4 @@ jobs:
           if [ -n "${{ matrix.rust_target }}" ]; then TARGET_ARGS=(--target "${{ matrix.rust_target }}"); fi
           MACOSX_DEPLOYMENT_TARGET=10.13 cargo build --release --locked ${TARGET_ARGS[@]+"${TARGET_ARGS[@]}"} \
             --features tauri/custom-protocol
-          cargo build --release --locked ${TARGET_ARGS[@]+"${TARGET_ARGS[@]}"} --bin cal --bin callimachus-mcp
+          cargo build --release --locked ${TARGET_ARGS[@]+"${TARGET_ARGS[@]}"} -p callimachus-standalone
