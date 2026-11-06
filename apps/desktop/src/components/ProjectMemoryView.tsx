@@ -329,7 +329,7 @@ export function ProjectMemoryView() {
             {remembering === project && (
               <RememberForm project={project} onClose={() => setRemembering(null)} />
             )}
-            {!distillOn && <MemorySetupCard />}
+            {!distillOn && <MemorySetupCard checklistLink />}
             {brief.data && (
               <div className="rounded-lg border p-3">
                 <Markdown>{brief.data}</Markdown>

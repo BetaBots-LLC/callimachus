@@ -131,7 +131,9 @@ function DesktopPage() {
           className="lg:col-span-4"
         >
           The same local index powers the CLI, the editor extension, and the MCP server. Index once;
-          reach it from anywhere.
+          reach it from anywhere. In Claude Code, the Callimachus plugin (
+          <code className="font-mono">/plugin install callimachus@callimachus</code>) brings the
+          skill, the MCP server and the memory hooks in one step.
         </FeaturePanel>
       </div>
 

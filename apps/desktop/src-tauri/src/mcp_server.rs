@@ -11,7 +11,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -89,6 +89,33 @@ This MCP server only reads the index; the Callimachus desktop app builds it. Ins
 history (or click Reindex in Settings), then retry. If the app is already installed and indexed, \
 point this server at its index with the CALLIMACHUS_DB environment variable.";
 
+/// This server's release: the app version a behind index needs, and the one in the notices.
+const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// app_config: the app version that last launched on this index, which the GUI records at
+/// every launch (only locally, consent or not). Read here, never written: when the index is
+/// ahead, it names the release this server should be updated to.
+const APP_VERSION_KEY: &str = "telemetry.last_version";
+
+/// Every tool's answer while the index is at an older schema than this server: the app has not
+/// run an update's migrations yet, and a tool call never runs them itself (see [`open_index`]).
+/// Plugin users get the server pinned to the plugin's release, often newer than the app they
+/// have: opening that older app would not upgrade the index, so the notice names the version.
+fn index_behind_notice() -> String {
+    format!(
+        "The index needs an upgrade: update the Callimachus app to {SERVER_VERSION} and open \
+         it once"
+    )
+}
+
+/// Every tool's answer while a newer Callimachus has upgraded the index past this server.
+/// Updating the package does not replace the running process, hence the restart. `app` is
+/// the version that upgraded the index, when the index recorded one newer than this server.
+fn index_ahead_notice(app: Option<&str>) -> String {
+    let target = app.unwrap_or("the latest version");
+    format!("This MCP server is older than the index: update callimachus-mcp to {target} and restart your agent")
+}
+
 /// The server's own usage guidance, sent once at initialize. Kept under 400 chars.
 const INSTRUCTIONS: &str = "Local index of the user's past AI coding sessions. Project memory \
 may already be in context via CLAUDE.md/AGENTS.md or a session hook; if so, skip project_memory \
@@ -103,6 +130,12 @@ struct Callimachus {
     /// Set once the index is seen to contain threads, so the empty-index probe stops running.
     /// An index never goes back to empty in practice, so this never needs to reset.
     has_threads: AtomicBool,
+    /// While `conn` is the read-only stand-in [`open_index`] opens for an index at another
+    /// schema: the path to reopen writable once the schema matches (the app upgraded it).
+    reopen: Mutex<Option<PathBuf>>,
+    /// `ledger.jsonl` next to the open index (None in memory): every answered tool call is
+    /// counted there for the Stats tab. Local only, never telemetry (`ledger.rs`).
+    ledger: Option<std::path::PathBuf>,
     tool_router: ToolRouter<Callimachus>,
     prompt_router: PromptRouter<Callimachus>,
 }
@@ -449,6 +482,7 @@ impl Callimachus {
         for route in tool_router.map.values_mut() {
             route.attr.input_schema = slim_input_schema(&route.attr.input_schema);
         }
+        let ledger = crate::ledger::path_for_conn(&conn);
         Self {
             conn: Arc::new(Mutex::new(conn)),
             // Never downloads: the server runs inside the user's repo (an agent's CWD) and
@@ -456,6 +490,8 @@ impl Callimachus {
             // downloaded, semantic arms fall back to keyword search.
             embedder: Arc::new(embed::Embedder::cached_only()),
             has_threads: AtomicBool::new(false),
+            reopen: Mutex::new(None),
+            ledger,
             tool_router,
             prompt_router: Self::prompt_router(),
         }
@@ -1074,10 +1110,20 @@ impl Callimachus {
         self.conn.lock().map_err(internal)
     }
 
-    /// The empty-index guidance as a tool result, or None once the index has real threads.
-    /// The synthetic "Recorded memory" threads that record_* creates don't count: they would
-    /// otherwise flip a never-indexed server to "has data" after one agent write.
+    /// The guidance every tool answers with instead of results ([`Self::index_notice`]), as a
+    /// tool result.
     fn empty_index_notice(&self) -> Result<Option<CallToolResult>, ErrorData> {
+        Ok(self.index_notice()?.map(text_result))
+    }
+
+    /// Why the index can't answer yet, or None when it can: a schema this binary doesn't match
+    /// ([`Self::schema_notice`]), else no indexed threads. The synthetic "Recorded memory"
+    /// threads that record_* creates don't count: they would otherwise flip a never-indexed
+    /// server to "has data" after one agent write.
+    fn index_notice(&self) -> Result<Option<String>, ErrorData> {
+        if let Some(notice) = self.schema_notice()? {
+            return Ok(Some(notice));
+        }
         if self.has_threads.load(Ordering::Relaxed) {
             return Ok(None);
         }
@@ -1093,7 +1139,51 @@ impl Callimachus {
             self.has_threads.store(true, Ordering::Relaxed);
             Ok(None)
         } else {
-            Ok(Some(text_result(EMPTY_INDEX_NOTICE.to_string())))
+            Ok(Some(EMPTY_INDEX_NOTICE.to_string()))
+        }
+    }
+
+    /// [`index_behind_notice`] or [`index_ahead_notice`] while the index's schema is not this
+    /// binary's. Checked on every call, not only at startup: the app can upgrade the index
+    /// under a running server (an app update while an agent session stays open), and a server
+    /// that started on the stand-in gets its writable connection back once the schema matches.
+    fn schema_notice(&self) -> Result<Option<String>, ErrorData> {
+        let conn = self.lock()?;
+        let pending = crate::db::schema_pending(&conn).map_err(internal)?;
+        Ok(match pending {
+            0 => {
+                drop(conn);
+                self.reopen_writable();
+                None
+            }
+            p if p > 0 => Some(index_behind_notice()),
+            _ => Some(index_ahead_notice(newer_app_version(&conn).as_deref())),
+        })
+    }
+
+    /// Whether a tool's answer goes in the value ledger: a real answer, not a tool error or
+    /// one of the [`Self::index_notice`] answers (no threads yet, or a version skew), none of
+    /// which helped the agent. Checked after the call, so a schema the app fixed in between
+    /// costs one uncounted call at most.
+    fn counts_as_help(&self, result: &CallToolResult) -> bool {
+        result.is_error != Some(true) && matches!(self.index_notice(), Ok(None))
+    }
+
+    /// Swap the read-only stand-in for a writable connection, once. A failed reopen (a lock
+    /// held past the wait) leaves the stand-in for the next call to retry; reads still work.
+    fn reopen_writable(&self) {
+        let Ok(mut reopen) = self.reopen.lock() else {
+            return;
+        };
+        let Some(path) = reopen.as_deref() else {
+            return;
+        };
+        let Ok(fresh) = crate::db::open_sidecar_current_long_lived(path) else {
+            return;
+        };
+        if let Ok(mut conn) = self.conn.lock() {
+            *conn = fresh;
+            *reopen = None;
         }
     }
 
@@ -1119,9 +1209,14 @@ impl Callimachus {
         if text.is_empty() {
             return Err(ErrorData::invalid_params("text is required", None));
         }
+        // Never write into an index at another schema: the stand-in is read-only, and its
+        // columns may not be the ones this binary writes.
+        if let Some(notice) = self.schema_notice()? {
+            return Ok(text_result(notice));
+        }
         // Writes still go through on an empty index (the note persists and shows up once the
         // app indexes), but the agent should learn that recall has nothing to search yet.
-        let empty_notice = self.empty_index_notice()?.is_some();
+        let empty_notice = self.index_notice()?.is_some();
         let project = project_key_or_cwd(args.project);
         let now = chrono::Utc::now().timestamp();
         let mut conn = self.lock()?;
@@ -1268,8 +1363,8 @@ impl Callimachus {
     /// markdown project_memory returns, at the MCP budget.
     fn read_memory_resource(&self, uri: &str) -> Result<String, ErrorData> {
         let project = memory_uri_project(uri)?;
-        if self.empty_index_notice()?.is_some() {
-            return Ok(EMPTY_INDEX_NOTICE.to_string());
+        if let Some(notice) = self.index_notice()? {
+            return Ok(notice);
         }
         let conn = self.lock()?;
         memory_markdown(
@@ -1906,6 +2001,27 @@ impl ServerHandler for Callimachus {
         ))
     }
 
+    // Written out (the macro generates this otherwise) to count each answered call in the
+    // value ledger ([`Callimachus::counts_as_help`]).
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::CallToolResponse, ErrorData> {
+        let name = request.name.clone();
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        let response = self.tool_router.call(tcc).await;
+        if let (Some(ledger), Ok(rmcp::model::CallToolResponse::Complete(result))) =
+            (&self.ledger, &response)
+        {
+            if self.counts_as_help(result) {
+                let now = chrono::Utc::now().timestamp();
+                crate::ledger::append_to(ledger, crate::ledger::Kind::Mcp, &name, now);
+            }
+        }
+        response
+    }
+
     async fn list_resources(
         &self,
         _request: Option<PaginatedRequestParams>,
@@ -1940,9 +2056,11 @@ impl ServerHandler for Callimachus {
 }
 
 /// Serve the MCP protocol over stdio against `conn`, until the client disconnects. Only
-/// [`serve_stdio`] calls it, after opening the index and building the runtime.
-async fn serve(conn: Connection) -> anyhow::Result<()> {
+/// [`serve_stdio`] calls it, after opening the index and building the runtime. `reopen` is
+/// [`open_index`]'s stand-in path, if any.
+async fn serve(conn: Connection, reopen: Option<PathBuf>) -> anyhow::Result<()> {
     let server = Callimachus::new(conn);
+    *server.reopen.lock().map_err(|e| anyhow::anyhow!("{e}"))? = reopen;
     // Drop the model a minute after the last semantic call instead of holding about 390 MB
     // for the whole agent session. Ends with the runtime (`shutdown_background`).
     let embedder = Arc::clone(&server.embedder);
@@ -1996,11 +2114,8 @@ pub fn serve_stdio(prog: &str, index_path: &Path) -> i32 {
         }
     };
     let result = rt.block_on(async {
-        // Writable: the server has write tools (complete_todo, record_*). WAL + busy_timeout
-        // let it coexist with the desktop app's writer; the sidecar open also waits out an
-        // index upgrade another process is running.
-        let conn = crate::db::open_sidecar(index_path)?;
-        serve(conn).await
+        let (conn, reopen) = open_index(prog, index_path)?;
+        serve(conn, reopen).await
     });
     // Don't wait on tokio's stdin reader: it is a blocking read that can't be cancelled, so a
     // plain drop could hang an exit that didn't come from stdin EOF. The process ends next.
@@ -2018,6 +2133,45 @@ pub fn serve_stdio(prog: &str, index_path: &Path) -> i32 {
             1
         }
     }
+}
+
+/// The server's connection: writable, since it has write tools (complete_todo, record_*), and
+/// WAL + busy_timeout let it coexist with the desktop app's writer.
+///
+/// An existing index opens only at this binary's schema, never migrating it. The server is
+/// often another version than the app (npx fetches the latest release; the app's own `--mcp`
+/// process outlives an app update), and an upgrade run from here would lock the older app out
+/// of its index, or hold the write lock for tens of seconds inside an agent's tool call. On a
+/// mismatch it serves from a read-only stand-in and every tool answers with what to update
+/// ([`Callimachus::schema_notice`]). A missing index is still created and migrated, as
+/// before: there is no app index that a fresh file could lock out.
+fn open_index(prog: &str, index_path: &Path) -> anyhow::Result<(Connection, Option<PathBuf>)> {
+    if !index_path.exists() {
+        return Ok((crate::db::open_sidecar(index_path)?, None));
+    }
+    match crate::db::open_sidecar_current_long_lived(index_path) {
+        Ok(conn) => Ok((conn, None)),
+        Err(e) if crate::db::is_schema_mismatch(&e) => {
+            eprintln!("{prog}: {e:#}; every tool says how to fix it until the schema matches");
+            Ok((
+                crate::db::open_readonly(index_path)?,
+                Some(index_path.to_path_buf()),
+            ))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// The app version recorded in the index ([`APP_VERSION_KEY`]) when it is newer than this
+/// server, else None (unrecorded, unparseable, or not newer: then the notice falls back to
+/// "the latest version" rather than naming a release that would not help).
+fn newer_app_version(conn: &Connection) -> Option<String> {
+    let recorded = crate::knowledge::app_config::get_nonblank(conn, APP_VERSION_KEY).ok()??;
+    let parse = |v: &str| -> Option<Vec<u64>> {
+        let core = v.split(['-', '+']).next()?;
+        core.split('.').map(|n| n.parse().ok()).collect()
+    };
+    (parse(&recorded)? > parse(SERVER_VERSION)?).then_some(recorded)
 }
 
 /// The server-log line for a missing index, or None when `index_path` exists. Only the
@@ -3230,5 +3384,159 @@ mod tests {
             checked > 0,
             "no docs found to cross-check: are the paths right?"
         );
+    }
+    /// A migrated index file at a fresh temp path, with its schema version moved by `shift`
+    /// (positive: newer than this binary, negative: older), as an update would leave it.
+    fn index_at_schema(shift: i32) -> PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "calli_mcp_skew_{}_{}.db",
+            std::process::id(),
+            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        for ext in ["db", "db-wal", "db-shm"] {
+            let _ = std::fs::remove_file(p.with_extension(ext));
+        }
+        let conn = crate::db::open(&p).unwrap();
+        let v: i32 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        conn.pragma_update(None, "user_version", v + shift).unwrap();
+        p
+    }
+
+    fn user_version(p: &Path) -> i32 {
+        crate::db::open_readonly(p)
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    async fn search_text(srv: &Callimachus) -> String {
+        text_of(
+            &srv.search_threads(Parameters(SearchArgs {
+                query: "anything".into(),
+                sources: vec![],
+                hybrid: false,
+                include_subagents: false,
+                limit: None,
+            }))
+            .await
+            .unwrap(),
+        )
+    }
+
+    async fn record_text(srv: &Callimachus) -> String {
+        text_of(
+            &srv.record_decision(Parameters(RememberArgs {
+                text: "use sqlite".into(),
+                project: Some("/proj/skew".into()),
+                rationale: None,
+            }))
+            .await
+            .unwrap(),
+        )
+    }
+
+    /// Only a recorded app version newer than this server is named in the ahead notice.
+    #[test]
+    fn the_ahead_notice_names_only_a_newer_recorded_app_version() {
+        let conn = empty_db();
+        assert_eq!(newer_app_version(&conn), None, "unrecorded");
+        for (recorded, named) in [
+            ("999.0.0", true),
+            ("999.0.0-rc.1", true),
+            (SERVER_VERSION, false),
+            ("0.0.1", false),
+            ("not a version", false),
+        ] {
+            crate::knowledge::app_config::put(&conn, APP_VERSION_KEY, recorded).unwrap();
+            assert_eq!(newer_app_version(&conn).is_some(), named, "{recorded}");
+        }
+    }
+
+    /// The value ledger counts real answers only: never the empty-index notice, never a
+    /// tool error.
+    #[test]
+    fn only_real_answers_count_in_the_ledger() {
+        let srv = Callimachus::new(empty_db());
+        assert!(!srv.counts_as_help(&text_result(EMPTY_INDEX_NOTICE.to_string())));
+        let srv = seeded_server();
+        assert!(srv.counts_as_help(&text_result("hits".to_string())));
+        let mut failed = text_result("boom".to_string());
+        failed.is_error = Some(true);
+        assert!(!srv.counts_as_help(&failed));
+    }
+
+    fn served(p: &Path) -> Callimachus {
+        let (conn, reopen) = open_index("test", p).unwrap();
+        let srv = Callimachus::new(conn);
+        *srv.reopen.lock().unwrap() = reopen;
+        srv
+    }
+
+    /// An index the app has not upgraded yet: every tool (reads, writes, the resource) says to
+    /// open the app, the server never migrates it, and once the app has upgraded it the next
+    /// call works on a writable connection again.
+    #[tokio::test]
+    async fn behind_schema_answers_with_the_upgrade_notice_and_never_migrates() {
+        let p = index_at_schema(-1);
+        let before = user_version(&p);
+        let srv = served(&p);
+        let behind = index_behind_notice();
+        assert!(behind.contains(&format!("update the Callimachus app to {SERVER_VERSION}")));
+        assert_eq!(search_text(&srv).await, behind);
+        assert_eq!(record_text(&srv).await, behind);
+        assert_eq!(
+            srv.read_memory_resource("callimachus://memory/proj")
+                .unwrap(),
+            behind
+        );
+        assert!(
+            !srv.counts_as_help(&text_result(behind.clone())),
+            "a skew notice never counts in the ledger"
+        );
+        assert_eq!(user_version(&p), before, "a tool call must never migrate");
+
+        // The app runs the upgrade (the schema is already there: only the version moved).
+        rusqlite::Connection::open(&p)
+            .unwrap()
+            .pragma_update(None, "user_version", before + 1)
+            .unwrap();
+        assert!(record_text(&srv).await.starts_with("Recorded decision"));
+        assert!(
+            srv.reopen.lock().unwrap().is_none(),
+            "back on a writable connection"
+        );
+    }
+
+    /// An index a newer Callimachus upgraded: every tool says to update this server, and the
+    /// check runs per call, so an upgrade under a running server is caught too.
+    #[tokio::test]
+    async fn ahead_schema_answers_with_the_update_notice() {
+        let p = index_at_schema(1);
+        let before = user_version(&p);
+        let srv = served(&p);
+        let ahead = index_ahead_notice(None);
+        assert!(
+            ahead.ends_with("update callimachus-mcp to the latest version and restart your agent")
+        );
+        assert_eq!(search_text(&srv).await, ahead);
+        assert_eq!(record_text(&srv).await, ahead);
+        assert_eq!(user_version(&p), before);
+        assert!(!srv.counts_as_help(&text_result(ahead.clone())));
+
+        let current = index_at_schema(0);
+        let srv = served(&current);
+        assert!(srv.reopen.lock().unwrap().is_none());
+        assert_ne!(search_text(&srv).await, ahead);
+        // The app that upgraded the index recorded its version: the notice names it.
+        crate::knowledge::app_config::put(&srv.lock().unwrap(), APP_VERSION_KEY, "999.0.0")
+            .unwrap();
+        srv.lock()
+            .unwrap()
+            .pragma_update(None, "user_version", user_version(&current) + 1)
+            .unwrap();
+        assert_eq!(search_text(&srv).await, index_ahead_notice(Some("999.0.0")));
+        assert!(index_ahead_notice(Some("999.0.0")).contains("callimachus-mcp to 999.0.0 and"));
     }
 }

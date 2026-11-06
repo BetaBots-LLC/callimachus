@@ -8,7 +8,8 @@
 //! default Obsidian vault for `cal export`.
 
 use crate::{
-    agent, context, cost, db, embed, export, gitlink, issues, knowledge, search, secrets, snapshot,
+    agent, context, cost, db, embed, export, gitlink, issues, knowledge, ledger, search, secrets,
+    snapshot,
 };
 use rusqlite::Connection;
 use std::borrow::Cow;
@@ -115,6 +116,7 @@ USAGE:
                                 the hook stays silent there
   cal hook --mute|--unmute [<path>]
                                 turn the recent-sessions digest off / on for one repo
+                                (every agent's hook honors it)
   cal agents [<project>] [-o FILE]
                                 write/refresh the memory block in AGENTS.md (or -o
                                 CLAUDE.md) so any agent reading it opens with the memory
@@ -140,6 +142,7 @@ OPTIONS:
   -y, --hybrid          fuse keyword + on-device semantic search
   -n, --limit N         max results (default 20; todos 50, files 40; hook: per kind)
       --budget CHARS    max chars `hook` prints (default 6000)
+      --for AGENT       hook protocol: claude (default), codex or gemini
   -V, --vault DIR       Obsidian vault dir for `export` (else CALLIMACHUS_VAULT)
   -o, --out FILE        write `export` output to FILE instead of a vault/stdout
   -S, --synthesize      prepend an LLM summary / decisions / gotchas / TODOs
@@ -305,6 +308,8 @@ struct Opts {
     because: Option<String>,
     /// `hook`: max chars to print.
     budget: Option<usize>,
+    /// `--for`: which agent's hook protocol a hook command speaks (see [`HookAgent`]).
+    for_agent: Option<String>,
     /// `--raw`: print stored text as is instead of redacting secrets (see [`Opts::shown`]).
     raw: bool,
     positional: Vec<String>,
@@ -369,6 +374,7 @@ fn parse(args: &[String]) -> anyhow::Result<Opts> {
                         .map_err(|_| anyhow::anyhow!("--budget needs a number of chars"))?,
                 )
             }
+            "--for" => o.for_agent = Some(next(&mut it, "--for")?),
             "--starred" => o.starred = true,
             "--off" => o.off = true,
             "--json" => o.json = true,
@@ -851,10 +857,11 @@ fn cmd_hook(args: &[String]) -> anyhow::Result<()> {
         .cloned()
         .collect();
     let o = parse(&rest)?;
+    let agent = HookAgent::from_opts(&o)?;
     match action.as_deref() {
         Some("--mute") => return cmd_hook_mute(&o, true),
         Some("--unmute") => return cmd_hook_mute(&o, false),
-        Some("--explain") => return cmd_hook_explain(&o),
+        Some("--explain") => return cmd_hook_explain(&o, agent),
         _ => {}
     }
     let payload = read_hook_payload();
@@ -870,6 +877,7 @@ fn cmd_hook(args: &[String]) -> anyhow::Result<()> {
         knowledge::project_key(&o.positional.join(" "))
     };
     let req = HookRequest {
+        agent,
         source,
         cwd: &cwd,
         project: &project,
@@ -877,9 +885,90 @@ fn cmd_hook(args: &[String]) -> anyhow::Result<()> {
         max_chars: o.budget,
     };
     if let HookOutcome::Print(text) = hook_outcome(&req, &db::default_index_path())? {
-        println!("{text}");
+        println!("{}", hook_stdout(agent, &text));
+        if counts_as_session(source) {
+            ledger::append(hook_ledger_kind(&text), &project);
+        }
     }
     Ok(())
+}
+
+/// Whether an injection counts in the value ledger, whose Stats line reads "sessions that
+/// started with injected memory": a new session (`startup`) or a fresh context (`clear`). A
+/// `compact` refresher re-injects into a session already counted, so three compactions would
+/// otherwise count one session four times.
+fn counts_as_session(source: &str) -> bool {
+    matches!(source, "startup" | "clear")
+}
+
+/// The agent whose hook protocol a hook command speaks (`--for`, default `claude`). The
+/// memory and digest are the same for all three; what differs is the stdout envelope, the
+/// context files that may already carry the managed block, whether harvested Claude Code
+/// memory is left out, and the prefix a SessionEnd queues the session under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HookAgent {
+    Claude,
+    Codex,
+    Gemini,
+}
+
+impl HookAgent {
+    fn from_opts(o: &Opts) -> anyhow::Result<Self> {
+        match o.for_agent.as_deref() {
+            None | Some("claude") => Ok(Self::Claude),
+            Some("codex") => Ok(Self::Codex),
+            Some("gemini") => Ok(Self::Gemini),
+            Some(other) => anyhow::bail!("--for takes claude, codex or gemini, not '{other}'"),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Claude => "Claude Code",
+            Self::Codex => "Codex",
+            Self::Gemini => "Gemini CLI",
+        }
+    }
+
+    /// The `knowledge::enqueue_distill_priority` reference prefix for this agent's sessions.
+    fn session_prefix(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::Gemini => "gemini",
+        }
+    }
+}
+
+/// What a SessionStart hook prints for `text`, per agent. Claude Code adds plain stdout as
+/// context. Codex does too (developers.openai.com/codex/hooks: plain stdout is added as
+/// developer context for SessionStart), and plain is the safe choice there: Codex runs hook
+/// commands under a login shell (`$SHELL -lc`, command_runner.rs `build_command`), so
+/// anything the user's profile prints lands on stdout ahead of ours. With its JSON envelope
+/// that noise fails Codex's `looks_like_json` check and the escaped envelope itself would be
+/// injected; plain text only gains the noise in front. Gemini CLI parses stdout as exactly
+/// one JSON object (plain text becomes a `systemMessage` shown to the user, not context), so
+/// nothing else may ever reach its stdout; the silent paths print nothing, which Gemini
+/// accepts as a success with no output (hookRunner.ts: an empty stdout skips parsing,
+/// verified 2026-11-06).
+fn hook_stdout(agent: HookAgent, text: &str) -> String {
+    match agent {
+        HookAgent::Claude | HookAgent::Codex => text.to_string(),
+        HookAgent::Gemini => serde_json::json!({
+            "hookSpecificOutput": { "additionalContext": text }
+        })
+        .to_string(),
+    }
+}
+
+/// Which ledger kind an injected hook output counts as: the digest alone (a repo with no
+/// memory yet) or project memory (facts, with or without a digest appended).
+fn hook_ledger_kind(text: &str) -> ledger::Kind {
+    if text.starts_with(export::DIGEST_HEADING) {
+        ledger::Kind::Digest
+    } else {
+        ledger::Kind::Hook
+    }
 }
 
 /// `cal hook` flags a person types, so their errors print instead of being swallowed.
@@ -895,6 +984,8 @@ fn is_interactive_hook(args: &[String]) -> bool {
 
 /// What one SessionStart hook run is asked to do.
 struct HookRequest<'a> {
+    /// Whose hook this is: decides the context files checked and the harvested-memory rule.
+    agent: HookAgent,
     source: &'a str,
     /// The session's working directory: decides which context files Claude Code loads.
     cwd: &'a std::path::Path,
@@ -933,10 +1024,11 @@ fn hook_outcome(req: &HookRequest, index: &std::path::Path) -> anyhow::Result<Ho
             "CALLIMACHUS_SKIP_HOOK=1 is set (a launcher already put the memory in context)".into(),
         ));
     }
-    if let Some(file) = managed_block_source(&claude_md_dirs(req.cwd)) {
+    if let Some(file) = managed_block_for(req.agent, req.cwd) {
         return Ok(HookOutcome::Silent(format!(
-            "managed block found in {} (Claude Code already loads this memory)",
-            file.display()
+            "managed block found in {} ({} already loads this memory)",
+            file.display(),
+            req.agent.label()
         )));
     }
     // Never create an index from inside a hook.
@@ -975,13 +1067,22 @@ fn hook_output(conn: &Connection, req: &HookRequest) -> anyhow::Result<HookOutco
     // Claude Code loads its own auto memory every session; injecting the harvested copy
     // would say the same thing twice. MCP, `cal memory` and the Projects tab keep them.
     // Filtered in SQL, so a repo full of recent auto memories still fills the window with
-    // its other facts.
-    let mem = knowledge::get_project_memory_facts_excluding(
-        conn,
-        req.project,
-        per_kind,
-        knowledge::harvest::EXTRACTOR_CLAUDE_MEMORY,
-    )?;
+    // its other facts. Codex and Gemini CLI never see Claude's auto memory, so for them the
+    // harvested facts are the point, labeled with where they came from.
+    let mem = if req.agent == HookAgent::Claude {
+        knowledge::get_project_memory_facts_excluding(
+            conn,
+            req.project,
+            per_kind,
+            knowledge::harvest::EXTRACTOR_CLAUDE_MEMORY,
+        )?
+    } else {
+        label_harvested(knowledge::get_project_memory_facts(
+            conn,
+            req.project,
+            per_kind,
+        )?)
+    };
     let pinned_todo = mem.open_todos.iter().any(|t| t.pinned);
     let has_facts = !mem.decisions.is_empty() || !mem.gotchas.is_empty() || pinned_todo;
     // A compacted session is its own recent activity: facts only.
@@ -1037,15 +1138,35 @@ fn hook_output(conn: &Connection, req: &HookRequest) -> anyhow::Result<HookOutco
     })
 }
 
+/// Prefix on a harvested Claude Code auto-memory fact in another agent's injection, so the
+/// agent knows it was written for (and by) a different tool.
+const HARVESTED_ORIGIN: &str = "(from Claude Code memory) ";
+
+/// `mem` with each harvested Claude Code memory's text marked with its origin.
+fn label_harvested(mut mem: knowledge::ProjectMemory) -> knowledge::ProjectMemory {
+    for f in mem
+        .decisions
+        .iter_mut()
+        .chain(mem.gotchas.iter_mut())
+        .chain(mem.open_todos.iter_mut())
+        .filter(|f| f.extractor == knowledge::harvest::EXTRACTOR_CLAUDE_MEMORY)
+    {
+        f.text.insert_str(0, HARVESTED_ORIGIN);
+    }
+    mem
+}
+
 /// Claude Code's cap on a hook's injected context, past which the agent sees a preview.
 const HOOK_OUTPUT_CAP: usize = 10_000;
 
-/// `cal hook --explain [path]`: the exact text a `startup` session in `path` (default: the
-/// current directory) would get, then its size, or the one reason it would get nothing.
-fn cmd_hook_explain(o: &Opts) -> anyhow::Result<()> {
+/// `cal hook --explain [path] [--for AGENT]`: the exact text a `startup` session in `path`
+/// (default: the current directory) would get, before the agent's envelope, then its size,
+/// or the one reason it would get nothing.
+fn cmd_hook_explain(o: &Opts, agent: HookAgent) -> anyhow::Result<()> {
     let cwd = hook_target_dir(o)?;
     let project = knowledge::project_key(&cwd.to_string_lossy());
     let req = HookRequest {
+        agent,
         source: "startup",
         cwd: &cwd,
         project: &project,
@@ -1215,6 +1336,167 @@ fn managed_block_source<P: AsRef<std::path::Path>>(dirs: &[P]) -> Option<std::pa
     dirs.iter()
         .map(|d| d.as_ref().join("AGENTS.md"))
         .find(|p| read_small_text(p).is_some_and(|t| t.contains(export::MANAGED_START)))
+}
+
+/// The context file that already carries the managed block for `agent`'s session in `cwd`
+/// (so the hook stays silent instead of injecting the memory twice).
+fn managed_block_for(agent: HookAgent, cwd: &std::path::Path) -> Option<std::path::PathBuf> {
+    match agent {
+        HookAgent::Claude => managed_block_source(&claude_md_dirs(cwd)),
+        HookAgent::Codex => {
+            let global = crate::indexer::codex::codex_root();
+            let names = codex_context_files(global.as_deref());
+            let names: Vec<&str> = names.iter().map(String::as_str).collect();
+            context_block_source(
+                &project_dirs(cwd),
+                global.as_deref(),
+                &names,
+                ContextRule::FirstExisting,
+            )
+        }
+        HookAgent::Gemini => {
+            let global = dirs::home_dir().map(|h| h.join(".gemini"));
+            let names = global
+                .as_deref()
+                .map(gemini_context_files)
+                .unwrap_or_else(|| vec!["GEMINI.md".into()]);
+            let names: Vec<&str> = names.iter().map(String::as_str).collect();
+            context_block_source(
+                &project_dirs(cwd),
+                global.as_deref(),
+                &names,
+                ContextRule::EveryFileWithImports,
+            )
+        }
+    }
+}
+
+/// Codex's instruction files, by precedence: in each dir (and in `CODEX_HOME`) an
+/// `AGENTS.override.md` is read instead of the `AGENTS.md` beside it.
+const CODEX_CONTEXT_FILES: [&str; 2] = ["AGENTS.override.md", "AGENTS.md"];
+
+/// [`CODEX_CONTEXT_FILES`], then the names `project_doc_fallback_filenames` in
+/// `<CODEX_HOME>/config.toml` adds (Codex reads one of those, CLAUDE.md say, in a dir with no
+/// AGENTS.md; `cal agents -o CLAUDE.md` puts the block there).
+fn codex_context_files(codex_home: Option<&std::path::Path>) -> Vec<String> {
+    let mut names: Vec<String> = CODEX_CONTEXT_FILES.iter().map(|n| n.to_string()).collect();
+    let fallbacks = codex_home
+        .and_then(|h| read_small_text(&h.join("config.toml")))
+        .and_then(|t| t.parse::<toml_edit::DocumentMut>().ok())
+        .and_then(|doc| {
+            let list = doc
+                .get("project_doc_fallback_filenames")?
+                .as_array()?
+                .clone();
+            Some(
+                list.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .unwrap_or_default();
+    for name in fallbacks {
+        if !name.is_empty() && !name.contains(['/', '\\']) && !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names
+}
+
+/// Gemini CLI's context file names: `context.fileName` (a string or a list) in the user's
+/// `settings.json`, else `GEMINI.md`. A user who points it at `AGENTS.md` loads the block
+/// `cal agents` writes there. Gemini strips comments from settings.json before parsing, so
+/// a commented file is read the same way.
+fn gemini_context_files(gemini_dir: &std::path::Path) -> Vec<String> {
+    let configured = read_small_text(&gemini_dir.join("settings.json"))
+        .and_then(|t| {
+            serde_json::from_str::<serde_json::Value>(&t)
+                .ok()
+                .or_else(|| serde_json::from_str(&crate::integration::strip_json_comments(&t)).ok())
+        })
+        .and_then(|v| v.get("context")?.get("fileName").cloned());
+    let names: Vec<String> = match configured {
+        Some(serde_json::Value::String(s)) => vec![s],
+        Some(serde_json::Value::Array(a)) => a
+            .iter()
+            .filter_map(|x| x.as_str().map(str::to_string))
+            .collect(),
+        _ => Vec::new(),
+    };
+    let names: Vec<String> = names
+        .into_iter()
+        .filter(|n| !n.is_empty() && !n.contains(['/', '\\']))
+        .collect();
+    if names.is_empty() {
+        vec!["GEMINI.md".into()]
+    } else {
+        names
+    }
+}
+
+/// The dirs Codex and Gemini CLI read project instructions from for a session in `cwd`: cwd
+/// up to its git root (both stop there), or cwd alone outside a repo. Resolved spellings,
+/// since [`git_root_of`] returns one.
+fn project_dirs(cwd: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let start = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let root = git_root_of(&start);
+    let mut dirs = Vec::new();
+    for dir in start.ancestors() {
+        dirs.push(dir.to_path_buf());
+        if dir == root {
+            return dirs;
+        }
+    }
+    // Unreachable in practice (the root is an ancestor of `start`); cwd alone is safe.
+    dirs.truncate(1);
+    dirs
+}
+
+/// How an agent picks among its context file names in one dir.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContextRule {
+    /// Codex: only the first existing name counts (`AGENTS.override.md` hides `AGENTS.md`).
+    FirstExisting,
+    /// Gemini CLI: every listed name that exists is loaded (`memoryDiscovery.ts`
+    /// `findUpwardGeminiFiles`), with its `@file` imports expanded (`processImports`), so a
+    /// GEMINI.md holding only `@AGENTS.md` loads the block `cal agents` wrote in AGENTS.md.
+    EveryFileWithImports,
+}
+
+/// The context file holding the managed block among `names` in `dirs` and the agent's global
+/// dir, read the way `rule` says the agent reads them.
+fn context_block_source(
+    dirs: &[std::path::PathBuf],
+    global: Option<&std::path::Path>,
+    names: &[&str],
+    rule: ContextRule,
+) -> Option<std::path::PathBuf> {
+    for dir in dirs.iter().map(std::path::PathBuf::as_path).chain(global) {
+        let existing = names.iter().map(|n| dir.join(n)).filter(|p| p.is_file());
+        let files: Vec<std::path::PathBuf> = match rule {
+            ContextRule::FirstExisting => existing.take(1).collect(),
+            ContextRule::EveryFileWithImports => existing.collect(),
+        };
+        for path in files {
+            let Some(text) = read_small_text(&path) else {
+                continue;
+            };
+            if text.contains(export::MANAGED_START) {
+                return Some(path);
+            }
+            if rule == ContextRule::EveryFileWithImports {
+                // The same import walk as the CLAUDE.md check in `managed_block_source`.
+                let base = path.parent().unwrap_or(dir);
+                for import in claude_md_imports(&text).into_iter().take(10) {
+                    let target = resolve_import(base, import);
+                    if read_small_text(&target).is_some_and(|t| t.contains(export::MANAGED_START)) {
+                        return Some(target);
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 /// `@path` imports in a CLAUDE.md (`@AGENTS.md`, `@docs/notes.md`, `@~/x.md`). Only tokens
@@ -1734,6 +2016,7 @@ fn cmd_stats(args: &[String]) -> anyhow::Result<()> {
         s.embedded, s.embeddable
     );
     println!("range: {} → {}", fmt_time(s.earliest), fmt_time(s.latest));
+    println!("{}", helped_line(&conn));
 
     println!("\nby source:");
     for src in &s.per_source {
@@ -1755,6 +2038,20 @@ fn cmd_stats(args: &[String]) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// `cal stats`' value line from the ledger (`ledger.rs`): hook injections, recall hits and
+/// MCP tool calls over the last 7 local days, rolled-up days plus lines the app has not
+/// folded yet.
+fn helped_line(conn: &Connection) -> String {
+    let now = chrono::Utc::now().timestamp();
+    let n = ledger::summary(conn, ledger::path_for_conn(conn).as_deref(), now)
+        .map(|s| s.week.total())
+        .unwrap_or(0);
+    format!(
+        "helped {n} {} in the last 7 days",
+        if n == 1 { "time" } else { "times" }
+    )
 }
 
 fn cmd_export(args: &[String]) -> anyhow::Result<()> {
@@ -1952,10 +2249,17 @@ fn run_agent_here(
 /// `claude-compact`), so the session's gist is in memory without a distill. Best-effort and
 /// SILENT (`run_hook_silently`): a hook must never break the agent loop, and PreCompact's
 /// plain stdout becomes compaction instructions, so it prints nothing.
-fn cmd_snapshot_hook(_args: &[String]) -> anyhow::Result<()> {
+fn cmd_snapshot_hook(args: &[String]) -> anyhow::Result<()> {
+    let agent = HookAgent::from_opts(&parse(args)?)?;
     let Some(v) = read_hook_payload() else {
         return Ok(());
     };
+    match agent {
+        HookAgent::Claude => {}
+        HookAgent::Codex => return codex_snapshot_hook(&v),
+        // Not installed for Gemini CLI (its PreCompress hook is not wired).
+        HookAgent::Gemini => return Ok(()),
+    }
     let event = v
         .get("hook_event_name")
         .and_then(|x| x.as_str())
@@ -2006,6 +2310,60 @@ fn cmd_snapshot_hook(_args: &[String]) -> anyhow::Result<()> {
     snapshot
 }
 
+/// `cal snapshot-hook --for codex`, Codex's PreCompact hook: the same rolling snapshot as
+/// Claude's, of the codex thread the payload's `transcript_path` (a
+/// `rollout-<timestamp>-<session id>.jsonl` file) or `session_id` names. Codex's PreCompact
+/// payload carries no compaction summary (only `trigger`), so there is none to store, and its
+/// plain stdout is ignored; it prints nothing anyway.
+fn codex_snapshot_hook(v: &serde_json::Value) -> anyhow::Result<()> {
+    let ids = codex_session_ids(v);
+    if ids.is_empty() || !db::default_index_path().exists() {
+        return Ok(());
+    }
+    let conn = open_hook_db_write(std::time::Duration::from_secs(2))?;
+    for id in &ids {
+        if let Some(tid) = knowledge::priority::codex_thread_for_session(&conn, id)? {
+            return snapshot::create_rolling_auto(&conn, tid, "PreCompact").map(|_| ());
+        }
+    }
+    Ok(())
+}
+
+/// The Codex session ids a hook payload names, most specific first: the uuid ending the
+/// rollout file name in `transcript_path`, then `session_id`.
+fn codex_session_ids(v: &serde_json::Value) -> Vec<String> {
+    let from_transcript = v
+        .get("transcript_path")
+        .and_then(|x| x.as_str())
+        .and_then(|p| {
+            std::path::Path::new(p)
+                .file_stem()?
+                .to_str()
+                .map(str::to_string)
+        })
+        .and_then(|stem| {
+            let tail = stem.get(stem.len().checked_sub(36)?..)?;
+            is_uuid(tail).then(|| tail.to_string())
+        });
+    let from_payload = v
+        .get("session_id")
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let mut ids: Vec<String> = from_transcript.into_iter().chain(from_payload).collect();
+    ids.dedup();
+    ids
+}
+
+/// `8-4-4-4-12` hex with dashes, the shape of a Codex session id.
+fn is_uuid(s: &str) -> bool {
+    s.len() == 36
+        && s.char_indices().all(|(i, c)| match i {
+            8 | 13 | 18 | 23 => c == '-',
+            _ => c.is_ascii_hexdigit(),
+        })
+}
+
 /// Internal hook target for Claude Code's SessionEnd event: puts the session that just
 /// ended at the front of the auto-distill queue (`knowledge::enqueue_distill_priority`), so
 /// its memory lands minutes after it ends instead of after the 30-minute idle wait. The app
@@ -2013,7 +2371,12 @@ fn cmd_snapshot_hook(_args: &[String]) -> anyhow::Result<()> {
 /// one `app_config` row. SessionEnd has no `transcript_path` and a 1.5 s budget shared by
 /// every SessionEnd hook, so it waits at most 1 s for the lock, skips the write when memory
 /// is off, and exits 0 silently on anything else.
-fn cmd_session_end(_args: &[String]) -> anyhow::Result<()> {
+///
+/// `--for codex|gemini` is the same hook for Codex (SessionEnd: default timeout 1 s, max 3 s)
+/// and Gemini CLI (SessionEnd is not awaited), queued as `codex:<session_id>` /
+/// `gemini:<session_id>`.
+fn cmd_session_end(args: &[String]) -> anyhow::Result<()> {
+    let agent = HookAgent::from_opts(&parse(args)?)?;
     let Some(v) = read_hook_payload() else {
         return Ok(());
     };
@@ -2022,11 +2385,16 @@ fn cmd_session_end(_args: &[String]) -> anyhow::Result<()> {
         return Ok(());
     }
     let conn = open_hook_db_write(std::time::Duration::from_secs(1))?;
-    session_end(&conn, &v, chrono::Utc::now().timestamp())
+    session_end(&conn, &v, chrono::Utc::now().timestamp(), agent)
 }
 
 /// [`cmd_session_end`] after the payload is read and the index opened.
-fn session_end(conn: &Connection, payload: &serde_json::Value, now: i64) -> anyhow::Result<()> {
+fn session_end(
+    conn: &Connection,
+    payload: &serde_json::Value,
+    now: i64,
+    agent: HookAgent,
+) -> anyhow::Result<()> {
     let Some(session) = payload
         .get("session_id")
         .and_then(|x| x.as_str())
@@ -2038,7 +2406,7 @@ fn session_end(conn: &Connection, payload: &serde_json::Value, now: i64) -> anyh
     if !cfg.enabled || !cfg.auto_distill {
         return Ok(());
     }
-    knowledge::enqueue_distill_priority(conn, &format!("claude:{session}"), now)
+    knowledge::enqueue_distill_priority(conn, &format!("{}:{session}", agent.session_prefix()), now)
 }
 
 /// Map a Claude Code hook's absolute `transcript_path` back to the indexed thread's
@@ -2138,6 +2506,7 @@ fn cmd_recall_now(_args: &[String]) -> anyhow::Result<()> {
     for h in &hits {
         println!("{}", recall_line(h));
     }
+    ledger::append(ledger::Kind::Recall, project.as_deref().unwrap_or(""));
     Ok(())
 }
 
@@ -2625,6 +2994,7 @@ mod tests {
 
     fn hook_req(source: &str) -> HookRequest<'_> {
         HookRequest {
+            agent: HookAgent::Claude,
             source,
             cwd: std::path::Path::new("/"),
             project: HOOK_PROJ,
@@ -2970,15 +3340,303 @@ mod tests {
         let queue = |conn: &Connection| {
             knowledge::app_config::get(conn, knowledge::priority::PRIORITY_KEY).unwrap()
         };
-        session_end(&conn, &payload, 100).unwrap();
+        session_end(&conn, &payload, 100, HookAgent::Claude).unwrap();
         assert_eq!(queue(&conn), None, "memory off: nothing written");
         knowledge::app_config::put_flag(&conn, "knowledge.enabled", true).unwrap();
         knowledge::set_auto_distill(&conn, true).unwrap();
-        session_end(&conn, &serde_json::json!({ "reason": "exit" }), 100).unwrap();
+        session_end(
+            &conn,
+            &serde_json::json!({ "reason": "exit" }),
+            100,
+            HookAgent::Claude,
+        )
+        .unwrap();
         assert_eq!(queue(&conn), None);
-        session_end(&conn, &payload, 100).unwrap();
+        session_end(&conn, &payload, 100, HookAgent::Claude).unwrap();
         let q = queue(&conn).unwrap();
         assert!(q.contains("\"claude:abc-123\""), "{q}");
+        // Codex and Gemini CLI sessions queue under their own prefix.
+        session_end(&conn, &payload, 101, HookAgent::Codex).unwrap();
+        session_end(&conn, &payload, 102, HookAgent::Gemini).unwrap();
+        let q = queue(&conn).unwrap();
+        assert!(
+            q.contains("\"codex:abc-123\"") && q.contains("\"gemini:abc-123\""),
+            "{q}"
+        );
+    }
+
+    /// `--for` picks the protocol; an unknown agent is an error (a hook swallows it, so
+    /// nothing prints), and the default is Claude.
+    #[test]
+    fn hook_agent_comes_from_the_for_flag() {
+        let agent = |a: &[&str]| HookAgent::from_opts(&parse(&argv(a)).unwrap());
+        assert_eq!(agent(&[]).unwrap(), HookAgent::Claude);
+        assert_eq!(agent(&["--for", "claude"]).unwrap(), HookAgent::Claude);
+        assert_eq!(agent(&["--for", "codex"]).unwrap(), HookAgent::Codex);
+        assert_eq!(agent(&["--for", "gemini"]).unwrap(), HookAgent::Gemini);
+        assert!(agent(&["--for", "cursor"]).is_err());
+        assert!(parse(&argv(&["--for"])).is_err());
+        // Bad flags on a hook still exit 0, silently.
+        assert_eq!(run_and_exit(&argv(&["hook", "--for", "nope"])), 0);
+        assert_eq!(run_and_exit(&argv(&["session-end", "--for", "nope"])), 0);
+    }
+
+    /// Claude's and Codex's stdout is the text itself (Codex runs hooks under a login shell
+    /// whose profile output would break a JSON envelope); Gemini's stdout is exactly one JSON
+    /// object holding the text, and nothing else.
+    #[test]
+    fn hook_stdout_is_wrapped_per_agent() {
+        let text = "## Project memory (x)\n\n- a \"quoted\" fact\n";
+        assert_eq!(hook_stdout(HookAgent::Claude, text), text);
+        assert_eq!(hook_stdout(HookAgent::Codex, text), text);
+
+        let out = hook_stdout(HookAgent::Gemini, text);
+        let mut stream = serde_json::Deserializer::from_str(&out).into_iter::<serde_json::Value>();
+        let only = stream.next().unwrap().unwrap();
+        assert!(
+            stream.next().is_none(),
+            "one JSON value and nothing else: {out}"
+        );
+        assert_eq!(out.trim(), out, "no stray whitespace or text around it");
+        assert_eq!(
+            only,
+            serde_json::json!({ "hookSpecificOutput": { "additionalContext": text } })
+        );
+    }
+
+    /// Every Gemini silent path prints nothing at all (an empty stdout is a success with
+    /// no output for Gemini CLI): the only printing path is a `Print` outcome, wrapped.
+    #[test]
+    fn gemini_silent_paths_print_nothing() {
+        let (conn, _) = hook_conn();
+        let mut req = hook_req("resume");
+        req.agent = HookAgent::Gemini;
+        let missing = std::env::temp_dir().join("calli-no-index-here.db");
+        for source in ["resume", "fork"] {
+            req.source = source;
+            assert!(matches!(
+                hook_outcome(&req, &missing).unwrap(),
+                HookOutcome::Silent(_)
+            ));
+        }
+        req.source = "startup";
+        assert!(matches!(
+            hook_outcome(&req, &missing).unwrap(),
+            HookOutcome::Silent(_)
+        ));
+        req.project = "/Users/me/nothing-here";
+        assert!(matches!(
+            hook_output(&conn, &req).unwrap(),
+            HookOutcome::Silent(_)
+        ));
+        // A bad payload or flag is an error the silent runner swallows before any print.
+        assert_eq!(
+            run_and_exit(&argv(&["hook", "--for", "gemini", "--nope"])),
+            0
+        );
+    }
+
+    /// Codex and Gemini CLI get harvested Claude Code memory (they never load Claude's own
+    /// auto memory), marked with its origin; Claude Code does not.
+    #[test]
+    fn other_agents_get_harvested_memory_with_its_origin() {
+        let (conn, tid) = hook_conn();
+        dts::fact(
+            &conn,
+            tid,
+            "decision",
+            "ship on fridays only",
+            "claude-memory",
+        );
+        let claude = printed(hook_output(&conn, &hook_req("startup")).unwrap());
+        assert!(!claude.contains("fridays"), "{claude}");
+        for agent in [HookAgent::Codex, HookAgent::Gemini] {
+            let mut req = hook_req("startup");
+            req.agent = agent;
+            let out = printed(hook_output(&conn, &req).unwrap());
+            assert!(
+                out.contains("- (from Claude Code memory) ship on fridays only"),
+                "{out}"
+            );
+        }
+    }
+
+    /// Codex reads AGENTS.override.md over AGENTS.md per dir, from cwd up to the git root;
+    /// Gemini reads GEMINI.md (or its configured `context.fileName`). A managed block in a
+    /// file the agent loads silences its hook; one above the git root does not.
+    #[test]
+    fn other_agents_check_their_own_context_files() {
+        let root = temp_dir("ctx-files");
+        let repo = root.join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join("sub")).unwrap();
+        let block = format!("{}\nmemory\n", export::MANAGED_START);
+        std::fs::write(root.join("AGENTS.md"), &block).unwrap(); // above the repo
+        let dirs = project_dirs(&repo.join("sub"));
+        assert_eq!(dirs.len(), 2, "{dirs:?}");
+        assert_eq!(
+            context_block_source(
+                &dirs,
+                None,
+                &CODEX_CONTEXT_FILES,
+                ContextRule::FirstExisting
+            ),
+            None
+        );
+
+        std::fs::write(repo.join("AGENTS.md"), &block).unwrap();
+        assert_eq!(
+            context_block_source(
+                &dirs,
+                None,
+                &CODEX_CONTEXT_FILES,
+                ContextRule::FirstExisting
+            ),
+            Some(dirs[1].join("AGENTS.md"))
+        );
+        // An override beside it wins, and it holds no block.
+        std::fs::write(repo.join("AGENTS.override.md"), "local rules\n").unwrap();
+        assert_eq!(
+            context_block_source(
+                &dirs,
+                None,
+                &CODEX_CONTEXT_FILES,
+                ContextRule::FirstExisting
+            ),
+            None
+        );
+
+        // Gemini: GEMINI.md by default, else what settings.json names.
+        let gem = root.join("gemini-home");
+        std::fs::create_dir_all(&gem).unwrap();
+        assert_eq!(gemini_context_files(&gem), ["GEMINI.md"]);
+        assert_eq!(
+            context_block_source(
+                &dirs,
+                Some(&gem),
+                &["GEMINI.md"],
+                ContextRule::EveryFileWithImports
+            ),
+            None
+        );
+        std::fs::write(
+            gem.join("settings.json"),
+            r#"{"context":{"fileName":["AGENTS.md","GEMINI.md"]}}"#,
+        )
+        .unwrap();
+        assert_eq!(gemini_context_files(&gem), ["AGENTS.md", "GEMINI.md"]);
+        std::fs::write(gem.join("GEMINI.md"), &block).unwrap();
+        assert_eq!(
+            context_block_source(
+                &dirs,
+                Some(&gem),
+                &["GEMINI.md"],
+                ContextRule::EveryFileWithImports
+            ),
+            Some(gem.join("GEMINI.md"))
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Gemini loads every configured name in a dir (not just the first that exists) and
+    /// expands its `@` imports; Codex keeps first-existing-wins, with the fallback names
+    /// from config.toml after AGENTS.md.
+    #[test]
+    fn context_files_follow_each_agents_loading_rules() {
+        let root = temp_dir("ctx-rules");
+        let repo = root.join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let dirs = project_dirs(&repo);
+        let block = format!("{}\nmemory\n", export::MANAGED_START);
+        let gemini = ["AGENTS.md", "GEMINI.md"];
+
+        // A block-less AGENTS.md beside the GEMINI.md that holds the block.
+        std::fs::write(repo.join("AGENTS.md"), "rules\n").unwrap();
+        std::fs::write(repo.join("GEMINI.md"), &block).unwrap();
+        assert_eq!(
+            context_block_source(&dirs, None, &gemini, ContextRule::EveryFileWithImports),
+            Some(dirs[0].join("GEMINI.md"))
+        );
+        assert_eq!(
+            context_block_source(&dirs, None, &gemini, ContextRule::FirstExisting),
+            None,
+            "Codex reads only the first existing name"
+        );
+
+        // GEMINI.md that only imports AGENTS.md, where `cal agents` wrote the block.
+        std::fs::write(repo.join("AGENTS.md"), &block).unwrap();
+        std::fs::write(repo.join("GEMINI.md"), "@AGENTS.md\n").unwrap();
+        assert_eq!(
+            context_block_source(
+                &dirs,
+                None,
+                &["GEMINI.md"],
+                ContextRule::EveryFileWithImports
+            ),
+            Some(dirs[0].join("AGENTS.md"))
+        );
+        assert_eq!(
+            context_block_source(&dirs, None, &["GEMINI.md"], ContextRule::FirstExisting),
+            None
+        );
+
+        // Codex fallback names come after AGENTS.md, in config.toml order.
+        let codex = root.join("codex-home");
+        std::fs::create_dir_all(&codex).unwrap();
+        assert_eq!(codex_context_files(Some(&codex)), CODEX_CONTEXT_FILES);
+        std::fs::write(
+            codex.join("config.toml"),
+            "project_doc_fallback_filenames = [\"CLAUDE.md\", \"AGENTS.md\", \"../x.md\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            codex_context_files(Some(&codex)),
+            ["AGENTS.override.md", "AGENTS.md", "CLAUDE.md"]
+        );
+        std::fs::remove_file(repo.join("AGENTS.md")).unwrap();
+        std::fs::write(repo.join("CLAUDE.md"), &block).unwrap();
+        let names = codex_context_files(Some(&codex));
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        assert_eq!(
+            context_block_source(&dirs, None, &names, ContextRule::FirstExisting),
+            Some(dirs[0].join("CLAUDE.md"))
+        );
+
+        // Gemini's settings.json may carry comments.
+        let gem = root.join("gemini-home");
+        std::fs::create_dir_all(&gem).unwrap();
+        std::fs::write(
+            gem.join("settings.json"),
+            "{\n  // where memory lives\n  \"context\": {/* both */ \"fileName\": [\"AGENTS.md\", \"GEMINI.md\"]}\n}\n",
+        )
+        .unwrap();
+        assert_eq!(gemini_context_files(&gem), ["AGENTS.md", "GEMINI.md"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The ledger counts sessions: a new one or a cleared context, never a compact refresher.
+    #[test]
+    fn only_new_contexts_count_in_the_ledger() {
+        assert!(counts_as_session("startup"));
+        assert!(counts_as_session("clear"));
+        for source in ["compact", "resume", "fork", ""] {
+            assert!(!counts_as_session(source), "{source}");
+        }
+    }
+
+    /// Codex's PreCompact payload names the session by its rollout file and its id.
+    #[test]
+    fn codex_session_ids_come_from_the_rollout_name_then_the_payload() {
+        let uuid = "019dc6b0-998d-7a31-a39d-1229e6b38072";
+        let v = serde_json::json!({
+            "session_id": uuid,
+            "transcript_path": format!("/h/.codex/sessions/2026/04/25/rollout-2026-04-25T15-09-15-{uuid}.jsonl"),
+        });
+        assert_eq!(codex_session_ids(&v), [uuid]);
+        let v = serde_json::json!({ "session_id": "other", "transcript_path": "/x/notes.jsonl" });
+        assert_eq!(codex_session_ids(&v), ["other"]);
+        assert!(codex_session_ids(&serde_json::json!({})).is_empty());
+        assert!(is_uuid(uuid) && !is_uuid("019dc6b0-998d-7a31-a39d-1229e6b3807z"));
     }
 
     /// `cal help` (USAGE) must document every real command, so a new subcommand can't ship

@@ -59,6 +59,17 @@ fn skill_path() -> Result<PathBuf> {
         .join("SKILL.md"))
 }
 
+/// `~/.agents/skills/recall/SKILL.md`: the shared user skills dir Codex, Gemini CLI and other
+/// agents scan besides their own. Written and refreshed even while the Claude Code plugin
+/// replaces Claude's copy; removed with it on uninstall.
+fn shared_skill_path() -> Result<PathBuf> {
+    Ok(home()?
+        .join(".agents")
+        .join("skills")
+        .join("recall")
+        .join("SKILL.md"))
+}
+
 /// `<claude config dir>/settings.json`: Claude Code's user settings (holds `hooks`).
 fn settings_path() -> Result<PathBuf> {
     Ok(claude_config_dir()?.join("settings.json"))
@@ -268,6 +279,9 @@ pub struct IntegrationStatus {
     pub cal_installed: bool,
     /// The app runs from a permanent location, so it can be registered with agents.
     pub exe_stable: bool,
+    /// Claude Code's config dir exists on this machine, so the Claude Code row is worth
+    /// showing at all (the setup checklist hides it otherwise).
+    pub present: bool,
     /// Why it can't be registered from where it runs (e.g. "Move Callimachus to /Applications
     /// first"). Install refuses while this is set.
     pub exe_problem: Option<String>,
@@ -279,6 +293,11 @@ pub struct IntegrationStatus {
     pub path_hint: Option<String>,
     pub skill_path: String,
     pub config_path: String,
+    /// The Callimachus Claude Code plugin (`callimachus@<marketplace>`) is enabled in Claude
+    /// Code's user settings and our `cal` is installed, so the plugin provides the skill, the
+    /// MCP server and the base hooks, and the app installs only `cal` (which the plugin's
+    /// hooks run). See [`plugin_takes_over`].
+    pub plugin_managed: bool,
 }
 
 /// Current integration state. `app_exe` is the running app's executable path
@@ -314,6 +333,9 @@ fn build_status(
         .ok()
         .and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|s| serde_json::from_str::<Value>(&s).ok());
+    // Only while it can take over (see [`plugin_takes_over`]): without `cal` the app keeps
+    // its own install, and Settings says so through `cal_problem`.
+    let plugin_managed = settings.as_ref().is_some_and(plugin_manages) && cal.installed;
     let hook_installed = settings
         .as_ref()
         .is_some_and(|v| event_has_our_hook(v, SESSION_START_HOOK.event, &exe));
@@ -329,6 +351,7 @@ fn build_status(
     };
 
     IntegrationStatus {
+        present: claude_config_dir().map(|d| d.is_dir()).unwrap_or(false),
         skill_installed,
         skill_outdated,
         mcp_registered,
@@ -341,6 +364,282 @@ fn build_status(
         path_hint,
         skill_path: skill.map(|p| p.display().to_string()).unwrap_or_default(),
         config_path: config.map(|p| p.display().to_string()).unwrap_or_default(),
+        plugin_managed,
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The Claude Code plugin
+// ---------------------------------------------------------------------------------------------
+
+/// How Claude Code records the Callimachus plugin in `enabledPlugins`: `<plugin>@<marketplace>`,
+/// both named `callimachus` (plugins/claude-code and .claude-plugin/marketplace.json).
+#[cfg(test)]
+const PLUGIN_ID: &str = "callimachus@callimachus";
+
+/// The plugin part of [`PLUGIN_ID`]. The same plugin installed from a fork's marketplace or a
+/// directory listing (`callimachus@claude-plugins-official`) carries the same hooks and server,
+/// so any marketplace counts.
+const PLUGIN_NAME: &str = "callimachus";
+
+/// True when Claude Code's user settings enable the Callimachus plugin and the plugin can stand
+/// in for the app's own skill, MCP entry and base hooks.
+///
+/// Both at once would double up: the plugin's skill is namespaced (`/callimachus:recall`) next
+/// to the personal `/recall`, both hooks would inject the same memory, and both MCP servers
+/// would start, because Claude Code dedupes a plugin server against a configured one by its
+/// command, and `npx -y callimachus-mcp` is not `<app> --mcp`
+/// (https://code.claude.com/docs/en/mcp, "Scope hierarchy and deduplication").
+///
+/// Unix only: the plugin's hooks run `~/.local/bin/cal` through `sh`, which a Windows install
+/// has neither of (`cal.exe` sits next to the app, and hooks fall back to PowerShell without
+/// Git Bash), so on Windows the app keeps installing everything itself.
+fn plugin_manages(settings: &Value) -> bool {
+    cfg!(unix) && plugin_enabled_in(settings)
+}
+
+/// `enabledPlugins["callimachus@<any marketplace>"] == true` in a parsed settings document.
+fn plugin_enabled_in(settings: &Value) -> bool {
+    settings
+        .get("enabledPlugins")
+        .and_then(Value::as_object)
+        .is_some_and(|m| {
+            m.iter().any(|(id, on)| {
+                id.split_once('@')
+                    .is_some_and(|(name, _)| name == PLUGIN_NAME)
+                    && on.as_bool() == Some(true)
+            })
+        })
+}
+
+/// [`plugin_manages`] for the user's `settings.json`. An unreadable or missing file means no.
+pub fn claude_plugin_managed() -> bool {
+    settings_path()
+        .ok()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .is_some_and(|v| plugin_manages(&v))
+}
+
+/// Whether the plugin takes over from the app for `exe`: enabled, and the `cal` link its hooks
+/// run (`~/.local/bin/cal`) is ours and live. Without that link the plugin's guarded hooks
+/// exit silently (or run another program's `cal`), so handing over would leave Claude Code
+/// with no memory at all; the app keeps its own install and Settings shows the `cal` problem.
+fn plugin_takes_over(exe: &Path) -> bool {
+    claude_plugin_managed() && cal_state(exe).installed
+}
+
+/// Claude Code's files the hand-over edits, as paths (tests point them at a temp dir).
+struct ClaudeFiles {
+    settings: PathBuf,
+    skill: PathBuf,
+    config: PathBuf,
+}
+
+fn claude_files() -> Result<ClaudeFiles> {
+    Ok(ClaudeFiles {
+        settings: settings_path()?,
+        skill: skill_path()?,
+        config: claude_config_path()?,
+    })
+}
+
+/// File name of the record of what [`hand_over_in`] removed, next to the index.
+const PLUGIN_HANDOVER_MARKER: &str = "plugin-handover.json";
+
+/// What the app removed when the plugin took over, so turning the plugin off puts back exactly
+/// that and nothing the user deleted by hand. Every field defaults, so any version parses it.
+#[derive(Debug, Default, PartialEq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct HandedOver {
+    /// Base hook events (`SessionStart`, `PreCompact`, `SessionEnd`) that held our hook.
+    hooks: Vec<String>,
+    /// The untouched `/recall` skill in Claude Code's skills dir.
+    skill: bool,
+    /// The app's `mcpServers.callimachus` entry (`<app> --mcp`).
+    mcp: bool,
+}
+
+impl HandedOver {
+    fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Fold in an earlier record: a second hand-over (the user re-ran Install) finds less to
+    /// remove and must not forget what the first one took.
+    fn merge(&mut self, earlier: HandedOver) {
+        for event in earlier.hooks {
+            if !self.hooks.contains(&event) {
+                self.hooks.push(event);
+            }
+        }
+        self.skill |= earlier.skill;
+        self.mcp |= earlier.mcp;
+    }
+}
+
+/// `<index dir>/plugin-handover.json`, beside the other integration markers.
+fn plugin_handover_marker_path() -> PathBuf {
+    crate::db::default_index_path()
+        .parent()
+        .map(|d| d.join(PLUGIN_HANDOVER_MARKER))
+        .unwrap_or_else(|| PathBuf::from(PLUGIN_HANDOVER_MARKER))
+}
+
+fn read_handover(path: &Path) -> Result<Option<HandedOver>> {
+    let Some(text) = read_config(path)? else {
+        return Ok(None);
+    };
+    serde_json::from_str(&text)
+        .map(Some)
+        .with_context(|| format!("{} is not a valid marker", path.display()))
+}
+
+/// The app's own pieces the plugin would replace, as installed right now.
+fn handover_candidates(files: &ClaudeFiles, exe: &Path) -> Result<HandedOver> {
+    let parse = |path: &Path| -> Result<Option<Value>> {
+        read_config(path)?
+            .map(|text| parse_json_object(&text, path))
+            .transpose()
+    };
+    let settings = parse(&files.settings)?;
+    let config = parse(&files.config)?;
+    Ok(HandedOver {
+        hooks: BASE_HOOKS
+            .iter()
+            .filter(|spec| {
+                settings
+                    .as_ref()
+                    .is_some_and(|v| event_has_our_hook(v, spec.event, exe))
+            })
+            .map(|spec| spec.event.to_string())
+            .collect(),
+        skill: read_config(&files.skill)?.is_some_and(|text| is_untouched_skill(&text)),
+        mcp: is_app_mcp_server(config.as_ref().and_then(|v| v.get("mcpServers"))),
+    })
+}
+
+/// Remove what the plugin now provides, where the app put it: our base hooks (SessionStart,
+/// PreCompact, SessionEnd, and retired ones; the opt-in proactive-recall hook stays, since
+/// the plugin does not ship it), the `/recall` skill when nobody edited it, and the MCP entry
+/// the app registered (`<app> --mcp`; an entry the user wrote by hand stays theirs). The
+/// record goes to `marker` first, so a removal cut short still restores. Returns whether
+/// anything changed.
+fn hand_over_in(files: &ClaudeFiles, marker: &Path, exe: &Path) -> Result<bool> {
+    let mut found = handover_candidates(files, exe)?;
+    if !found.is_empty() {
+        if let Some(earlier) = read_handover(marker).unwrap_or(None) {
+            found.merge(earlier);
+        }
+        write_atomic(marker, serde_json::to_string_pretty(&found)?.as_bytes())?;
+    }
+    let mut changed = update_json_file(&files.settings, false, |obj| {
+        strip_base_hooks(obj, exe);
+        Ok(())
+    })?;
+    if read_config(&files.skill)?.is_some_and(|text| is_untouched_skill(&text)) {
+        remove_if_exists(&files.skill)?;
+        // An empty `skills/recall/` would still show up in a listing of the user's skills.
+        if let Some(dir) = files.skill.parent() {
+            let _ = std::fs::remove_dir(dir); // fails, harmlessly, when not empty
+        }
+        changed = true;
+    }
+    changed |= remove_app_mcp_json(&files.config)?;
+    Ok(changed)
+}
+
+/// The reverse of [`hand_over_in`] once the plugin is off: put back what `marker` says the
+/// app removed, aimed at `exe`, then drop the marker. A piece already there again (the user
+/// re-ran Install, or wrote their own skill or MCP entry) is left as it is. Returns whether
+/// anything changed.
+fn take_back_in(files: &ClaudeFiles, marker: &Path, exe: &Path, cli: &Path) -> Result<bool> {
+    let Some(handed) = read_handover(marker)? else {
+        return Ok(false);
+    };
+    let specs: Vec<&HookSpec> = BASE_HOOKS
+        .into_iter()
+        .filter(|spec| handed.hooks.iter().any(|e| e == spec.event))
+        .collect();
+    let mut changed = false;
+    if !specs.is_empty() {
+        changed |= update_json_file(&files.settings, true, |obj| {
+            for spec in &specs {
+                if our_hook_command(obj, spec.event, exe).is_none() {
+                    upsert_hook(obj, spec, &spec_command(exe, spec, spec.subcommand), exe)?;
+                }
+            }
+            Ok(())
+        })?;
+    }
+    if handed.skill && read_config(&files.skill)?.is_none() {
+        write_skill_at(&files.skill, cli)?;
+        changed = true;
+    }
+    if handed.mcp {
+        let present = read_config(&files.config)?
+            .map(|text| parse_json_object(&text, &files.config))
+            .transpose()?
+            .is_some_and(|v| v.get("mcpServers").and_then(|m| m.get(MCP_NAME)).is_some());
+        if !present {
+            register_mcp_json(&files.config, exe)?;
+            changed = true;
+        }
+    }
+    remove_if_exists(marker)?;
+    Ok(changed)
+}
+
+/// The plugin state the last hand-over sync acted on in this process (None before the first).
+static PLUGIN_SYNCED: std::sync::Mutex<Option<bool>> = std::sync::Mutex::new(None);
+
+fn note_plugin_synced(takes_over: bool) {
+    if let Ok(mut last) = PLUGIN_SYNCED.lock() {
+        *last = Some(takes_over);
+    }
+}
+
+/// Hand over to the plugin, or take back from it, to match `takes_over`.
+fn sync_plugin_handover(exe: &Path, takes_over: bool) -> Result<bool> {
+    note_plugin_synced(takes_over);
+    let files = claude_files()?;
+    let marker = plugin_handover_marker_path();
+    if takes_over {
+        hand_over_in(&files, &marker, exe)
+    } else {
+        let cli = cli_entrypoint(exe, &cal_state(exe));
+        take_back_in(&files, &marker, exe, &cli)
+    }
+}
+
+/// The watcher's minute tick: the user can turn the plugin on or off (`/plugin`) while the app
+/// keeps running, and until the next launch both sets of hooks would inject memory and both
+/// MCP servers start, or, the other way, nothing would. So re-read `enabledPlugins` (one small
+/// file) and, only when the answer changed since the last sync, hand over or take back. A
+/// failed sync is not retried until the plugin state changes again or the app relaunches, so
+/// a broken settings.json costs one log line, not one a minute.
+pub fn plugin_handover_tick(current_exe: &Path) -> Result<bool> {
+    let Ok(exe) = stable_app_exe(current_exe) else {
+        return Ok(false);
+    };
+    let takes_over = plugin_takes_over(&exe);
+    let unchanged = PLUGIN_SYNCED
+        .lock()
+        .map(|last| *last == Some(takes_over))
+        .unwrap_or(true);
+    if unchanged {
+        return Ok(false);
+    }
+    sync_plugin_handover(&exe, takes_over)
+}
+
+/// Strip our hooks from every event except the opt-in UserPromptSubmit one.
+fn strip_base_hooks(obj: &mut Map<String, Value>, exe: &Path) {
+    for event in ALL_HOOK_EVENTS
+        .into_iter()
+        .filter(|e| *e != PROACTIVE_RECALL_HOOK.event)
+    {
+        strip_our_hooks(obj, event, exe);
     }
 }
 
@@ -351,7 +650,9 @@ fn build_status(
 /// Install (or refresh) the skill, the MCP registration, the `cal` CLI and the Claude Code hooks
 /// (SessionStart injects each repo's memory; PreCompact snapshots the session before
 /// compaction and keeps its summary; SessionEnd queues the session for auto-distill).
-/// Idempotent.
+/// Idempotent. With the Claude Code plugin enabled ([`plugin_takes_over`]) it installs only
+/// `cal` and the shared `~/.agents/skills/` copy of the skill, and removes the app's own
+/// copies of what the plugin provides.
 ///
 /// Refuses to run from a temporary location (see [`stable_app_exe`]). A `cal` failure is
 /// reported in `cal_problem` rather than aborting halfway: the hooks and MCP entry launch the app
@@ -363,8 +664,18 @@ fn build_status(
 pub fn install(app_exe: &Path) -> Result<IntegrationStatus> {
     let exe = stable_app_exe(app_exe)?;
     let cal_error = install_cal(&exe).err().map(|e| format!("{e:#}"));
-    let cal = cal_state(&exe);
-    write_skill(&cli_entrypoint(&exe, &cal))?;
+    let cli = cli_entrypoint(&exe, &cal_state(&exe));
+    // Codex and Gemini CLI read this copy whoever serves Claude Code.
+    write_shared_skill(&cli)?;
+    if plugin_takes_over(&exe) {
+        // The plugin brings the skill, the MCP server and the hooks; they run `cal`.
+        sync_plugin_handover(&exe, true)?;
+        return Ok(build_status(app_exe, cal_error, true));
+    }
+    // A full install supersedes any earlier hand-over record.
+    remove_if_exists(&plugin_handover_marker_path())?;
+    note_plugin_synced(false);
+    write_skill_at(&skill_path()?, &cli)?;
     register_mcp_json(&claude_config_path()?, &exe)?;
     install_hook(&exe)?;
     Ok(build_status(app_exe, cal_error, true))
@@ -419,6 +730,10 @@ fn uninstall_pieces() -> Result<()> {
     };
     attempt("skill", skill_path().and_then(|p| remove_if_exists(&p)));
     attempt(
+        "shared skill",
+        shared_skill_path().and_then(|p| remove_untouched_skill(&p)),
+    );
+    attempt(
         "Claude Code MCP entry",
         claude_config_path().and_then(|c| remove_mcp_json(&c)),
     );
@@ -459,6 +774,8 @@ struct RemovedIntegration {
     claude_mcp: bool,
     /// Ids (see [`agent_targets`]) of the other agents whose config held our MCP entry.
     agents: Vec<String>,
+    /// Ids (`codex`, `gemini`) of the agents whose hooks file held our memory hooks.
+    agent_hooks: Vec<String>,
     /// The `cal` entry point.
     cal: bool,
     /// The `/recall` skill.
@@ -481,6 +798,11 @@ impl RemovedIntegration {
         for id in earlier.agents {
             if !self.agents.contains(&id) {
                 self.agents.push(id);
+            }
+        }
+        for id in earlier.agent_hooks {
+            if !self.agent_hooks.contains(&id) {
+                self.agent_hooks.push(id);
             }
         }
         self.proactive_recall |= earlier.proactive_recall;
@@ -544,6 +866,12 @@ fn detect_installed(exe: &Path) -> RemovedIntegration {
         })
         .map(|a| a.id.to_string())
         .collect();
+    let agent_hooks = hook_targets()
+        .unwrap_or_default()
+        .iter()
+        .filter(|t| agent_hooks_present(t, exe))
+        .map(|t| t.id.to_string())
+        .collect();
     RemovedIntegration {
         claude_hooks: BASE_HOOKS
             .iter()
@@ -553,6 +881,7 @@ fn detect_installed(exe: &Path) -> RemovedIntegration {
         proactive_recall: has_hook(PROACTIVE_RECALL_HOOK.event),
         claude_mcp: claude_config_path().is_ok_and(|c| has_mcp_json(&c)),
         agents,
+        agent_hooks,
         cal: cal_state(exe).installed,
         skill: skill_path().is_ok_and(|p| p.is_file()),
     }
@@ -587,6 +916,11 @@ pub fn uninstall_all_with_marker() -> Result<()> {
     }
     if let Err(e) = uninstall_agents() {
         errors.push(format!("other agents: {e:#}"));
+    }
+    // Windows hook commands carry no missing-binary guard, so hooks left behind by a removed
+    // app would error in Codex and Gemini CLI at every session start.
+    if let Err(e) = uninstall_all_agent_hooks(&exe) {
+        errors.push(format!("{e:#}"));
     }
     combine_errors(errors)
 }
@@ -625,10 +959,16 @@ pub fn restore_from_marker(current_exe: &Path) -> Result<bool> {
     if removed.cal {
         attempt("cal", install_cal(&exe));
     }
+    // No plugin check here: the uninstaller that leaves this marker runs only on Windows,
+    // where the plugin never takes over, and anywhere else the plugin sync that
+    // `refresh_installed` runs right after this hands the pieces over again.
     if removed.skill {
+        let cli = cli_entrypoint(&exe, &cal_state(&exe));
         attempt(
             "skill",
-            write_skill(&cli_entrypoint(&exe, &cal_state(&exe))),
+            skill_path()
+                .and_then(|p| write_skill_at(&p, &cli))
+                .and_then(|()| write_shared_skill(&cli)),
         );
     }
     if removed.claude_mcp {
@@ -667,6 +1007,20 @@ pub fn restore_from_marker(current_exe: &Path) -> Result<bool> {
             }
         }
         Err(e) => attempt("agents", Err(e)),
+    }
+    match hook_targets() {
+        Ok(targets) => {
+            for t in targets
+                .into_iter()
+                .filter(|t| t.dir.is_dir() && removed.agent_hooks.iter().any(|id| id == t.id))
+            {
+                attempt(
+                    t.label,
+                    install_hooks_into(&t.file, t.specs, &exe).map(|_| ()),
+                );
+            }
+        }
+        Err(e) => attempt("agent hooks", Err(e)),
     }
     attempt("marker", remove_if_exists(&path));
     combine_errors(errors).map(|()| true)
@@ -713,11 +1067,21 @@ pub fn refresh_installed(current_exe: &Path) -> Result<bool> {
         settings_path()
             .and_then(|p| update_json_file(&p, false, |obj| refresh_hooks_in(obj, &exe))),
     );
-    record("SessionEnd hook", add_session_end_hook_once(&exe));
-    record(
-        "Claude Code MCP entry",
-        claude_config_path().and_then(|c| refresh_mcp_json(&c, &exe)),
-    );
+    // `cal` before the plugin check: a dangling link re-pointed here is what the plugin's
+    // hooks run, and what decides whether it can take over.
+    record("cal", refresh_cal(&exe));
+    // With the Claude Code plugin enabled, the app's copies would double-inject memory and
+    // start a second MCP server, so they go; once it is off again, they come back. The
+    // watcher's minute tick repeats this when the plugin state changes while the app runs.
+    let plugin = plugin_takes_over(&exe);
+    record("Claude Code plugin", sync_plugin_handover(&exe, plugin));
+    if !plugin {
+        record("SessionEnd hook", add_session_end_hook_once(&exe));
+        record(
+            "Claude Code MCP entry",
+            claude_config_path().and_then(|c| refresh_mcp_json(&c, &exe)),
+        );
+    }
     match agent_targets() {
         Ok(agents) => {
             for agent in agents {
@@ -730,8 +1094,19 @@ pub fn refresh_installed(current_exe: &Path) -> Result<bool> {
         }
         Err(e) => record("agents", Err(e)),
     }
-    record("cal", refresh_cal(&exe));
-    record("skill", refresh_skill(&exe));
+    record("Codex and Gemini CLI hooks", refresh_agent_hooks(&exe));
+    // The shared copy is refreshed in plugin mode too: the plugin replaces only Claude's.
+    let cli = cli_entrypoint(&exe, &cal_state(&exe));
+    record(
+        "shared skill",
+        shared_skill_path().and_then(|p| refresh_skill_at(&p, &cli)),
+    );
+    if !plugin {
+        record(
+            "skill",
+            skill_path().and_then(|p| refresh_skill_at(&p, &cli)),
+        );
+    }
 
     combine_errors(errors).map(|()| changed)
 }
@@ -789,13 +1164,31 @@ fn cli_entrypoint(exe: &Path, cal: &CalState) -> PathBuf {
     }
 }
 
-fn write_skill(cli: &Path) -> Result<()> {
-    let path = skill_path()?;
+/// The `~/.agents/skills/` copy, written independently of Claude Code's (which the plugin
+/// replaces). An edited one (the user's own `recall` skill there) is left alone.
+fn write_shared_skill(cli: &Path) -> Result<()> {
+    let shared = shared_skill_path()?;
+    match read_config(&shared)? {
+        Some(existing) if !is_untouched_skill(&existing) => Ok(()),
+        _ => write_skill_at(&shared, cli),
+    }
+}
+
+fn write_skill_at(path: &Path, cli: &Path) -> Result<()> {
     let rendered = render_skill(cli);
-    if read_config(&path)?.as_deref() == Some(rendered.as_str()) {
+    if read_config(path)?.as_deref() == Some(rendered.as_str()) {
         return Ok(());
     }
-    write_atomic(&path, rendered.as_bytes())
+    write_atomic(path, rendered.as_bytes())
+}
+
+/// Remove a skill copy only if it is one of ours, untouched: the shared dir is not ours alone,
+/// and a `recall` skill the user wrote there must survive an uninstall.
+fn remove_untouched_skill(path: &Path) -> Result<()> {
+    match read_config(path)? {
+        Some(text) if is_untouched_skill(&text) => remove_if_exists(path),
+        _ => Ok(()),
+    }
 }
 
 /// FNV-1a (64-bit) of every SKILL.md this app has shipped, LF line endings. Older versions wrote
@@ -844,17 +1237,15 @@ fn is_untouched_skill(text: &str) -> bool {
 
 /// Bring an untouched copy of a bundled skill (this version's or an older one's) to this
 /// version's rendered text. A skill the user edited is left for the "skill outdated" prompt in
-/// Settings.
-fn refresh_skill(exe: &Path) -> Result<bool> {
-    let path = skill_path()?;
-    let Some(existing) = read_config(&path)? else {
+/// Settings. Never creates it.
+fn refresh_skill_at(path: &Path, cli: &Path) -> Result<bool> {
+    let Some(existing) = read_config(path)? else {
         return Ok(false);
     };
-    let cli = cli_entrypoint(exe, &cal_state(exe));
-    if existing == render_skill(&cli) || !is_untouched_skill(&existing) {
+    if existing == render_skill(cli) || !is_untouched_skill(&existing) {
         return Ok(false);
     }
-    write_skill(&cli)?;
+    write_skill_at(path, cli)?;
     Ok(true)
 }
 
@@ -872,6 +1263,27 @@ struct HookSpec {
     /// Seconds before Claude Code cancels the hook. Its default is 600, long enough to stall a
     /// session start for minutes if the index were ever locked.
     timeout_secs: u64,
+    /// The agent's `timeout` field is in milliseconds (Gemini CLI), not seconds.
+    millis: bool,
+    /// The hook entry's `name` (Gemini CLI lists, enables and disables hooks by it).
+    name: Option<&'static str>,
+    /// The agent runs hook commands through PowerShell on Windows (Gemini CLI:
+    /// `powershell -NoProfile -NonInteractive -Command <cmd>`, gemini-cli `shell-utils.ts`
+    /// `getShellConfiguration`), where a command starting with a quoted path is a string
+    /// expression and the subcommand after it a syntax error ("Unexpected token 'hook'").
+    /// Those commands get the call operator: `& "<exe>" hook --for gemini`.
+    powershell: bool,
+}
+
+impl HookSpec {
+    /// The `timeout` value as the agent reads it.
+    fn timeout_value(&self) -> u64 {
+        if self.millis {
+            self.timeout_secs * 1000
+        } else {
+            self.timeout_secs
+        }
+    }
 }
 
 /// Injects the repo's memory. Skips `resume`: the earlier injection is still in the resumed
@@ -882,6 +1294,9 @@ const SESSION_START_HOOK: HookSpec = HookSpec {
     subcommand: "hook",
     matcher: Some("startup|clear|compact"),
     timeout_secs: 10,
+    millis: false,
+    name: None,
+    powershell: false,
 };
 
 /// Snapshots the live session before its context is compacted.
@@ -890,6 +1305,9 @@ const PRE_COMPACT_HOOK: HookSpec = HookSpec {
     subcommand: "snapshot-hook",
     matcher: None,
     timeout_secs: 10,
+    millis: false,
+    name: None,
+    powershell: false,
 };
 
 /// Moves the session that just ended to the front of the auto-distill queue (`cal
@@ -901,6 +1319,9 @@ const SESSION_END_HOOK: HookSpec = HookSpec {
     subcommand: "session-end",
     matcher: None,
     timeout_secs: 5,
+    millis: false,
+    name: None,
+    powershell: false,
 };
 
 /// Opt-in: injects "you may have solved this before" notes. Toggled by `set_proactive_recall`.
@@ -909,7 +1330,79 @@ const PROACTIVE_RECALL_HOOK: HookSpec = HookSpec {
     subcommand: "recall-now",
     matcher: None,
     timeout_secs: 15,
+    millis: false,
+    name: None,
+    powershell: false,
 };
+
+/// Codex's SessionStart hook (`~/.codex/hooks.json`). Codex's matcher is a regex over the
+/// same sources as Claude Code's (`startup|resume|clear|compact|fork`), and its `timeout` is
+/// in seconds.
+const CODEX_SESSION_START_HOOK: HookSpec = HookSpec {
+    event: "SessionStart",
+    subcommand: "hook --for codex",
+    matcher: Some("startup|clear|compact"),
+    timeout_secs: 10,
+    millis: false,
+    name: None,
+    powershell: false,
+};
+
+/// Codex's PreCompact hook: a rolling snapshot of the session (its payload has no summary).
+const CODEX_PRE_COMPACT_HOOK: HookSpec = HookSpec {
+    event: "PreCompact",
+    subcommand: "snapshot-hook --for codex",
+    matcher: None,
+    timeout_secs: 10,
+    millis: false,
+    name: None,
+    powershell: false,
+};
+
+/// Codex's SessionEnd hook. Codex gives SessionEnd 1 s by default and at most 3 s
+/// (developers.openai.com/codex/hooks, checked 2026-11-06); the write takes milliseconds.
+const CODEX_SESSION_END_HOOK: HookSpec = HookSpec {
+    event: "SessionEnd",
+    subcommand: "session-end --for codex",
+    matcher: None,
+    timeout_secs: 3,
+    millis: false,
+    name: None,
+    powershell: false,
+};
+
+/// Gemini CLI's SessionStart hook (`~/.gemini/settings.json`). Lifecycle matchers there are
+/// exact strings, not regexes, so `*` takes every source and `cal hook` itself stays silent
+/// on `resume` (the resumed history already holds the earlier injection). Timeouts are in
+/// milliseconds.
+const GEMINI_SESSION_START_HOOK: HookSpec = HookSpec {
+    event: "SessionStart",
+    subcommand: "hook --for gemini",
+    matcher: Some("*"),
+    timeout_secs: 10,
+    millis: true,
+    name: Some("callimachus-memory"),
+    powershell: true,
+};
+
+/// Gemini CLI's SessionEnd hook. Gemini does not wait for it, so the timeout only bounds a
+/// stuck process.
+const GEMINI_SESSION_END_HOOK: HookSpec = HookSpec {
+    event: "SessionEnd",
+    subcommand: "session-end --for gemini",
+    matcher: Some("*"),
+    timeout_secs: 5,
+    millis: true,
+    name: Some("callimachus-session-end"),
+    powershell: true,
+};
+
+const CODEX_HOOKS: [&HookSpec; 3] = [
+    &CODEX_SESSION_START_HOOK,
+    &CODEX_PRE_COMPACT_HOOK,
+    &CODEX_SESSION_END_HOOK,
+];
+const GEMINI_HOOKS: [&HookSpec; 2] = [&GEMINI_SESSION_START_HOOK, &GEMINI_SESSION_END_HOOK];
 
 /// What `install()` sets up. Proactive recall stays a separate opt-in because it reads every
 /// prompt.
@@ -932,6 +1425,21 @@ const ALL_HOOK_EVENTS: [&str; 5] = [
 /// (main.rs dispatches on it), so hooks don't depend on the `cal` link.
 fn hook_command(exe: &Path, subcommand: &str) -> String {
     hook_command_for(&exe.to_string_lossy(), subcommand, cfg!(windows))
+}
+
+/// [`hook_command`] in the shell `spec`'s agent runs it under (see [`HookSpec::powershell`]).
+fn spec_command(exe: &Path, spec: &HookSpec, subcommand: &str) -> String {
+    spec_command_for(&exe.to_string_lossy(), spec, subcommand, cfg!(windows))
+}
+
+fn spec_command_for(exe: &str, spec: &HookSpec, subcommand: &str, windows: bool) -> String {
+    if windows && spec.powershell {
+        // Still ends with `"<exe>" <subcommand>`, the shape `our_hook_subcommand` and
+        // `hook_target` recognize, so refresh and uninstall find it like any other.
+        format!("& \"{exe}\" {subcommand}")
+    } else {
+        hook_command_for(exe, subcommand, windows)
+    }
 }
 
 /// On Unix the command is guarded, `[ ! -x "<exe>" ] || "<exe>" hook`: once the app is moved
@@ -961,8 +1469,19 @@ fn sh_double_quote(s: &str) -> String {
     out
 }
 
-/// The subcommands our hooks run.
-const HOOK_SUBCOMMANDS: [&str; 4] = ["hook", "snapshot-hook", "recall-now", "session-end"];
+/// The subcommands our hooks run, with the `--for` forms the Codex and Gemini CLI hooks use.
+/// No entry is a suffix of another after a space, so a command matches exactly one.
+const HOOK_SUBCOMMANDS: [&str; 9] = [
+    "hook",
+    "snapshot-hook",
+    "recall-now",
+    "session-end",
+    "hook --for codex",
+    "snapshot-hook --for codex",
+    "session-end --for codex",
+    "hook --for gemini",
+    "session-end --for gemini",
+];
 
 /// The subcommand of a command shaped like ours. Every form we've written (`"<cal>" hook`, the
 /// guarded `[ ! -x "<exe>" ] || "<exe>" hook`, and the Windows `"<exe>" hook`) ends with a
@@ -1054,10 +1573,14 @@ fn upsert_hook(
     if let Some(matcher) = spec.matcher {
         group.insert("matcher".into(), json!(matcher));
     }
-    group.insert(
-        "hooks".into(),
-        json!([{ "type": "command", "command": command, "timeout": spec.timeout_secs }]),
-    );
+    let mut hook = Map::new();
+    if let Some(name) = spec.name {
+        hook.insert("name".into(), json!(name));
+    }
+    hook.insert("type".into(), json!("command"));
+    hook.insert("command".into(), json!(command));
+    hook.insert("timeout".into(), json!(spec.timeout_value()));
+    group.insert("hooks".into(), json!([hook]));
     arr.push(Value::Object(group));
     Ok(())
 }
@@ -1122,11 +1645,70 @@ fn apply_base_hooks(obj: &mut Map<String, Value>, exe: &Path) -> Result<()> {
 /// `specs` in their current shape, aimed at `exe`; retired hooks are stripped.
 fn apply_hooks(obj: &mut Map<String, Value>, specs: &[&HookSpec], exe: &Path) -> Result<()> {
     for spec in specs {
-        upsert_hook(obj, spec, &hook_command(exe, spec.subcommand), exe)?;
+        upsert_hook(obj, spec, &spec_command(exe, spec, spec.subcommand), exe)?;
     }
     for event in LEGACY_HOOK_EVENTS {
         strip_our_hooks(obj, event, exe);
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// Transcript retention (`cleanupPeriodDays`)
+// ---------------------------------------------------------------------------------------------
+
+/// How long Claude Code keeps session transcripts when `cleanupPeriodDays` is unset. The
+/// settings reference lists the key's default as unset; the effective number is stated at
+/// https://code.claude.com/docs/en/data-usage ("store session transcripts locally ... under
+/// `~/.claude/projects/` for 30 days by default") and
+/// https://code.claude.com/docs/en/claude-directory#cleaned-up-automatically ("The default
+/// is 30 days and the minimum is 1; setting `0` fails with a validation error"), checked
+/// 2026-11-06.
+pub const CLAUDE_DEFAULT_CLEANUP_DAYS: i64 = 30;
+
+/// The settings key Claude Code's transcript sweep reads.
+const CLEANUP_KEY: &str = "cleanupPeriodDays";
+
+/// `cleanupPeriodDays` from the user's Claude Code settings (`<claude config dir>/
+/// settings.json`, so `CLAUDE_CONFIG_DIR` and the Settings override apply), or None when it
+/// is unset. Project and managed settings can override it per repo or per organization;
+/// this reads the user-level value, the one Settings can change.
+pub fn claude_cleanup_period_days() -> Result<Option<i64>> {
+    cleanup_days_in(&settings_path()?)
+}
+
+fn cleanup_days_in(path: &Path) -> Result<Option<i64>> {
+    let Some(text) = read_config(path)? else {
+        return Ok(None);
+    };
+    let root = parse_json_object(&text, path)?;
+    Ok(root.get(CLEANUP_KEY).and_then(Value::as_i64))
+}
+
+/// Set `cleanupPeriodDays` in the user's Claude Code settings (None removes the key, back to
+/// Claude Code's default), through the same atomic merge as the hooks: every other setting
+/// is kept and an unparseable file is left alone.
+pub fn set_claude_cleanup_period_days(days: Option<i64>) -> Result<()> {
+    set_cleanup_days_in(&settings_path()?, days)
+}
+
+fn set_cleanup_days_in(path: &Path, days: Option<i64>) -> Result<()> {
+    if let Some(d) = days {
+        if d < 1 {
+            bail!("Transcript retention must be at least 1 day (Claude Code rejects {d})");
+        }
+    }
+    update_json_file(path, days.is_some(), |obj| {
+        match days {
+            Some(d) => {
+                obj.insert(CLEANUP_KEY.into(), Value::from(d));
+            }
+            None => {
+                obj.remove(CLEANUP_KEY);
+            }
+        }
+        Ok(())
+    })?;
     Ok(())
 }
 
@@ -1143,25 +1725,37 @@ fn install_hook(exe: &Path) -> Result<()> {
 /// `timeout` / `matcher` are added only where an older version left them out. Missing hooks are
 /// not added back, and the user's own hooks are never touched. The full reshape is Install's job.
 fn refresh_hooks_in(obj: &mut Map<String, Value>, exe: &Path) -> Result<()> {
-    if let Some(events) = obj.get_mut("hooks").and_then(Value::as_object_mut) {
-        for spec in [
+    refresh_specs_in(
+        obj,
+        &[
             &SESSION_START_HOOK,
             &PRE_COMPACT_HOOK,
             &SESSION_END_HOOK,
             &PROACTIVE_RECALL_HOOK,
-        ] {
-            let Some(groups) = events.get_mut(spec.event).and_then(Value::as_array_mut) else {
-                continue;
-            };
-            for group in groups.iter_mut().filter_map(Value::as_object_mut) {
-                refresh_group(group, spec, exe);
-            }
-        }
-    }
+        ],
+        exe,
+    );
     for event in LEGACY_HOOK_EVENTS {
         strip_our_hooks(obj, event, exe);
     }
     Ok(())
+}
+
+/// [`refresh_group`] over every group of each spec's event (shared by Claude Code's
+/// `settings.json`, Codex's `hooks.json` and Gemini CLI's `settings.json`, which use the
+/// same `hooks.<event>[].hooks[]` shape).
+fn refresh_specs_in(obj: &mut Map<String, Value>, specs: &[&HookSpec], exe: &Path) {
+    let Some(events) = obj.get_mut("hooks").and_then(Value::as_object_mut) else {
+        return;
+    };
+    for spec in specs {
+        let Some(groups) = events.get_mut(spec.event).and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for group in groups.iter_mut().filter_map(Value::as_object_mut) {
+            refresh_group(group, spec, exe);
+        }
+    }
 }
 
 /// `<index dir>/session-end-hook-added`: SessionEnd was offered to this install once.
@@ -1254,9 +1848,9 @@ fn refresh_group(group: &mut Map<String, Value>, spec: &HookSpec, exe: &Path) {
         ours += 1;
         // Keep the subcommand that's there; only the binary and the quoting are ours to fix.
         let sub = our_hook_subcommand(cmd).unwrap_or(spec.subcommand);
-        let command = hook_command(&refresh_target(cmd, exe), sub);
+        let command = spec_command(&refresh_target(cmd, exe), spec, sub);
         hook.insert("command".into(), json!(command));
-        hook.entry("timeout").or_insert(json!(spec.timeout_secs));
+        hook.entry("timeout").or_insert(json!(spec.timeout_value()));
     }
     // A matcher scopes the whole group, so only add one to a group that holds nothing but ours.
     let all_ours = ours > 0 && ours == hooks.len();
@@ -1333,12 +1927,74 @@ fn parse_json_object(text: &str, path: &Path) -> Result<Value> {
     if text.trim().is_empty() {
         return Ok(Value::Object(Map::new()));
     }
-    let value: Value = serde_json::from_str(text)
-        .with_context(|| format!("{} is not valid JSON; not modifying it", path.display()))?;
+    let value: Value = match serde_json::from_str(text) {
+        Ok(v) => v,
+        // Gemini CLI strips comments from its settings.json on load, so a file can be fine
+        // for its agent and still not JSON. Rewriting it would drop the user's comments, so
+        // say that is the reason instead of a bare parse error.
+        Err(_) if serde_json::from_str::<Value>(&strip_json_comments(text)).is_ok() => bail!(
+            "{} has comments, which Callimachus can't keep when it edits the file; remove \
+             them, or add the Callimachus entries by hand. Not modifying it",
+            path.display()
+        ),
+        Err(e) => {
+            return Err(e)
+                .with_context(|| format!("{} is not valid JSON; not modifying it", path.display()))
+        }
+    };
     if !value.is_object() {
         bail!("{} is not a JSON object; not modifying it", path.display());
     }
     Ok(value)
+}
+
+/// `text` with `//` line comments and `/* */` block comments removed (outside strings), the
+/// JSON-with-comments Gemini CLI accepts in its settings.json. Newlines inside a block comment
+/// are kept so a later parse error still points at the right line.
+pub(crate) fn strip_json_comments(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    let mut in_string = false;
+    while let Some(c) = chars.next() {
+        if in_string {
+            out.push(c);
+            match c {
+                '\\' => out.extend(chars.next()),
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match (c, chars.peek()) {
+            ('"', _) => {
+                in_string = true;
+                out.push(c);
+            }
+            ('/', Some('/')) => {
+                for c in chars.by_ref() {
+                    if c == '\n' {
+                        out.push('\n');
+                        break;
+                    }
+                }
+            }
+            ('/', Some('*')) => {
+                chars.next();
+                let mut prev = '\0';
+                for c in chars.by_ref() {
+                    if prev == '*' && c == '/' {
+                        break;
+                    }
+                    if c == '\n' {
+                        out.push('\n');
+                    }
+                    prev = c;
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// Read-modify-write a JSON config whose root is an object. Skips the write when `edit` leaves
@@ -1502,6 +2158,28 @@ fn remove_mcp_json(cfg: &Path) -> Result<()> {
         Ok(())
     })?;
     Ok(())
+}
+
+/// Remove `mcpServers.callimachus` only when it is an app registration (any path, run with
+/// exactly `--mcp`, the shape [`register_mcp_json`] writes). Returns whether the file changed.
+fn remove_app_mcp_json(cfg: &Path) -> Result<bool> {
+    update_json_file(cfg, false, |obj| {
+        let ours = is_app_mcp_server(obj.get("mcpServers"));
+        if let Some(servers) = obj.get_mut("mcpServers").and_then(Value::as_object_mut) {
+            if ours {
+                servers.retain(|k, _| k != MCP_NAME);
+            }
+        }
+        Ok(())
+    })
+}
+
+/// An `mcpServers` map whose `callimachus` is an app registration (run with exactly `--mcp`).
+fn is_app_mcp_server(servers: Option<&Value>) -> bool {
+    servers
+        .and_then(|m| m.get(MCP_NAME))
+        .and_then(|s| s.get("args"))
+        .is_some_and(|a| *a == json!(["--mcp"]))
 }
 
 /// True if a JSON config registers our MCP server pointing at this exe.
@@ -2231,6 +2909,322 @@ pub fn uninstall_agents() -> Result<()> {
     combine_errors(errors)
 }
 
+// ---------------------------------------------------------------------------------------------
+// Codex and Gemini CLI memory hooks
+// ---------------------------------------------------------------------------------------------
+
+/// One agent's memory-hook state for Settings > Agents (`agent_hooks_status`).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentHooksStatus {
+    /// `codex` or `gemini`.
+    pub agent: String,
+    /// The file the hooks live in.
+    pub config_path: String,
+    /// Our SessionStart hook is in that file.
+    pub installed: bool,
+    /// Why Install would not help or is refused (hooks turned off in the agent's own config,
+    /// or the agent is not set up here), else None.
+    pub blocked: Option<String>,
+    /// Codex only: a startup refresh changed our hook commands (the app moved, or a new
+    /// AppImage name), and Codex runs a changed hook only after the user trusts it again in
+    /// `/hooks`. Cleared by the next Install or Remove from Settings.
+    pub needs_approval: bool,
+}
+
+/// An agent whose hooks Callimachus can install, and where.
+struct HookTarget {
+    id: &'static str,
+    label: &'static str,
+    /// The agent's config dir (presence marker, as in [`agent_targets`]).
+    dir: PathBuf,
+    /// The JSON file holding `hooks`: Codex's `hooks.json`, Gemini CLI's `settings.json`.
+    file: PathBuf,
+    specs: &'static [&'static HookSpec],
+}
+
+/// Codex and Gemini CLI, at the config dirs [`agent_targets`] resolves (so a Settings
+/// override of Codex's home is honored). Codex reads `<CODEX_HOME>/hooks.json` as well as
+/// `[hooks]` tables in `config.toml`; the JSON file keeps our edit out of the user's TOML.
+/// (Codex warns at startup when one layer defines hooks in both, so a config.toml that
+/// already defines hooks blocks the install, see [`CODEX_HOOKS_IN_TOML`].)
+fn hook_targets() -> Result<Vec<HookTarget>> {
+    Ok(agent_targets()?
+        .into_iter()
+        .filter_map(|a| match a.id {
+            "codex" => Some(HookTarget {
+                id: a.id,
+                label: a.label,
+                file: a.dir.join("hooks.json"),
+                dir: a.dir,
+                specs: &CODEX_HOOKS,
+            }),
+            "gemini" => Some(HookTarget {
+                id: a.id,
+                label: a.label,
+                file: a.config,
+                dir: a.dir,
+                specs: &GEMINI_HOOKS,
+            }),
+            _ => None,
+        })
+        .collect())
+}
+
+fn find_hook_target(agent: &str) -> Result<HookTarget> {
+    hook_targets()?
+        .into_iter()
+        .find(|t| t.id == agent)
+        .ok_or_else(|| anyhow!("memory hooks are available for codex and gemini, not '{agent}'"))
+}
+
+/// Shown when the agent's own config turns its hook system off.
+const CODEX_HOOKS_OFF: &str = "hooks are disabled in config.toml";
+const GEMINI_HOOKS_OFF: &str = "hooks are disabled in settings.json (hooksConfig.enabled)";
+/// Codex warns at every startup when one config layer defines hooks both in `config.toml` and
+/// in `hooks.json` ("prefer a single representation", engine/discovery.rs), and our edits stay
+/// out of the user's TOML, so a user who already keeps hooks there adds ours by hand.
+const CODEX_HOOKS_IN_TOML: &str = "Codex hooks already live in config.toml; add ours there";
+/// `hooksConfig.disabled` names our SessionStart hook, so Gemini CLI never runs it.
+const GEMINI_HOOK_DISABLED: &str = "the Callimachus hook is turned off in settings.json \
+     (hooksConfig.disabled lists callimachus-memory); remove it from that list";
+
+/// Why installing `t`'s hooks would do nothing: the agent is not set up here, or its config
+/// turns hooks off. Codex hooks are on by default and only `[features] hooks = false` (or the
+/// older alias `codex_hooks = false`) turns them off; Gemini CLI's switch is
+/// `hooksConfig.enabled`, default true (both checked against the vendor docs on 2026-11-06).
+/// Unreadable config is not a block: the agent would report it itself.
+fn hooks_blocked(t: &HookTarget) -> Option<String> {
+    if !t.dir.is_dir() {
+        return Some(format!(
+            "{} is not set up on this machine (no {})",
+            t.label,
+            t.dir.display()
+        ));
+    }
+    match t.id {
+        "codex" => {
+            let doc = std::fs::read_to_string(t.dir.join("config.toml"))
+                .ok()?
+                .parse::<toml_edit::DocumentMut>()
+                .ok()?;
+            if codex_hooks_disabled(&doc) {
+                Some(CODEX_HOOKS_OFF.to_string())
+            } else {
+                codex_hooks_in_toml(&doc).then(|| CODEX_HOOKS_IN_TOML.to_string())
+            }
+        }
+        "gemini" => {
+            let v = read_json_lenient(&t.file)?;
+            if gemini_hooks_disabled(&v) {
+                Some(GEMINI_HOOKS_OFF.to_string())
+            } else {
+                gemini_hook_disabled_by_name(&v, t.specs[0])
+                    .then(|| GEMINI_HOOK_DISABLED.to_string())
+            }
+        }
+        _ => None,
+    }
+}
+
+/// `config.toml` defines hook events itself (`[[hooks.SessionStart]]` and the like). The
+/// `[hooks.state]` table Codex writes when the user trusts a hook is not a definition.
+fn codex_hooks_in_toml(doc: &toml_edit::DocumentMut) -> bool {
+    doc.get("hooks")
+        .and_then(toml_edit::Item::as_table_like)
+        .is_some_and(|t| t.iter().any(|(k, _)| k != "state"))
+}
+
+/// Gemini CLI skips a hook whose `name` is in `hooksConfig.disabled`.
+fn gemini_hook_disabled_by_name(v: &Value, spec: &HookSpec) -> bool {
+    let Some(name) = spec.name else {
+        return false;
+    };
+    v.get("hooksConfig")
+        .and_then(|h| h.get("disabled"))
+        .and_then(Value::as_array)
+        .is_some_and(|names| names.iter().any(|n| n.as_str() == Some(name)))
+}
+
+fn codex_hooks_disabled(doc: &toml_edit::DocumentMut) -> bool {
+    let features = doc.get("features");
+    ["hooks", "codex_hooks"]
+        .iter()
+        .any(|k| features.and_then(|f| f.get(k)).and_then(|v| v.as_bool()) == Some(false))
+}
+
+fn gemini_hooks_disabled(v: &Value) -> bool {
+    v.get("hooksConfig")
+        .and_then(|h| h.get("enabled"))
+        .and_then(Value::as_bool)
+        == Some(false)
+}
+
+/// Whether `t`'s file holds our SessionStart hook for it (whether or not the agent runs it).
+fn agent_hooks_present(t: &HookTarget, exe: &Path) -> bool {
+    read_json_lenient(&t.file)
+        .and_then(|v| our_hook_command(v.as_object()?, t.specs[0].event, exe))
+        .is_some_and(|cmd| our_hook_subcommand(&cmd) == Some(t.specs[0].subcommand))
+}
+
+/// [`agent_hooks_present`], and the agent runs it: a Gemini hook disabled by name is off.
+fn agent_hooks_installed(t: &HookTarget, exe: &Path) -> bool {
+    agent_hooks_present(t, exe)
+        && !(t.id == "gemini"
+            && read_json_lenient(&t.file)
+                .is_some_and(|v| gemini_hook_disabled_by_name(&v, t.specs[0])))
+}
+
+/// A JSON config for a status read: comments stripped first (Gemini CLI allows them in its
+/// settings.json), None when missing or unparseable.
+fn read_json_lenient(path: &Path) -> Option<Value> {
+    let text = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&text)
+        .ok()
+        .or_else(|| serde_json::from_str(&strip_json_comments(&text)).ok())
+}
+
+/// `<index dir>/codex-hooks-repointed`: a refresh changed our Codex hook commands since the
+/// user last installed them from Settings (see [`AgentHooksStatus::needs_approval`]).
+const CODEX_REPOINTED_MARKER: &str = "codex-hooks-repointed";
+
+fn codex_repointed_marker_path() -> PathBuf {
+    crate::db::default_index_path()
+        .parent()
+        .map(|d| d.join(CODEX_REPOINTED_MARKER))
+        .unwrap_or_else(|| PathBuf::from(CODEX_REPOINTED_MARKER))
+}
+
+fn agent_hooks_row(t: &HookTarget, exe: &Path) -> AgentHooksStatus {
+    let installed = agent_hooks_installed(t, exe);
+    AgentHooksStatus {
+        agent: t.id.to_string(),
+        config_path: t.file.display().to_string(),
+        installed,
+        blocked: hooks_blocked(t),
+        needs_approval: installed && t.id == "codex" && codex_repointed_marker_path().exists(),
+    }
+}
+
+/// Memory-hook state for Codex and Gemini CLI (both rows, detected or not; `blocked` says
+/// which are not set up).
+pub fn agent_hooks_status(app_exe: &Path) -> Vec<AgentHooksStatus> {
+    let (exe, _) = resolve_exe(app_exe);
+    hook_targets()
+        .unwrap_or_default()
+        .iter()
+        .map(|t| agent_hooks_row(t, &exe))
+        .collect()
+}
+
+/// Merge `specs` into the hooks file at `file` (created if missing), aimed at `exe`.
+fn install_hooks_into(file: &Path, specs: &[&HookSpec], exe: &Path) -> Result<bool> {
+    update_json_file(file, true, |obj| {
+        for spec in specs {
+            upsert_hook(obj, spec, &spec_command(exe, spec, spec.subcommand), exe)?;
+        }
+        Ok(())
+    })
+}
+
+/// Strip our hooks on `specs`' events from `file`, leaving the rest of it.
+fn remove_hooks_from(file: &Path, specs: &[&HookSpec], exe: &Path) -> Result<bool> {
+    update_json_file(file, false, |obj| {
+        for spec in specs {
+            strip_our_hooks(obj, spec.event, exe);
+        }
+        Ok(())
+    })
+}
+
+/// Install the memory hooks for `agent` (`codex` or `gemini`): SessionStart injects each
+/// repo's memory (`cal hook --for <agent>`), SessionEnd queues the session for auto-distill,
+/// and for Codex PreCompact snapshots the session. Merges into the agent's file with the
+/// same atomic writer as the Claude Code hooks, keeping the user's own hooks; idempotent.
+/// Refuses while blocked or while the app runs from a temporary location.
+pub fn install_agent_hooks(app_exe: &Path, agent: &str) -> Result<AgentHooksStatus> {
+    let t = find_hook_target(agent)?;
+    if let Some(reason) = hooks_blocked(&t) {
+        bail!("Can't add {} memory hooks: {reason}", t.label);
+    }
+    let exe = stable_app_exe(app_exe)?;
+    install_hooks_into(&t.file, t.specs, &exe)?;
+    clear_repointed(&t)?;
+    Ok(agent_hooks_row(&t, &exe))
+}
+
+/// Remove our hooks from `agent`'s file (only ours; a missing file is left missing).
+pub fn uninstall_agent_hooks(app_exe: &Path, agent: &str) -> Result<AgentHooksStatus> {
+    let t = find_hook_target(agent)?;
+    let (exe, _) = resolve_exe(app_exe);
+    remove_hooks_from(&t.file, t.specs, &exe)?;
+    clear_repointed(&t)?;
+    Ok(agent_hooks_row(&t, &exe))
+}
+
+/// An Install or Remove from Settings comes with its own note about trusting new hooks, so
+/// the "approve again" flag from an earlier refresh has done its job.
+fn clear_repointed(t: &HookTarget) -> Result<()> {
+    if t.id == "codex" {
+        remove_if_exists(&codex_repointed_marker_path())?;
+    }
+    Ok(())
+}
+
+/// Startup refresh of the Codex and Gemini CLI hooks the user installed: the same in-place
+/// re-point as [`refresh_hooks_in`]; never adds a missing hook or creates a file. Codex
+/// trusts a hook by the hash of its declaration (command, timeout, matcher; `hook_hash` in
+/// its engine/discovery.rs), so a changed Codex entry stops running until the user approves
+/// it again in `/hooks`: that leaves the marker behind `needs_approval` for Settings to say so.
+fn refresh_agent_hooks(exe: &Path) -> Result<bool> {
+    let mut changed = false;
+    let mut errors = Vec::new();
+    for t in hook_targets()? {
+        match update_json_file(&t.file, false, |obj| {
+            refresh_specs_in(obj, t.specs, exe);
+            Ok(())
+        }) {
+            Ok(c) => {
+                changed |= c;
+                if c && t.id == "codex" {
+                    let marker = codex_repointed_marker_path();
+                    if let Err(e) = std::fs::write(&marker, b"") {
+                        errors.push(format!("{}: {e:#}", marker.display()));
+                    }
+                }
+            }
+            Err(e) => errors.push(format!("{}: {e:#}", t.label)),
+        }
+    }
+    combine_errors(errors).map(|()| changed)
+}
+
+/// What Settings > Agents > Other agents' Remove does: every MCP entry ([`uninstall_agents`])
+/// and every Codex and Gemini CLI memory hook. The Windows hook commands carry no
+/// missing-binary guard, so hooks left behind by an uninstalled app would error at every
+/// session start. Tries both, then reports any failures.
+pub fn uninstall_agents_and_hooks() -> Result<()> {
+    let mut errors = Vec::new();
+    if let Err(e) = uninstall_agents() {
+        errors.push(format!("{e:#}"));
+    }
+    if let Err(e) = uninstall_all_agent_hooks(&current_stable_exe()) {
+        errors.push(format!("{e:#}"));
+    }
+    combine_errors(errors)
+}
+
+/// Remove our hooks from every agent's hooks file (the app's own uninstall).
+fn uninstall_all_agent_hooks(exe: &Path) -> Result<()> {
+    let mut errors = Vec::new();
+    for t in hook_targets()? {
+        if let Err(e) = remove_hooks_from(&t.file, t.specs, exe) {
+            errors.push(format!("{} hooks: {e:#}", t.label));
+        }
+    }
+    combine_errors(errors)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2431,6 +3425,38 @@ mod tests {
         remove_mcp_json(&cfg).unwrap(); // our entry isn't there: nothing to do
         assert_eq!(std::fs::read_to_string(&cfg).unwrap(), original);
         assert!(!update_json_file(&cfg, false, |_| Ok(())).unwrap());
+    }
+
+    #[test]
+    fn cleanup_days_read_and_write_keep_the_other_settings() {
+        let tmp = TempDir::new("cleanup");
+        let path = tmp.path().join("settings.json");
+        // No file: unset, and removing the key creates nothing.
+        assert_eq!(cleanup_days_in(&path).unwrap(), None);
+        set_cleanup_days_in(&path, None).unwrap();
+        assert!(!path.exists());
+
+        std::fs::write(&path, r#"{"theme":"dark","hooks":{"SessionStart":[]}}"#).unwrap();
+        assert_eq!(cleanup_days_in(&path).unwrap(), None);
+        set_cleanup_days_in(&path, Some(365)).unwrap();
+        assert_eq!(cleanup_days_in(&path).unwrap(), Some(365));
+        let v = read_json(&path);
+        assert_eq!(v["theme"], "dark");
+        assert!(v["hooks"]["SessionStart"].is_array());
+
+        // Restoring "unset" removes only our key.
+        set_cleanup_days_in(&path, None).unwrap();
+        let v = read_json(&path);
+        assert!(v.get(CLEANUP_KEY).is_none());
+        assert_eq!(v["theme"], "dark");
+
+        // Claude Code rejects 0, so we never write it.
+        assert!(set_cleanup_days_in(&path, Some(0)).is_err());
+        // An unparseable file is reported and left alone.
+        std::fs::write(&path, "{ not json").unwrap();
+        assert!(cleanup_days_in(&path).is_err());
+        assert!(set_cleanup_days_in(&path, Some(365)).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ not json");
     }
 
     #[test]
@@ -2679,6 +3705,238 @@ mod tests {
         .unwrap();
         apply_base_hooks(only_ours.as_object_mut().unwrap(), exe).unwrap();
         assert!(only_ours["hooks"].get("SubagentStop").is_none());
+    }
+
+    #[test]
+    fn plugin_is_detected_only_when_enabled() {
+        assert!(plugin_enabled_in(
+            &json!({"enabledPlugins": {"callimachus@callimachus": true}})
+        ));
+        // The same plugin from another marketplace (a fork, a directory listing).
+        assert!(plugin_enabled_in(
+            &json!({"enabledPlugins": {"callimachus@claude-plugins-official": true}})
+        ));
+        for off in [
+            json!({}),
+            json!({"enabledPlugins": {"callimachus@callimachus": false}}),
+            json!({"enabledPlugins": {"callimachus-extras@callimachus": true}}),
+            json!({"enabledPlugins": {"other@callimachus": true}}),
+            json!({"enabledPlugins": {"callimachus": true}}),
+            json!({"enabledPlugins": {"callimachus@callimachus": "yes"}}),
+            json!({"enabledPlugins": ["callimachus@callimachus"]}),
+        ] {
+            assert!(!plugin_enabled_in(&off), "{off}");
+        }
+        assert_eq!(
+            plugin_manages(&json!({"enabledPlugins": {"callimachus@callimachus": true}})),
+            cfg!(unix),
+            "Windows keeps the app's own install: the plugin's sh hooks find no cal there"
+        );
+    }
+
+    /// Handing over to the plugin strips the base hooks the plugin ships, keeps the opt-in
+    /// proactive-recall hook (the plugin has none) and the user's own hooks.
+    #[test]
+    fn hand_over_strips_base_hooks_only() {
+        let exe = Path::new("/x/callimachus");
+        let mut root = json!({
+            "hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "echo mine"}]}]}
+        });
+        let obj = root.as_object_mut().unwrap();
+        apply_base_hooks(obj, exe).unwrap();
+        upsert_hook(
+            obj,
+            &PROACTIVE_RECALL_HOOK,
+            &hook_command(exe, "recall-now"),
+            exe,
+        )
+        .unwrap();
+        strip_base_hooks(obj, exe);
+        for spec in BASE_HOOKS {
+            assert_eq!(ours_in(&root, spec.event), 0, "{} handed over", spec.event);
+        }
+        assert_eq!(ours_in(&root, PROACTIVE_RECALL_HOOK.event), 1);
+        assert_eq!(
+            root["hooks"]["SessionStart"][0]["hooks"][0]["command"],
+            "echo mine"
+        );
+    }
+
+    /// The hand-over records what it removed, and turning the plugin off puts back exactly
+    /// that: a piece the user removed or replaced in the meantime is left as they made it,
+    /// and pieces the app never installed are not added.
+    #[test]
+    fn plugin_hand_over_round_trips_through_its_marker() {
+        let tmp = TempDir::new("plugin_round_trip");
+        let files = ClaudeFiles {
+            settings: tmp.path().join("settings.json"),
+            skill: tmp.path().join("skills/recall/SKILL.md"),
+            config: tmp.path().join(".claude.json"),
+        };
+        let marker = tmp.path().join(PLUGIN_HANDOVER_MARKER);
+        let exe = Path::new("/Applications/Callimachus.app/Contents/MacOS/callimachus");
+        let cli = Path::new("/Users/me/.local/bin/cal");
+        update_json_file(&files.settings, true, |obj| apply_base_hooks(obj, exe)).unwrap();
+        write_skill_at(&files.skill, cli).unwrap();
+        register_mcp_json(&files.config, exe).unwrap();
+
+        assert!(hand_over_in(&files, &marker, exe).unwrap());
+        let settings = read_json(&files.settings);
+        for spec in BASE_HOOKS {
+            assert_eq!(ours_in(&settings, spec.event), 0, "{}", spec.event);
+        }
+        assert!(!files.skill.exists());
+        assert!(
+            !files.skill.parent().unwrap().exists(),
+            "the empty recall dir goes too"
+        );
+        assert!(read_json(&files.config)["mcpServers"]
+            .get(MCP_NAME)
+            .is_none());
+        let handed = read_handover(&marker).unwrap().unwrap();
+        assert_eq!(handed.hooks, ["SessionStart", "PreCompact", "SessionEnd"]);
+        assert!(handed.skill && handed.mcp);
+        // Again (Install re-run): nothing left to take, and the record is kept.
+        assert!(!hand_over_in(&files, &marker, exe).unwrap());
+        assert_eq!(read_handover(&marker).unwrap().unwrap(), handed);
+
+        // The plugin goes off; meanwhile the user wrote their own MCP entry.
+        update_json_file(&files.config, false, |obj| {
+            obj.insert("mcpServers".into(), json!({MCP_NAME: {"command": "npx"}}));
+            Ok(())
+        })
+        .unwrap();
+        assert!(take_back_in(&files, &marker, exe, cli).unwrap());
+        let settings = read_json(&files.settings);
+        for spec in BASE_HOOKS {
+            assert_eq!(ours_in(&settings, spec.event), 1, "{}", spec.event);
+        }
+        assert_eq!(
+            std::fs::read_to_string(&files.skill).unwrap(),
+            render_skill(cli)
+        );
+        assert_eq!(
+            read_json(&files.config)["mcpServers"][MCP_NAME]["command"],
+            "npx"
+        );
+        assert!(!marker.exists());
+        assert!(
+            !take_back_in(&files, &marker, exe, cli).unwrap(),
+            "no marker: nothing to restore"
+        );
+
+        // Only what was handed over comes back: a user who had removed SessionEnd and the
+        // MCP entry before enabling the plugin keeps them removed.
+        update_json_file(&files.settings, false, |obj| {
+            strip_our_hooks(obj, SESSION_END_HOOK.event, exe);
+            Ok(())
+        })
+        .unwrap();
+        std::fs::write(&files.config, "{}").unwrap();
+        hand_over_in(&files, &marker, exe).unwrap();
+        take_back_in(&files, &marker, exe, cli).unwrap();
+        let settings = read_json(&files.settings);
+        assert_eq!(ours_in(&settings, SESSION_START_HOOK.event), 1);
+        assert_eq!(ours_in(&settings, SESSION_END_HOOK.event), 0);
+        assert!(read_json(&files.config).get("mcpServers").is_none());
+    }
+
+    /// Only the entry the app registered (`<app> --mcp`) gives way to the plugin's server; a
+    /// hand-written one (which Claude Code dedupes against the plugin's by command) stays.
+    #[test]
+    fn hand_over_removes_only_the_app_mcp_entry() {
+        let tmp = TempDir::new("plugin_mcp");
+        let cfg = tmp.path().join(".claude.json");
+        let exe = Path::new("/Applications/Callimachus.app/Contents/MacOS/callimachus");
+        std::fs::write(&cfg, r#"{"mcpServers": {"other": {"command": "x"}}}"#).unwrap();
+        register_mcp_json(&cfg, exe).unwrap();
+        assert!(remove_app_mcp_json(&cfg).unwrap());
+        let v = read_json(&cfg);
+        assert!(v["mcpServers"].get(MCP_NAME).is_none());
+        assert_eq!(v["mcpServers"]["other"]["command"], "x");
+        assert!(
+            !remove_app_mcp_json(&cfg).unwrap(),
+            "nothing left to remove"
+        );
+
+        std::fs::write(
+            &cfg,
+            r#"{"mcpServers": {"callimachus": {"command": "npx", "args": ["-y", "callimachus-mcp"]}}}"#,
+        )
+        .unwrap();
+        assert!(!remove_app_mcp_json(&cfg).unwrap());
+        assert_eq!(read_json(&cfg)["mcpServers"][MCP_NAME]["command"], "npx");
+    }
+
+    /// The repo's Claude Code plugin (plugins/claude-code) ships what `install()` would: the
+    /// bundled skill byte for byte, the base hooks with the same events, matchers, timeouts and
+    /// subcommands (guarded like ours, run through the `cal` link the app installs), the MCP
+    /// server under our name, and the app's version, which sync-versions.mjs keeps in step.
+    #[test]
+    fn claude_plugin_mirrors_the_app_install() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../plugins/claude-code");
+        let read = |rel: &str| {
+            std::fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"))
+        };
+        // The plugin's copy is the bundled text plus a fixed note on where `cal` lives (the
+        // app renders that note per machine instead); plugins/test pins the same suffix.
+        const PLUGIN_SKILL_SUFFIX: &str = "\n## With the Claude Code plugin\n\nThe `cal` CLI is \
+            `~/.local/bin/cal` (on Windows, `cal.exe` next to the Callimachus app). If a bare \
+            `cal` is not found or prints a calendar (the system `cal(1)` winning on PATH), call \
+            it by that full path. The MCP prompts' slash commands carry the plugin's prefix, \
+            for example `/mcp__plugin_callimachus_callimachus__recall`.\n";
+        assert_eq!(
+            read("skills/recall/SKILL.md"),
+            format!("{SKILL_MD}{PLUGIN_SKILL_SUFFIX}"),
+            "plugins/claude-code/skills/recall/SKILL.md is resources/recall/SKILL.md plus the \
+             plugin note"
+        );
+
+        let cal = "\"$HOME/.local/bin/cal\"";
+        let mut expected = Map::new();
+        for spec in BASE_HOOKS {
+            let mut group = Map::new();
+            if let Some(m) = spec.matcher {
+                group.insert("matcher".into(), json!(m));
+            }
+            group.insert(
+                "hooks".into(),
+                json!([{
+                    "type": "command",
+                    "command": format!("[ ! -x {cal} ] || {cal} {}", spec.subcommand),
+                    "timeout": spec.timeout_secs,
+                }]),
+            );
+            expected.insert(spec.event.into(), json!([group]));
+        }
+        let hooks: Value = serde_json::from_str(&read("hooks/hooks.json")).unwrap();
+        assert_eq!(hooks["hooks"], Value::Object(expected));
+
+        let mcp: Value = serde_json::from_str(&read(".mcp.json")).unwrap();
+        let version = env!("CARGO_PKG_VERSION");
+        assert_eq!(
+            mcp["mcpServers"][MCP_NAME],
+            json!({"command": "npx", "args": ["-y", format!("callimachus-mcp@{version}")]})
+        );
+
+        let manifest: Value = serde_json::from_str(&read(".claude-plugin/plugin.json")).unwrap();
+        assert_eq!(manifest["version"], version);
+        let market: Value = serde_json::from_str(
+            &std::fs::read_to_string(root.join("../../.claude-plugin/marketplace.json")).unwrap(),
+        )
+        .unwrap();
+        let entry = &market["plugins"][0];
+        assert_eq!(
+            format!(
+                "{}@{}",
+                manifest["name"].as_str().unwrap(),
+                market["name"].as_str().unwrap()
+            ),
+            PLUGIN_ID
+        );
+        assert_eq!(entry["name"], manifest["name"]);
+        assert_eq!(entry["source"]["path"], "plugins/claude-code");
+        assert_eq!(entry["source"]["ref"], format!("v{version}"));
     }
 
     #[test]
@@ -3219,5 +4477,335 @@ mod tests {
         let shadowed = [system_bin.clone(), local_bin.clone()];
         let hint = path_hint_for(&shadowed, &cal, &exe, Some(&home)).unwrap();
         assert!(hint.contains("comes before ~/.local/bin"), "{hint}");
+    }
+
+    // ---- Codex and Gemini CLI memory hooks ----
+
+    fn target_in(dir: &Path, id: &'static str) -> HookTarget {
+        let (file, specs): (PathBuf, &'static [&'static HookSpec]) = match id {
+            "codex" => (dir.join("hooks.json"), &CODEX_HOOKS),
+            _ => (dir.join("settings.json"), &GEMINI_HOOKS),
+        };
+        HookTarget {
+            id,
+            label: if id == "codex" { "Codex" } else { "Gemini CLI" },
+            dir: dir.to_path_buf(),
+            file,
+            specs,
+        }
+    }
+
+    fn hook_entry<'a>(root: &'a Value, event: &str) -> &'a Value {
+        &our_group(root, event)["hooks"][0]
+    }
+
+    /// Codex: hooks.json is created, the three hooks land with Codex's matcher and second
+    /// timeouts (SessionEnd at its 3 s max), a reinstall adds no duplicate, the user's own
+    /// hooks survive, and uninstall leaves only them.
+    #[test]
+    fn codex_hooks_install_idempotently_and_uninstall_cleanly() {
+        let tmp = TempDir::new("codex-hooks");
+        let t = target_in(tmp.path(), "codex");
+        let exe = Path::new("/Applications/Callimachus.app/Contents/MacOS/callimachus");
+        assert!(!agent_hooks_installed(&t, exe));
+        for _ in 0..2 {
+            install_hooks_into(&t.file, t.specs, exe).unwrap();
+        }
+        let root = read_json(&t.file);
+        for event in ["SessionStart", "PreCompact", "SessionEnd"] {
+            assert_eq!(ours_in(&root, event), 1, "{event}");
+        }
+        assert_eq!(
+            our_group(&root, "SessionStart")["matcher"],
+            "startup|clear|compact"
+        );
+        let start = hook_entry(&root, "SessionStart");
+        assert_eq!(start["timeout"], 10);
+        assert!(
+            start["command"]
+                .as_str()
+                .unwrap()
+                .ends_with("\" hook --for codex"),
+            "{start}"
+        );
+        assert!(start.get("name").is_none());
+        assert_eq!(hook_entry(&root, "SessionEnd")["timeout"], 3);
+        assert!(hook_entry(&root, "PreCompact")["command"]
+            .as_str()
+            .unwrap()
+            .ends_with("snapshot-hook --for codex"));
+        assert!(agent_hooks_installed(&t, exe));
+        // Claude's hook detection does not mistake a Codex hook for Claude's.
+        assert_eq!(
+            our_hook_subcommand(start["command"].as_str().unwrap()),
+            Some("hook --for codex")
+        );
+
+        // The user's own hook in the same event survives install and uninstall.
+        let mut with_user = read_json(&t.file);
+        with_user["hooks"]["SessionStart"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"hooks": [{"type": "command", "command": "my-own-hook"}]}));
+        std::fs::write(&t.file, serde_json::to_string(&with_user).unwrap()).unwrap();
+        install_hooks_into(&t.file, t.specs, exe).unwrap();
+        remove_hooks_from(&t.file, t.specs, exe).unwrap();
+        let after = read_json(&t.file);
+        assert_eq!(
+            after,
+            json!({"hooks": {"SessionStart": [
+                {"hooks": [{"type": "command", "command": "my-own-hook"}]}
+            ]}})
+        );
+        assert!(!agent_hooks_installed(&t, exe));
+    }
+
+    /// Gemini: merged into settings.json next to the MCP entry and other settings, with
+    /// exact-string `*` matchers, millisecond timeouts and hook names.
+    #[test]
+    fn gemini_hooks_merge_into_settings_json() {
+        let tmp = TempDir::new("gemini-hooks");
+        let t = target_in(tmp.path(), "gemini");
+        std::fs::write(
+            &t.file,
+            r#"{"theme":"dark","mcpServers":{"callimachus":{"command":"/x","args":["--mcp"]}}}"#,
+        )
+        .unwrap();
+        let exe = Path::new("/opt/callimachus/callimachus");
+        for _ in 0..2 {
+            install_hooks_into(&t.file, t.specs, exe).unwrap();
+        }
+        let root = read_json(&t.file);
+        assert_eq!(root["theme"], "dark");
+        assert_eq!(root["mcpServers"]["callimachus"]["command"], "/x");
+        assert_eq!(ours_in(&root, "SessionStart"), 1);
+        assert_eq!(ours_in(&root, "SessionEnd"), 1);
+        assert_eq!(ours_in(&root, "PreCompress"), 0);
+        assert_eq!(our_group(&root, "SessionStart")["matcher"], "*");
+        let start = hook_entry(&root, "SessionStart");
+        assert_eq!(start["timeout"], 10_000);
+        assert_eq!(start["name"], "callimachus-memory");
+        assert_eq!(start["type"], "command");
+        assert!(start["command"]
+            .as_str()
+            .unwrap()
+            .ends_with("\" hook --for gemini"));
+        assert!(hook_entry(&root, "SessionEnd")["command"]
+            .as_str()
+            .unwrap()
+            .ends_with("session-end --for gemini"));
+
+        remove_hooks_from(&t.file, t.specs, exe).unwrap();
+        let after = read_json(&t.file);
+        assert!(after.get("hooks").is_none(), "{after}");
+        assert_eq!(after["mcpServers"]["callimachus"]["command"], "/x");
+    }
+
+    /// Startup refresh re-points a dead target in both files, keeps `--for`, the user's
+    /// timeout and Gemini's millisecond unit, and never creates a file.
+    #[test]
+    fn agent_hook_refresh_repoints_and_keeps_tuning() {
+        let tmp = TempDir::new("agent-hook-refresh");
+        let dead = Path::new("/gone/Callimachus.app/Contents/MacOS/callimachus");
+        let exe = Path::new("/Applications/Callimachus.app/Contents/MacOS/callimachus");
+        for id in ["codex", "gemini"] {
+            let dir = tmp.path().join(id);
+            std::fs::create_dir_all(&dir).unwrap();
+            let t = target_in(&dir, id);
+            install_hooks_into(&t.file, t.specs, dead).unwrap();
+            let mut root = read_json(&t.file);
+            let start = root["hooks"]["SessionStart"][0]["hooks"][0]
+                .as_object_mut()
+                .unwrap();
+            start.insert("timeout".into(), json!(7));
+            // An entry an older build wrote without a timeout gets the agent's unit.
+            root["hooks"]["SessionEnd"][0]["hooks"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("timeout");
+            std::fs::write(&t.file, serde_json::to_string(&root).unwrap()).unwrap();
+
+            let changed = update_json_file(&t.file, false, |obj| {
+                refresh_specs_in(obj, t.specs, exe);
+                Ok(())
+            })
+            .unwrap();
+            assert!(changed, "{id}");
+            let root = read_json(&t.file);
+            let start = hook_entry(&root, "SessionStart");
+            assert_eq!(
+                start["command"],
+                hook_command(exe, &format!("hook --for {id}")),
+                "{id}"
+            );
+            assert_eq!(start["timeout"], 7, "the user's timeout stays");
+            let end_timeout = if id == "codex" { 3 } else { 5_000 };
+            assert_eq!(hook_entry(&root, "SessionEnd")["timeout"], end_timeout);
+            assert!(agent_hooks_installed(&t, exe));
+        }
+        // No file: refresh writes none.
+        let t = target_in(&tmp.path().join("none"), "codex");
+        assert!(!update_json_file(&t.file, false, |obj| {
+            refresh_specs_in(obj, t.specs, exe);
+            Ok(())
+        })
+        .unwrap());
+        assert!(!t.file.exists());
+    }
+
+    /// Hooks turned off in the agent's own config, or an agent that is not set up, block
+    /// the install with a reason; on by default otherwise.
+    #[test]
+    fn agent_hooks_report_blocked_states() {
+        let tmp = TempDir::new("agent-hook-blocked");
+        let codex = target_in(tmp.path(), "codex");
+        assert_eq!(hooks_blocked(&codex), None, "no config.toml: hooks are on");
+        std::fs::write(tmp.path().join("config.toml"), "model = \"o3\"\n").unwrap();
+        assert_eq!(hooks_blocked(&codex), None);
+        std::fs::write(tmp.path().join("config.toml"), "[features]\nhooks = true\n").unwrap();
+        assert_eq!(hooks_blocked(&codex), None);
+        for off in [
+            "[features]\nhooks = false\n",
+            "[features]\ncodex_hooks = false\n",
+        ] {
+            std::fs::write(tmp.path().join("config.toml"), off).unwrap();
+            assert_eq!(
+                hooks_blocked(&codex).as_deref(),
+                Some(CODEX_HOOKS_OFF),
+                "{off}"
+            );
+        }
+
+        let gemini = target_in(tmp.path(), "gemini");
+        std::fs::write(&gemini.file, r#"{"hooksConfig":{"enabled":true}}"#).unwrap();
+        assert_eq!(hooks_blocked(&gemini), None);
+        std::fs::write(&gemini.file, r#"{"hooksConfig":{"enabled":false}}"#).unwrap();
+        assert_eq!(hooks_blocked(&gemini).as_deref(), Some(GEMINI_HOOKS_OFF));
+
+        let missing = target_in(&tmp.path().join("not-here"), "gemini");
+        assert!(hooks_blocked(&missing)
+            .unwrap()
+            .starts_with("Gemini CLI is not set up on this machine"));
+    }
+
+    /// Gemini CLI runs hooks through PowerShell on Windows, so its commands there use the
+    /// call operator, and are still recognized (and re-pointed) like every other form.
+    #[test]
+    fn gemini_windows_commands_use_the_powershell_call_operator() {
+        let exe = r"C:\Users\me\AppData\Local\Callimachus\callimachus.exe";
+        let cmd = spec_command_for(exe, &GEMINI_SESSION_START_HOOK, "hook --for gemini", true);
+        assert_eq!(cmd, format!("& \"{exe}\" hook --for gemini"));
+        assert_eq!(our_hook_subcommand(&cmd), Some("hook --for gemini"));
+        assert_eq!(hook_target(&cmd, false), Some(PathBuf::from(exe)));
+        // Codex and Claude Code keep the plain quoted form; Unix is unchanged for Gemini.
+        assert_eq!(
+            spec_command_for(exe, &CODEX_SESSION_START_HOOK, "hook --for codex", true),
+            format!("\"{exe}\" hook --for codex")
+        );
+        assert_eq!(
+            spec_command_for(
+                "/opt/c/callimachus",
+                &GEMINI_SESSION_START_HOOK,
+                "hook --for gemini",
+                false
+            ),
+            hook_command_for("/opt/c/callimachus", "hook --for gemini", false)
+        );
+        assert!(GEMINI_HOOKS.iter().all(|s| s.powershell));
+        assert!(!CODEX_HOOKS
+            .iter()
+            .chain(BASE_HOOKS.iter())
+            .any(|s| s.powershell));
+    }
+
+    /// Codex hooks defined in config.toml block ours (hooks.json beside them makes Codex warn
+    /// at every startup), but the trust state Codex writes there does not.
+    #[test]
+    fn codex_hooks_in_config_toml_block_the_install() {
+        let tmp = TempDir::new("codex-toml-hooks");
+        let codex = target_in(tmp.path(), "codex");
+        let toml = tmp.path().join("config.toml");
+        std::fs::write(&toml, "[hooks.state.\"x\"]\ntrusted_hash = \"abc\"\n").unwrap();
+        assert_eq!(hooks_blocked(&codex), None);
+        std::fs::write(
+            &toml,
+            "[[hooks.SessionStart]]\nmatcher = \"startup\"\n[[hooks.SessionStart.hooks]]\ntype = \"command\"\ncommand = \"echo hi\"\n",
+        )
+        .unwrap();
+        assert_eq!(hooks_blocked(&codex).as_deref(), Some(CODEX_HOOKS_IN_TOML));
+    }
+
+    /// A Gemini hook listed by name in `hooksConfig.disabled` reports off and blocked, also
+    /// in a settings.json with comments.
+    #[test]
+    fn gemini_hook_disabled_by_name_reports_off() {
+        let tmp = TempDir::new("gemini-disabled");
+        let t = target_in(tmp.path(), "gemini");
+        let exe = Path::new("/opt/callimachus/callimachus");
+        install_hooks_into(&t.file, t.specs, exe).unwrap();
+        assert!(agent_hooks_installed(&t, exe));
+        let mut root = read_json(&t.file);
+        root["hooksConfig"] = json!({"disabled": ["callimachus-memory"]});
+        let text = format!("// mine\n{}", serde_json::to_string_pretty(&root).unwrap());
+        std::fs::write(&t.file, text).unwrap();
+        assert!(agent_hooks_present(&t, exe), "still in the file");
+        assert!(!agent_hooks_installed(&t, exe));
+        assert_eq!(hooks_blocked(&t).as_deref(), Some(GEMINI_HOOK_DISABLED));
+        // The install error names the comments instead of a bare parse error.
+        let err = install_hooks_into(&t.file, t.specs, exe).unwrap_err();
+        assert!(format!("{err:#}").contains("has comments"), "{err:#}");
+    }
+
+    /// Comments go, strings that look like comments stay.
+    #[test]
+    fn json_comments_are_stripped_outside_strings() {
+        let text = "{\n  // a\n  \"url\": \"http://x/*y*/\", /* b\n c */ \"q\": \"\\\"//\"\n}";
+        let v: Value = serde_json::from_str(&strip_json_comments(text)).unwrap();
+        assert_eq!(v, json!({"url": "http://x/*y*/", "q": "\"//"}));
+        assert_eq!(
+            strip_json_comments(text).lines().count(),
+            text.lines().count()
+        );
+    }
+
+    /// Every `--for` subcommand is recognized as exactly itself, so refresh keeps it.
+    #[test]
+    fn for_agent_subcommands_are_recognized_exactly() {
+        let exe = Path::new("/Applications/Callimachus.app/Contents/MacOS/callimachus");
+        for sub in HOOK_SUBCOMMANDS {
+            let cmd = hook_command_for(&exe.to_string_lossy(), sub, false);
+            assert_eq!(our_hook_subcommand(&cmd), Some(sub), "{cmd}");
+            assert!(is_our_hook(&cmd, exe));
+            let win = hook_command_for(&exe.to_string_lossy(), sub, true);
+            assert_eq!(our_hook_subcommand(&win), Some(sub), "{win}");
+        }
+    }
+
+    /// The uninstaller's marker records the agents with hooks, and folds an earlier one in.
+    #[test]
+    fn marker_keeps_agent_hooks() {
+        let mut later = RemovedIntegration::default();
+        later.merge(RemovedIntegration {
+            agent_hooks: vec!["gemini".into()],
+            ..Default::default()
+        });
+        assert_eq!(later.agent_hooks, ["gemini"]);
+        let old: RemovedIntegration = serde_json::from_str(r#"{"cal":true}"#).unwrap();
+        assert!(old.agent_hooks.is_empty(), "an older marker still parses");
+    }
+
+    /// The shared-dir copy is removed only when it is one of ours, untouched.
+    #[test]
+    fn shared_skill_removal_spares_an_edited_copy() {
+        let tmp = TempDir::new("shared-skill");
+        let ours = tmp.path().join("ours.md");
+        let theirs = tmp.path().join("theirs.md");
+        write_skill_at(&ours, Path::new("/home/me/.local/bin/cal")).unwrap();
+        std::fs::write(&theirs, "---\nname: recall\n---\nmy own\n").unwrap();
+        remove_untouched_skill(&ours).unwrap();
+        remove_untouched_skill(&theirs).unwrap();
+        remove_untouched_skill(&tmp.path().join("missing.md")).unwrap();
+        assert!(!ours.exists());
+        assert!(theirs.exists());
     }
 }

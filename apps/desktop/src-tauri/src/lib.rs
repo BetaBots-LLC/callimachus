@@ -21,7 +21,11 @@ pub mod gitlink;
 pub mod integration;
 pub mod issues;
 pub mod knowledge;
+// Local-only counts of what the hooks and MCP server did; never telemetry (module docs).
+pub mod ledger;
 pub mod mcp_server;
+// The first-run checklist's saved answers; GUI only.
+mod onboarding;
 pub mod search;
 pub mod snapshot;
 // Opt-in analytics, GUI only: constructed in `run()` and nowhere else (see its module docs).
@@ -1915,6 +1919,16 @@ pub(crate) fn harvest_claude_memory_tick(app: &AppHandle, conn: &rusqlite::Conne
     }
 }
 
+/// Fold the value ledger's past days into `ledger.daily` on `conn` (the watcher's writer, at
+/// launch and on its minute tick). A busy index waits for the next tick.
+pub(crate) fn ledger_rollup_tick(conn: &rusqlite::Connection) {
+    match ledger::rollup(conn) {
+        Ok(_) => {}
+        Err(e) if db::is_busy(&e) => {}
+        Err(e) => app_log!("[ledger] rollup: {e:#}"),
+    }
+}
+
 /// After a harvest pass changed facts: log it, have open views refetch project memory (the
 /// null `index:updated` payload is main.tsx's housekeeping contract), and embed the new
 /// facts for recall when the model is on disk. The embed runs on its own thread because it
@@ -3505,10 +3519,29 @@ async fn install_agent_integrations(
     Ok(result)
 }
 
-/// Remove the `callimachus` MCP registration from the other agents.
+/// Remove the `callimachus` MCP registration and the Codex and Gemini CLI memory hooks
+/// from the other agents.
 #[tauri::command]
 async fn uninstall_agent_integrations() -> AppResult<()> {
-    blocking(integration::uninstall_agents).await
+    blocking(integration::uninstall_agents_and_hooks).await
+}
+
+/// Settings > Agents: the Codex and Gemini CLI memory hooks (installed, and why not).
+#[tauri::command]
+async fn agent_hooks_status() -> AppResult<Vec<integration::AgentHooksStatus>> {
+    blocking(|| Ok(integration::agent_hooks_status(&current_exe()?))).await
+}
+
+/// Add the memory hooks to `agent` (`codex` or `gemini`).
+#[tauri::command]
+async fn install_agent_hooks(agent: String) -> AppResult<integration::AgentHooksStatus> {
+    blocking(move || integration::install_agent_hooks(&current_exe()?, &agent)).await
+}
+
+/// Remove the memory hooks from `agent`.
+#[tauri::command]
+async fn uninstall_agent_hooks(agent: String) -> AppResult<integration::AgentHooksStatus> {
+    blocking(move || integration::uninstall_agent_hooks(&current_exe()?, &agent)).await
 }
 
 /// The SessionStart hook's settings: whether it injects the recent-sessions digest for a
@@ -3525,6 +3558,134 @@ async fn hook_settings(
 async fn set_hook_digest(app: AppHandle, on: bool) -> AppResult<()> {
     write_blocking(&app, move |conn| {
         export::hook_settings::set_digest_enabled(conn, on)
+    })
+    .await
+}
+
+/// The first-run setup checklist's saved step states (`onboarding.steps`).
+#[tauri::command]
+async fn onboarding_state(
+    pool: tauri::State<'_, db::ReadPool>,
+) -> AppResult<onboarding::OnboardingSteps> {
+    read_blocking(&pool, onboarding::get).await
+}
+
+/// Mark a checklist step done or skipped, or clear it (`state: null`) to reopen it. Returns
+/// every step. The read-modify-write runs under the one writer lock, so two quick clicks
+/// can't drop each other's step.
+#[tauri::command]
+async fn set_onboarding_step(
+    app: AppHandle,
+    step: String,
+    state: Option<String>,
+) -> AppResult<onboarding::OnboardingSteps> {
+    write_blocking(&app, move |conn| {
+        onboarding::set_step(conn, &step, state.as_deref())
+    })
+    .await
+}
+
+// ---- value ledger and transcript retention (ledger.rs) ----
+
+/// What `value_ledger` returns: the Stats card "What Callimachus did for your agents this
+/// week" and the retention guard under it.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ValueLedger {
+    week: ledger::Counts,
+    all_time: u64,
+    preserved: PreservedSessions,
+}
+
+/// Indexed sessions whose transcript Claude Code has since deleted, with the retention that
+/// decides how many more will go.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PreservedSessions {
+    threads: i64,
+    source: &'static str,
+    /// The user-level `cleanupPeriodDays`, or null when unset (or settings.json unreadable).
+    cleanup_period_days: Option<i64>,
+    /// What Claude Code applies: the setting, else its documented 30-day default.
+    effective_days: i64,
+    /// The value before Callimachus last changed it (null: it was unset), when a restore is
+    /// on offer.
+    previous_cleanup_days: Option<i64>,
+    can_restore: bool,
+}
+
+/// app_config: the `cleanupPeriodDays` value (`{"days": n | null}`) Callimachus replaced,
+/// so the Stats card can put it back. Cleared once restored.
+const RETENTION_PREVIOUS_KEY: &str = "retention.claude_previous";
+
+/// The remembered value, if any (`Some(None)`: it was unset). A remembered value below 1 day
+/// reads as unset: Claude Code rejects one (`0` is a validation error that pauses its sweep)
+/// and so does [`integration::set_claude_cleanup_period_days`], so restoring it would fail
+/// forever with the button still on offer.
+fn retention_previous(conn: &rusqlite::Connection) -> anyhow::Result<Option<Option<i64>>> {
+    Ok(knowledge::app_config::get(conn, RETENTION_PREVIOUS_KEY)?
+        .and_then(|v| serde_json::from_str::<serde_json::Value>(&v).ok())
+        .map(|v| valid_cleanup_days(v.get("days").and_then(serde_json::Value::as_i64))))
+}
+
+/// A `cleanupPeriodDays` Claude Code accepts, else None (unset). A non-integer value (a
+/// string, a float) already reads as None.
+fn valid_cleanup_days(days: Option<i64>) -> Option<i64> {
+    days.filter(|d| *d >= 1)
+}
+
+#[tauri::command]
+async fn value_ledger(pool: tauri::State<'_, db::ReadPool>) -> AppResult<ValueLedger> {
+    read_blocking(&pool, |conn| {
+        let now = chrono::Utc::now().timestamp();
+        let summary = ledger::summary(conn, ledger::path_for_conn(conn).as_deref(), now)?;
+        // ~21k stats on the author's index; this runs on the blocking pool.
+        let threads = match indexer::claude::projects_root() {
+            Some(root) => ledger::preserved_claude_threads(conn, &root)?,
+            None => 0,
+        };
+        // An unreadable settings.json reads as unset here; changing it reports the problem.
+        let days = integration::claude_cleanup_period_days().unwrap_or(None);
+        let previous = retention_previous(conn)?;
+        Ok(ValueLedger {
+            week: summary.week,
+            all_time: summary.all_time,
+            preserved: PreservedSessions {
+                threads,
+                source: "claude_code",
+                cleanup_period_days: days,
+                effective_days: days.unwrap_or(integration::CLAUDE_DEFAULT_CLEANUP_DAYS),
+                previous_cleanup_days: previous.flatten(),
+                can_restore: previous.is_some(),
+            },
+        })
+    })
+    .await
+}
+
+/// Set Claude Code's `cleanupPeriodDays` (null removes it, back to the 30-day default).
+/// Remembers the value it replaced so the Stats card can offer it back; setting that
+/// remembered value again is the restore, which forgets it.
+#[tauri::command]
+async fn set_claude_cleanup_days(app: AppHandle, days: Option<i64>) -> AppResult<()> {
+    write_blocking(&app, move |conn| {
+        let current = integration::claude_cleanup_period_days()?;
+        if current == days {
+            return Ok(());
+        }
+        let previous = retention_previous(conn)?;
+        integration::set_claude_cleanup_period_days(days)?;
+        if previous == Some(days) {
+            knowledge::app_config::delete(conn, RETENTION_PREVIOUS_KEY)?;
+        } else if previous.is_none() {
+            // An invalid value is remembered as unset, so the restore can always run.
+            knowledge::app_config::put(
+                conn,
+                RETENTION_PREVIOUS_KEY,
+                &serde_json::json!({ "days": valid_cleanup_days(current) }).to_string(),
+            )?;
+        }
+        Ok(())
     })
     .await
 }
@@ -4449,8 +4610,15 @@ pub fn run() {
             agent_integrations_status,
             install_agent_integrations,
             uninstall_agent_integrations,
+            agent_hooks_status,
+            install_agent_hooks,
+            uninstall_agent_hooks,
             hook_settings,
             set_hook_digest,
+            onboarding_state,
+            set_onboarding_step,
+            value_ledger,
+            set_claude_cleanup_days,
             set_star,
             set_thread_tags,
             list_tags,
@@ -4545,6 +4713,27 @@ mod startup_tests {
         assert_eq!(splash_hold(Some(shown), now), Duration::from_millis(550));
         let shown = now - Duration::from_secs(2); // a slow launch: no extra wait
         assert_eq!(splash_hold(Some(shown), now), Duration::ZERO);
+    }
+
+    /// A remembered `cleanupPeriodDays` Claude Code would reject reads as unset, so the
+    /// Stats card's restore removes the key instead of failing on every click.
+    #[test]
+    fn an_invalid_remembered_retention_restores_as_unset() {
+        let p = temp_db("retention");
+        let conn = db::open(&p).unwrap();
+        assert_eq!(retention_previous(&conn).unwrap(), None);
+        for (stored, read) in [
+            (r#"{"days":0}"#, None),
+            (r#"{"days":-3}"#, None),
+            (r#"{"days":"365"}"#, None),
+            (r#"{"days":null}"#, None),
+            (r#"{"days":90}"#, Some(90)),
+        ] {
+            knowledge::app_config::put(&conn, RETENTION_PREVIOUS_KEY, stored).unwrap();
+            assert_eq!(retention_previous(&conn).unwrap(), Some(read), "{stored}");
+        }
+        assert_eq!(valid_cleanup_days(Some(0)), None);
+        assert_eq!(valid_cleanup_days(Some(1)), Some(1));
     }
 
     #[test]

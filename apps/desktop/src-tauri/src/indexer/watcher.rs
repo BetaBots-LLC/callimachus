@@ -385,6 +385,8 @@ fn run(app: AppHandle) -> anyhow::Result<()> {
     // Not on a first run: until something is indexed, indexing waits for the user to start
     // it from onboarding. Roots are already watched, so a write during the pass is queued.
     let mut catch_up_at = has_threads(&conn).then(Instant::now);
+    // Yesterday's hook and MCP counts into Stats before the first view asks for them.
+    crate::ledger_rollup_tick(&conn);
     if catch_up_at.is_none() {
         // Nothing indexed yet: every TODO will come from indexing itself, so the one-time
         // backfill for older indexes has nothing to do.
@@ -471,7 +473,8 @@ fn run(app: AppHandle) -> anyhow::Result<()> {
             }
         }
 
-        // The once-a-minute tick: new roots, the batch log line, idle memory.
+        // The once-a-minute tick: new roots, the batch log line, idle memory, the ledger
+        // rollup and the plugin hand-over.
         if last_root_check.elapsed() >= ROOT_RECHECK {
             if rollup.flush(last_root_check.elapsed()) {
                 // The minute's writes filled this connection's page cache (64 MiB).
@@ -479,6 +482,21 @@ fn run(app: AppHandle) -> anyhow::Result<()> {
             }
             crate::embed_reap_tick(&app);
             auto_distill_idle_tick(&app, &conn, &mut distill_idle_at);
+            // Here rather than after an indexing pass, so a tray app on an idle day still
+            // folds yesterday in. A no-op (one short read) until the ledger holds a line from
+            // before today.
+            crate::ledger_rollup_tick(&conn);
+            // The Claude Code plugin can be turned on or off while the app runs: hand the
+            // app's hooks, skill and MCP entry over, or take them back (one small read when
+            // nothing changed).
+            match std::env::current_exe()
+                .map_err(anyhow::Error::from)
+                .and_then(|exe| crate::integration::plugin_handover_tick(&exe))
+            {
+                Ok(true) => app_log!("[integration] Claude Code plugin hand-over updated"),
+                Ok(false) => {}
+                Err(e) => app_log!("[integration] Claude Code plugin hand-over: {e:#}"),
+            }
             // A session that ended while its transcript was already indexed has nothing to
             // index again, so the batch check above never sees its queue entry.
             priority_distill_kick(&app, &conn);

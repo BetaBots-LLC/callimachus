@@ -65,8 +65,8 @@ jobs:
       - name: Typecheck + build frontend
         run: pnpm turbo run typecheck build lint
 
-      - name: npm wrapper tests
-        run: node --test packages/callimachus-mcp/test/*.test.mjs
+      - name: npm wrapper and Claude Code plugin tests
+        run: node --test packages/callimachus-mcp/test/*.test.mjs plugins/test/*.test.mjs
 
       # vsce refuses to package an @types/vscode newer than engines.vscode, but only
       # publish-extension.yml packages the extension. `vsce ls` runs the same manifest

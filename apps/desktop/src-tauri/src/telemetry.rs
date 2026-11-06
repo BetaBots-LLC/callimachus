@@ -1909,11 +1909,14 @@ mod tests {
 
     /// The CLI, the hooks it runs on every prompt, and the MCP server must never
     /// reference telemetry: they run inside other tools' sessions and must stay silent.
+    /// The value ledger runs inside every hook and MCP process too, and promises never to
+    /// reach telemetry.
     #[test]
     fn sidecar_entry_points_never_touch_telemetry() {
         let sidecars = [
             ("cli_core.rs", include_str!("cli_core.rs")),
             ("mcp_server.rs", include_str!("mcp_server.rs")),
+            ("ledger.rs", include_str!("ledger.rs")),
             ("cli.rs", include_str!("../standalone/src/cli.rs")),
             ("mcp.rs", include_str!("../standalone/src/mcp.rs")),
             ("main.rs", include_str!("main.rs")),

@@ -92,6 +92,17 @@ function McpPage() {
             label="register (Claude Code shown)"
             lines={["claude mcp add callimachus -- npx -y callimachus-mcp"]}
           />
+          <p className="text-sm leading-relaxed text-muted-foreground">
+            In Claude Code you can instead install the Callimachus plugin, which bundles this server
+            with the <code className="font-mono">/callimachus:recall</code> skill and the memory
+            hooks. On macOS and Linux the app then installs only the CLI the hooks run, so nothing
+            loads twice. On Windows, skip the plugin and connect Claude Code from the app's Settings
+            &gt; Agents: the plugin's hooks need Git Bash there, and the app keeps its own install.
+          </p>
+          <CommandBlock
+            label="Claude Code plugin (then /plugin install callimachus@callimachus)"
+            lines={["claude plugin marketplace add BetaBots-LLC/callimachus"]}
+          />
           <p className="cat-label pt-2">Or build from source</p>
           <CommandBlock
             label="from a checkout of the repo (add --force over an earlier source install)"

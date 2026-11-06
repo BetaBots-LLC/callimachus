@@ -8,12 +8,13 @@ import { Switch } from "@/components/ui/switch";
 import { api } from "../../lib/api";
 import { track } from "../../lib/telemetry";
 import { errorText, notify } from "../../lib/toast";
+import { useChecklist } from "../../store/checklist";
 import { type Theme, useTheme } from "../../store/theme";
 import { cn } from "@/lib/utils";
 import { openPrivacy, useTelemetryChoice, useTelemetryStatus } from "../TelemetryConsent";
 import { InlineError, SectionHeader, SettingRow, SettingsGroup } from "./shared";
 
-/** App-level behavior: appearance, the tray, and the opt-in analytics. */
+/** App-level behavior: appearance, the tray, the setup checklist and the opt-in analytics. */
 export function GeneralSection() {
   return (
     <>
@@ -27,6 +28,9 @@ export function GeneralSection() {
         </SettingsGroup>
         <SettingsGroup title="Window">
           <CloseToTrayRow />
+        </SettingsGroup>
+        <SettingsGroup title="Setup">
+          <ChecklistRow />
         </SettingsGroup>
         <SettingsGroup title="Privacy">
           <TelemetryRow />
@@ -104,6 +108,22 @@ function CloseToTrayRow() {
           disabled={closeToTray.isPending || setCloseToTray.isPending}
           onCheckedChange={(v) => setCloseToTray.mutate(v)}
         />
+      }
+    />
+  );
+}
+
+/** Reopens the first-run checklist, for a step that was skipped or never finished. */
+function ChecklistRow() {
+  const show = useChecklist((s) => s.show);
+  return (
+    <SettingRow
+      title="Setup checklist"
+      description="Index your history, connect your agents, turn on memory and build semantic search. Reopen it to finish a step you skipped."
+      control={
+        <Button size="sm" variant="outline" onClick={() => show()}>
+          Open setup checklist
+        </Button>
       }
     />
   );

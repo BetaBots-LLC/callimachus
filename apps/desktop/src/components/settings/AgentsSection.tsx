@@ -3,7 +3,13 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { Switch } from "@/components/ui/switch";
-import { api, type HarvestSettings, type HookSettings } from "../../lib/api";
+import {
+  type AgentHooksStatus,
+  api,
+  type HarvestSettings,
+  type HookAgentId,
+  type HookSettings,
+} from "../../lib/api";
 import { track } from "../../lib/telemetry";
 import { errorText, notify } from "../../lib/toast";
 import {
@@ -32,6 +38,7 @@ export function AgentsSection() {
         </SettingsGroup>
         <SettingsGroup title="Other agents">
           <OtherAgentsRow />
+          <AgentHooksRows />
         </SettingsGroup>
       </div>
     </>
@@ -84,9 +91,16 @@ function ClaudeCodeRows() {
   });
 
   const s = status.data;
+  // The Claude Code plugin brings the skill, the MCP server and the hooks; the app adds only
+  // the `cal` CLI those hooks run, so `cal` alone means connected.
+  const managed = !!s?.pluginManaged;
   const connected =
-    !!s && s.skillInstalled && s.mcpRegistered && s.hookInstalled && !s.skillOutdated;
-  const partial = !!s && (s.skillInstalled || s.mcpRegistered || s.hookInstalled) && !connected;
+    !!s &&
+    (managed
+      ? s.calInstalled
+      : s.skillInstalled && s.mcpRegistered && s.hookInstalled && !s.skillOutdated);
+  const partial =
+    !!s && !managed && (s.skillInstalled || s.mcpRegistered || s.hookInstalled) && !connected;
   // Running from a disk image, App Translocation or an AppImage mount: install would
   // register a path that disappears, so the backend refuses with this same message.
   // `=== false`, not `!`: a status without the field (an older backend) must not lock
@@ -103,12 +117,20 @@ function ClaudeCodeRows() {
           </span>
         }
         description={
-          <>
-            Installs the <code>/recall</code> skill, registers Callimachus as an MCP server, and
-            adds the <code>cal</code> CLI the VS Code extension uses. Hooks inject each repo's
-            memory when a session starts, snapshot a session before its context is compacted, and,
-            when auto-distill is on, queue a session that ends for distillation.
-          </>
+          managed ? (
+            <>
+              Managed by the Claude Code plugin, which provides the <code>/callimachus:recall</code>{" "}
+              skill, the MCP server and the memory hooks. Callimachus installs only the{" "}
+              <code>cal</code> CLI those hooks run, so memory is never injected twice.
+            </>
+          ) : (
+            <>
+              Installs the <code>/recall</code> skill, registers Callimachus as an MCP server, and
+              adds the <code>cal</code> CLI the VS Code extension uses. Hooks inject each repo's
+              memory when a session starts, snapshot a session before its context is compacted, and,
+              when auto-distill is on, queue a session that ends for distillation.
+            </>
+          )
         }
         control={
           <>
@@ -134,9 +156,11 @@ function ClaudeCodeRows() {
                 ? "Installing…"
                 : connected
                   ? "Reinstall"
-                  : partial
-                    ? "Finish setup"
-                    : "Enable for Claude Code"}
+                  : managed
+                    ? "Install the cal CLI"
+                    : partial
+                      ? "Finish setup"
+                      : "Enable for Claude Code"}
             </Button>
           </>
         }
@@ -149,13 +173,17 @@ function ClaudeCodeRows() {
           // Only when something needs attention: when all is well the "connected" pill says so.
           (!connected || s?.calProblem) && (
             <StatusList>
-              <StatusItem
-                state={s?.skillInstalled ? (s.skillOutdated ? "warning" : "ok") : "missing"}
-              >
-                {s?.skillOutdated ? "skill outdated" : "skill"}
-              </StatusItem>
-              <StatusItem state={s?.mcpRegistered ? "ok" : "missing"}>MCP server</StatusItem>
-              <StatusItem state={s?.hookInstalled ? "ok" : "missing"}>memory hook</StatusItem>
+              {!managed && (
+                <>
+                  <StatusItem
+                    state={s?.skillInstalled ? (s.skillOutdated ? "warning" : "ok") : "missing"}
+                  >
+                    {s?.skillOutdated ? "skill outdated" : "skill"}
+                  </StatusItem>
+                  <StatusItem state={s?.mcpRegistered ? "ok" : "missing"}>MCP server</StatusItem>
+                  <StatusItem state={s?.hookInstalled ? "ok" : "missing"}>memory hook</StatusItem>
+                </>
+              )}
               <StatusItem state={s?.calInstalled ? "ok" : s?.calProblem ? "warning" : "missing"}>
                 cal CLI
               </StatusItem>
@@ -165,12 +193,15 @@ function ClaudeCodeRows() {
         {s?.calProblem && <Note>{s.calProblem}</Note>}
         {s?.pathHint && <PathHint hint={s.pathHint} />}
         {unstable && s?.exeProblem && <InlineError>{s.exeProblem}</InlineError>}
-        {install.isSuccess && (
-          <Note>
-            Done. Restart Claude Code (or run <code>/mcp</code>) to pick up the server, then type{" "}
-            <code>/recall</code>.
-          </Note>
-        )}
+        {install.isSuccess &&
+          (managed ? (
+            <Note>Done. New Claude Code sessions get each repo's memory from the plugin.</Note>
+          ) : (
+            <Note>
+              Done. Restart Claude Code (or run <code>/mcp</code>) to pick up the server, then type{" "}
+              <code>/recall</code>.
+            </Note>
+          ))}
         {install.isError && (
           <InlineError>Couldn't connect Claude Code: {errorText(install.error)}</InlineError>
         )}
@@ -424,6 +455,141 @@ function OtherAgentsRow() {
       )}
       {uninstall.isError && (
         <InlineError>Couldn't remove the registration: {errorText(uninstall.error)}</InlineError>
+      )}
+    </SettingRow>
+  );
+}
+
+const HOOK_AGENTS: Record<
+  HookAgentId,
+  {
+    label: string;
+    injects: string;
+    /** `configPath` is the row's hooks file, under the agent's config dir as the backend
+     *  resolved it (CODEX_HOME, or the Settings override), so the fix names the real file. */
+    blockedFix: (configPath: string) => string;
+    afterInstall: string;
+  }
+> = {
+  codex: {
+    label: "Codex",
+    injects:
+      "Injects the repo's memory when a Codex session starts, clears or compacts (imported Claude Code memories included, marked as such), or a recent-sessions digest while it has none. Also snapshots a session before compaction and queues an ended session for auto-distill.",
+    blockedFix: (configPath) =>
+      `Remove hooks = false (or codex_hooks = false) from the [features] table in ${siblingFile(configPath, "config.toml")}, then try again.`,
+    afterInstall:
+      "Codex runs a new hook only after you trust it: run /hooks in Codex and approve the Callimachus entries.",
+  },
+  gemini: {
+    label: "Gemini CLI",
+    injects:
+      "Injects the repo's memory when a Gemini CLI session starts or is cleared (imported Claude Code memories included, marked as such), or a recent-sessions digest while it has none. Also queues an ended session for auto-distill.",
+    blockedFix: (configPath) => `Set hooksConfig.enabled to true in ${configPath}, then try again.`,
+    afterInstall: "New Gemini CLI sessions pick them up.",
+  },
+};
+
+/** `name` next to `file`: Codex's hooks.json and config.toml share its config dir. */
+function siblingFile(file: string, name: string): string {
+  const cut = Math.max(file.lastIndexOf("/"), file.lastIndexOf("\\"));
+  return cut < 0 ? name : `${file.slice(0, cut + 1)}${name}`;
+}
+
+/** Memory hooks in Codex's and Gemini CLI's own hook systems, one switch per detected agent.
+ *  Cursor gets none: its sessionStart payload carries no working directory to pick the repo. */
+function AgentHooksRows() {
+  const integrations = useQuery({
+    queryKey: ["agent_integrations"],
+    queryFn: api.agentIntegrationsStatus,
+  });
+  const hooks = useQuery({ queryKey: ["agent_hooks"], queryFn: api.agentHooksStatus });
+  // Installing refuses from an unstable app path, like the MCP registration above.
+  const recall = useRecallStatus();
+  const exeProblem = recall.data?.exeStable === false ? recall.data.exeProblem : null;
+
+  const present = new Set((integrations.data ?? []).filter((a) => a.present).map((a) => a.id));
+  const rows = (hooks.data ?? []).filter((r) => present.has(r.agent));
+  if (hooks.isError) {
+    return (
+      <SettingRow title="Memory hooks">
+        <InlineError>
+          Couldn't read the Codex and Gemini CLI hooks: {errorText(hooks.error)}
+        </InlineError>
+      </SettingRow>
+    );
+  }
+  return (
+    <>
+      {rows.map((row) => (
+        <AgentHookRow key={row.agent} row={row} exeProblem={exeProblem ?? null} />
+      ))}
+    </>
+  );
+}
+
+function AgentHookRow({ row, exeProblem }: { row: AgentHooksStatus; exeProblem: string | null }) {
+  const id = useId();
+  const qc = useQueryClient();
+  const info = HOOK_AGENTS[row.agent];
+  const set = useMutation({
+    mutationFn: (on: boolean) =>
+      on ? api.installAgentHooks(row.agent) : api.uninstallAgentHooks(row.agent),
+    onSuccess: (next, on) => {
+      qc.setQueryData<AgentHooksStatus[]>(["agent_hooks"], (prev) =>
+        prev?.map((r) => (r.agent === next.agent ? next : r)),
+      );
+      if (on)
+        notify.success(`${info.label} memory hooks added`, { description: info.afterInstall });
+      else notify.success(`${info.label} memory hooks removed`);
+    },
+    onError: (e, on) =>
+      notify.error(
+        on ? `Couldn't add the ${info.label} hooks` : `Couldn't remove the ${info.label} hooks`,
+        { description: errorText(e) },
+      ),
+    onSettled: () => qc.invalidateQueries({ queryKey: ["agent_hooks"] }),
+  });
+  // A blocked agent can still be switched off (hooks added before the agent's config
+  // turned them off), never on.
+  const cantTurnOn = !row.installed && (!!row.blocked || !!exeProblem);
+  return (
+    <SettingRow
+      htmlFor={id}
+      title={`${info.label} memory hooks`}
+      description={info.injects}
+      control={
+        <Switch
+          id={id}
+          checked={row.installed}
+          disabled={set.isPending || cantTurnOn}
+          onCheckedChange={(v) => set.mutate(v)}
+        />
+      }
+    >
+      {row.blocked ? (
+        <InlineError>
+          Can't turn these on: {row.blocked}. {info.blockedFix(row.configPath)}
+        </InlineError>
+      ) : (
+        <Note>
+          {row.installed && !row.needsApproval ? `${info.afterInstall} ` : ""}Writes{" "}
+          <code>{row.configPath}</code>. Mute the digest for one repo with{" "}
+          <code className="whitespace-nowrap">cal hook --mute</code> from inside it; that works for
+          every agent.
+        </Note>
+      )}
+      {/* Codex trusts a hook by its command, and an app update or move changes the path the
+          hooks run, so Codex holds them until the user approves them again. */}
+      {row.installed && row.needsApproval && (
+        <Note>
+          Codex asks you to approve the hooks again in <code>/hooks</code> after an update or move:
+          run <code>/hooks</code> in Codex and approve the Callimachus entries.
+        </Note>
+      )}
+      {set.isError && (
+        <InlineError>
+          Couldn't change the {info.label} hooks: {errorText(set.error)}
+        </InlineError>
       )}
     </SettingRow>
   );

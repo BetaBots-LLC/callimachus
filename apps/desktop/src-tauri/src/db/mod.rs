@@ -192,6 +192,28 @@ pub fn open_sidecar_current_with(path: &Path, busy: Duration) -> Result<Connecti
     Ok(conn)
 }
 
+/// [`open_sidecar_current`] for a long-lived sidecar, the MCP server: the same no-migrate
+/// check, then the app's reader-friendly cache, mmap and checkpoint settings in place of a
+/// hook's minimal ones, since it serves searches for a whole agent session and its writes
+/// (record_*, complete_todo) are rare enough that checkpointing them costs nothing.
+pub fn open_sidecar_current_long_lived(path: &Path) -> Result<Connection> {
+    let conn = open_sidecar_current(path)?;
+    conn.pragma_update(None, "cache_size", -65536_i64)?; // 64 MiB, as `open`
+    conn.pragma_update(None, "mmap_size", MMAP_SIZE)?;
+    conn.pragma_update(None, "wal_autocheckpoint", 2000_i64)?;
+    conn.pragma_update(None, "journal_size_limit", 67_108_864_i64)?;
+    Ok(conn)
+}
+
+/// Migrations this binary would apply to `conn`'s index: 0 when current, positive when the
+/// index is behind, negative when a newer binary upgraded it. One `user_version` read, cheap
+/// enough to run before every MCP tool call.
+pub fn schema_pending(conn: &Connection) -> Result<i32> {
+    migrations::MIGRATIONS
+        .pending_migrations(conn)
+        .context("reading the schema version")
+}
+
 /// True when `e` is SQLite giving up on a lock, SQLITE_BUSY or SQLITE_LOCKED (any extended
 /// code), anywhere in its chain: under `.context()`, inside a migration error, behind an
 /// `AppError`, or flattened to text by `anyhow!(e.to_string())`. The one lock check for

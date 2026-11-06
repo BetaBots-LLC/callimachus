@@ -42,6 +42,8 @@ dist/
 
 # Claude
 .claude*
+# The Claude Code plugin manifest and the marketplace catalog are shipped files.
+!.claude-plugin/
 
 # env
 .env*

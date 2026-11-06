@@ -8,6 +8,7 @@ import {
   FolderGit2,
   History,
   Lightbulb,
+  ListChecks,
   MessagesSquare,
   Moon,
   RefreshCw,
@@ -34,6 +35,7 @@ import {
 import { api } from "../lib/api";
 import { formatTime } from "../lib/format";
 import { useBuildSemanticIndex, useIndexRewriting, useReindex } from "../lib/queries";
+import { useChecklist } from "../store/checklist";
 import { useUi, type View } from "../store/ui";
 import { useTheme } from "../store/theme";
 import { useUpdater } from "../store/updater";
@@ -58,6 +60,7 @@ const ACTIONS = {
   build: "build semantic index embeddings",
   theme: "toggle theme dark light",
   updates: "check for updates upgrade version",
+  checklist: "setup checklist onboarding getting started connect agents",
 } as const;
 
 /**
@@ -113,6 +116,7 @@ export function CommandPalette() {
   const buildIndex = useBuildSemanticIndex();
   const openSettings = useUi((s) => s.openSettings);
   const checkForUpdates = useUpdater((s) => s.check);
+  const showChecklist = useChecklist((s) => s.show);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -211,6 +215,10 @@ export function CommandPalette() {
         <RefreshCw />
         <span>Check for updates</span>
       </CommandItem>
+      <CommandItem value={ACTIONS.checklist} onSelect={() => run(() => showChecklist())}>
+        <ListChecks />
+        <span>Setup checklist</span>
+      </CommandItem>
     </CommandGroup>
   );
   // Recent threads lead while nothing is typed, so they show above the fold; with text,
@@ -280,6 +288,7 @@ export function CommandPalette() {
                   value={SEARCH_VALUE}
                   onSelect={() =>
                     run(() => {
+                      useChecklist.getState().close();
                       setQuery(typed.trim());
                       setView("search");
                     })

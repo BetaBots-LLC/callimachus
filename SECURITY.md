@@ -47,8 +47,9 @@ Specifically:
   (ollama.com) is a cloud provider like any other: picking it sends conversation
   content to Ollama's hosted service, keyed by your Ollama API key. Indexing,
   search, and embeddings are **always local** regardless of which engine you pick.
-- **Agents you connect.** The MCP server, the SessionStart and optional
-  proactive-recall hooks, and the managed `AGENTS.md` / `CLAUDE.md` block hand
+- **Agents you connect.** The MCP server, the SessionStart hooks (Claude Code,
+  and Codex and Gemini CLI when you turn theirs on), the optional
+  proactive-recall hook, and the managed `AGENTS.md` / `CLAUDE.md` block hand
   excerpts of your history (search results, threads an agent asks for, project
   memory), redacted the same way, to that agent, which sends them to its own
   provider along with the rest of its context. Callimachus makes no network request for this; it happens
@@ -115,6 +116,25 @@ browser storage, no cross-site tracking.
   stores Claude Code's compaction summary, redacted, and prints nothing; the
   SessionEnd hook only queues the session for auto-distillation, which then
   sends it to the provider you chose, if you turned that on.
+- The Codex and Gemini CLI memory hooks (Settings > Agents > Other agents, off
+  until you turn them on per agent) are the same commands with `--for codex` /
+  `--for gemini`, written into `~/.codex/hooks.json` and `~/.gemini/settings.json`
+  next to your own hooks, and hold to the same rules: read the local index, never
+  create or upgrade it, exit silently on any error. The Codex PreCompact hook only
+  takes a local snapshot. These agents also receive imported Claude Code memories,
+  which they send to their own providers with the rest of their context.
+- The value ledger (`ledger.jsonl` next to the index, or `<name>.ledger.jsonl`
+  for another index file) counts what the hooks and the MCP server did: one line
+  per injection, recall hit or MCP tool call, with a timestamp and a short detail
+  (the project path or the tool name). It is written by appending to a local file
+  (owner-only permissions on macOS and Linux; on Windows it inherits the index
+  folder's permissions), folded into the index by the desktop app for the Stats
+  tab once each day is over, never read by telemetry and never sent anywhere.
+- "Keep transcripts for a year" in the Stats tab edits one key,
+  `cleanupPeriodDays`, in Claude Code's user `settings.json`, only after you
+  confirm, through the same atomic merge as the hooks (every other setting is
+  kept; an unparseable file is left alone), and offers to restore the value it
+  replaced.
 - Claude Code auto memory (`~/.claude/projects/*/memory/*.md`) is read by the
   desktop app only and redacted before it is stored in the local index, and the
   PreCompact hook's compaction summaries are stored the same way. Both then

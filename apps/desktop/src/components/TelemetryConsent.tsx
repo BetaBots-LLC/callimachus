@@ -3,7 +3,9 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { X } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { api } from "../lib/api";
 import { PRIVACY_URL, setTelemetry, telemetryState, type TelemetryStatus } from "../lib/telemetry";
+import { useChecklist } from "../store/checklist";
 import { useUi } from "../store/ui";
 
 /** Shared by the card and the Settings switch so both always show the same answer. */
@@ -39,6 +41,13 @@ export function useTelemetryChoice() {
   });
 }
 
+/** Whether to ask at all: only while no choice has been made and only in builds that can
+ *  send (or the DEV preview). */
+function useShouldAsk(): boolean {
+  const s = useTelemetryStatus().data;
+  return previewForced() || (!!s && s.available && s.consent === "unset");
+}
+
 export function openPrivacy() {
   void openUrl(PRIVACY_URL).catch(() => {
     /* no browser available: nothing useful to do */
@@ -48,22 +57,27 @@ export function openPrivacy() {
 /**
  * App-level, opt-in consent prompt for anonymous usage data. Rendered next to the
  * update banner, independent of view and thread count, so upgraded users with an
- * existing index see it too (Onboarding never renders for them). Shown only while no
- * choice has been made and only in builds that can send at all. Until the user clicks
- * Allow, nothing is queued or sent. Closing it with the X just defers the question to
- * the next launch.
+ * existing index see it too (the setup checklist only opens by itself on an empty index).
+ * Shown only while no choice has been made and only in builds that can send at all. Until
+ * the user clicks Allow, nothing is queued or sent. Closing it with the X just defers the
+ * question to the next launch.
  */
 export function TelemetryConsent() {
-  const status = useTelemetryStatus();
   const choose = useTelemetryChoice();
   const [deferred, setDeferred] = useState(false);
   // Settings › General carries the same switch in place, so the card would only cover
   // the section list there.
-  const inSettings = useUi((st) => st.view === "settings");
+  const view = useUi((st) => st.view);
+  // The checklist asks in its footer (TelemetryConsentLine). On first launch the card sat
+  // fixed over the checklist's lower steps, so it steps aside while the checklist is on
+  // screen: open (or forced by an empty index, App.tsx) and the Search view showing. A
+  // first-run user who spends the session in another tab still gets asked there.
+  const checklistOpen = useChecklist((st) => st.open);
+  const { data: stats } = useQuery({ queryKey: ["db_stats"], queryFn: api.dbStats });
+  const checklistShown = view === "search" && (checklistOpen || stats?.threads === 0);
 
-  const s = status.data;
-  const shouldAsk = previewForced() || (!!s && s.available && s.consent === "unset");
-  if (deferred || inSettings || !shouldAsk) return null;
+  const shouldAsk = useShouldAsk();
+  if (deferred || view === "settings" || checklistShown || !shouldAsk) return null;
 
   return (
     <section
@@ -111,6 +125,50 @@ export function TelemetryConsent() {
         </Button>
       </div>
       <p className="text-[11px] text-muted-foreground">You can change this anytime in Settings.</p>
+    </section>
+  );
+}
+
+/**
+ * The same question as one line, for the setup checklist's footer. Allow and No record the
+ * choice exactly as the card does; leaving it unanswered asks again in the card once the
+ * checklist closes.
+ */
+export function TelemetryConsentLine() {
+  const choose = useTelemetryChoice();
+  if (!useShouldAsk()) return null;
+  return (
+    <section
+      aria-label="Anonymous usage data"
+      className="flex flex-wrap items-center justify-center gap-x-2 gap-y-1 text-xs text-muted-foreground"
+    >
+      <span>Share anonymous usage data? Never your conversations.</span>
+      <span className="inline-flex items-center gap-1">
+        <Button
+          size="xs"
+          variant="outline"
+          disabled={choose.isPending}
+          onClick={() => choose.mutate(true)}
+        >
+          Allow
+        </Button>
+        <Button
+          size="xs"
+          variant="ghost"
+          disabled={choose.isPending}
+          onClick={() => choose.mutate(false)}
+        >
+          No
+        </Button>
+        <Button size="xs" variant="link" className="px-1" onClick={openPrivacy}>
+          What's collected
+        </Button>
+      </span>
+      {choose.isError && (
+        <span role="alert" className="w-full text-destructive">
+          Couldn't save your choice. Set it in Settings &gt; General.
+        </span>
+      )}
     </section>
   );
 }
