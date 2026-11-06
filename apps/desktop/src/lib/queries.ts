@@ -38,11 +38,29 @@ export function useEmbedStatus() {
 /** Cache slot for the last `embed:error` message (main.tsx writes it). */
 export const EMBED_ERROR_KEY = ["embed_error"] as const;
 
+/** Mutation keys of the two job starters, so every button that starts one (the search
+ *  bar, the results list, the palette) sees the same pending start: with separate
+ *  isPending flags a second click elsewhere ran a second start before jobs_status
+ *  reported the job. */
+export const REINDEX_KEY = ["reindex"] as const;
+export const BUILD_EMBEDDINGS_KEY = ["build_embeddings"] as const;
+
+/** Whether a Reindex start from any button in this window is still in flight. */
+export function useReindexStarting(): boolean {
+  return useIsMutating({ mutationKey: REINDEX_KEY }) > 0;
+}
+
+/** Whether a semantic-index build start from any button in this window is in flight. */
+export function useBuildStarting(): boolean {
+  return useIsMutating({ mutationKey: BUILD_EMBEDDINGS_KEY }) > 0;
+}
+
 /** Start a semantic index build (the search bar's button, and the results list when a
  *  hybrid search finds no model). main.tsx toasts when it finishes. */
 export function useBuildSemanticIndex() {
   const queryClient = useQueryClient();
   return useMutation({
+    mutationKey: BUILD_EMBEDDINGS_KEY,
     mutationFn: api.buildEmbeddings,
     // A retry starts clean; a new failure arrives as a fresh embed:error.
     onMutate: () => {
@@ -56,6 +74,24 @@ export function useBuildSemanticIndex() {
       void confirmUserStarted(queryClient, "embed"); // a no-op start (job busy) gets no toast
     },
     onError: () => unmarkUserStarted("embed"),
+  });
+}
+
+/** Start a full reindex in the background (the search bar's Reindex button, and the
+ *  empty-index state of the results list). It never blocks the UI: callers reflect the
+ *  job flag, and main.tsx refreshes results and stats on index:done and toasts. */
+export function useReindex() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationKey: REINDEX_KEY,
+    mutationFn: api.indexAll,
+    onMutate: () => markUserStarted("index"), // main.tsx toasts when it finishes
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["index_status"] });
+      // Also refreshes jobs_status, which then polls until the reindex ends.
+      void confirmUserStarted(queryClient, "index"); // a no-op start (job busy) gets no toast
+    },
+    onError: () => unmarkUserStarted("index"),
   });
 }
 
@@ -189,6 +225,10 @@ export async function waitForReindexSlot(queryClient: QueryClient): Promise<void
 export function userReindexing(s: JobsStatus | null | undefined): boolean {
   return !!s?.index;
 }
+
+/** The most hits the backend keeps per thread (MAX_HITS_PER_THREAD in search/mod.rs), so
+ *  a thread with this many matches may have more: the UI says "3+" there. */
+export const MAX_HITS_PER_THREAD = 3;
 
 /** The ResultsList query key. The query text sits at index 1 ("" for the recent list), and
  *  main.tsx's live refresh relies on that to tell the cheap recent list from a search. */

@@ -4,7 +4,7 @@ import { Button } from "@/components/ui/button";
 
 /**
  * Gate for the knowledge-powered views (Knowledge / Ask / Projects). When distillation is
- * off, the tab stays visible but shows a teaser + a CTA into Settings — so the feature is
+ * off, the tab stays visible but shows a teaser + a CTA into Settings, so the feature is
  * discoverable instead of hidden behind a flag.
  */
 export function KnowledgeGate({

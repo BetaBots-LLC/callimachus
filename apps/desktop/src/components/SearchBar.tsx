@@ -1,5 +1,5 @@
-import { useLayoutEffect, useRef, useState } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 import { useDebouncedCallback } from "@tanstack/react-pacer";
 import {
   api,
@@ -8,18 +8,18 @@ import {
   SOURCE_LABELS,
   type SourceKind,
 } from "../lib/api";
-import { useUi } from "../store/ui";
+import { RESULTS_LIST_ID, resultOptionId, resultsNav, SEARCH_INPUT_ID, useUi } from "../store/ui";
 import {
   embedStatusQuery,
   useBuildSemanticIndex,
+  useBuildStarting,
   useEmbedError,
   useIndexError,
   useIndexRewriting,
   useJobsStatus,
+  useReindex,
+  useReindexStarting,
   userReindexing,
-  confirmUserStarted,
-  markUserStarted,
-  unmarkUserStarted,
 } from "../lib/queries";
 import { CatchUpNote, JobProgress } from "./JobProgress";
 import {
@@ -63,7 +63,11 @@ export function SearchBar() {
   const toggleStarredOnly = useUi((s) => s.toggleStarredOnly);
   const selectedTags = useUi((s) => s.selectedTags);
   const toggleTag = useUi((s) => s.toggleTag);
-  const queryClient = useQueryClient();
+  const highlightedIndex = useUi((s) => s.highlightedIndex);
+  const setHighlightedIndex = useUi((s) => s.setHighlightedIndex);
+  const resultCount = useUi((s) => s.resultCount);
+  const setOpenFirstPending = useUi((s) => s.setOpenFirstPending);
+  const indexEmpty = useUi((s) => s.indexEmpty);
 
   const tags = useQuery({ queryKey: ["list_tags"], queryFn: api.listTags, staleTime: 60_000 });
 
@@ -71,6 +75,17 @@ export function SearchBar() {
   // index, and the results list keeps filtering by the stored query, so the box must show
   // it again.
   const [text, setText] = useState(() => useUi.getState().query);
+  // The committed query can also change from outside this bar (a Coach error row, the
+  // palette's "Search for"), and the bar now stays mounted, so mirror those into the box.
+  // Its own commits are debounced, so only a value this bar did not just commit counts.
+  const query = useUi((s) => s.query);
+  const committedHere = useRef(query);
+  useEffect(() => {
+    if (query !== committedHere.current) {
+      committedHere.current = query;
+      setText(query);
+    }
+  }, [query]);
   // Focus the box on mount and each time the Search tab is shown again. autoFocus fires
   // only on DOM insertion, and the tab now stays mounted (a hidden Activity) while another
   // tab is open; layout effects re-run on reveal.
@@ -79,20 +94,39 @@ export function SearchBar() {
     inputRef.current?.focus();
   }, []);
   // Pacer handles the debounce (no manual timer / useEffect).
-  const commitQuery = useDebouncedCallback((value: string) => setQuery(value.trim()), {
-    wait: 260,
-  });
+  const commitQuery = useDebouncedCallback(
+    (value: string) => {
+      committedHere.current = value.trim();
+      setQuery(value.trim());
+    },
+    { wait: 260 },
+  );
 
   function onChange(value: string) {
     setText(value);
+    setOpenFirstPending(false); // an Enter pressed for the shorter text no longer applies
     commitQuery(value);
+  }
+
+  // The keys act on the rows of the text in the box. While the debounce still holds it
+  // back, commit it now and report that the rows on screen are not its rows yet (ResultsList
+  // also publishes 0 rows while it shows the previous query's as placeholder). The pending
+  // debounced call then commits the same value again, which setQuery ignores.
+  function commitTextNow(): boolean {
+    const value = text.trim();
+    if (value === useUi.getState().query) return false;
+    committedHere.current = value;
+    setQuery(value);
+    return true;
   }
 
   function clear() {
     setText("");
+    setOpenFirstPending(false);
     // Supersede any pending debounced value (it would re-apply the old text), and clear
     // the committed query right away instead of after the debounce.
     commitQuery("");
+    committedHere.current = "";
     setQuery("");
   }
 
@@ -101,16 +135,8 @@ export function SearchBar() {
   // Only a user-started reindex counts: the launch catch-up scan is its own job and stays
   // quiet (CatchUpNote), so it no longer flashes "Indexing…" on every launch.
   const indexing = userReindexing(useJobsStatus().data);
-  const reindex = useMutation({
-    mutationFn: api.indexAll,
-    onMutate: () => markUserStarted("index"), // main.tsx toasts when it finishes
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["index_status"] });
-      // Also refreshes jobs_status, which then polls until the reindex ends.
-      void confirmUserStarted(queryClient, "index"); // a no-op start (job busy) gets no toast
-    },
-    onError: () => unmarkUserStarted("index"),
-  });
+  const reindex = useReindex();
+  const reindexStarting = useReindexStarting();
 
   // Event-driven; never polls while idle (see lib/queries.ts). Selected down to what this
   // bar shows, so a running build's per-batch embed:progress (which only JobProgress
@@ -122,11 +148,12 @@ export function SearchBar() {
   // Reindex and Build return without doing anything while Shrink index / Reclaim space runs.
   const rewriting = useIndexRewriting();
   const buildIndex = useBuildSemanticIndex();
+  const buildStarting = useBuildStarting();
 
   const embedPct =
     embed.data && embed.data.total > 0 ? Math.round((embed.data.done / embed.data.total) * 100) : 0;
 
-  // How many "More" sources are active — surfaced on the dropdown so a hidden
+  // How many "More" sources are active, surfaced on the dropdown so a hidden
   // filter is never silently in effect.
   const moreActiveCount = MORE.filter((s) => sources.includes(s)).length;
 
@@ -137,12 +164,51 @@ export function SearchBar() {
           <InputGroupInput
             placeholder="Search every thread…  (try file:embed/mod.rs)"
             ref={inputRef}
+            id={SEARCH_INPUT_ID}
             value={text}
             onChange={(e) => onChange(e.currentTarget.value)}
+            // A combobox over the results listbox: focus stays here while ArrowUp/ArrowDown
+            // move the highlighted row and Enter opens it.
+            role="combobox"
+            aria-label="Search threads"
+            aria-autocomplete="list"
+            aria-controls={RESULTS_LIST_ID}
+            aria-expanded={resultCount > 0}
+            aria-activedescendant={
+              highlightedIndex >= 0 && highlightedIndex < resultCount
+                ? resultOptionId(highlightedIndex)
+                : undefined
+            }
             onKeyDown={(e) => {
               if (e.key === "Escape" && text) {
                 e.preventDefault();
                 clear();
+                return;
+              }
+              if (e.nativeEvent.isComposing) return;
+              const count = resultCount;
+              if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+                // Uncommitted text: commit it and drop the key until its rows arrive.
+                if (commitTextNow()) {
+                  e.preventDefault();
+                  return;
+                }
+                if (count === 0) return;
+                e.preventDefault(); // keep the caret where it is
+                const step = e.key === "ArrowDown" ? 1 : -1;
+                const from = highlightedIndex < 0 && step < 0 ? count : highlightedIndex;
+                setHighlightedIndex(Math.min(count - 1, Math.max(0, from + step)));
+              } else if (e.key === "Enter") {
+                e.preventDefault();
+                // Enter opens the highlighted row, or the top one. Before the rows of the
+                // typed text exist, ResultsList opens the top row once they arrive.
+                if (commitTextNow() || count === 0) {
+                  setOpenFirstPending(true);
+                } else {
+                  resultsNav.open(
+                    highlightedIndex >= 0 && highlightedIndex < count ? highlightedIndex : 0,
+                  );
+                }
               }
             }}
           />
@@ -155,9 +221,10 @@ export function SearchBar() {
           )}
         </InputGroup>
         <Button
-          variant="secondary"
+          // On an empty index the empty state's Reindex is the one primary action.
+          variant={indexEmpty ? "outline" : "secondary"}
           onClick={() => reindex.mutate()}
-          disabled={indexing || reindex.isPending || embed.data?.running || rewriting}
+          disabled={indexing || reindexStarting || embed.data?.running || rewriting}
         >
           {indexing ? (
             <>
@@ -259,7 +326,7 @@ export function SearchBar() {
               size="xs"
               variant="outline"
               onClick={() => buildIndex.mutate()}
-              disabled={indexing || buildIndex.isPending || rewriting}
+              disabled={indexing || buildStarting || rewriting}
               title={`${embed.data.done}/${embed.data.total} messages embedded`}
             >
               Build semantic index ({embedPct}%)

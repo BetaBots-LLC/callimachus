@@ -1,6 +1,7 @@
 import { type ReactNode, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Pencil, Pin, Plus, Trash2 } from "lucide-react";
+import { Menu as MenuPrimitive } from "@base-ui/react/menu";
+import { ChevronDown, Pencil, Pin, Plus, Trash2 } from "lucide-react";
 import { api, type MemoryFact, type ProjectMemory } from "../lib/api";
 import { useUi } from "../store/ui";
 import { shortPath } from "../lib/format";
@@ -8,6 +9,14 @@ import { useEmbedStatus, useIndexRewriting } from "../lib/queries";
 import { AGGREGATE_STALE_MS } from "../lib/queryClient";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { Spinner } from "@/components/ui/spinner";
 import { Progress, ProgressLabel, ProgressValue } from "@/components/ui/progress";
 import {
   Select,
@@ -16,7 +25,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { Item, ItemActions, ItemContent, ItemDescription, ItemTitle } from "@/components/ui/item";
+import { Item } from "@/components/ui/item";
 import { cn } from "@/lib/utils";
 import { Loading } from "./Loading";
 import { Markdown } from "./Markdown";
@@ -139,7 +148,7 @@ export function ProjectMemoryView() {
     ),
   });
   // Locally remember hidden facts so the conflicts panel (a mutation result, not a
-  // query) updates immediately — hiding a decision resolves any conflict it's in.
+  // query) updates immediately: hiding a decision resolves any conflict it's in.
   const [hiddenIds, setHiddenIds] = useState<Set<number>>(() => new Set());
   const factActions: FactActions = {
     onOpen: (threadId) => {
@@ -174,6 +183,15 @@ export function ProjectMemoryView() {
       ? "Indexing… (wait)"
       : "Rewriting index… (wait)";
 
+  // The More menu closes on click, so its trigger carries the pending state.
+  const morePending = brief.isPending
+    ? "Summarizing…"
+    : conflicts.isPending
+      ? "Reviewing…"
+      : writeFile.isPending || agentsFile.isPending
+        ? "Writing…"
+        : null;
+
   return (
     <div className="mx-auto flex h-full w-full max-w-3xl flex-col p-6">
       <div className="shrink-0 space-y-3 pb-3">
@@ -197,6 +215,8 @@ export function ProjectMemoryView() {
           )}
         </div>
 
+        {/* One primary action, one secondary, and the rest behind More, so the toolbar
+            fits on one row at every width (six buttons wrapped at 1100 and 1440). */}
         <div className="flex flex-wrap items-center gap-2">
           {isDistilling ? (
             <Button size="sm" variant="secondary" onClick={() => cancel.mutate()}>
@@ -224,39 +244,52 @@ export function ProjectMemoryView() {
           >
             <Plus /> Remember
           </Button>
-          <Button
-            size="sm"
-            variant="outline"
-            onClick={() => brief.mutate()}
-            disabled={!project || brief.isPending || empty || isDistilling}
-          >
-            {brief.isPending ? "Summarizing…" : "Synthesize brief"}
-          </Button>
-          <Button
-            size="sm"
-            variant="ghost"
-            onClick={() => writeFile.mutate()}
-            disabled={!project || writeFile.isPending || empty}
-          >
-            {writeFile.isPending ? "Writing…" : "Write memory file"}
-          </Button>
-          <Button
-            size="sm"
-            variant="ghost"
-            onClick={() => agentsFile.mutate()}
-            disabled={!project || agentsFile.isPending || empty}
-            title="Write/refresh the memory block in this repo's AGENTS.md"
-          >
-            {agentsFile.isPending ? "Writing…" : "Update AGENTS.md"}
-          </Button>
-          <Button
-            size="sm"
-            variant="ghost"
-            onClick={() => conflicts.mutate()}
-            disabled={!project || conflicts.isPending || !mem || mem.decisions.length < 2}
-          >
-            {conflicts.isPending ? "Reviewing…" : "Review conflicts"}
-          </Button>
+          <DropdownMenu>
+            <DropdownMenuTrigger
+              render={<Button size="sm" variant="outline" disabled={!project} />}
+            >
+              {morePending ? (
+                <>
+                  <Spinner /> {morePending}
+                </>
+              ) : (
+                <>
+                  More <ChevronDown className="size-3.5" />
+                </>
+              )}
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="start" className="min-w-48">
+              <DropdownMenuItem
+                onClick={() => brief.mutate()}
+                disabled={!project || brief.isPending || !!empty || isDistilling}
+              >
+                Synthesize brief
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                onClick={() => conflicts.mutate()}
+                disabled={!project || conflicts.isPending || !mem || mem.decisions.length < 2}
+              >
+                Review conflicts
+              </DropdownMenuItem>
+              <MenuPrimitive.Separator className="-mx-1 my-1 h-px bg-border" />
+              <MenuPrimitive.Group>
+                <DropdownMenuLabel>Export</DropdownMenuLabel>
+                <DropdownMenuItem
+                  onClick={() => writeFile.mutate()}
+                  disabled={!project || writeFile.isPending || !!empty}
+                >
+                  Write memory file
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  onClick={() => agentsFile.mutate()}
+                  disabled={!project || agentsFile.isPending || !!empty}
+                  title="Write/refresh the memory block in this repo's AGENTS.md"
+                >
+                  Update AGENTS.md
+                </DropdownMenuItem>
+              </MenuPrimitive.Group>
+            </DropdownMenuContent>
+          </DropdownMenu>
         </div>
 
         {isDistilling && (
@@ -328,8 +361,7 @@ export function ProjectMemoryView() {
             {empty ? (
               <p className="px-1 text-sm text-muted-foreground">
                 Nothing distilled for this project yet. Click <b>Build memory</b> to distill its{" "}
-                {mem?.pendingCount ?? 0} thread(s) into decisions, gotchas, and TODOs. Needs
-                distillation enabled in Settings.
+                {mem?.pendingCount ?? 0} thread(s) into decisions, gotchas, and TODOs.
               </p>
             ) : (
               <>
@@ -441,7 +473,7 @@ function Section({
           {facts.length}
         </span>
       </h3>
-      <div className="flex flex-col gap-1.5">
+      <div className="divide-y divide-border overflow-hidden rounded-xl border bg-card">
         {facts.map((f) => (
           <FactRow key={f.id} fact={f} actions={actions} />
         ))}
@@ -462,7 +494,7 @@ function FactRow({ fact, actions }: { fact: MemoryFact; actions: FactActions }) 
       setEditing(false);
     };
     return (
-      <Item variant="outline" className="items-stretch gap-2 ring-1 ring-ring/30">
+      <div className="flex items-stretch gap-2 bg-muted/30 px-3 py-2.5">
         <textarea
           // biome-ignore lint/a11y/noAutofocus: focus the edit field the user just opened
           autoFocus
@@ -492,13 +524,13 @@ function FactRow({ fact, actions }: { fact: MemoryFact; actions: FactActions }) 
             Cancel
           </Button>
         </div>
-      </Item>
+      </div>
     );
   }
 
   return (
-    <Item
-      variant="outline"
+    // biome-ignore lint/a11y/useSemanticElements: the row holds its own icon buttons, and a <button> cannot nest them
+    <div
       role="button"
       tabIndex={0}
       onClick={() => actions.onOpen(fact.threadId)}
@@ -509,23 +541,26 @@ function FactRow({ fact, actions }: { fact: MemoryFact; actions: FactActions }) 
         }
       }}
       className={cn(
-        "cursor-pointer items-start transition-colors hover:bg-muted/40 focus-visible:bg-muted/40",
-        fact.pinned && "border-amber-500/25 bg-amber-500/4",
+        "group/item flex cursor-pointer items-start gap-2 px-3 py-2.5 outline-none transition-colors hover:bg-muted/40 focus-visible:bg-muted/40 focus-visible:ring-[3px] focus-visible:ring-inset focus-visible:ring-ring/50",
+        // A faint tint so pinned rows read apart at a glance, not only by the 12px pin.
+        fact.pinned && "bg-amber-500/5",
       )}
     >
-      <ItemContent>
-        <ItemTitle className="block w-full font-normal leading-relaxed line-clamp-none">
+      <div className="min-w-0 flex-1">
+        <p className="text-sm leading-relaxed text-foreground">
           {fact.pinned && (
             <Pin className="mr-1.5 inline size-3 -translate-y-px fill-amber-500 text-amber-500" />
           )}
           {fact.text}
-        </ItemTitle>
-        {fact.title && <ItemDescription className="line-clamp-1">{fact.title}</ItemDescription>}
-      </ItemContent>
+        </p>
+        {fact.title && (
+          <p className="mt-0.5 line-clamp-1 text-[13px] text-muted-foreground">{fact.title}</p>
+        )}
+      </div>
       {/* Reserved width + invisible→visible keeps the row from reflowing and the
           actions from ever getting "stuck"; opacity gives a smooth fade-in.
           Revealed on hover and on keyboard focus-within (a11y). */}
-      <ItemActions className="invisible self-start gap-0.5 opacity-0 transition-opacity duration-150 group-hover/item:visible group-hover/item:opacity-100 group-focus-within/item:visible group-focus-within/item:opacity-100">
+      <div className="invisible flex shrink-0 items-center self-start gap-0.5 opacity-0 transition-opacity duration-150 group-hover/item:visible group-hover/item:opacity-100 group-focus-within/item:visible group-focus-within/item:opacity-100">
         <IconBtn
           title={fact.pinned ? "Unpin" : "Pin"}
           onClick={() => actions.onPin(fact.id, !fact.pinned)}
@@ -538,8 +573,8 @@ function FactRow({ fact, actions }: { fact: MemoryFact; actions: FactActions }) 
         <IconBtn title="Delete" onClick={() => actions.onHide(fact.id)}>
           <Trash2 className="size-3.5" />
         </IconBtn>
-      </ItemActions>
-    </Item>
+      </div>
+    </div>
   );
 }
 

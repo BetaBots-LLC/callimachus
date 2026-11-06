@@ -361,6 +361,93 @@ function threadMessages(at: number) {
   ];
 }
 
+/** The first thread as a long session: 18 prompts, each answered through a run of tool
+ *  calls and results (one run has two parallel calls), like real Claude Code transcripts,
+ *  where 70% of rows are tool rows. Ids start at 1 like threadMessages, so the search hits
+ *  on this thread (HIT_PLAN: 1 a prompt, 2 a reply, 3 a Bash row) land on the same roles,
+ *  and hit 3 sits inside a tool run. */
+function longThreadMessages(at: number) {
+  const tools: [string, (n: number) => string, (n: number) => string][] = [
+    [
+      "Bash",
+      (n) => `{"command":"pnpm test webhooks --run ${n}"}`,
+      (n) => `PASS tests/webhooks/retry.test.ts (${n} tests)\n${"ok ".repeat(140)}`,
+    ],
+    [
+      "Read",
+      (n) => `{"file_path":"/Users/dev/code/payments-api/src/webhooks/retry${n}.ts"}`,
+      (n) =>
+        Array.from(
+          { length: 40 },
+          (_, i) => `${i + 1}\texport const step${n}_${i} = schedule(${i});`,
+        ).join("\n"),
+    ],
+    [
+      "Edit",
+      (n) =>
+        `{"file_path":"/Users/dev/code/payments-api/src/webhooks/queue.ts","old_string":"tick()","new_string":"await tick(${n})"}`,
+      () => "The file has been updated.",
+    ],
+    [
+      "Grep",
+      (n) => `{"pattern":"scheduler.flush","path":"src/${n % 2 ? "webhooks" : "queue"}"}`,
+      () => "src/webhooks/retry.ts:41\nsrc/queue/scheduler.ts:88",
+    ],
+  ];
+  type Row = {
+    id: number;
+    role: string;
+    text: string;
+    toolName: string | null;
+    ts: number;
+    model: string | null;
+  };
+  const rows: Row[] = [];
+  let id = 1;
+  const push = (role: string, text: string, toolName: string | null = null) =>
+    rows.push({
+      id: id++,
+      role,
+      text,
+      toolName,
+      ts: at - 7_200 + id * 6,
+      model: role === "assistant" && !toolName ? "claude-opus-4-8" : null,
+    });
+  for (let turn = 0; turn < 18; turn++) {
+    push(
+      "user",
+      turn === 0
+        ? "The `webhook retries after 5xx` test fails about 1 in 10 runs on CI. Can you find out why?"
+        : `Step ${turn + 1}: now check the ${["queue drain", "backoff jitter", "dead-letter path", "idempotency keys"][turn % 4]} and run the suite again.`,
+    );
+    push(
+      "assistant",
+      `Looking at the ${["retry scheduler", "fake timers", "queue worker"][turn % 3]} first, then I'll run the suite.`,
+    );
+    const calls = 2 + ((turn * 5) % 9);
+    for (let c = 0; c < calls; c++) {
+      const [name, args, out] = tools[(turn + c * (c % 3 === 0 ? 1 : 3)) % tools.length];
+      if (turn === 3 && c === 1) {
+        // Two parallel calls, then both results in order.
+        push("assistant", `Read: ${tools[1][1](c)}`, "Read");
+        push("assistant", `Grep: ${tools[3][1](c)}`, "Grep");
+        push("tool", tools[1][2](c));
+        push("tool", tools[3][2](c));
+        continue;
+      }
+      push("assistant", `${name}: ${args(turn * 10 + c)}`, name);
+      push("tool", out(turn * 10 + c));
+    }
+    push(
+      "assistant",
+      turn === 17
+        ? "Fixed: `retry.test.ts` now awaits `scheduler.flush()` before advancing timers. 50 consecutive runs pass."
+        : `The ${["timer", "queue", "retry"][turn % 3]} change holds; ${turn + 3} runs pass so far.`,
+    );
+  }
+  return rows;
+}
+
 function filterThreads(filters?: SearchFilters): ThreadSummary[] {
   let out = threads;
   if (filters?.sources?.length) out = out.filter((t) => filters.sources?.includes(t.source));
@@ -369,22 +456,55 @@ function filterThreads(filters?: SearchFilters): ThreadSummary[] {
   return out.slice(0, filters?.limit ?? 50);
 }
 
+// Ranked like the backend: several hits per thread (it keeps up to 3), most of them tool
+// output, so the results list groups them per thread and labels where each one matched.
+// [thread index, role, message number in the thread, snippet with {q} and {p}]. The first
+// thread is the long one, where 4 is the first Bash result; elsewhere 3 is the tool row.
+// Snippets put the match 40+ characters in, like snippet() often does.
+const HIT_PLAN: [number, string, number, string][] = [
+  [0, "tool", 4, "FAIL tests/webhooks/retry.test.ts > {q} header is re-signed on retry"],
+  [0, "assistant", 2, "...the retry path drops the {q} token, so attempt two gets a 401..."],
+  [1, "user", 1, "Why does the charts page lose {q} state after the Recharts upgrade?"],
+  [0, "user", 1, "Can you check whether {q} survives the webhook retry?"],
+  [2, "tool", 3, '{p}/main.tf: module "{q}" { source = "./modules/iam" }'],
+  [1, "tool", 3, "GET /api/{q}/session 200 in 41ms"],
+  [3, "assistant", 2, "The push token refresh runs before {q} completes on cold start..."],
+  [4, "tool", 3, '{"error":"missing {q} header","status":400}'],
+  [2, "assistant", 4, "Split the {q} roles per workspace so staging cannot assume prod."],
+  [5, "user", 1, "Batch the inserts but keep the {q} check per row."],
+];
+
+/** A mock message id: unique across threads like the backend's (get_thread serves these),
+ *  so message_text and the thread's match ids find the right row. */
+const MESSAGE_ID_SPAN = 10_000;
+const messageId = (threadId: number, n: number) => threadId * MESSAGE_ID_SPAN + n;
+
+// `?index=empty` shows the empty-index state; a query containing "nomatch" or
+// "kubernetes" finds nothing (the no-match state).
+const EMPTY_INDEX = params.get("index") === "empty";
+
 function searchHits(query: string, filters?: SearchFilters): SearchHit[] {
   const q = query.trim() || "retry";
-  return filterThreads(filters)
-    .slice(0, 6)
-    .map((t, i) => ({
-      threadId: t.id,
-      messageId: 1000 + i,
-      source: t.source,
-      title: t.title,
-      projectPath: t.projectPath,
-      role: i % 2 ? "user" : "assistant",
+  if (EMPTY_INDEX || /nomatch|kubernetes/i.test(q)) return [];
+  const pool = filterThreads(filters).slice(0, 6);
+  return HIT_PLAN.filter(([t]) => t < pool.length).map(([t, role, n, text]) => {
+    const thread = pool[t];
+    return {
+      threadId: thread.id,
+      messageId: messageId(thread.id, n),
+      source: thread.source,
+      title: thread.title,
+      projectPath: thread.projectPath,
+      // No toolName: the backend's SearchHit (search/mod.rs) has none.
+      role,
       // Match boundaries are the backend's char(1)/char(2) sentinels (lib/format renderSnippet
       // escapes the text first, then turns them into <mark>), not literal tags.
-      snippet: `...we should \u0001${q}\u0002 this before the next release, see the notes in ${t.projectPath?.split("/").pop()}...`,
-      ts: t.updatedAt,
-    }));
+      snippet: text
+        .replace("{q}", `\u0001${q}\u0002`)
+        .replace("{p}", thread.projectPath?.split("/").pop() ?? ""),
+      ts: thread.updatedAt,
+    };
+  });
 }
 
 const projectInfos = (): ProjectInfo[] =>
@@ -707,10 +827,27 @@ const handlers: Record<string, Handler> = {
     };
   },
   warm_semantic: ok,
-  recent_threads: (a) => filterThreads(a.filters as SearchFilters | undefined),
+  recent_threads: (a) => (EMPTY_INDEX ? [] : filterThreads(a.filters as SearchFilters | undefined)),
   search_by_file: () => threads.slice(0, 3),
-  get_thread: (a) => threadDetail(Number(a.threadId)),
-  message_text: (a) => threadMessages(NOW).find((m) => m.id === Number(a.id))?.text ?? "",
+  get_thread: (a) => {
+    const d = threadDetail(Number(a.threadId));
+    if (!d) return d;
+    const own = <M extends { id: number }>(m: M): M => ({ ...m, id: messageId(d.id, m.id) });
+    if (d.id !== threads[0]?.id) return { ...d, messages: d.messages.map(own) };
+    // The first thread is the long one (longThreadMessages), previewed like the backend.
+    const msgs = longThreadMessages(d.updatedAt ?? NOW).map((m) => ({
+      ...m,
+      text: m.role === "tool" || m.toolName ? m.text.slice(0, 300) : m.text,
+      textLen: m.text.length,
+    }));
+    return { ...d, messages: msgs.map(own) };
+  },
+  message_text: (a) => {
+    const id = Number(a.id);
+    const threadId = Math.floor(id / MESSAGE_ID_SPAN);
+    const msgs = threadId === threads[0]?.id ? longThreadMessages(NOW) : threadMessages(NOW);
+    return msgs.find((m) => m.id === id % MESSAGE_ID_SPAN)?.text ?? "";
+  },
   set_star: (a) => {
     threads = threads.map((t) =>
       t.id === Number(a.threadId) ? { ...t, starred: Boolean(a.starred) } : t,

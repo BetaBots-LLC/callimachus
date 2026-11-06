@@ -25,6 +25,20 @@ export function renderSnippet(snippet: string): string {
   return escaped.split(MARK_START).join("<mark>").split(MARK_END).join("</mark>");
 }
 
+// Trim a snippet's head so its first match starts within about `lead` characters. A
+// results row shows one truncated line, and snippet() often puts the match 40+ characters
+// in, past the ellipsis ("Bash output: FAIL tests/webhooks/retry.test.…" with no visible
+// match). Backs up to a word boundary so the line never starts mid-word, and marks the cut
+// with "…". Run it on the raw snippet, before renderSnippet.
+export function leadToMatch(snippet: string, lead = 20): string {
+  const at = snippet.indexOf(MARK_START);
+  if (at <= lead) return snippet;
+  const from = at - lead;
+  const space = snippet.slice(from, at).search(/\s/);
+  const start = space < 0 ? from : from + space + 1;
+  return `…${snippet.slice(start)}`;
+}
+
 // USD spend formatter: thousands separators + cents. A positive sub-cent amount reads
 // as "<$0.01" instead of collapsing to "$0.00"; at $0.01 and above, toLocaleString rounds
 // half-up as usual. Negatives fall through to toLocaleString ("-$…") so an upstream data

@@ -94,8 +94,7 @@ export function AskView() {
         ) : (
           <div className="space-y-3 px-1">
             <p className="text-sm text-muted-foreground">
-              Ask a question — Callimachus searches your past sessions and answers with citations to
-              the threads it used. Needs distillation enabled (an LLM engine) in Settings.
+              Ask a question. Callimachus searches your past sessions and answers with citations.
             </p>
             <div className="space-y-1.5">
               <p className="text-[0.7rem] font-medium uppercase tracking-wide text-muted-foreground">

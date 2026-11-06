@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
+import { ChevronRight } from "lucide-react";
 import { api, type CoachFact } from "../lib/api";
 import { AGGREGATE_STALE_MS } from "../lib/queryClient";
 import { useUi } from "../store/ui";
@@ -24,7 +25,7 @@ function level(count: number, max: number): number {
 }
 
 // Brand sunset (#C16E2C) at rising opacity reads as intensity on both themes; level 0 is a
-// faint track. Kept off the Tailwind palette on purpose — this ramp is the view's signature.
+// faint track. Kept off the Tailwind palette on purpose: this ramp is the view's signature.
 const CELL_BG = [
   "color-mix(in oklab, var(--muted-foreground) 14%, transparent)",
   "rgba(193, 110, 44, 0.3)",
@@ -110,8 +111,8 @@ function PriorWorkSearch({ onOpen }: { onOpen: (threadId: number) => void }) {
       {find.data &&
         (find.data.length === 0 ? (
           <p className="mt-3 text-sm text-muted-foreground">
-            No prior work found — needs distilled decisions / gotchas (enable Knowledge in
-            Settings).
+            No prior work found. This check reads distilled decisions and gotchas, so it finds more
+            once your sessions are distilled.
           </p>
         ) : (
           <ul className="mt-3 space-y-1.5">
@@ -147,8 +148,16 @@ function PriorWorkSearch({ onOpen }: { onOpen: (threadId: number) => void }) {
   );
 }
 
-/** Errors you keep hitting across sessions, grouped + counted from the whole index. */
-function RecurringIssues({ todayMid }: { todayMid: number }) {
+/** Errors you keep hitting across sessions, grouped + counted from the whole index. Each
+ *  row seeds Search with the error text, so the threads behind the count are one click
+ *  away instead of a retype. */
+function RecurringIssues({
+  todayMid,
+  onSearch,
+}: {
+  todayMid: number;
+  onSearch: (text: string) => void;
+}) {
   const { data } = useQuery({
     queryKey: ["recurring_issues"],
     queryFn: () => api.recurringIssues(),
@@ -161,21 +170,25 @@ function RecurringIssues({ todayMid }: { todayMid: number }) {
       <h2 className="mb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">
         Recurring errors · last 180 days
       </h2>
-      <ul className="space-y-1.5">
+      <ul className="divide-y overflow-hidden rounded-lg border">
         {issues.slice(0, 8).map((i) => (
-          <li key={i.example} className="rounded-lg border px-3 py-2">
-            <div className="flex items-baseline gap-2">
-              <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 font-mono text-[0.7rem] tabular-nums text-foreground">
-                {i.count}×
+          <li key={i.example}>
+            <button
+              type="button"
+              onClick={() => onSearch(i.example)}
+              title={`Search for ${i.example}`}
+              className="flex w-full cursor-pointer items-center gap-3 px-3 py-2 text-left transition-colors outline-none hover:bg-muted/50 focus-visible:ring-[3px] focus-visible:ring-inset focus-visible:ring-ring/50"
+            >
+              <span className="min-w-0 flex-1">
+                <code className="block truncate text-xs text-foreground">{i.example}</code>
+                <span className="mt-1 block text-[0.7rem] text-muted-foreground">
+                  <span className="font-medium tabular-nums text-foreground">{i.count}</span> times
+                  across {i.threads} thread{i.threads === 1 ? "" : "s"} · last seen{" "}
+                  {relativeDay(i.lastSeen, todayMid)}
+                </span>
               </span>
-              <code className="truncate text-xs text-foreground" title={i.example}>
-                {i.example}
-              </code>
-            </div>
-            <div className="mt-1 text-[0.7rem] text-muted-foreground">
-              across {i.threads} thread{i.threads === 1 ? "" : "s"} · last seen{" "}
-              {relativeDay(i.lastSeen, todayMid)}
-            </div>
+              <ChevronRight className="size-4 shrink-0 text-muted-foreground" />
+            </button>
           </li>
         ))}
       </ul>
@@ -186,6 +199,11 @@ function RecurringIssues({ todayMid }: { todayMid: number }) {
 export function CoachView() {
   const selectThread = useUi((s) => s.selectThread);
   const setView = useUi((s) => s.setView);
+  const setQuery = useUi((s) => s.setQuery);
+  const openSettings = useUi((s) => s.openSettings);
+  // Same key App.tsx reads for the tab gates, so this is a cache hit.
+  const knowledge = useQuery({ queryKey: ["knowledge_config"], queryFn: api.knowledgeConfig });
+  const knowledgeOn = !!knowledge.data?.enabled;
   const { data, isLoading } = useQuery({
     queryKey: ["coach_overview"],
     queryFn: api.coachOverview,
@@ -218,7 +236,7 @@ export function CoachView() {
       <div className="mb-5">
         <h1 className="text-xl font-semibold tracking-tight">Coach</h1>
         <p className="text-sm text-muted-foreground">
-          What your history is telling you — recent activity and the decisions worth remembering.
+          What your history is telling you: recent activity and the decisions worth remembering.
         </p>
       </div>
 
@@ -281,7 +299,13 @@ export function CoachView() {
         </div>
       </section>
 
-      <RecurringIssues todayMid={todayMid} />
+      <RecurringIssues
+        todayMid={todayMid}
+        onSearch={(text) => {
+          setQuery(text);
+          setView("search");
+        }}
+      />
 
       {/* This week's captured knowledge */}
       <section>
@@ -299,9 +323,32 @@ export function CoachView() {
           </div>
         </div>
         {(data?.decisions.length ?? 0) === 0 && (data?.gotchas.length ?? 0) === 0 && (
-          <p className="mt-3 text-xs text-muted-foreground">
-            Decisions and gotchas appear here once your recent sessions have been distilled (enable
-            the Knowledge layer in Settings).
+          <p className="mt-3 text-[13px] text-muted-foreground">
+            {knowledgeOn ? (
+              <>
+                Decisions and gotchas appear here after this week's sessions are distilled.{" "}
+                <Button
+                  variant="link"
+                  className="h-auto p-0 text-[13px]"
+                  onClick={() => setView("projects")}
+                >
+                  Open Projects
+                </Button>{" "}
+                to build memory.
+              </>
+            ) : (
+              <>
+                Decisions and gotchas appear here once your sessions are distilled. That needs the
+                Knowledge layer.{" "}
+                <Button
+                  variant="link"
+                  className="h-auto p-0 text-[13px]"
+                  onClick={() => openSettings("knowledge")}
+                >
+                  Turn it on in Settings
+                </Button>
+              </>
+            )}
           </p>
         )}
       </section>
