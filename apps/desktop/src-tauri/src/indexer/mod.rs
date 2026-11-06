@@ -68,9 +68,10 @@ pub struct IndexReport {
 }
 
 impl IndexReport {
-    /// Count one file or thread a scan processed: `Some(n)` was indexed with `n` messages,
-    /// `None` was unchanged or skipped on purpose, and an error is counted, not raised, so
-    /// one bad file never aborts the rest of the pass.
+    /// Count one file or thread a scan processed: `Some(n)` was processed and `n` message
+    /// rows were inserted (often 0: a title-only append, or an unchanged re-parse after a
+    /// stamp change), `None` was unchanged or skipped on purpose, and an error is counted,
+    /// not raised, so one bad file never aborts the rest of the pass.
     pub fn record(&mut self, result: Result<Option<usize>>) {
         match result {
             Ok(Some(n)) => {
@@ -396,6 +397,11 @@ pub fn source_id(conn: &Connection, kind: &str) -> Result<i64> {
 }
 
 /// Insert or fully replace a thread and all its messages. Empty threads are dropped.
+/// Returns how many message rows were inserted: the whole thread on a first index or a
+/// full replace, only the new tail on an append, 0 when nothing changed or the thread was
+/// skipped. Legacy rows rewritten in place by the tool-output cap upgrade (see
+/// `is_recapped`) are not counted. Callers report this as "messages indexed", so a 1-line
+/// append to a 17k-message session reads as 1, not 17,114.
 pub fn upsert_thread(
     conn: &mut Connection,
     source_id: i64,
@@ -413,39 +419,18 @@ pub fn upsert_thread(
     }
     let t0 = std::time::Instant::now();
     let now = chrono::Utc::now().timestamp();
-    // UTF-8 byte size of all message text (String::len is byte length) — stored so the
+    // UTF-8 byte size of all message text (String::len is byte length), stored so the
     // cleanup list reads a column instead of SUM(LENGTH(text)) across every message.
     let bytes: i64 = thread.messages.iter().map(|m| m.text.len() as i64).sum();
     // Count of DISTILLABLE messages (what the LLM actually sees); distill staleness keys off
     // this, not total message_count, so appended tool/system rows don't re-trigger a distill.
-    let distillable: i64 = thread
-        .messages
-        .iter()
-        .filter(|m| m.role == "user" || m.role == "assistant")
-        .count() as i64;
-    // On its own, the write is one IMMEDIATE transaction: it takes the write lock up front,
-    // so the busy handler waits for another writer instead of failing a read-to-write
-    // upgrade. Inside a caller's open transaction (claude::scan batches a full scan into a
-    // few commits) it is a savepoint, so a failing thread rolls back only its own rows.
-    // Either way, dropping the scope without committing rolls it back.
-    let written = if conn.is_autocommit() {
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let written = write_thread(&tx, source_id, thread, now, bytes, distillable)?;
-        if written {
-            tx.commit()?;
-        }
-        written
-    } else {
-        let sp = conn.savepoint()?;
-        let written = write_thread(&sp, source_id, thread, now, bytes, distillable)?;
-        if written {
-            sp.commit()?;
-        }
-        written
-    };
-    if !written {
+    let distillable = distillable_count(&thread.messages);
+    let Some(written) = in_write_tx(conn, |tx| {
+        write_thread(tx, source_id, thread, now, bytes, distillable)
+    })?
+    else {
         return Ok(0);
-    }
+    };
     // A re-index does a full message replace; on a huge changed thread (FTS re-tokenizes
     // everything) that can take seconds. Log the slow ones so a stall is visible/explained
     // in the terminal rather than looking like a hang.
@@ -458,11 +443,68 @@ pub fn upsert_thread(
             elapsed.as_secs_f64(),
         );
     }
-    Ok(thread.messages.len())
+    Ok(written)
 }
 
-/// The body of [`upsert_thread`], run under the write lock `tx` holds. Returns false (and
-/// writes nothing) when the thread was tombstoned.
+/// Append `thread.messages` (ONLY the new tail, its `usage` keyed by index into that tail)
+/// to an already stored thread whose first `start_seq` messages are known to be unchanged,
+/// and refresh the thread's metadata from `thread`. For sources that prove a pure append
+/// themselves (Claude Code's byte cursor: fingerprint plus stored count): unlike
+/// [`upsert_thread`] it never reads the stored message texts, so its cost tracks the tail,
+/// not the thread. On a 17k-message session that prefix read was most of a 30-40 ms append.
+///
+/// Returns the rows inserted, or None when the stored thread is not the one the caller
+/// expects (missing, tombstoned, or its message count moved because another writer got
+/// there first). Nothing is written then, and the caller should fall back to a full parse.
+pub fn append_messages(
+    conn: &mut Connection,
+    source_id: i64,
+    thread: &ParsedThread,
+    start_seq: usize,
+) -> Result<Option<usize>> {
+    let now = chrono::Utc::now().timestamp();
+    in_write_tx(conn, |tx| {
+        write_append(tx, source_id, thread, start_seq, now)
+    })
+}
+
+/// Run `write` under the write lock and commit only when it returns Some. On its own that
+/// is one IMMEDIATE transaction: it takes the lock up front, so the busy handler waits for
+/// another writer instead of failing a read-to-write upgrade. Inside a caller's open
+/// transaction (claude::scan batches a full scan into a few commits) it is a savepoint, so
+/// a failing thread rolls back only its own rows. Either way, dropping the scope without
+/// committing rolls it back.
+fn in_write_tx<T>(
+    conn: &mut Connection,
+    write: impl FnOnce(&Connection) -> Result<Option<T>>,
+) -> Result<Option<T>> {
+    if conn.is_autocommit() {
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let out = write(&tx)?;
+        if out.is_some() {
+            tx.commit()?;
+        }
+        Ok(out)
+    } else {
+        let sp = conn.savepoint()?;
+        let out = write(&sp)?;
+        if out.is_some() {
+            sp.commit()?;
+        }
+        Ok(out)
+    }
+}
+
+/// Messages the distiller reads (user and assistant turns, tool calls included).
+fn distillable_count(messages: &[ParsedMessage]) -> i64 {
+    messages
+        .iter()
+        .filter(|m| m.role == "user" || m.role == "assistant")
+        .count() as i64
+}
+
+/// The body of [`upsert_thread`], run under the write lock `tx` holds. Returns the rows
+/// inserted, or None (and writes nothing) when the thread was tombstoned.
 fn write_thread(
     tx: &Connection,
     source_id: i64,
@@ -470,12 +512,12 @@ fn write_thread(
     now: i64,
     bytes: i64,
     distillable: i64,
-) -> Result<bool> {
+) -> Result<Option<usize>> {
     // Re-check under the write lock: the watcher indexes on its own connection, so a delete
     // that committed after the early check would otherwise be undone by the INSERT below
     // (the thread comes back next to its own tombstone).
     if crate::cleanup::is_tombstoned(tx, source_id, &thread.external_id)? {
-        return Ok(false);
+        return Ok(None);
     }
 
     let project_key = thread.project_path.as_deref().and_then(canonical_project);
@@ -524,9 +566,10 @@ fn write_thread(
     // and re-FTS-ing the whole thread (the dominant cost on long, actively-growing sessions).
     // We verify the prefix by reading every stored message and comparing it to the new parse:
     // a read-only scan with no FTS work, still far cheaper than the full rewrite, and unlike
-    // point-sampling it can never keep a stale in-place edit — any mismatch or shrink falls
+    // point-sampling it can never keep a stale in-place edit: any mismatch or shrink falls
     // back to a correct full replace (also covers rewritten / DB-backed sources). When
     // n == existing_count and the prefix matches, the tail is empty: a clean no-op.
+    // (Sources that can prove an append without this read use `append_messages`.)
     let existing_count: i64 = tx.query_row(
         "SELECT COUNT(*) FROM messages WHERE thread_id = ?1",
         [thread_id],
@@ -586,161 +629,296 @@ fn write_thread(
     } else {
         0
     };
+    let tail = &thread.messages[start_seq..];
+    let usage: std::collections::HashMap<usize, &MsgUsage> = thread
+        .usage
+        .iter()
+        .filter(|(i, _)| *i >= start_seq)
+        .map(|(i, u)| (*i - start_seq, u))
+        .collect();
+    let inserted = insert_messages(tx, thread_id, start_seq, tail, &usage)?;
+    derive_todos(
+        tx,
+        thread_id,
+        &inserted,
+        incremental,
+        thread.is_subagent,
+        now,
+    )?;
+    derive_file_mentions(tx, thread_id, &inserted, incremental)?;
+    // A full replace of an existing thread (prefix mismatch / shrink) means the content
+    // changed even if the count didn't (e.g. an in-place edit).
+    invalidate_distilled(
+        tx,
+        thread_id,
+        distillable,
+        existing_count > 0 && !incremental,
+    )?;
+    Ok(Some(inserted.len()))
+}
 
-    // (message id, role, text, message timestamp) for each newly inserted row.
-    let mut inserted: Vec<(i64, &str, &str, Option<i64>)> =
-        Vec::with_capacity(thread.messages.len().saturating_sub(start_seq));
+/// The body of [`append_messages`], run under the write lock `tx` holds.
+fn write_append(
+    tx: &Connection,
+    source_id: i64,
+    thread: &ParsedThread,
+    start_seq: usize,
+    now: i64,
+) -> Result<Option<usize>> {
+    if crate::cleanup::is_tombstoned(tx, source_id, &thread.external_id)? {
+        return Ok(None);
+    }
+    let Some((thread_id, stored_count)) = tx
+        .query_row(
+            "SELECT id, message_count FROM threads WHERE source_id = ?1 AND external_id = ?2",
+            params![source_id, thread.external_id],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+        )
+        .optional()?
+    else {
+        return Ok(None);
+    };
+    // The caller checked the count before parsing, but the watcher and a full scan index on
+    // separate connections: re-check under the lock. The rows must add up too (MAX(seq) is
+    // one probe of the (thread_id, seq) unique index), or the tail would land at the wrong
+    // seq; either mismatch means a full parse is the safe answer.
+    let next_seq: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(seq) + 1, 0) FROM messages WHERE thread_id = ?1",
+        [thread_id],
+        |r| r.get(0),
+    )?;
+    if stored_count != start_seq as i64 || next_seq != stored_count {
+        return Ok(None);
+    }
+
+    let tail_bytes: i64 = thread.messages.iter().map(|m| m.text.len() as i64).sum();
+    let project_key = thread.project_path.as_deref().and_then(canonical_project);
+    tx.execute(
+        "UPDATE threads SET title = ?2, project_path = ?3, git_branch = ?4, created_at = ?5,
+            updated_at = ?6, message_count = message_count + ?7, last_indexed_at = ?8,
+            bytes = bytes + ?9, project_key = ?10, distillable_count = distillable_count + ?11
+         WHERE id = ?1",
+        params![
+            thread_id,
+            thread.title,
+            thread.project_path,
+            thread.git_branch,
+            thread.created_at,
+            thread.updated_at,
+            thread.messages.len() as i64,
+            now,
+            tail_bytes,
+            project_key,
+            distillable_count(&thread.messages),
+        ],
+    )?;
+    let distillable: i64 = tx.query_row(
+        "SELECT distillable_count FROM threads WHERE id = ?1",
+        [thread_id],
+        |r| r.get(0),
+    )?;
+    let usage: std::collections::HashMap<usize, &MsgUsage> =
+        thread.usage.iter().map(|(i, u)| (*i, u)).collect();
+    let inserted = insert_messages(tx, thread_id, start_seq, &thread.messages, &usage)?;
+    derive_todos(tx, thread_id, &inserted, true, thread.is_subagent, now)?;
+    derive_file_mentions(tx, thread_id, &inserted, true)?;
+    invalidate_distilled(tx, thread_id, distillable, false)?;
+    Ok(Some(inserted.len()))
+}
+
+/// One message row just inserted: (message id, role, text, message timestamp).
+type Inserted<'a> = (i64, &'a str, &'a str, Option<i64>);
+
+/// Insert `messages` as seqs `first_seq..`, with `usage` keyed by index into `messages`.
+fn insert_messages<'a>(
+    tx: &Connection,
+    thread_id: i64,
+    first_seq: usize,
+    messages: &'a [ParsedMessage],
+    usage: &std::collections::HashMap<usize, &MsgUsage>,
+) -> Result<Vec<Inserted<'a>>> {
+    let mut inserted = Vec::with_capacity(messages.len());
+    let mut stmt = tx.prepare(
+        "INSERT INTO messages
+            (thread_id, seq, role, text, tool_name, ts,
+             model, input_tokens, output_tokens, cache_write_tokens, cache_read_tokens)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+    )?;
+    for (i, m) in messages.iter().enumerate() {
+        let u = usage.get(&i);
+        stmt.execute(params![
+            thread_id,
+            (first_seq + i) as i64,
+            m.role,
+            m.text,
+            m.tool_name,
+            m.ts,
+            u.map(|u| u.model.as_str()),
+            u.map(|u| u.input),
+            u.map(|u| u.output),
+            u.map(|u| u.cache_write),
+            u.map(|u| u.cache_read),
+        ])?;
+        inserted.push((
+            tx.last_insert_rowid(),
+            m.role.as_str(),
+            m.text.as_str(),
+            m.ts,
+        ));
+    }
+    Ok(inserted)
+}
+
+/// Free heuristic knowledge tier: re-derive this thread's TODO facts every index
+/// (delete + rescan) so they never go stale. Only user/assistant text is scanned.
+/// The LLM-distilled facts (extractor='llm') are left untouched here. Gated on the
+/// opt-in: when knowledge is off we don't write todo facts at all. Subagent threads are
+/// skipped: their "TODO"s are the parent agent's task list echoed back, not the user's.
+fn derive_todos(
+    tx: &Connection,
+    thread_id: i64,
+    inserted: &[Inserted],
+    appended: bool,
+    is_subagent: bool,
+    now: i64,
+) -> Result<()> {
+    if !crate::knowledge::get_config(tx)?.enabled || is_subagent {
+        return Ok(());
+    }
+    const MAX_TODOS_PER_THREAD: usize = 25;
+    // Keep CURATED todos (done / dismissed / pinned) so closing one survives re-index;
+    // re-derive only the open, untouched ones.
+    // Full replace re-derives open heuristic todos from scratch; an append keeps the
+    // existing ones (the `seen` seed below dedups) and scans only the new tail.
+    if !appended {
+        tx.execute(
+            "DELETE FROM facts WHERE thread_id = ?1 AND extractor = 'heuristic'
+                AND status = 'open' AND hidden = 0 AND pinned = 0",
+            [thread_id],
+        )?;
+    }
+    // An append whose tail has no user/assistant text has nothing to scan: skip the seeds.
+    if !inserted
+        .iter()
+        .any(|(_, role, _, _)| *role == "user" || *role == "assistant")
     {
-        let usage_by_idx: std::collections::HashMap<usize, &MsgUsage> =
-            thread.usage.iter().map(|(i, u)| (*i, u)).collect();
-        let mut stmt = tx.prepare(
-            "INSERT INTO messages
-                (thread_id, seq, role, text, tool_name, ts,
-                 model, input_tokens, output_tokens, cache_write_tokens, cache_read_tokens)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-        )?;
-        for (seq, m) in thread.messages.iter().enumerate().skip(start_seq) {
-            let u = usage_by_idx.get(&seq);
-            stmt.execute(params![
-                thread_id,
-                seq as i64,
-                m.role,
-                m.text,
-                m.tool_name,
-                m.ts,
-                u.map(|u| u.model.as_str()),
-                u.map(|u| u.input),
-                u.map(|u| u.output),
-                u.map(|u| u.cache_write),
-                u.map(|u| u.cache_read),
-            ])?;
-            inserted.push((
-                tx.last_insert_rowid(),
-                m.role.as_str(),
-                m.text.as_str(),
-                m.ts,
-            ));
-        }
+        return Ok(());
     }
-
-    // Free heuristic knowledge tier: re-derive this thread's TODO facts every index
-    // (delete + rescan) so they never go stale. Only user/assistant text is scanned.
-    // The LLM-distilled facts (extractor='llm') are left untouched here. Gated on the
-    // opt-in: when knowledge is off we don't write todo facts at all. Subagent threads are
-    // skipped: their "TODO"s are the parent agent's task list echoed back, not the user's.
-    if crate::knowledge::get_config(tx)?.enabled && !thread.is_subagent {
-        const MAX_TODOS_PER_THREAD: usize = 25;
-        // Keep CURATED todos (done / dismissed / pinned) so closing one survives re-index;
-        // re-derive only the open, untouched ones.
-        // Full replace re-derives open heuristic todos from scratch; an append keeps the
-        // existing ones (the `seen` seed below dedups) and scans only the new tail.
-        if !incremental {
-            tx.execute(
-                "DELETE FROM facts WHERE thread_id = ?1 AND extractor = 'heuristic'
-                    AND status = 'open' AND hidden = 0 AND pinned = 0",
-                [thread_id],
-            )?;
-        }
-        let mut fstmt = tx.prepare(
-            "INSERT INTO facts (thread_id, kind, text, source_message_id, status, extractor, created_at)
-             VALUES (?1, 'todo', ?2, ?3, 'open', 'heuristic', ?4)",
-        )?;
-        let mut seen = std::collections::HashSet::new();
-        // Seed with kept curated todos so we don't re-add an open copy of a closed one.
+    let mut fstmt = tx.prepare(
+        "INSERT INTO facts (thread_id, kind, text, source_message_id, status, extractor, created_at)
+         VALUES (?1, 'todo', ?2, ?3, 'open', 'heuristic', ?4)",
+    )?;
+    let mut seen = std::collections::HashSet::new();
+    // Seed with kept curated todos so we don't re-add an open copy of a closed one.
+    {
+        let mut kept =
+            tx.prepare("SELECT text FROM facts WHERE thread_id = ?1 AND extractor = 'heuristic'")?;
+        for t in kept
+            .query_map([thread_id], |r| r.get::<_, String>(0))?
+            .flatten()
         {
-            let mut kept = tx.prepare(
-                "SELECT text FROM facts WHERE thread_id = ?1 AND extractor = 'heuristic'",
-            )?;
-            for t in kept
-                .query_map([thread_id], |r| r.get::<_, String>(0))?
-                .flatten()
-            {
-                seen.insert(t.to_ascii_lowercase());
-            }
+            seen.insert(t.to_ascii_lowercase());
         }
-        // The cap is a per-thread TOTAL; on an append the existing open todos weren't deleted,
-        // so they still count toward it — seed the counter instead of starting at 0.
-        let mut count: usize = if incremental {
-            tx.query_row(
-                "SELECT COUNT(*) FROM facts WHERE thread_id = ?1
-                    AND extractor = 'heuristic' AND status = 'open'",
-                [thread_id],
-                |r| r.get::<_, i64>(0),
-            )? as usize
-        } else {
-            0
-        };
-        'outer: for (mid, role, text, ts) in &inserted {
-            if *role != "user" && *role != "assistant" {
-                continue;
+    }
+    // The cap is a per-thread TOTAL; on an append the existing open todos weren't deleted,
+    // so they still count toward it, so seed the counter instead of starting at 0.
+    let mut count: usize = if appended {
+        tx.query_row(
+            "SELECT COUNT(*) FROM facts WHERE thread_id = ?1
+                AND extractor = 'heuristic' AND status = 'open'",
+            [thread_id],
+            |r| r.get::<_, i64>(0),
+        )? as usize
+    } else {
+        0
+    };
+    'outer: for (mid, role, text, ts) in inserted {
+        if *role != "user" && *role != "assistant" {
+            continue;
+        }
+        for todo in crate::knowledge::extract_todos(text) {
+            if count >= MAX_TODOS_PER_THREAD {
+                break 'outer;
             }
-            for todo in crate::knowledge::extract_todos(text) {
-                if count >= MAX_TODOS_PER_THREAD {
-                    break 'outer;
-                }
-                if seen.insert(todo.to_ascii_lowercase()) {
-                    // Stamped with the source message's time, not index time, so a
-                    // re-index of old history doesn't make old TODOs look new.
-                    fstmt.execute(params![
-                        thread_id,
-                        todo,
-                        mid,
-                        crate::knowledge::todo_created_at(*ts, now)
-                    ])?;
-                    count += 1;
-                }
+            if seen.insert(todo.to_ascii_lowercase()) {
+                // Stamped with the source message's time, not index time, so a
+                // re-index of old history doesn't make old TODOs look new.
+                fstmt.execute(params![
+                    thread_id,
+                    todo,
+                    mid,
+                    crate::knowledge::todo_created_at(*ts, now)
+                ])?;
+                count += 1;
             }
         }
     }
+    Ok(())
+}
 
-    // Code-aware search: re-derive this thread's file-path mentions (delete + rescan,
-    // every index). Only user/assistant text — tool RESULTS (ls output) would be noise.
-    // Full replace re-derives file mentions; an append keeps existing + adds the tail's
-    // (INSERT OR IGNORE dedups at the unique constraint).
-    if !incremental {
+/// Code-aware search: re-derive this thread's file-path mentions (delete + rescan,
+/// every index). Only user/assistant text: tool RESULTS (ls output) would be noise.
+/// Full replace re-derives file mentions; an append keeps existing + adds the tail's
+/// (INSERT OR IGNORE dedups at the unique constraint).
+fn derive_file_mentions(
+    tx: &Connection,
+    thread_id: i64,
+    inserted: &[Inserted],
+    appended: bool,
+) -> Result<()> {
+    if !appended {
         tx.execute(
             "DELETE FROM file_mentions WHERE thread_id = ?1",
             [thread_id],
         )?;
     }
-    {
-        const MAX_PATHS_PER_THREAD: usize = 200;
-        let mut pstmt =
-            tx.prepare("INSERT OR IGNORE INTO file_mentions (thread_id, path) VALUES (?1, ?2)")?;
-        let mut seen = std::collections::HashSet::new();
-        // On an append the existing mentions are kept, so seed `seen` with them — both to
-        // dedup and so the per-thread cap counts the thread total, not just the new tail.
-        if incremental {
-            let mut existing = tx.prepare("SELECT path FROM file_mentions WHERE thread_id = ?1")?;
-            for p in existing
-                .query_map([thread_id], |r| r.get::<_, String>(0))?
-                .flatten()
-            {
-                seen.insert(p.to_ascii_lowercase());
-            }
+    const MAX_PATHS_PER_THREAD: usize = 200;
+    let mut pstmt =
+        tx.prepare("INSERT OR IGNORE INTO file_mentions (thread_id, path) VALUES (?1, ?2)")?;
+    let mut seen = std::collections::HashSet::new();
+    // On an append the existing mentions are kept, so seed `seen` with them, both to
+    // dedup and so the per-thread cap counts the thread total, not just the new tail.
+    if appended {
+        let mut existing = tx.prepare("SELECT path FROM file_mentions WHERE thread_id = ?1")?;
+        for p in existing
+            .query_map([thread_id], |r| r.get::<_, String>(0))?
+            .flatten()
+        {
+            seen.insert(p.to_ascii_lowercase());
         }
-        'paths: for (_mid, role, text, _ts) in &inserted {
-            if *role != "user" && *role != "assistant" {
-                continue;
+    }
+    'paths: for (_mid, role, text, _ts) in inserted {
+        if *role != "user" && *role != "assistant" {
+            continue;
+        }
+        for path in extract_paths(text) {
+            if seen.len() >= MAX_PATHS_PER_THREAD {
+                break 'paths;
             }
-            for path in extract_paths(text) {
-                if seen.len() >= MAX_PATHS_PER_THREAD {
-                    break 'paths;
-                }
-                if seen.insert(path.to_ascii_lowercase()) {
-                    pstmt.execute(params![thread_id, path])?;
-                }
+            if seen.insert(path.to_ascii_lowercase()) {
+                pstmt.execute(params![thread_id, path])?;
             }
         }
     }
+    Ok(())
+}
 
-    // Invalidate LLM-distilled knowledge when the message set actually changed. The
-    // upsert above doesn't touch knowledge_msg_count (set at distillation time), so it
-    // still holds the prior count here; only threads that were distilled AND changed
-    // get reset, so unchanged re-indexes never wipe distilled facts. A full replace of an
-    // existing thread (prefix mismatch / shrink) means the content changed even if the
-    // count didn't (e.g. an in-place edit), so treat that as changed too.
-    let content_changed = existing_count > 0 && !incremental;
+/// Mark LLM-distilled knowledge stale when the message set actually changed. The thread
+/// upsert doesn't touch knowledge_msg_count (set at distillation time), so it still holds
+/// the prior count here; only threads that were distilled AND changed get reset, so
+/// unchanged re-indexes never touch distilled knowledge. `content_changed` covers a full
+/// replace whose count didn't move (an in-place edit).
+///
+/// The facts themselves stay: `knowledge::store_distilled` replaces the non-curated LLM
+/// facts atomically when the re-distill lands, so until then the old ones keep serving
+/// Project Memory, the SessionStart hook and recall. Deleting them here emptied an active
+/// session's memory on its first appended turn, for the rest of the session.
+fn invalidate_distilled(
+    tx: &Connection,
+    thread_id: i64,
+    distillable: i64,
+    content_changed: bool,
+) -> Result<()> {
     let prev_kcount: Option<i64> = tx
         .query_row(
             "SELECT knowledge_msg_count FROM threads WHERE id = ?1",
@@ -757,24 +935,19 @@ fn write_thread(
                 "UPDATE threads SET knowledge_extracted = 0, knowledge_error = NULL WHERE id = ?1",
                 [thread_id],
             )?;
-            // Keep curated facts (pinned / edited / hidden) even when the thread changed.
-            tx.execute(
-                "DELETE FROM facts WHERE thread_id = ?1 AND extractor = 'llm'
-                    AND pinned = 0 AND edited = 0 AND hidden = 0",
-                [thread_id],
-            )?;
         }
     }
-
-    Ok(true)
+    Ok(())
 }
 
-/// True when `stored` is a tool row indexed before the index-time tool-output cap and `new`
-/// is the same output freshly parsed, i.e. capped by `claude::cap_tool_text`. Every indexer
-/// that caps (Claude, Codex, Gemini, Qwen, Cline and forks, Continue) caps exactly the
-/// `tool` rows, so an upgrade must not read the shorter text as a rewritten transcript.
+/// True when `stored` is a row indexed before the index-time cap and `new` is the same text
+/// freshly parsed, i.e. capped by `claude::cap_tool_text`. Every indexer that caps (Claude,
+/// Codex, Gemini, Qwen, Cline and forks, Continue) caps the `tool` rows; Claude Code also
+/// caps its tool calls (assistant rows with a tool_name, "Write: {input json}"). An upgrade
+/// must not read the shorter text as a rewritten transcript and fully replace the thread.
+/// Uncapped sources never match: their fresh text is the full one, longer than any cap.
 fn is_recapped(new: &ParsedMessage, stored: &str) -> bool {
-    new.role == "tool"
+    (new.role == "tool" || (new.role == "assistant" && new.tool_name.is_some()))
         && stored.len() > new.text.len()
         && stored.len() > claude::TOOL_TEXT_CAP_CHARS
         && claude::cap_tool_text(stored) == new.text
@@ -956,7 +1129,10 @@ mod tests {
         let sid = source_id(&conn, "claude_code").unwrap();
 
         // Initial index: 3 messages, all inserted.
-        upsert_thread(&mut conn, sid, &thread_with(&["alpha", "beta", "gamma"])).unwrap();
+        assert_eq!(
+            upsert_thread(&mut conn, sid, &thread_with(&["alpha", "beta", "gamma"])).unwrap(),
+            3
+        );
         let tid: i64 = conn
             .query_row("SELECT id FROM threads WHERE external_id = 't1'", [], |r| {
                 r.get(0)
@@ -967,12 +1143,17 @@ mod tests {
 
         // Re-index after two messages were appended: the new tail is inserted, the existing
         // three rows are reused (rowids unchanged) — proof we didn't re-insert the prefix.
-        upsert_thread(
-            &mut conn,
-            sid,
-            &thread_with(&["alpha", "beta", "gamma", "delta", "epsilon"]),
-        )
-        .unwrap();
+        let grown = thread_with(&["alpha", "beta", "gamma", "delta", "epsilon"]);
+        assert_eq!(
+            upsert_thread(&mut conn, sid, &grown).unwrap(),
+            2,
+            "counts only the new rows"
+        );
+        assert_eq!(
+            upsert_thread(&mut conn, sid, &grown).unwrap(),
+            0,
+            "an unchanged re-parse writes nothing"
+        );
         let after = message_rowids(&conn, tid);
         assert_eq!(after.len(), 5);
         assert_eq!(
@@ -983,7 +1164,11 @@ mod tests {
 
         // A shrink falls back to a full replace: count drops to 3 and the new content lands.
         // (Rowid identity can't be asserted here — SQLite reuses rowids after a full delete.)
-        upsert_thread(&mut conn, sid, &thread_with(&["alpha", "CHANGED", "gamma"])).unwrap();
+        assert_eq!(
+            upsert_thread(&mut conn, sid, &thread_with(&["alpha", "CHANGED", "gamma"])).unwrap(),
+            3,
+            "a full replace rewrites every row"
+        );
         assert_eq!(message_rowids(&conn, tid).len(), 3, "shrink → full replace");
         let seq1: String = conn
             .query_row(
@@ -1137,6 +1322,87 @@ mod tests {
         assert_eq!(stored, "different output");
     }
 
+    /// Claude Code tool calls are capped at parse time too, so a legacy uncapped call row
+    /// (a huge Write input) is rewritten in place on the next re-parse, not read as a
+    /// rewritten transcript.
+    #[test]
+    fn uncapped_legacy_tool_calls_are_recapped_in_place() {
+        use super::claude::cap_tool_text;
+        let mut conn = temp_db("recap_call");
+        let sid = source_id(&conn, "claude_code").unwrap();
+        let raw = format!("Write: {{\"content\":\"{}\"}}", "x = 1\\n".repeat(5_000));
+        let call = |text: String| ParsedMessage {
+            role: "assistant".into(),
+            text,
+            tool_name: Some("Write".into()),
+            ts: Some(1),
+        };
+        let mut legacy = thread_with(&["write it"]);
+        legacy.messages.push(call(raw.clone()));
+        upsert_thread(&mut conn, sid, &legacy).unwrap();
+        let tid: i64 = conn
+            .query_row("SELECT id FROM threads", [], |r| r.get(0))
+            .unwrap();
+        let before = message_rowids(&conn, tid);
+
+        let mut fresh = thread_with(&["write it"]);
+        fresh.messages.push(call(cap_tool_text(&raw)));
+        fresh.messages.push(ParsedMessage {
+            role: "user".into(),
+            text: "thanks".into(),
+            tool_name: None,
+            ts: Some(2),
+        });
+        assert_eq!(upsert_thread(&mut conn, sid, &fresh).unwrap(), 1);
+        let after = message_rowids(&conn, tid);
+        assert_eq!(&after[..2], &before[..], "no full replace");
+        let stored: String = conn
+            .query_row(
+                "SELECT text FROM messages WHERE thread_id = ?1 AND seq = 1",
+                [tid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, cap_tool_text(&raw));
+
+        // A prose assistant row is never "recapped": a shorter text there is a real edit.
+        let prose = ParsedMessage {
+            role: "assistant".into(),
+            text: raw.clone(),
+            tool_name: None,
+            ts: None,
+        };
+        assert!(!super::is_recapped(
+            &ParsedMessage {
+                text: cap_tool_text(&raw),
+                ..prose
+            },
+            &raw
+        ));
+    }
+
+    /// The append path's seq check must be one probe of the (thread_id, seq) unique index,
+    /// not a scan of the thread's rows: it runs under the write lock on every append.
+    #[test]
+    fn the_append_seq_check_uses_the_unique_index() {
+        let conn = temp_db("append_plan");
+        let plan: Vec<String> = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT COALESCE(MAX(seq) + 1, 0) FROM messages WHERE thread_id = ?1",
+            )
+            .unwrap()
+            .query_map([1_i64], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let plan = plan.join(" | ");
+        assert!(
+            plan.contains("USING COVERING INDEX sqlite_autoindex_messages_1"),
+            "{plan}"
+        );
+    }
+
     /// The tombstone is checked again under the write lock: an indexer that passed the early
     /// check just before the user's delete committed must not re-insert the thread.
     #[test]
@@ -1243,6 +1509,21 @@ mod tests {
             "a tool-only append must NOT re-trigger distillation"
         );
 
+        conn.execute(
+            "INSERT INTO facts (thread_id, kind, text, status, extractor, created_at)
+             VALUES (?1, 'decision', 'Use FTS5 for search', 'open', 'llm', 0)",
+            [tid],
+        )
+        .unwrap();
+        let llm_facts = |c: &rusqlite::Connection| -> i64 {
+            c.query_row(
+                "SELECT COUNT(*) FROM facts WHERE thread_id = ?1 AND extractor = 'llm'",
+                [tid],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+
         // Append a USER row: distillable +1, knowledge invalidated for re-distill.
         let mut with_user = with_tool.clone();
         with_user.push(("user", "e"));
@@ -1253,6 +1534,29 @@ mod tests {
             0,
             "a new user/assistant message DOES re-trigger distillation"
         );
+        assert_eq!(
+            llm_facts(&conn),
+            1,
+            "stale facts keep serving until the re-distill replaces them"
+        );
+
+        // Same through the byte-cursor append path, and through a full replace.
+        conn.execute(
+            "UPDATE threads SET knowledge_extracted = 1, knowledge_msg_count = distillable_count WHERE id = ?1",
+            [tid],
+        )
+        .unwrap();
+        let tail = mk(&[("assistant", "f")]);
+        assert_eq!(
+            super::append_messages(&mut conn, sid, &tail, 6).unwrap(),
+            Some(1)
+        );
+        assert_eq!(col(&conn, "distillable_count"), 6);
+        assert_eq!(col(&conn, "message_count"), 7);
+        assert_eq!(col(&conn, "knowledge_extracted"), 0);
+        assert_eq!(llm_facts(&conn), 1);
+        upsert_thread(&mut conn, sid, &mk(&[("user", "rewritten")])).unwrap();
+        assert_eq!(llm_facts(&conn), 1, "a full replace keeps them too");
 
         let _ = std::fs::remove_file(&p);
     }

@@ -670,6 +670,7 @@ mod tests {
                     tool_name: None,
                     ts: None,
                     model: None,
+                    text_len: 0,
                 },
                 MessageRow {
                     id: 2,
@@ -678,6 +679,7 @@ mod tests {
                     tool_name: None,
                     ts: None,
                     model: None,
+                    text_len: 0,
                 },
                 MessageRow {
                     id: 3,
@@ -686,6 +688,7 @@ mod tests {
                     tool_name: Some("Bash".into()),
                     ts: None,
                     model: None,
+                    text_len: 0,
                 },
             ],
         }

@@ -1,4 +1,4 @@
-import { memo, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { api, OPEN_TARGETS, SOURCE_LABELS, type MessageRow, type ThreadDetail } from "../lib/api";
@@ -22,14 +22,20 @@ import { ExternalLink, GitCommitHorizontal, MoreHorizontal, Star } from "lucide-
 import { TagsEditor } from "./TagsEditor";
 import { KnowledgeButton } from "./KnowledgeSection";
 import { Loading } from "./Loading";
+import { Spinner } from "@/components/ui/spinner";
+import {
+  type LargeMessageState,
+  LargeMessageStates,
+  MAX_MARKDOWN_CHARS,
+} from "./largeMessageState";
 // Lazy: keeps the markdown + highlight stack off the startup path (see LazyMarkdown).
 import { Markdown } from "./LazyMarkdown";
 
 /** An inline notice tied to the thread it is about. */
 type Notice = { threadId: number; text: string };
 
-// Module-level, not a ref: this view remounts on every tab switch, and coming back to the
-// Search tab with the same thread selected is not a new "thread opened".
+// Module-level, not a ref: effects re-run each time the Search tab is shown again (App keeps
+// it in an Activity), and coming back to the same thread is not a new "thread opened".
 let lastReportedThread: number | null = null;
 
 export function ThreadView() {
@@ -50,9 +56,13 @@ export function ThreadView() {
     queryFn: () => api.getThread(threadId as number),
     enabled: threadId != null,
     // A long transcript is ~12 MB of heap, and nothing reads a thread once it is closed, so
-    // drop it after a minute instead of the default five. Not shorter: this view remounts
-    // on every tab switch, and a quick look at Chat shouldn't refetch the open thread.
+    // drop it after a minute instead of the default five. App holds the open thread while
+    // the Search tab is hidden (RetainOpenThread), so a visit to Chat doesn't drop it.
     gcTime: 60_000,
+    // Never refetch on its own: a big thread is megabytes over IPC, and every change to it
+    // goes through the cache (star and tag edits patch it, main.tsx marks it stale when the
+    // watcher reindexes). Otherwise showing the Search tab again refetched it after 5 s.
+    staleTime: Infinity,
   });
 
   // Once per opened thread, not per refetch (live updates refetch open threads).
@@ -123,6 +133,8 @@ export function ThreadView() {
   const openInCli = useMutation({
     mutationFn: (program: string) => api.openThreadInCli(threadId as number, program),
   });
+  // Default staleTime on purpose: nothing invalidates this when a key is saved in Settings,
+  // so it refreshes when the Search tab is shown again (one cheap IPC).
   const canSynth = useQuery({ queryKey: ["can_synthesize"], queryFn: api.canSynthesize });
   const markExported = () => {
     setExported(true);
@@ -302,6 +314,9 @@ function CommitsSection({ threadId }: { threadId: number }) {
   const { data: commits } = useQuery({
     queryKey: ["thread_commits", threadId],
     queryFn: () => api.threadCommits(threadId),
+    // Default staleTime: besides "Find/Rescan" below (which writes the cache), `cal commits`
+    // writes stored links from a terminal, so main.tsx invalidates this on index:updated
+    // and index:done.
   });
   const link = useMutation({
     mutationFn: () => api.linkThreadCommits(threadId),
@@ -355,20 +370,63 @@ function CommitsSection({ threadId }: { threadId: number }) {
   );
 }
 
+/** Height guess for a row before it is measured. One 110 px guess for every row made a
+ *  7,570-message thread's scroll height about 25% wrong, so the virtualizer kept
+ *  correcting the offset while scrolling up. Fitted on that thread's rendered rows in the
+ *  default window (1,100 px wide): collapsed tool rows are 50 px; prose is about
+ *  86 + 0.145 px per char + 17 px per line break (overall bias under 1%, mean error 40 px,
+ *  against 17% low and 52 px for the old guess); a message over the markdown limit
+ *  renders as a collapsed block. */
+function estimateRowSize(m: MessageRow): number {
+  if (m.toolName || m.role === "tool") return 50;
+  if (m.text.length > MAX_MARKDOWN_CHARS) return 90;
+  let breaks = 0;
+  for (let i = m.text.indexOf("\n"); i !== -1; i = m.text.indexOf("\n", i + 1)) breaks++;
+  return Math.round(86 + 0.145 * m.text.length + 17 * breaks);
+}
+
 function MessageList({ messages }: { messages: MessageRow[] }) {
   const parentRef = useRef<HTMLDivElement>(null);
+  // Expansion state lives here, keyed by message id, not in each row: the virtualizer
+  // unmounts rows that leave the overscan window, which used to collapse an expanded tool
+  // row (and forget a large message's "Show more" progress) after scrolling ~10 rows away.
+  // The list is keyed per thread, so each thread starts collapsed.
+  const [openTools, setOpenTools] = useState<ReadonlySet<number>>(() => new Set());
+  const [largeStates] = useState(() => new Map<number, LargeMessageState>());
+  const setToolOpen = useCallback((id: number, open: boolean) => {
+    setOpenTools((prev) => {
+      if (prev.has(id) === open) return prev;
+      const next = new Set(prev);
+      if (open) next.add(id);
+      else next.delete(id);
+      return next;
+    });
+  }, []);
+  // Stable per `messages`: the virtualizer rebuilds its layout when getItemKey changes.
+  // Keying by message id keeps measured heights on the right rows when a refetch
+  // changes the array.
+  const getItemKey = useCallback((i: number) => messages[i].id, [messages]);
+  // Computed once per `messages`: the virtualizer asks again for every unmeasured row each
+  // time a measurement changes, and counting line breaks is a scan of the text.
+  const estimates = useMemo(() => messages.map(estimateRowSize), [messages]);
+  const estimateSize = useCallback((i: number) => estimates[i], [estimates]);
   const virtualizer = useVirtualizer({
     count: messages.length,
     getScrollElement: () => parentRef.current,
-    estimateSize: () => 110,
+    estimateSize,
+    getItemKey,
     overscan: 8,
   });
   // Arriving from a search hit: land centered on the matched message. Otherwise open
   // pinned to the newest message (chat-style), scroll up for history. A second pass on
-  // the next frame corrects the landing after dynamic heights are measured.
+  // the next frame corrects the landing after dynamic heights are measured. Only once
+  // per target: a refetch (new `messages`) or showing the Search tab again (effects
+  // re-run) must not move the reader.
   const target = useUi((s) => s.targetMessageId);
+  const landed = useRef<number | null | undefined>(undefined);
   useEffect(() => {
-    if (messages.length === 0) return;
+    if (messages.length === 0 || landed.current === target) return;
+    landed.current = target;
     const idx = target != null ? messages.findIndex((m) => m.id === target) : -1;
     const index = idx >= 0 ? idx : messages.length - 1;
     const align = idx >= 0 ? "center" : "end";
@@ -377,22 +435,49 @@ function MessageList({ messages }: { messages: MessageRow[] }) {
     const raf = requestAnimationFrame(go);
     return () => cancelAnimationFrame(raf);
   }, [messages, target, virtualizer]);
+  // App hides the Search tab with display: none while another tab is open. Chromium keeps
+  // a hidden scroller's offset, but not every engine is guaranteed to, so remember the
+  // last offset seen while visible and put it back when the tab is shown (layout effects
+  // re-run then) if it was lost.
+  const savedTop = useRef(0);
+  useLayoutEffect(() => {
+    const el = parentRef.current;
+    if (el && el.scrollTop === 0 && savedTop.current > 0) el.scrollTop = savedTop.current;
+  }, []);
   return (
-    <div ref={parentRef} className="min-h-0 flex-1 overflow-y-auto pt-3">
-      <div className="relative w-full" style={{ height: virtualizer.getTotalSize() }}>
-        {virtualizer.getVirtualItems().map((vrow) => (
-          <div
-            key={vrow.key}
-            data-index={vrow.index}
-            ref={virtualizer.measureElement}
-            className="absolute left-0 top-0 w-full px-5 pb-3"
-            style={{ transform: `translateY(${vrow.start}px)` }}
-          >
-            <Message m={messages[vrow.index]} highlight={messages[vrow.index].id === target} />
-          </div>
-        ))}
+    <LargeMessageStates.Provider value={largeStates}>
+      <div
+        ref={parentRef}
+        className="min-h-0 flex-1 overflow-y-auto pt-3"
+        onScroll={(e) => {
+          // clientHeight is 0 while hidden: an engine resetting the offset then is not the
+          // reader scrolling.
+          if (e.currentTarget.clientHeight > 0) savedTop.current = e.currentTarget.scrollTop;
+        }}
+      >
+        <div className="relative w-full" style={{ height: virtualizer.getTotalSize() }}>
+          {virtualizer.getVirtualItems().map((vrow) => {
+            const m = messages[vrow.index];
+            return (
+              <div
+                key={vrow.key}
+                data-index={vrow.index}
+                ref={virtualizer.measureElement}
+                className="absolute left-0 top-0 w-full px-5 pb-3"
+                style={{ transform: `translateY(${vrow.start}px)` }}
+              >
+                <Message
+                  m={m}
+                  highlight={m.id === target}
+                  open={openTools.has(m.id)}
+                  onToggle={setToolOpen}
+                />
+              </div>
+            );
+          })}
+        </div>
       </div>
-    </div>
+    </LargeMessageStates.Provider>
   );
 }
 
@@ -427,15 +512,36 @@ function toolBody(text: string, toolName: string | null): string {
   return asCodeBlock(body, "text");
 }
 
-/** A collapsed tool call/result. The body is parsed and rendered only once the row is
- *  first opened: most tool rows are never expanded, and a large thread has thousands. */
-function ToolMessage({ m, ring }: { m: MessageRow; ring: string }) {
-  const [opened, setOpened] = useState(false);
+/** A collapsed tool call/result. get_thread sends only a preview of its text (most tool
+ *  rows are never expanded, and their output is most of a long thread's payload), so the
+ *  full text is fetched on first expand. The body is parsed and rendered only while open. */
+function ToolMessage({
+  m,
+  ring,
+  open,
+  onToggle,
+}: {
+  m: MessageRow;
+  ring: string;
+  open: boolean;
+  onToggle: (id: number, open: boolean) => void;
+}) {
+  // textLen is the full length; a backend that sends whole rows makes these equal.
+  const truncated = (m.textLen ?? 0) > m.text.length;
+  const full = useQuery({
+    queryKey: ["message_text", m.id],
+    queryFn: () => api.messageText(m.id),
+    enabled: open && truncated,
+    // A stored message never changes once indexed.
+    staleTime: Infinity,
+  });
+  const text = truncated ? (full.data ?? m.text) : m.text;
   return (
     <details
       className={cn("rounded-lg border bg-muted/40 px-3 py-2 text-sm", ring)}
+      open={open}
       onToggle={(e) => {
-        if (e.currentTarget.open) setOpened(true);
+        if (e.currentTarget.open !== open) onToggle(m.id, e.currentTarget.open);
       }}
     >
       <summary className="cursor-pointer text-muted-foreground">
@@ -443,19 +549,41 @@ function ToolMessage({ m, ring }: { m: MessageRow; ring: string }) {
           {m.toolName ? `tool · ${m.toolName}` : "result"}
         </span>
       </summary>
-      {opened && (
+      {open && (
         <div className="mt-2 max-h-80 overflow-auto text-[0.8rem]">
-          <Markdown>{toolBody(m.text, m.toolName)}</Markdown>
+          {truncated && full.isPending && (
+            <div className="mb-1 flex items-center gap-1.5 text-xs text-muted-foreground">
+              <Spinner className="size-3" />
+              Loading the full output…
+            </div>
+          )}
+          {truncated && full.isError && (
+            <div className="mb-1 text-xs text-destructive">
+              Couldn't load the full output, showing the first {m.text.length} characters. Close and
+              reopen this row to try again.
+            </div>
+          )}
+          <Markdown stateId={m.id}>{toolBody(text, m.toolName)}</Markdown>
         </div>
       )}
     </details>
   );
 }
 
-const Message = memo(function Message({ m, highlight }: { m: MessageRow; highlight?: boolean }) {
+const Message = memo(function Message({
+  m,
+  highlight,
+  open,
+  onToggle,
+}: {
+  m: MessageRow;
+  highlight?: boolean;
+  open: boolean;
+  onToggle: (id: number, open: boolean) => void;
+}) {
   const ring = highlight ? "ring-2 ring-primary/60" : "";
   if (m.toolName || m.role === "tool") {
-    return <ToolMessage m={m} ring={ring} />;
+    return <ToolMessage m={m} ring={ring} open={open} onToggle={onToggle} />;
   }
   return (
     <div
@@ -473,7 +601,7 @@ const Message = memo(function Message({ m, highlight }: { m: MessageRow; highlig
           </span>
         )}
       </div>
-      <Markdown>{m.text}</Markdown>
+      <Markdown stateId={m.id}>{m.text}</Markdown>
     </div>
   );
 });

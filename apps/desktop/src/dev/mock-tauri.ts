@@ -1,7 +1,8 @@
 // Browser-only fake of the Tauri runtime, so the UI runs (and can be screenshotted) without Rust.
 // Use: `pnpm --filter callimachus dev`, then open
 //   http://localhost:1420/mock.html?view=settings&section=providers&theme=light
-// Params: theme, consent, knowledge, agents, keys, update, jobs (see SCENARIO below). Dev-only.
+// Params: theme, consent, knowledge, agents, keys, update, jobs, semantic, searchMs (see
+// SCENARIO below). Dev-only.
 import type {
   AgentIntegration,
   AutoDistillBudget,
@@ -45,6 +46,12 @@ const SCENARIO = {
   keys: pick("keys", ["none", "some"] as const, "some"),
   update: pick("update", ["available", "fail", "none"] as const, "none"),
   jobs: pick("jobs", ["idle", "indexing"] as const, "idle"),
+  // What a hybrid search reports as `semanticSkipped`: the model is ready (null), still
+  // loading, or not cached at all.
+  semantic: pick("semantic", ["ready", "loading", "unavailable"] as const, "ready"),
+  // How long a search takes. Above 0, a search still running when the next one starts
+  // comes back superseded (empty), as the backend's cancellation does.
+  searchMs: Math.max(0, Number(params.get("searchMs")) || 0),
 };
 
 // The theme store reads this at module load, which happens after this file runs.
@@ -115,6 +122,8 @@ export function emit(event: string, payload?: unknown): void {
 }
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+// Bumped by every search_threads call; a slower call that sees a newer one is superseded.
+let searchGeneration = 0;
 
 // ---------------------------------------------------------------------------
 // Fake data: a developer with a year of Claude Code + Codex history
@@ -210,6 +219,7 @@ const dataRoots: DataRoots = {
 };
 const jobs: JobsStatus = {
   index: SCENARIO.jobs === "indexing",
+  catchUp: false,
   embed: false,
   distill: false,
   rewrite: false,
@@ -304,41 +314,51 @@ function threadDetail(id: number): ThreadDetail | null {
     updatedAt: at,
     starred: t.starred,
     tags: ["payments", "flaky-test"],
-    messages: [
-      {
-        id: 1,
-        role: "user",
-        text: "The `webhook retries after 5xx` test fails about 1 in 10 runs on CI. Can you find out why?",
-        toolName: null,
-        ts: at - 3_600,
-        model: null,
-      },
-      {
-        id: 2,
-        role: "assistant",
-        text: "The test advances fake timers before the retry is scheduled, so the assertion races the queue. I'll await the scheduler tick first.",
-        toolName: null,
-        ts: at - 3_540,
-        model: "claude-opus-4-8",
-      },
-      {
-        id: 3,
-        role: "tool",
-        text: "PASS tests/webhooks/retry.test.ts (50 runs, 0 failures)",
-        toolName: "Bash",
-        ts: at - 3_200,
-        model: null,
-      },
-      {
-        id: 4,
-        role: "assistant",
-        text: "Fixed: `retry.test.ts` now awaits `scheduler.flush()` before advancing timers. 50 consecutive runs pass.",
-        toolName: null,
-        ts: at - 3_100,
-        model: "claude-opus-4-8",
-      },
-    ],
+    // Like the backend: tool rows carry a 300-char preview plus the full length, and
+    // message_text serves the rest on expand.
+    messages: threadMessages(at).map((m) => ({
+      ...m,
+      text: m.role === "tool" || m.toolName ? m.text.slice(0, 300) : m.text,
+      textLen: m.text.length,
+    })),
   };
+}
+
+function threadMessages(at: number) {
+  return [
+    {
+      id: 1,
+      role: "user",
+      text: "The `webhook retries after 5xx` test fails about 1 in 10 runs on CI. Can you find out why?",
+      toolName: null,
+      ts: at - 3_600,
+      model: null,
+    },
+    {
+      id: 2,
+      role: "assistant",
+      text: "The test advances fake timers before the retry is scheduled, so the assertion races the queue. I'll await the scheduler tick first.",
+      toolName: null,
+      ts: at - 3_540,
+      model: "claude-opus-4-8",
+    },
+    {
+      id: 3,
+      role: "tool",
+      text: "PASS tests/webhooks/retry.test.ts (50 runs, 0 failures)",
+      toolName: "Bash",
+      ts: at - 3_200,
+      model: null,
+    },
+    {
+      id: 4,
+      role: "assistant",
+      text: "Fixed: `retry.test.ts` now awaits `scheduler.flush()` before advancing timers. 50 consecutive runs pass.",
+      toolName: null,
+      ts: at - 3_100,
+      model: "claude-opus-4-8",
+    },
+  ];
 }
 
 function filterThreads(filters?: SearchFilters): ThreadSummary[] {
@@ -360,7 +380,9 @@ function searchHits(query: string, filters?: SearchFilters): SearchHit[] {
       title: t.title,
       projectPath: t.projectPath,
       role: i % 2 ? "user" : "assistant",
-      snippet: `...we should <mark>${q}</mark> this before the next release, see the notes in ${t.projectPath?.split("/").pop()}...`,
+      // Match boundaries are the backend's char(1)/char(2) sentinels (lib/format renderSnippet
+      // escapes the text first, then turns them into <mark>), not literal tags.
+      snippet: `...we should \u0001${q}\u0002 this before the next release, see the notes in ${t.projectPath?.split("/").pop()}...`,
       ts: t.updatedAt,
     }));
 }
@@ -671,10 +693,24 @@ const handlers: Record<string, Handler> = {
   can_synthesize: () => [...keys.values()].some(Boolean),
 
   // Threads -----------------------------------------------------------------
-  search_threads: (a) => searchHits(String(a.query ?? ""), a.filters as SearchFilters | undefined),
+  search_threads: async (a) => {
+    const generation = ++searchGeneration;
+    if (SCENARIO.searchMs > 0) await sleep(SCENARIO.searchMs);
+    const filters = a.filters as SearchFilters | undefined;
+    if (generation !== searchGeneration) {
+      return { hits: [], semanticSkipped: null, superseded: true };
+    }
+    return {
+      hits: searchHits(String(a.query ?? ""), filters),
+      semanticSkipped: filters?.hybrid && SCENARIO.semantic !== "ready" ? SCENARIO.semantic : null,
+      superseded: false,
+    };
+  },
+  warm_semantic: ok,
   recent_threads: (a) => filterThreads(a.filters as SearchFilters | undefined),
   search_by_file: () => threads.slice(0, 3),
   get_thread: (a) => threadDetail(Number(a.threadId)),
+  message_text: (a) => threadMessages(NOW).find((m) => m.id === Number(a.id))?.text ?? "",
   set_star: (a) => {
     threads = threads.map((t) =>
       t.id === Number(a.threadId) ? { ...t, starred: Boolean(a.starred) } : t,

@@ -27,14 +27,20 @@ function placeholder(text: string): string {
 
 /** ./Markdown's Markdown, loaded on first use. Each instance has its own Suspense
  *  boundary, so a row waiting on the chunk never blanks the whole view. */
-export const Markdown = memo(function LazyMarkdown({ children }: { children: string }) {
+export const Markdown = memo(function LazyMarkdown({
+  children,
+  stateId,
+}: {
+  children: string;
+  stateId?: number;
+}) {
   return (
     <Suspense
       fallback={
         <div className="whitespace-pre-wrap wrap-break-word text-sm">{placeholder(children)}</div>
       }
     >
-      <MarkdownImpl>{children}</MarkdownImpl>
+      <MarkdownImpl stateId={stateId}>{children}</MarkdownImpl>
     </Suspense>
   );
 });

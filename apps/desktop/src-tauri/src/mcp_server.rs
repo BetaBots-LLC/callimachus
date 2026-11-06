@@ -85,8 +85,10 @@ and use check_decision or recall_* with a specific topic. Search with search_cur
 search_threads (hybrid=true for fuzzy recall), then get_thread_knowledge before get_thread.";
 
 struct Callimachus {
-    conn: Mutex<Connection>,
-    embedder: embed::Embedder,
+    /// Shared with the idle reaper `serve` starts, which shrinks its page cache.
+    conn: Arc<Mutex<Connection>>,
+    /// Shared with the idle reaper `serve` starts (see `SIDECAR_IDLE_UNLOAD`).
+    embedder: Arc<embed::Embedder>,
     /// Set once the index is seen to contain threads, so the empty-index probe stops running.
     /// An index never goes back to empty in practice, so this never needs to reset.
     has_threads: AtomicBool,
@@ -344,11 +346,11 @@ impl Callimachus {
             route.attr.input_schema = slim_input_schema(&route.attr.input_schema);
         }
         Self {
-            conn: Mutex::new(conn),
+            conn: Arc::new(Mutex::new(conn)),
             // Never downloads: the server runs inside the user's repo (an agent's CWD) and
             // a tool call must not block on a 128 MB fetch. Without the model the app
             // downloaded, semantic arms fall back to keyword search.
-            embedder: embed::Embedder::cached_only(),
+            embedder: Arc::new(embed::Embedder::cached_only()),
             has_threads: AtomicBool::new(false),
             tool_router,
         }
@@ -1336,12 +1338,42 @@ impl ServerHandler for Callimachus {
 /// Serve the MCP protocol over stdio against `conn`, until the client disconnects. Only
 /// [`serve_stdio`] calls it, after opening the index and building the runtime.
 async fn serve(conn: Connection) -> anyhow::Result<()> {
-    let service = Callimachus::new(conn)
+    let server = Callimachus::new(conn);
+    // Drop the model a minute after the last semantic call instead of holding about 390 MB
+    // for the whole agent session. Ends with the runtime (`shutdown_background`).
+    let embedder = Arc::clone(&server.embedder);
+    let conn = Arc::clone(&server.conn);
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(MODEL_REAP_EVERY);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            if embedder.is_loaded() {
+                let (e, conn) = (Arc::clone(&embedder), Arc::clone(&conn));
+                // Freeing the session joins ORT's pool threads: keep that off the reactor.
+                let _ = tokio::task::spawn_blocking(move || {
+                    // The semantic calls that loaded the model also filled the page cache
+                    // (a KNN reads vector pages); hand both back together.
+                    if e.unload_if_idle() {
+                        if let Ok(conn) = conn.try_lock() {
+                            crate::db::shrink_memory(&conn);
+                        }
+                    }
+                })
+                .await;
+            }
+        }
+    });
+    let service = server
         .serve((tokio::io::stdin(), tokio::io::stdout()))
         .await?;
     service.waiting().await?;
     Ok(())
 }
+
+/// How often the server checks whether its model has been idle past `SIDECAR_IDLE_UNLOAD`,
+/// so it unloads between 60 and 75 s after the last semantic call.
+const MODEL_REAP_EVERY: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// The whole stdio MCP server process, shared by both entry points (the `callimachus-mcp`
 /// binary and the app's `--mcp` mode) so they can't drift: say so when there is no index

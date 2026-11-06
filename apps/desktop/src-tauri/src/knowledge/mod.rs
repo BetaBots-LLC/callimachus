@@ -629,7 +629,9 @@ pub fn get_thread_knowledge(conn: &Connection, thread_id: i64) -> Result<ThreadK
         gotchas,
         todos,
         extracted,
-        stale: extracted && kmsg != Some(mcount),
+        // Distilled at some point (the count is kept) and then changed: the indexer only
+        // clears `knowledge_extracted`, so the old facts above still show, marked stale.
+        stale: kmsg.is_some() && (!extracted || kmsg != Some(mcount)),
         error,
         can_distill: get_config(conn)?.enabled,
     })
@@ -1086,7 +1088,8 @@ pub fn project_decisions(conn: &Connection, project: &str) -> Result<Vec<(i64, S
 }
 
 /// IDs of threads ANYWHERE that need distilling: never distilled, invalidated by new turns
-/// (the indexer resets `knowledge_extracted` and drops the old facts), or distilled when
+/// (the indexer resets `knowledge_extracted`; the old facts keep serving until the re-distill
+/// replaces them), or distilled when
 /// the message count was recorded differently. Newest first, capped. Skips threads that
 /// previously errored so a broken one isn't retried forever.
 ///
@@ -1104,18 +1107,39 @@ pub fn pending_threads_since(
     limit: i64,
     since: Option<i64>,
 ) -> Result<Vec<i64>> {
-    let mut stmt = conn.prepare(&format!(
-        "SELECT id FROM threads
-         WHERE {DISTILLABLE} AND knowledge_error IS NULL
+    pending_threads_window(conn, limit, since, None)
+}
+
+/// The WHERE clause `pending_threads` documents, shared with the auto-distill idle deadline
+/// so both agree on which threads are waiting.
+fn pending_predicate() -> String {
+    format!(
+        "{DISTILLABLE} AND knowledge_error IS NULL
            AND (knowledge_extracted = 0
                 OR (knowledge_msg_count != distillable_count
                     AND (knowledge_extracted_at IS NULL OR updated_at IS NULL
-                         OR updated_at > knowledge_extracted_at)))
+                         OR updated_at > knowledge_extracted_at)))"
+    )
+}
+
+/// `pending_threads_since`, also skipping threads updated at or after `idle_before` (a
+/// session still in progress). A NULL updated_at counts as idle.
+fn pending_threads_window(
+    conn: &Connection,
+    limit: i64,
+    since: Option<i64>,
+    idle_before: Option<i64>,
+) -> Result<Vec<i64>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id FROM threads
+         WHERE {}
            AND (?2 IS NULL OR updated_at >= ?2)
+           AND (?3 IS NULL OR updated_at IS NULL OR updated_at < ?3)
          ORDER BY updated_at DESC
-         LIMIT ?1"
+         LIMIT ?1",
+        pending_predicate()
     ))?;
-    let rows = stmt.query_map(params![limit, since], |r| r.get::<_, i64>(0))?;
+    let rows = stmt.query_map(params![limit, since, idle_before], |r| r.get::<_, i64>(0))?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
@@ -1134,6 +1158,12 @@ pub const AUTO_DISTILL_DEFAULT_DAILY_CAP: i64 = 50;
 /// Only threads active within this window are auto-distilled; older history stays
 /// available to the explicit per-project "Build memory".
 pub const AUTO_DISTILL_RECENT_DAYS: i64 = 30;
+
+/// Auto-distill waits until a thread has been idle this long (by its last message time).
+/// A live session changes every turn: distilling it mid-flight re-packs and re-sends the
+/// whole thread for each kick, and the result is stale a turn later. Its earlier facts keep
+/// serving in the meantime, because the indexer only marks them stale.
+pub const AUTO_DISTILL_IDLE_SECS: i64 = 30 * 60;
 
 /// The per-day auto-distill allowance (`knowledge.auto_distill_daily_cap`).
 pub fn auto_distill_daily_cap(conn: &Connection) -> Result<i64> {
@@ -1175,7 +1205,8 @@ pub fn auto_distill_remaining_today(conn: &Connection, now: i64) -> Result<i64> 
     Ok((auto_distill_daily_cap(conn)? - auto_distill_used_today(conn, now)?).max(0))
 }
 
-/// The next auto-distill batch: at most `batch` recently active pending threads, and never
+/// The next auto-distill batch: at most `batch` recently active pending threads that have
+/// gone idle ([`AUTO_DISTILL_IDLE_SECS`]), and never
 /// more than today's remaining allowance. The returned ids are counted against the
 /// allowance immediately, so a cancelled run errs on the side of spending less. Returns an
 /// empty list once the day's allowance is used up, which ends the auto-distill drain.
@@ -1185,13 +1216,50 @@ pub fn auto_distill_worklist(conn: &Connection, batch: i64, now: i64) -> Result<
         return Ok(Vec::new());
     }
     let since = now - AUTO_DISTILL_RECENT_DAYS * 86_400;
-    let ids = pending_threads_since(conn, take, Some(since))?;
+    let ids = pending_threads_window(conn, take, Some(since), Some(now - AUTO_DISTILL_IDLE_SECS))?;
     if !ids.is_empty() {
         let used = auto_distill_used_today(conn, now)? + ids.len() as i64;
         app_config::put(conn, "knowledge.auto_distill_day", &utc_day(now))?;
         app_config::put(conn, "knowledge.auto_distill_used", &used.to_string())?;
     }
     Ok(ids)
+}
+
+/// How many threads the auto-distill worklist would take at `now` with no daily cap: the
+/// same recent-and-idle filter, so Settings does not count live sessions it will skip.
+pub fn auto_distill_eligible_count(conn: &Connection, now: i64) -> Result<usize> {
+    let since = now - AUTO_DISTILL_RECENT_DAYS * 86_400;
+    Ok(pending_threads_window(
+        conn,
+        i64::MAX,
+        Some(since),
+        Some(now - AUTO_DISTILL_IDLE_SECS),
+    )?
+    .len())
+}
+
+/// Margin past the idle edge before the deadline kick, so a clock tick of skew cannot land
+/// it one second early and find the thread still live.
+const AUTO_DISTILL_IDLE_SLACK_SECS: i64 = 5;
+
+/// When the earliest pending thread the worklist skipped as live becomes idle (unix
+/// seconds), or None when no pending thread is waiting on the idle filter. No other kick
+/// follows a session going quiet (the watcher's top-up embed lands about a minute after the
+/// last write, still inside the window), so without this the day's last session waited for
+/// some unrelated later kick. A thread written again in the meantime only moves its own
+/// edge later, so a kick at this deadline is never late; when it finds nothing, the caller
+/// asks again.
+pub fn auto_distill_next_idle_at(conn: &Connection, now: i64) -> Result<Option<i64>> {
+    let earliest: Option<i64> = conn.query_row(
+        &format!(
+            "SELECT MIN(updated_at) FROM threads
+             WHERE {} AND updated_at >= ?1",
+            pending_predicate()
+        ),
+        [now - AUTO_DISTILL_IDLE_SECS],
+        |r| r.get(0),
+    )?;
+    Ok(earliest.map(|t| t + AUTO_DISTILL_IDLE_SECS + AUTO_DISTILL_IDLE_SLACK_SECS))
 }
 
 // ---- cheap keyword prefilter for proactive recall ----
@@ -1525,8 +1593,26 @@ mod tests {
         .unwrap();
         let k2 = get_thread_knowledge(&conn, id).unwrap();
         assert!(!k2.extracted, "changed message count must reset extraction");
-        assert!(k2.decisions.is_empty(), "llm facts cleared on invalidation");
+        assert!(k2.stale, "shown as stale, not as never distilled");
+        assert_eq!(
+            k2.decisions.len(),
+            1,
+            "the old facts keep serving until the re-distill lands"
+        );
         assert!(needs_distill(&conn, id).unwrap());
+
+        // The re-distill replaces them in one transaction.
+        let d2 = Distilled {
+            summary: "did auth, then more".into(),
+            decisions: vec!["use jwt with refresh".into()],
+            gotchas: Vec::new(),
+        };
+        store_distilled(&mut conn, id, &d2, 200).unwrap();
+        let k3 = get_thread_knowledge(&conn, id).unwrap();
+        assert!(k3.extracted && !k3.stale);
+        assert_eq!(k3.decisions.len(), 1);
+        assert_eq!(k3.decisions[0].text, "use jwt with refresh");
+        assert!(k3.gotchas.is_empty(), "replaced, not merged");
     }
 
     #[test]
@@ -2127,7 +2213,7 @@ mod tests {
 
         // Auto-distill: recent threads only, and a daily allowance that is reserved up front.
         let now = 1_800_000_000;
-        conn.execute("UPDATE threads SET updated_at = ?1", [now - 60])
+        conn.execute("UPDATE threads SET updated_at = ?1", [now - 3_600])
             .unwrap();
         set_auto_distill_daily_cap(&conn, 1).unwrap();
         assert_eq!(auto_distill_remaining_today(&conn, now).unwrap(), 1);
@@ -2147,6 +2233,87 @@ mod tests {
             .unwrap()
             .is_empty());
         assert_eq!(auto_distill_daily_cap(&conn).unwrap(), 100);
+    }
+
+    /// A session still in progress is left alone until it has been idle for
+    /// AUTO_DISTILL_IDLE_SECS, without spending the day's allowance on it; manual and
+    /// per-project distills (pending_threads) still see it.
+    #[test]
+    fn auto_distill_waits_until_a_thread_goes_idle() {
+        let mut conn = temp_db();
+        let live = seed_thread(
+            &mut conn,
+            "live",
+            "/proj/idle",
+            false,
+            &["a", "b", "c", "d"],
+        );
+        let now = 1_800_000_000;
+        conn.execute("UPDATE threads SET updated_at = ?1", [now - 60])
+            .unwrap();
+        assert!(auto_distill_worklist(&conn, 25, now).unwrap().is_empty());
+        assert_eq!(
+            auto_distill_remaining_today(&conn, now).unwrap(),
+            AUTO_DISTILL_DEFAULT_DAILY_CAP,
+            "a skipped live thread costs no allowance"
+        );
+        assert_eq!(pending_threads(&conn, 10).unwrap(), vec![live]);
+
+        // Exactly at the boundary it is still live; one second past it, it is due.
+        let edge = now - AUTO_DISTILL_IDLE_SECS;
+        conn.execute("UPDATE threads SET updated_at = ?1", [edge])
+            .unwrap();
+        assert!(auto_distill_worklist(&conn, 25, now).unwrap().is_empty());
+        conn.execute("UPDATE threads SET updated_at = ?1", [edge - 1])
+            .unwrap();
+        assert_eq!(auto_distill_worklist(&conn, 25, now).unwrap(), vec![live]);
+    }
+
+    /// The deadline kick lands once the earliest skipped live thread is due, the Settings
+    /// count matches what the worklist would take, and nothing is scheduled once no pending
+    /// thread is waiting on the idle filter.
+    #[test]
+    fn auto_distill_next_idle_at_is_when_the_earliest_live_thread_is_due() {
+        let mut conn = temp_db();
+        let first = seed_thread(&mut conn, "first", "/proj/a", false, &["a", "b", "c", "d"]);
+        let later = seed_thread(&mut conn, "later", "/proj/b", false, &["a", "b", "c", "d"]);
+        let now = 1_800_000_000;
+        let set = |conn: &Connection, id: i64, at: i64| {
+            conn.execute(
+                "UPDATE threads SET updated_at = ?1 WHERE id = ?2",
+                params![at, id],
+            )
+            .unwrap();
+        };
+        set(&conn, first, now - 120);
+        set(&conn, later, now - 10);
+
+        let due = auto_distill_next_idle_at(&conn, now).unwrap().unwrap();
+        assert_eq!(
+            due,
+            now - 120 + AUTO_DISTILL_IDLE_SECS + AUTO_DISTILL_IDLE_SLACK_SECS
+        );
+        assert_eq!(auto_distill_eligible_count(&conn, now).unwrap(), 0);
+        assert_eq!(auto_distill_eligible_count(&conn, due).unwrap(), 1);
+        assert_eq!(auto_distill_worklist(&conn, 25, due).unwrap(), vec![first]);
+
+        // Re-armed from the remaining live thread, then nothing once it is idle too.
+        let next = auto_distill_next_idle_at(&conn, due).unwrap().unwrap();
+        assert_eq!(
+            next,
+            now - 10 + AUTO_DISTILL_IDLE_SECS + AUTO_DISTILL_IDLE_SLACK_SECS
+        );
+        assert_eq!(auto_distill_next_idle_at(&conn, next).unwrap(), None);
+
+        // A live thread that is not pending (it errored) schedules nothing.
+        set(&conn, first, now - 2 * AUTO_DISTILL_IDLE_SECS);
+        set(&conn, later, now);
+        conn.execute(
+            "UPDATE threads SET knowledge_error = 'boom' WHERE id = ?1",
+            [later],
+        )
+        .unwrap();
+        assert_eq!(auto_distill_next_idle_at(&conn, now).unwrap(), None);
     }
 
     #[test]

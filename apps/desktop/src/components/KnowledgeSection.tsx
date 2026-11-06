@@ -65,7 +65,14 @@ export function KnowledgeButton({ threadId }: { threadId: number }) {
                 disabled={distill.isPending}
               >
                 <Sparkles className="size-3.5" />
-                {distill.isPending ? "Distilling…" : d.stale ? "Re-distill" : "Distill"}
+                {/* Only a thread that still shows distilled facts says Re-distill: one whose
+                    facts an older build deleted, or that distilled to nothing, is stale too,
+                    but its body says "Hit Distill". */}
+                {distill.isPending
+                  ? "Distilling…"
+                  : d.stale && hasDistilled
+                    ? "Re-distill"
+                    : "Distill"}
               </Button>
             )}
           </div>

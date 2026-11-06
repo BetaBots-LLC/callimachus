@@ -70,11 +70,14 @@ Store tool results through `claude::cap_tool_text` (16,000 chars: the head plus 
 4,000 chars, with an elision marker in between). Tool output was ~70% of all stored text
 but is never embedded or distilled; the tail is kept because that is where build and test
 errors (what `issues.rs` mines) usually are. Cap the **trimmed** text so the result is
-deterministic and the incremental prefix check stays stable. Rows indexed before the cap
-are not a mismatch either: `upsert_thread` treats a stored `tool` row whose capped form is
-the new text as matching and rewrites it in place, so the first re-parse after an upgrade
-doesn't full-replace the thread. `cleanup::compact_tool_output` rewrites such rows in bulk
-with the same function, for the sources registered with `caps_tool_output: true`.
+deterministic and the incremental prefix check stays stable. Claude Code also caps its tool
+calls (assistant rows with a `tool_name`, `"Write: {input json}"`), since a Write carries the
+whole file; the other sources store calls in full. Rows indexed before the cap are not a
+mismatch either: `upsert_thread` treats a stored `tool` row, or a stored tool call, whose
+capped form is the new text as matching and rewrites it in place, so the first re-parse
+after an upgrade doesn't full-replace the thread. `cleanup::compact_tool_output` rewrites
+such rows in bulk with the same function: `tool` rows for the sources registered with
+`caps_tool_output: true`, tool calls for Claude Code only.
 
 ## Things every indexer must skip
 

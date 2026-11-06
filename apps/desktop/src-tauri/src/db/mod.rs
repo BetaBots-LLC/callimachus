@@ -452,13 +452,30 @@ pub fn read_pool(path: &Path, size: u32) -> Result<ReadPool> {
             path.display()
         );
     }
+    // One reader stays open; the rest close after two idle minutes. r2d2's default keeps
+    // max_size readers forever (min_idle = max_size, so idle_timeout never fires), and each
+    // holds up to a 16 MiB page cache: 6 x 16 MiB for the app's lifetime, mostly in the
+    // tray. Bursty UI reads still fan out to max_size and pay ~1 ms per reopened reader.
     let pool = r2d2::Pool::builder()
         .max_size(size.max(2))
+        .min_idle(Some(1))
+        .idle_timeout(Some(READER_IDLE_TIMEOUT))
         .build(ReadManager {
             path: path.to_path_buf(),
         })
         .context("building read pool")?;
     Ok(ReadPool(pool))
+}
+
+/// How long a pooled reader beyond the first may sit unused before the pool closes it.
+pub const READER_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Hand a connection's page cache back to the allocator (`PRAGMA shrink_memory`) after a
+/// burst of work: the writers' caches are 64 MiB each and otherwise stay full for the
+/// life of the process. They refill on demand. Best effort; a failure changes nothing.
+pub fn shrink_memory(conn: &Connection) {
+    let _ = conn.execute_batch("PRAGMA shrink_memory;");
+    crate::memtrim::release_freed_memory();
 }
 
 #[cfg(test)]
@@ -519,6 +536,10 @@ mod tests {
         let _: i64 = c2
             .query_row("SELECT COUNT(*) FROM threads", [], |r| r.get(0))
             .unwrap();
+        // Idle readers are reaped down to one instead of all staying open (and cached).
+        assert_eq!(pool.0.min_idle(), Some(1));
+        assert_eq!(pool.0.idle_timeout(), Some(READER_IDLE_TIMEOUT));
+        shrink_memory(&c2);
     }
 
     fn fresh_path(tag: &str) -> PathBuf {

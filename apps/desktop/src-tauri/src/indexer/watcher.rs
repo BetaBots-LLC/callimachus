@@ -30,12 +30,25 @@ const ROOT_RECHECK: Duration = Duration::from_secs(60);
 /// How long to wait before retrying a catch-up deferred by a running reindex or embed build.
 const CATCH_UP_RETRY: Duration = Duration::from_secs(30);
 
+/// Watcher quiet before the semantic-index top-up (`crate::embed_kick`) starts: one agent
+/// turn writes a burst of debounced batches, and this makes it one build instead of one per
+/// batch.
+const EMBED_QUIET: Duration = Duration::from_secs(60);
+
+/// Longest a burst can hold the top-up off. Parallel agents can keep the watcher busy for
+/// hours without a quiet minute, and vector recall would miss all of it meanwhile.
+const EMBED_MAX_WAIT: Duration = Duration::from_secs(10 * 60);
+
 /// Minimum time between two scans of the same source. Cursor's state.vscdb takes writes
 /// for all editor state, not just chat, so its WAL changes constantly while Cursor is in
-/// use; coalescing keeps that from turning into a continuous rescan loop.
+/// use; coalescing keeps that from turning into a continuous rescan loop. Copilot's scan
+/// walks every workspace of every editor, and a chat being streamed rewrites its session
+/// file many times a second, so it is coalesced too (a backstop to the chatSessions filter).
 fn min_interval(kind: &str) -> Duration {
     if kind == super::cursor::KIND {
         Duration::from_secs(30)
+    } else if kind == super::copilot::KIND {
+        Duration::from_secs(5)
     } else {
         Duration::ZERO
     }
@@ -50,6 +63,9 @@ struct Target {
     /// When set, only files whose name starts with this belong to the source (the
     /// directory is shared with unrelated files, e.g. other extensions' storage).
     file_prefix: Option<&'static str>,
+    /// When set, only paths it accepts belong to the source: for a recursive root whose
+    /// relevant files sit at a known depth among unrelated ones.
+    accept: Option<fn(&Path) -> bool>,
 }
 
 impl Target {
@@ -59,8 +75,17 @@ impl Target {
             kind,
             mode: RecursiveMode::Recursive,
             file_prefix: None,
+            accept: None,
         }
     }
+}
+
+/// Copilot's `workspaceStorage` filter: only `<hash>/chatSessions/...` holds chats. Every
+/// other file there (each workspace's state.vscdb, other extensions' caches and SQLite
+/// journals, a Python REPL history) is written all day while the editor is open, and each
+/// write used to trigger a full Copilot rescan of every workspace.
+fn in_chat_sessions(path: &Path) -> bool {
+    path.components().any(|c| c.as_os_str() == "chatSessions")
 }
 
 /// Stores to watch, each tagged with the source kind it belongs to.
@@ -85,6 +110,7 @@ fn watch_targets() -> Vec<Target> {
                 kind: super::cursor::KIND,
                 mode: RecursiveMode::NonRecursive,
                 file_prefix: Some("state.vscdb"),
+                accept: None,
             });
         }
     }
@@ -111,6 +137,7 @@ fn watch_targets() -> Vec<Target> {
                 kind: super::opencode::KIND,
                 mode: RecursiveMode::NonRecursive,
                 file_prefix: Some("opencode.db"),
+                accept: None,
             });
         }
     }
@@ -128,7 +155,11 @@ fn watch_targets() -> Vec<Target> {
     }
     // VS Code-native / Copilot chat: each editor's workspaceStorage + emptyWindowChatSessions.
     for p in super::copilot::watch_roots() {
-        v.push(Target::new(p, super::copilot::KIND));
+        let workspaces = p.file_name().is_some_and(|n| n == "workspaceStorage");
+        v.push(Target {
+            accept: workspaces.then_some(in_chat_sessions as fn(&Path) -> bool),
+            ..Target::new(p, super::copilot::KIND)
+        });
     }
     v
 }
@@ -167,7 +198,7 @@ fn route(path: &Path, routes: &[Target]) -> Option<&'static str> {
                 .file_name()
                 .and_then(|n| n.to_str())
                 .is_some_and(|n| n.starts_with(prefix)),
-        };
+        } && t.accept.is_none_or(|accept| accept(path));
         if accepted {
             return Some(t.kind);
         }
@@ -226,6 +257,91 @@ pub fn spawn(app: AppHandle) {
     });
 }
 
+/// Fires once `quiet` has passed since the last `poke`, then disarms: a burst of pokes
+/// (one agent turn's debounced batches) fires once, a quiet period after the last of them,
+/// or `max_wait` after the first if the burst never goes quiet.
+#[derive(Debug)]
+struct QuietTimer {
+    quiet: Duration,
+    max_wait: Duration,
+    /// The first poke of the current burst.
+    first: Option<Instant>,
+    due: Option<Instant>,
+}
+
+impl QuietTimer {
+    fn new(quiet: Duration, max_wait: Duration) -> Self {
+        Self {
+            quiet,
+            max_wait,
+            first: None,
+            due: None,
+        }
+    }
+
+    /// Something happened: (re)start the quiet period from `now`.
+    fn poke(&mut self, now: Instant) {
+        let first = *self.first.get_or_insert(now);
+        self.due = Some((now + self.quiet).min(first + self.max_wait));
+    }
+
+    /// When it will fire, if armed (for the loop's sleep).
+    fn due(&self) -> Option<Instant> {
+        self.due
+    }
+
+    /// True once, when the quiet period has passed by `now`.
+    fn fire(&mut self, now: Instant) -> bool {
+        if self.due.is_some_and(|d| d <= now) {
+            self.due = None;
+            self.first = None;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Watcher batches since the last per-minute log line. Agents write all day, so a line per
+/// batch (every 800 ms while one streams) would drown the log, and no line at all left 16
+/// CPU-hours in 46 h unexplained.
+#[derive(Default)]
+struct Rollup {
+    batches: usize,
+    paths: usize,
+    threads: usize,
+    busy: Duration,
+    cpu: Duration,
+}
+
+impl Rollup {
+    fn record(&mut self, paths: usize, threads: usize, clock: &crate::jobclock::JobClock) {
+        self.batches += 1;
+        self.paths += paths;
+        self.threads += threads;
+        self.busy += clock.wall();
+        self.cpu += clock.thread_cpu().unwrap_or_default();
+    }
+
+    /// Log and reset; false (and no line) when there were no batches.
+    fn flush(&mut self, window: Duration) -> bool {
+        if self.batches == 0 {
+            return false;
+        }
+        app_log!(
+            "[watcher] last {} s: {} batches, {} paths, {} threads indexed, busy {}, {} cpu",
+            window.as_secs(),
+            self.batches,
+            self.paths,
+            self.threads,
+            crate::jobclock::fmt_duration(self.busy),
+            crate::jobclock::fmt_duration(self.cpu)
+        );
+        *self = Self::default();
+        true
+    }
+}
+
 /// Work accumulated for one source until it is due.
 #[derive(Default)]
 struct Pending {
@@ -261,6 +377,10 @@ fn run(app: AppHandle) -> anyhow::Result<()> {
 
     let mut pending: HashMap<&'static str, Pending> = HashMap::new();
     let mut last_run: HashMap<&'static str, Instant> = HashMap::new();
+    let mut embed_timer = QuietTimer::new(EMBED_QUIET, EMBED_MAX_WAIT);
+    let mut rollup = Rollup::default();
+    // Unix time the earliest session auto-distill skipped as live goes idle.
+    let mut distill_idle_at: Option<i64> = None;
 
     // Not on a first run: until something is indexed, indexing waits for the user to start
     // it from onboarding. Roots are already watched, so a write during the pass is queued.
@@ -269,18 +389,28 @@ fn run(app: AppHandle) -> anyhow::Result<()> {
     loop {
         if catch_up_at.is_some_and(|at| at <= Instant::now()) {
             catch_up_at = if catch_up(&app, &mut conn, &mut last_run) {
+                // Sessions written while the app was closed (and anything a sidecar
+                // indexed) may need vectors: top up once things settle.
+                embed_timer.poke(Instant::now());
                 None
             } else {
                 Some(Instant::now() + CATCH_UP_RETRY)
             };
         }
 
-        // Sleep until the next deferred scan, catch-up retry or root re-check is due.
+        if embed_timer.fire(Instant::now()) && crate::embed_kick(&app) == crate::EmbedKick::Busy {
+            // A reindex, a VACUUM or a build holds the writer: try again after it.
+            embed_timer.poke(Instant::now());
+        }
+
+        // Sleep until the next deferred scan, catch-up retry, embed top-up or root re-check
+        // is due.
         let now = Instant::now();
         let next_due = pending
             .keys()
             .map(|k| due_at(k, &last_run))
             .chain(catch_up_at)
+            .chain(embed_timer.due())
             .min()
             .map(|d| d.saturating_duration_since(now));
         let until_root_check = ROOT_RECHECK.saturating_sub(last_root_check.elapsed());
@@ -319,12 +449,25 @@ fn run(app: AppHandle) -> anyhow::Result<()> {
             .collect();
         for kind in due {
             if let Some(work) = pending.remove(kind) {
-                reindex(&app, &mut conn, kind, work);
+                let paths = work.paths.len();
+                let clock = crate::jobclock::JobClock::start();
+                let threads = reindex(&app, &mut conn, kind, work).map_or(0, |r| r.threads_indexed);
+                rollup.record(paths, threads, &clock);
+                if threads > 0 {
+                    embed_timer.poke(Instant::now());
+                }
                 last_run.insert(kind, Instant::now());
             }
         }
 
+        // The once-a-minute tick: new roots, the batch log line, idle memory.
         if last_root_check.elapsed() >= ROOT_RECHECK {
+            if rollup.flush(last_root_check.elapsed()) {
+                // The minute's writes filled this connection's page cache (64 MiB).
+                db::shrink_memory(&conn);
+            }
+            crate::embed_reap_tick(&app);
+            auto_distill_idle_tick(&app, &conn, &mut distill_idle_at);
             table = register_roots(&conn, &mut debouncer, &mut watched, &mut warned);
             last_root_check = Instant::now();
         }
@@ -338,10 +481,35 @@ fn has_threads(conn: &Connection) -> bool {
         .unwrap_or(false)
 }
 
+/// Kick auto-distill when a session it skipped as live goes idle
+/// (`knowledge::AUTO_DISTILL_IDLE_SECS`). Every other kick (launch, catch-up, a build's end,
+/// the top-up embed a minute after the last write) lands while that session is still inside
+/// the window, so without this the day's last session waited for an unrelated later kick.
+/// Runs on the once-a-minute tick, so the kick lands up to a minute past the deadline.
+/// `armed` holds the deadline; once it passes, kick and look again, which re-arms for the
+/// next live thread (or the same one, if it was written again). A kick that finds a writer
+/// job or a distill running loses nothing: those kick again when they end.
+fn auto_distill_idle_tick(app: &AppHandle, conn: &Connection, armed: &mut Option<i64>) {
+    let now = chrono::Utc::now().timestamp();
+    if armed.is_some_and(|at| at > now) {
+        return;
+    }
+    if armed.take().is_some() {
+        crate::auto_distill_kick(app);
+    }
+    let on = crate::knowledge::get_config(conn).is_ok_and(|c| c.enabled && c.auto_distill);
+    if on {
+        *armed = crate::knowledge::auto_distill_next_idle_at(conn, now)
+            .ok()
+            .flatten();
+    }
+}
+
 /// Re-scan every source once, on the watcher's own connection, to pick up what changed
 /// while the app was closed. Unchanged files cost a stat and one lookup each, so this is
-/// fast when there is nothing to do. Holds the reindex flag meanwhile, so a Reindex click
-/// doesn't start a second scan of the same files, then kicks auto-distill the way index_all
+/// fast when there is nothing to do. Holds `CatchUpJob` meanwhile (not the user-facing
+/// reindex flag, so the search bar stays quiet), which a Reindex click waits for instead of
+/// starting a second scan of the same files, then kicks auto-distill the way index_all
 /// does. Returns false, having done nothing, when a reindex, an embedding build or a
 /// whole-file rewrite already holds the writer.
 fn catch_up(
@@ -349,25 +517,58 @@ fn catch_up(
     conn: &mut Connection,
     last_run: &mut HashMap<&'static str, Instant>,
 ) -> bool {
-    // Same rule as index_all: never fight a semantic build or a VACUUM for the write lock.
-    if app.state::<crate::EmbedJob>().is_running() || app.state::<crate::CompactJob>().0.is_set() {
+    // Cleared on drop, including when a scan panics, so a Reindex never waits on it forever.
+    let Some(job) = crate::JobGuard::try_acquire(&app.state::<crate::CatchUpJob>().0) else {
         return false;
-    }
-    // Cleared on drop, including when a scan panics, so Reindex is never left disabled.
-    let Some(job) = crate::JobGuard::try_acquire(&app.state::<crate::IndexJob>().0) else {
-        return false; // a reindex is running
     };
+    // Claim, then check: index_all / index_source claim IndexJob and then wait for this
+    // flag, and a build claims EmbedJob and then checks this one, so one side of each pair
+    // always sees the other and they never write side by side. Checking before the claim
+    // left a window where a build and this scan both passed their checks.
+    if app.state::<crate::IndexJob>().0.is_set()
+        || app.state::<crate::EmbedJob>().is_running()
+        || app.state::<crate::CompactJob>().0.is_set()
+    {
+        return false; // a reindex, a semantic build or a VACUUM is running; `job` drops
+    }
+    let total = crate::jobclock::JobClock::start();
+    let mut sum = super::IndexReport::default();
     for source in super::SOURCES {
         let full = Pending {
             paths: Vec::new(),
             full: true,
         };
-        reindex(app, conn, source.kind, full);
+        let clock = crate::jobclock::JobClock::start();
+        if let Some(r) = reindex(app, conn, source.kind, full) {
+            // One line per source that has anything on disk; absent agents stay silent.
+            if r.threads_indexed + r.threads_skipped + r.errors > 0 {
+                app_log!(
+                    "[catch-up] {}: {} indexed, {} unchanged, {} errors in {}",
+                    source.kind,
+                    r.threads_indexed,
+                    r.threads_skipped,
+                    r.errors,
+                    clock.thread_summary()
+                );
+            }
+            sum.threads_indexed += r.threads_indexed;
+            sum.threads_skipped += r.threads_skipped;
+            sum.errors += r.errors;
+        }
         last_run.insert(source.kind, Instant::now());
     }
-    // Released first: auto_distill_kick returns early while IndexJob is set. The launch kick
-    // usually lands during this pass and bails, and a drain running when it started yielded
-    // to it, so this kick is what distills the sessions written while the app was closed.
+    app_log!(
+        "[catch-up] all sources: {} indexed, {} unchanged, {} errors in {}",
+        sum.threads_indexed,
+        sum.threads_skipped,
+        sum.errors,
+        total.thread_summary()
+    );
+    db::shrink_memory(conn);
+    // Released first: auto_distill_kick returns early while CatchUpJob is set. The launch
+    // kick usually lands during this pass and bails, and a drain running when it started
+    // yielded to it, so this kick is what distills the sessions written while the app was
+    // closed.
     drop(job);
     crate::auto_distill_kick(app);
     true
@@ -412,8 +613,14 @@ fn register_roots<W: notify::Watcher, C: notify_debouncer_full::FileIdCache>(
 }
 
 /// Re-index one source and notify the frontend. Writes on its own `conn`, so the UI's
-/// shared connection is never blocked across the scan.
-fn reindex(app: &AppHandle, conn: &mut Connection, kind: &'static str, work: Pending) {
+/// shared connection is never blocked across the scan. Returns the report, or None when the
+/// scan failed (logged here).
+fn reindex(
+    app: &AppHandle,
+    conn: &mut Connection,
+    kind: &'static str,
+    work: Pending,
+) -> Option<super::IndexReport> {
     let run = |conn: &mut Connection| -> anyhow::Result<super::IndexReport> {
         // Claude Code: index just the transcripts that changed (a debounced batch during
         // an active session names one or two files out of thousands).
@@ -439,13 +646,18 @@ fn reindex(app: &AppHandle, conn: &mut Connection, kind: &'static str, work: Pen
         }
     }
     match report {
-        Ok(r) if r.threads_indexed > 0 => {
-            // Nudge the UI (payload: the source kind): main.tsx throttles this (~4s) into
-            // refetches of the visible results/stats and marks open threads stale.
-            let _ = app.emit("index:updated", kind);
+        Ok(r) => {
+            if r.threads_indexed > 0 {
+                // Nudge the UI (payload: the source kind): main.tsx throttles this (~4s) into
+                // refetches of the visible results/stats and marks open threads stale.
+                let _ = app.emit("index:updated", kind);
+            }
+            Some(r)
         }
-        Err(e) => app_log!("[watcher] {kind}: {e}"),
-        _ => {}
+        Err(e) => {
+            app_log!("[watcher] {kind}: {e}");
+            None
+        }
     }
 }
 
@@ -476,11 +688,16 @@ mod tests {
                 kind: super::super::cursor::KIND,
                 mode: RecursiveMode::NonRecursive,
                 file_prefix: Some("state.vscdb"),
+                accept: None,
             },
             Target::new(
                 base.join("globalStorage/emptyWindowChatSessions"),
                 super::super::copilot::KIND,
             ),
+            Target {
+                accept: Some(in_chat_sessions),
+                ..Target::new(base.join("workspaceStorage"), super::super::copilot::KIND)
+            },
             Target::new(
                 base.join("globalStorage/saoudrizwan.claude-dev/tasks"),
                 super::super::cline::KIND,
@@ -508,6 +725,23 @@ mod tests {
             None,
             "unrelated extension storage doesn't trigger a Cursor rescan"
         );
+        // Copilot's workspaceStorage: only chat session files, not the other files every
+        // workspace writes all day.
+        let ws = "/home/me/.config/Cursor/User/workspaceStorage";
+        assert_eq!(
+            r(&format!("{ws}/abc123/chatSessions/s.jsonl")),
+            Some("copilot")
+        );
+        assert_eq!(r(&format!("{ws}/abc123/chatSessions")), Some("copilot"));
+        for noise in [
+            "abc123/state.vscdb",
+            "abc123/state.vscdb-journal",
+            "abc123/GitHub.copilot-chat/codebase-external.sqlite",
+            "abc123/ms-python.python/pythonrc.py",
+            "abc123/workspace.json",
+        ] {
+            assert_eq!(r(&format!("{ws}/{noise}")), None, "{noise}");
+        }
         // A relocated Claude config dir (no "/.claude/" in the path) still routes.
         assert_eq!(
             r("/data/claude-work/projects/-proj/s.jsonl"),
@@ -518,5 +752,52 @@ mod tests {
             r("/Users/x/.claude/projects/-p/s.jsonl"),
             Some("claude_code")
         );
+    }
+
+    #[test]
+    fn copilot_scans_are_coalesced() {
+        assert_eq!(
+            min_interval(super::super::copilot::KIND),
+            Duration::from_secs(5)
+        );
+        assert_eq!(min_interval(super::super::claude::KIND), Duration::ZERO);
+    }
+
+    #[test]
+    fn quiet_timer_fires_once_after_the_last_poke() {
+        let t0 = Instant::now();
+        let s = Duration::from_secs;
+        let mut t = QuietTimer::new(s(60), s(600));
+        assert_eq!(t.due(), None);
+        assert!(!t.fire(t0 + s(600)), "never armed");
+
+        // A burst of batches: each one pushes the deadline out.
+        t.poke(t0);
+        t.poke(t0 + s(20));
+        t.poke(t0 + s(45));
+        assert_eq!(t.due(), Some(t0 + s(105)));
+        assert!(
+            !t.fire(t0 + s(60)),
+            "60 s after the first poke is not quiet"
+        );
+        assert!(!t.fire(t0 + s(104)));
+        assert!(t.fire(t0 + s(105)), "60 s after the last poke");
+        assert_eq!(t.due(), None, "disarmed after firing");
+        assert!(!t.fire(t0 + s(500)), "fires once per burst");
+
+        // The next burst arms it again.
+        t.poke(t0 + s(600));
+        assert!(t.fire(t0 + s(661)));
+
+        // A burst that never goes quiet still fires max_wait after its first poke.
+        let t1 = t0 + s(1000);
+        for i in 0..40 {
+            t.poke(t1 + s(30 * i));
+            if t.fire(t1 + s(30 * i)) {
+                assert_eq!(i, 20, "fired at {} s", 30 * i);
+                break;
+            }
+        }
+        assert_eq!(t.due(), None);
     }
 }

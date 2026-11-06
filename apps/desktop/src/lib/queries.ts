@@ -4,6 +4,7 @@ import {
   type QueryClient,
   queryOptions,
   useIsMutating,
+  useMutation,
   useQuery,
   useQueryClient,
 } from "@tanstack/react-query";
@@ -36,6 +37,27 @@ export function useEmbedStatus() {
 
 /** Cache slot for the last `embed:error` message (main.tsx writes it). */
 export const EMBED_ERROR_KEY = ["embed_error"] as const;
+
+/** Start a semantic index build (the search bar's button, and the results list when a
+ *  hybrid search finds no model). main.tsx toasts when it finishes. */
+export function useBuildSemanticIndex() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: api.buildEmbeddings,
+    // A retry starts clean; a new failure arrives as a fresh embed:error.
+    onMutate: () => {
+      queryClient.setQueryData(EMBED_ERROR_KEY, null);
+      markUserStarted("embed");
+    },
+    // embed_status never refetches on its own while idle; pick up running:true now so the
+    // progress bar appears.
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["embed_status"] });
+      void confirmUserStarted(queryClient, "embed"); // a no-op start (job busy) gets no toast
+    },
+    onError: () => unmarkUserStarted("embed"),
+  });
+}
 
 /**
  * Which background jobs the user started from the UI this session, so main.tsx can toast
@@ -156,4 +178,25 @@ export async function waitForReindexSlot(queryClient: QueryClient): Promise<void
   while (reindexBlocked(await fetchJobsStatus(queryClient))) {
     await new Promise((resolve) => setTimeout(resolve, JOB_POLL_MS));
   }
+}
+
+/** A reindex the user started (Reindex, Onboarding, a source's Reindex). The quiet launch
+ *  catch-up scan is a separate flag (`catchUp`, its own job), so it never drives
+ *  "Indexing…", the progress bar or a disabled Reindex button: it runs on every launch and
+ *  usually takes well under 2 s, so showing it read as a stuck 0% reindex. A Reindex
+ *  clicked during the catch-up holds `index` while it waits for the scan, and shows as
+ *  indexing from the click. */
+export function userReindexing(s: JobsStatus | null | undefined): boolean {
+  return !!s?.index;
+}
+
+/** The ResultsList query key. The query text sits at index 1 ("" for the recent list), and
+ *  main.tsx's live refresh relies on that to tell the cheap recent list from a search. */
+export function resultsKey(query: string, ...rest: unknown[]) {
+  return ["results", query, ...rest] as const;
+}
+
+/** Whether a cached results key is a typed search (or `file:` lookup), not the recent list. */
+export function isSearchResultsKey(key: readonly unknown[]): boolean {
+  return key[0] === "results" && typeof key[1] === "string" && key[1] !== "";
 }
