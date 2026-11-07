@@ -30,13 +30,14 @@ export const AGGREGATE_KEYS = [
   "spend",
   "projects",
   "cleanup",
+  "today",
 ] as const;
 
 /**
  * Mark index_stats and every aggregate stale after a write that changes the thread set
  * without an `index:done` (cleanup deletes, a per-source reindex, a saved chat). Without
  * this, the 5-minute stale window keeps listing deleted threads, or missing new ones, in
- * Stats / Coach / Projects. Only mounted views refetch now; the rest reload on next visit.
+ * Stats / Today / Projects. Only mounted views refetch now; the rest reload on next visit.
  */
 export function invalidateIndexDerived() {
   for (const key of ["index_stats", ...AGGREGATE_KEYS]) {

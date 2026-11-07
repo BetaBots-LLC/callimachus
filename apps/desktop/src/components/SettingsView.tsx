@@ -2,11 +2,10 @@ import { type ComponentType, type ReactNode, useRef } from "react";
 import { Tabs as TabsPrimitive } from "@base-ui/react/tabs";
 import {
   Bot,
+  Cpu,
   Database,
   FileOutput,
   FolderOpen,
-  KeyRound,
-  Lightbulb,
   RefreshCw,
   SlidersHorizontal,
 } from "lucide-react";
@@ -14,11 +13,10 @@ import { cn } from "@/lib/utils";
 import { type SettingsSection, useUi } from "../store/ui";
 import { useUpdater } from "../store/updater";
 import { AgentsSection } from "./settings/AgentsSection";
+import { EngineSection } from "./settings/EngineSection";
 import { ExportSection } from "./settings/ExportSection";
 import { GeneralSection } from "./settings/GeneralSection";
 import { IndexSection } from "./settings/IndexSection";
-import { KnowledgeSection } from "./settings/KnowledgeSection";
-import { ProvidersSection } from "./settings/ProvidersSection";
 import { SourcesSection } from "./settings/SourcesSection";
 import { UpdatesSection } from "./settings/UpdatesSection";
 
@@ -29,11 +27,10 @@ const SECTIONS: {
   render: () => ReactNode;
 }[] = [
   { id: "general", label: "General", icon: SlidersHorizontal, render: () => <GeneralSection /> },
-  { id: "providers", label: "Providers", icon: KeyRound, render: () => <ProvidersSection /> },
+  { id: "engine", label: "AI engine", icon: Cpu, render: () => <EngineSection /> },
   { id: "agents", label: "Agents", icon: Bot, render: () => <AgentsSection /> },
   { id: "sources", label: "Sources", icon: FolderOpen, render: () => <SourcesSection /> },
   { id: "index", label: "Index & storage", icon: Database, render: () => <IndexSection /> },
-  { id: "knowledge", label: "Knowledge", icon: Lightbulb, render: () => <KnowledgeSection /> },
   { id: "export", label: "Export", icon: FileOutput, render: () => <ExportSection /> },
   { id: "updates", label: "Updates", icon: RefreshCw, render: () => <UpdatesSection /> },
 ];

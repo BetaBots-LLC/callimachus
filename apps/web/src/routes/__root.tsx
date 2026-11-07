@@ -14,7 +14,7 @@ export const Route = createRootRoute({
       { charSet: "utf-8" },
       { name: "viewport", content: "width=device-width, initial-scale=1" },
       { name: "theme-color", content: "#1c160f" },
-      ...seo({ title: `Callimachus — ${TAGLINE}`, description: DESCRIPTION }),
+      ...seo({ title: `Callimachus: ${TAGLINE}`, description: DESCRIPTION }),
     ],
     links: [
       { rel: "stylesheet", href: appCss },

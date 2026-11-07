@@ -4,7 +4,7 @@ import { BarChart3, Moon, Settings, Sun } from "lucide-react";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { SearchBar } from "./components/SearchBar";
 import { ResultsList } from "./components/ResultsList";
-import { KnowledgeGate } from "./components/KnowledgeGate";
+import { TodayView } from "./components/TodayView";
 import { TelemetryConsent } from "./components/TelemetryConsent";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { Loading } from "./components/Loading";
@@ -18,23 +18,15 @@ import { useChecklist } from "./store/checklist";
 import { useUi, type View } from "./store/ui";
 import { useTheme } from "./store/theme";
 
-// Only the Search view (results + thread) is needed for first paint. The other views load
-// on first visit, which keeps their code out of the startup bundle the webview has to
-// parse behind the splash (most noticeable on low-end Windows and Linux machines).
+// Only Today (the launch view) and the Search view (results + thread) are in the entry. The
+// other views load on first visit, which keeps their code out of the startup bundle the
+// webview has to parse behind the splash (most noticeable on low-end Windows and Linux).
 const loadChat = () => import("./components/ChatView");
-const loadCoach = () => import("./components/CoachView");
-const loadKnowledge = () => import("./components/KnowledgeView");
-const loadAsk = () => import("./components/AskView");
-const loadProjects = () => import("./components/ProjectMemoryView");
+const loadProjects = () => import("./components/ProjectPage");
 const loadStats = () => import("./components/StatsView");
 const loadSettings = () => import("./components/SettingsView");
 const ChatView = lazy(() => loadChat().then((m) => ({ default: m.ChatView })));
-const CoachView = lazy(() => loadCoach().then((m) => ({ default: m.CoachView })));
-const KnowledgeView = lazy(() => loadKnowledge().then((m) => ({ default: m.KnowledgeView })));
-const AskView = lazy(() => loadAsk().then((m) => ({ default: m.AskView })));
-const ProjectMemoryView = lazy(() =>
-  loadProjects().then((m) => ({ default: m.ProjectMemoryView })),
-);
+const ProjectPage = lazy(() => loadProjects().then((m) => ({ default: m.ProjectPage })));
 const StatsView = lazy(() => loadStats().then((m) => ({ default: m.StatsView })));
 const SettingsView = lazy(() => loadSettings().then((m) => ({ default: m.SettingsView })));
 
@@ -70,9 +62,6 @@ function usePrefetchViews() {
         loadChat,
         loadSettings,
         loadStats,
-        loadCoach,
-        loadKnowledge,
-        loadAsk,
         loadProjects,
       ]) {
         warm(load); // a real failure resurfaces on visit, inside the boundary
@@ -174,22 +163,27 @@ const warmThreadView = () => {
 
 // Content views shown as labeled tabs. Utilities (Stats, Settings) live as right-side icons.
 const TABS: { id: View; label: string; load?: () => Promise<unknown> }[] = [
+  { id: "today", label: "Today" },
   { id: "search", label: "Search" },
   { id: "chat", label: "Chat", load: loadChat },
-  { id: "coach", label: "Coach", load: loadCoach },
-  { id: "knowledge", label: "Knowledge", load: loadKnowledge },
-  { id: "ask", label: "Ask", load: loadAsk },
   { id: "projects", label: "Projects", load: loadProjects },
 ];
 
 function App() {
   usePrefetchViews();
+  // The launch is recorded as the last open (`mark_app_opened`, which Today reads as
+  // "since") by TodayView itself, once per window and after its first successful load:
+  // marking at launch would make that very load read the moment just stored and show
+  // nothing.
   const view = useUi((s) => s.view);
   const setView = useUi((s) => s.setView);
   const setCommandOpen = useUi((s) => s.setCommandOpen);
   const theme = useTheme((s) => s.resolved);
   const toggleTheme = useTheme((s) => s.toggle);
-  const { data: stats } = useQuery({ queryKey: ["db_stats"], queryFn: api.dbStats });
+  const { data: stats, isPending: statsPending } = useQuery({
+    queryKey: ["db_stats"],
+    queryFn: api.dbStats,
+  });
   // An empty index opens the setup checklist, which then stays open until the user closes it
   // or opens a thread or a search (store/checklist.ts): the index step finishing must not
   // pull the other three steps away mid-setup.
@@ -197,12 +191,12 @@ function App() {
   const checklistOpen = useChecklist((s) => s.open);
   const openFirstRun = useChecklist((s) => s.openFirstRun);
   useEffect(() => {
-    if (indexEmpty) openFirstRun();
-  }, [indexEmpty, openFirstRun]);
-  // LLM distillation gates Ask only. Knowledge and Projects always render (TODOs, Remember
-  // and harvested memory need no engine) and show the memory card inline while it is off.
-  const knowledge = useQuery({ queryKey: ["knowledge_config"], queryFn: api.knowledgeConfig });
-  const on = !!knowledge.data?.enabled;
+    if (!indexEmpty) return;
+    openFirstRun();
+    // The checklist renders in the Search view, so an empty index launches there instead
+    // of on a Today with nothing to show.
+    if (useUi.getState().view === "today") setView("search");
+  }, [indexEmpty, openFirstRun, setView]);
   // DEV-only preview of the first-run screen on a populated index:
   //   VITE_ONBOARD=1 pnpm desktop:dev   (or devtools: localStorage.setItem("cal:onboard","1"))
   const forceOnboard =
@@ -213,12 +207,13 @@ function App() {
       <header className="flex items-center justify-between border-b px-4 py-2">
         <div className="flex items-center gap-3">
           <span className="font-semibold tracking-tight">Callimachus</span>
-          <nav className="flex gap-1">
+          <nav className="flex gap-1" aria-label="Views">
             {TABS.map((t) => (
               <Button
                 key={t.id}
                 size="sm"
                 variant={view === t.id ? "secondary" : "ghost"}
+                aria-current={view === t.id ? "page" : undefined}
                 onClick={() => setView(t.id)}
                 {...prefetchOnIntent(t.load)}
               >
@@ -334,19 +329,17 @@ function App() {
         <ErrorBoundary key={view} scope="view">
           <Suspense fallback={<Loading label="Loading…" className="flex-1" />}>
             <div className="flex min-h-0 flex-1 flex-col">
+              {/* Not before db_stats answers: on an empty index the effect above moves to
+                  Search in the same commit, and a Today mounted earlier could load and mark
+                  the open first. A failed db_stats still shows Today, with its own error. */}
+              {view === "today" &&
+                (statsPending ? (
+                  <Loading label="Loading today…" className="h-full" />
+                ) : (
+                  <TodayView />
+                ))}
               {view === "chat" && <ChatView />}
-              {view === "coach" && <CoachView />}
-              {view === "knowledge" && <KnowledgeView />}
-              {view === "ask" && (
-                <KnowledgeGate
-                  enabled={on}
-                  feature="Ask your history"
-                  blurb="Ask a question and get a synthesized, cited answer drawn from your own past sessions."
-                >
-                  <AskView />
-                </KnowledgeGate>
-              )}
-              {view === "projects" && <ProjectMemoryView />}
+              {view === "projects" && <ProjectPage />}
               {view === "stats" && <StatsView />}
               {view === "settings" && <SettingsView />}
             </div>

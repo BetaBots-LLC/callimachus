@@ -1,12 +1,14 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useState } from "react";
+import { type KeyboardEvent, useRef, useState } from "react";
 import { api, SOURCE_LABELS, type SourceKind, type ValueLedger } from "../lib/api";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Spinner } from "@/components/ui/spinner";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { formatUsd, shortPath } from "../lib/format";
 import { AGGREGATE_STALE_MS } from "../lib/queryClient";
 import { errorText, notify } from "../lib/toast";
+import { useUi } from "../store/ui";
 import { cn } from "@/lib/utils";
 import { Loading } from "./Loading";
 
@@ -44,6 +46,8 @@ export function StatsView() {
         />
         <Stat label="Span" value={spanLabel(data.earliest, data.latest)} />
       </dl>
+
+      <ActivityCard />
 
       <ValueCard />
 
@@ -111,6 +115,232 @@ export function StatsView() {
         </Card>
       </div>
     </div>
+  );
+}
+
+const HEATMAP_DAYS = 364; // 52 weeks, inclusive of today
+
+/** GitHub-style intensity, 0..4, scaled to the busiest day so quiet histories still show. */
+function level(count: number, max: number): number {
+  if (count <= 0) return 0;
+  const r = count / Math.max(max, 1);
+  if (r > 0.66) return 4;
+  if (r > 0.33) return 3;
+  if (r > 0.12) return 2;
+  return 1;
+}
+
+// Brand sunset (#C16E2C) at rising opacity reads as intensity on both themes; level 0 is a
+// faint track. Kept off the Tailwind palette on purpose: this ramp is the heatmap's signature.
+const CELL_BG = [
+  "color-mix(in oklab, var(--muted-foreground) 14%, transparent)",
+  "rgba(193, 110, 44, 0.3)",
+  "rgba(193, 110, 44, 0.5)",
+  "rgba(193, 110, 44, 0.72)",
+  "rgba(193, 110, 44, 0.95)",
+];
+
+// Days are local calendar days, as search::coach_heatmap buckets them ("YYYY-MM-DD" in the
+// machine's zone), so the cell label, the Search chip and the range a click opens all name
+// the same day. (UTC buckets put evening work west of Greenwich on the next day's cell.)
+const DATE_FMT: Intl.DateTimeFormatOptions = { weekday: "short", month: "short", day: "numeric" };
+
+/** The local day `offset` days from `today` (0 = today). Calendar arithmetic, not 86,400 s
+ *  steps, so a DST change never skips or repeats a day. */
+function dayAt(today: Date, offset: number): Date {
+  return new Date(today.getFullYear(), today.getMonth(), today.getDate() + offset);
+}
+
+/** A local date as the backend's day key, "YYYY-MM-DD". */
+function dayKey(d: Date): string {
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+// Arrow keys move like a calendar: a column is a week, so left and right step a week.
+const STEP: Record<string, number> = {
+  ArrowUp: -1,
+  ArrowDown: 1,
+  ArrowLeft: -7,
+  ArrowRight: 7,
+};
+
+/**
+ * Daily activity over the last 52 weeks (moved here from the old Coach tab). A day with
+ * activity opens Search scoped to it, listing that day's threads. The grid is one Tab stop:
+ * the arrow keys move between days (Home / End: first day, today) and Enter opens one,
+ * rather than 364 stops in the page's Tab order.
+ */
+function ActivityCard() {
+  const openSearch = useUi((s) => s.openSearch);
+  const { data, isError, error, refetch, isFetching } = useQuery({
+    queryKey: ["coach_overview"],
+    queryFn: api.coachOverview,
+    staleTime: AGGREGATE_STALE_MS, // refreshed by index events (main.tsx)
+  });
+  // Days are offsets from today (0), negative into the past.
+  const today = new Date();
+  const [focusDay, setFocusDay] = useState(0);
+  const grid = useRef<HTMLDivElement>(null);
+  // A cold cache is a GROUP BY over every message (seconds on a large index), and a failure
+  // left the card silently missing: the card keeps its place and says which it is.
+  if (!data) {
+    return (
+      <Card>
+        <CardHeader>
+          <CardTitle>Activity</CardTitle>
+          <CardDescription>Pick a day to see its threads in Search.</CardDescription>
+        </CardHeader>
+        <CardContent>
+          {isError ? (
+            <div role="alert" className="flex flex-wrap items-center gap-2 text-sm">
+              <span className="text-destructive">
+                Couldn't load the activity: {errorText(error)}
+              </span>
+              <Button
+                size="xs"
+                variant="outline"
+                disabled={isFetching}
+                onClick={() => void refetch()}
+              >
+                Try again
+              </Button>
+            </div>
+          ) : (
+            // The grid's own shape (53 week columns, 7 days), so nothing jumps when it lands.
+            <div
+              role="status"
+              aria-label="Loading the activity"
+              className="aspect-[53/7] w-full animate-pulse rounded-md bg-muted"
+            />
+          )}
+        </CardContent>
+      </Card>
+    );
+  }
+
+  const startDay = -HEATMAP_DAYS;
+  // Pad the start back to the beginning of its week (Sunday) so columns align like a calendar.
+  const gridStart = startDay - dayAt(today, startDay).getDay();
+  // Columns = the index of today's column + 1 (today sits at day-offset / 7). No trailing
+  // all-empty column.
+  const weekCount = Math.floor((0 - gridStart) / 7) + 1;
+
+  const byDay = new Map(data.heatmap.map((d) => [d.day, d]));
+  const maxDay = data.heatmap.reduce((m, d) => Math.max(m, d.messages), 0);
+  const totalMessages = data.heatmap.reduce((n, d) => n + d.messages, 0);
+  const activeDays = data.heatmap.filter((d) => d.messages > 0).length;
+  const current = Math.min(0, Math.max(startDay, focusDay));
+
+  const open = (offset: number) => {
+    const day = byDay.get(dayKey(dayAt(today, offset)));
+    if (!day || day.messages <= 0) return;
+    // The backend's own bounds for the local day (inclusive, also on a 23 or 25 hour DST
+    // day), and with both bounds recent_threads lists the threads with a message inside, so
+    // the list is the threads behind the cell's count. The cell counts every repo and
+    // source, top-level sessions only, so the filters that would hide some of them reset.
+    openSearch({
+      query: "",
+      project: null,
+      sources: [],
+      starred: null,
+      tags: [],
+      includeSubagents: false,
+      after: day.start,
+      before: day.end,
+    });
+  };
+  const moveTo = (offset: number) => {
+    const next = Math.min(0, Math.max(startDay, offset));
+    setFocusDay(next);
+    grid.current?.querySelector<HTMLElement>(`[data-day="${next}"]`)?.focus();
+  };
+  const onKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
+    const step = STEP[e.key];
+    if (step) moveTo(current + step);
+    else if (e.key === "Home") moveTo(startDay);
+    else if (e.key === "End") moveTo(0);
+    else return;
+    e.preventDefault();
+  };
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
+          <span>Activity</span>
+          <span className="text-[13px] font-normal text-muted-foreground tabular-nums">
+            {totalMessages.toLocaleString()} messages · {activeDays} active days in the last 52
+            weeks
+          </span>
+        </CardTitle>
+        <CardDescription>Pick a day to see its threads in Search.</CardDescription>
+      </CardHeader>
+      <CardContent>
+        <TooltipProvider delay={80}>
+          {/* biome-ignore lint/a11y/useSemanticElements: a fieldset would draw a form group around a chart; this only names the roving set of day buttons */}
+          <div
+            ref={grid}
+            role="group"
+            aria-label="Messages per day, last 52 weeks"
+            className="flex w-full gap-0.5"
+            onKeyDown={onKeyDown}
+          >
+            {Array.from({ length: weekCount }, (_, w) => gridStart + w * 7).map((weekStart) => (
+              <div key={weekStart} className="flex flex-1 flex-col gap-0.5">
+                {Array.from({ length: 7 }, (_, d) => {
+                  const day = weekStart + d;
+                  if (day < startDay || day > 0) {
+                    return <div key={day} className="aspect-square" />;
+                  }
+                  const date = dayAt(today, day);
+                  const c = byDay.get(dayKey(date))?.messages ?? 0;
+                  const label = `${date.toLocaleDateString(undefined, DATE_FMT)}: ${c.toLocaleString()} message${c === 1 ? "" : "s"}`;
+                  return (
+                    <Tooltip key={day}>
+                      <TooltipTrigger
+                        render={
+                          <button
+                            type="button"
+                            data-day={day}
+                            tabIndex={day === current ? 0 : -1}
+                            aria-label={label}
+                            aria-disabled={c === 0 || undefined}
+                            onClick={() => open(day)}
+                            onFocus={() => setFocusDay(day)}
+                            className={cn(
+                              "aspect-square rounded-xs outline-none",
+                              "focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 focus-visible:ring-offset-card",
+                              c > 0
+                                ? "cursor-pointer hover:ring-1 hover:ring-ring/60"
+                                : "cursor-default",
+                            )}
+                            style={{ backgroundColor: CELL_BG[level(c, maxDay)] }}
+                          />
+                        }
+                      />
+                      {/* Visual only: the button's aria-label already says this, so a
+                            screen reader announces each day once. */}
+                      <TooltipContent aria-hidden>{label}</TooltipContent>
+                    </Tooltip>
+                  );
+                })}
+              </div>
+            ))}
+          </div>
+        </TooltipProvider>
+        <div
+          className="mt-2 flex items-center gap-1.5 text-[0.7rem] text-muted-foreground"
+          aria-hidden="true"
+        >
+          <span>Less</span>
+          {CELL_BG.map((bg) => (
+            <span key={bg} className="size-2.5 rounded-xs" style={{ backgroundColor: bg }} />
+          ))}
+          <span>More</span>
+        </div>
+      </CardContent>
+    </Card>
   );
 }
 
@@ -273,6 +503,7 @@ function RetentionGuard({ preserved }: { preserved: ValueLedger["preserved"] }) 
 
 /** Estimated AI spend by model + the priciest threads, from captured token usage. */
 function SpendCard() {
+  const openSettings = useUi((s) => s.openSettings);
   const { data } = useQuery({
     queryKey: ["spend"],
     queryFn: () => api.spend(),
@@ -288,9 +519,16 @@ function SpendCard() {
         </CardHeader>
         <CardContent>
           <p className="text-sm text-muted-foreground">
-            No token usage captured yet. Hit{" "}
-            <span className="font-medium text-foreground">Reindex</span> to read it from your source
-            files. Then this shows your estimated AI spend by model and your priciest threads.
+            No token usage captured yet. Use{" "}
+            <Button
+              variant="link"
+              className="h-auto p-0 align-baseline text-sm"
+              onClick={() => openSettings("index")}
+            >
+              Reindex everything
+            </Button>{" "}
+            in Settings to read it from your source files. Then this shows your estimated AI spend
+            by model and your priciest threads.
           </p>
         </CardContent>
       </Card>

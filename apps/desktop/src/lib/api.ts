@@ -124,6 +124,8 @@ export interface ThreadSummary {
   messageCount: number;
   updatedAt: number | null;
   starred: boolean;
+  /** Absent when the source records no branch (and from older backends). */
+  gitBranch?: string | null;
 }
 
 export interface MessageRow {
@@ -147,6 +149,9 @@ export interface ThreadDetail {
   externalId: string;
   title: string | null;
   projectPath: string | null;
+  /** The canonical project (worktrees resolve to the main repo): the key Projects groups
+   *  by. Absent when the thread has no project, and from older backends. */
+  projectKey?: string | null;
   gitBranch: string | null;
   createdAt: number | null;
   updatedAt: number | null;
@@ -243,11 +248,16 @@ export interface AskSource {
   title: string | null;
   source: SourceKind;
   projectPath: string | null;
+  /** The thread's best-matching message, to open it there; absent or null when unknown. */
+  messageId?: number | null;
 }
 
 export interface AskAnswer {
   answer: string;
   sources: AskSource[];
+  /** `answer` plus a "Sources:" footer of `[thread N] title` lines: what the chat saves
+   *  (and re-sends), so a reopened chat still knows the cited threads. */
+  answerWithSources: string;
 }
 
 /** A semantically-recalled fact (decision/gotcha) with its source thread. */
@@ -306,9 +316,14 @@ export interface Stats {
   topProjects: ProjectStat[];
 }
 
-// One day's message activity, for the Coach coding heatmap.
+// One day's message activity, for the Stats activity heatmap.
 export interface DayActivity {
-  day: number; // unix seconds at UTC midnight
+  /** The local calendar day, "YYYY-MM-DD" (the machine's time zone). */
+  day: string;
+  /** Unix seconds of that day's local midnight. */
+  start: number;
+  /** Unix seconds of the day's last second, inclusive (a DST day is 23 or 25 hours). */
+  end: number;
   messages: number;
 }
 
@@ -497,6 +512,123 @@ export interface ValueLedger {
   };
 }
 
+/** A saved snapshot as the app lists it (`list_snapshots`, `today`). */
+export interface Snapshot {
+  id: number;
+  threadId: number | null;
+  /** Null when the thread was deleted after the snapshot was taken. */
+  threadTitle: string | null;
+  /** Where the session ran (a worktree path for a worktree session). */
+  projectPath: string | null;
+  /** The canonical project key (a worktree's main repo), what the Project page and the
+   *  search scope take; the stored path when the thread was pruned. */
+  projectKey: string | null;
+  sourceKind: string | null;
+  label: string;
+  /** The hook event of an auto snapshot ("PreCompact", ...), else "manual". */
+  event: string;
+  createdAt: number;
+  /** Body length in chars (in a detail, of the redacted body it holds). */
+  chars: number;
+}
+
+/** A snapshot plus its markdown body, redacted (`load_snapshot`). */
+export interface SnapshotDetail extends Snapshot {
+  body: string;
+}
+
+/** What a project's agents are given (`agent_view`). */
+export interface AgentView {
+  /** Exactly what the SessionStart hook prints for a new Claude Code session; "" when silent. */
+  hook: string;
+  hookChars: number;
+  /** Why the hook would print nothing (managed block found, muted, no threads...). */
+  hookSilentReason: string | null;
+  /** Claude Code's cap on a hook's injected context (10,000 chars). */
+  hookCap: number;
+  /** The managed AGENTS.md / CLAUDE.md block as `cal agents` writes it, markers included. */
+  agentsFile: string;
+  agentsChars: number;
+  /** The recent-sessions digest is muted for this repo (`cal hook --mute`). */
+  muted: boolean;
+  /** Claude Code's SessionStart hook is installed (by the app or the plugin): without it no
+   *  session receives `hook`, however full the preview is. */
+  hookInstalled: boolean;
+  /** Whether the repo's AGENTS.md / CLAUDE.md holds this block: missing, as Update
+   *  AGENTS.md would write it now, or older than the memory. */
+  agentsFileState: "absent" | "current" | "stale";
+}
+
+export interface TodayCommit {
+  /** Full sha (what a copy puts on the clipboard). */
+  sha: string;
+  shortSha: string;
+  subject: string | null;
+  committedAt: number;
+}
+
+export interface TodayThread {
+  id: number;
+  title: string | null;
+  source: SourceKind;
+  lastActive: number;
+  durationSecs: number;
+  messages: number;
+  commits: TodayCommit[];
+}
+
+export interface TodayGroup {
+  /** Canonical project key; "" for sessions with no project. */
+  project: string;
+  threads: TodayThread[];
+}
+
+export interface TodayTodo {
+  id: number;
+  text: string;
+  project: string;
+  threadId: number;
+}
+
+export interface TodayIssue {
+  /** A representative error line, as the recurring errors list shows it. */
+  signature: string;
+  count: number;
+  lastSeen: number;
+  project: string;
+}
+
+/** Activity since the last open (`today`). Never involves an LLM. */
+export interface Today {
+  since: number;
+  groups: TodayGroup[];
+  newTodos: TodayTodo[];
+  issuesSeenAgain: TodayIssue[];
+  snapshots: Snapshot[];
+  /** The 2 s git budget ran out before every repo's commits were linked. */
+  commitsPartial: boolean;
+  /** More sessions matched than the backend returns (its newest 200): `groups` holds only
+   *  the newest. */
+  truncated: boolean;
+}
+
+/** A decision or gotcha matching a search (`search_facts`). */
+export interface FactHit {
+  id: number;
+  kind: "decision" | "gotcha";
+  text: string;
+  project: string;
+  threadId: number;
+  /** The message the fact came from, to open the thread there; null when unknown. */
+  sourceMessageId: number | null;
+  title: string | null;
+  pinned: boolean;
+  extractor: FactExtractor;
+  /** When the fact was distilled (unix seconds), for Search's date range; absent from an
+   *  older backend. */
+  createdAt?: number | null;
+}
+
 export const api = {
   dbStats: () => invoke<DbStats>("db_stats"),
   indexStats: () => invoke<Stats>("index_stats"),
@@ -505,7 +637,9 @@ export const api = {
   recurringIssues: (project?: string) =>
     invoke<IssueCluster[]>("recurring_issues", { project: project ?? null }),
   // Estimated $ spend by model + priciest threads (needs a reindex to capture token usage).
-  spend: (project?: string) => invoke<Spend>("spend", { project: project ?? null }),
+  // `since` (epoch secs) narrows the window; omitted = all time.
+  spend: (project?: string, since?: number) =>
+    invoke<Spend>("spend", { project: project ?? null, since: since ?? null }),
   // Whether closing the window hides the app to the system tray instead of quitting.
   getCloseToTray: () => invoke<boolean>("get_close_to_tray"),
   setCloseToTray: (on: boolean) => invoke<void>("set_close_to_tray", { on }),
@@ -659,8 +793,13 @@ export const api = {
     invoke<RecallHit[]>("recall_decisions", { query, project: project ?? null }),
   recallGotchas: (query: string, project?: string) =>
     invoke<RecallHit[]>("recall_gotchas", { query, project: project ?? null }),
-  // Ask-your-history (RAG): synthesized answer + cited source threads.
+  // Ask-your-history (RAG): synthesized answer + cited source threads. Saves nothing: the
+  // chat store saves the turn with saveChat once the answer is shown.
   askHistory: (question: string) => invoke<AskAnswer>("ask_history", { question }),
+  // Save a chat whose last reply did not come from send_chat (an Ask answer), as send_chat
+  // saves one: `messages` is the conversation so far, `reply` its last assistant turn.
+  saveChat: (threadId: string, messages: ChatMessage[], reply: string) =>
+    invoke<void>("save_chat", { threadId, messages, reply }),
   embeddingStatus: () => invoke<EmbedStatus>("embedding_status"),
   buildEmbeddings: () => invoke<void>("build_embeddings"),
   // Stream a chat completion; onChunk fires per chunk (reasoning or answer text),
@@ -726,6 +865,25 @@ export const api = {
     invoke<AgentHooksStatus>("install_agent_hooks", { agent }),
   uninstallAgentHooks: (agent: HookAgentId) =>
     invoke<AgentHooksStatus>("uninstall_agent_hooks", { agent }),
+  // Snapshots for the Project page: one project's key, or null for all.
+  listSnapshots: (project: string | null, limit: number) =>
+    invoke<Snapshot[]>("list_snapshots", { project, limit }),
+  loadSnapshot: (id: number) => invoke<SnapshotDetail>("load_snapshot", { id }),
+  deleteSnapshot: (id: number) => invoke<boolean>("delete_snapshot", { id }),
+  // Opens the agent CLI (claude, codex, ...) in a new terminal, seeded like `cal resume`.
+  resumeSnapshot: (id: number, agent: string) => invoke<void>("resume_snapshot", { id, agent }),
+  // The hook text and AGENTS.md block a project's agents get.
+  agentView: (project: string) => invoke<AgentView>("agent_view", { project }),
+  // Activity since `since` (null: since the last app open, else the last 24 h).
+  today: (since: number | null) => invoke<Today>("today", { since }),
+  // Call after the Today view has loaded, so the window shown is not the one just marked.
+  markAppOpened: () => invoke<void>("mark_app_opened"),
+  // The repo the Project page (and the Search scope chip) opens on.
+  lastProject: () => invoke<string | null>("last_project"),
+  setLastProject: (project: string | null) => invoke<void>("set_last_project", { project }),
+  // Decisions and gotchas matching a search, for the facts group above the results.
+  searchFacts: (query: string, project: string | null, limit: number) =>
+    invoke<FactHit[]>("search_facts", { query, project, limit }),
   // Opt-in usage analytics: consent state + whether this build can send at all.
   telemetryState,
   setTelemetry,
@@ -897,7 +1055,7 @@ export const SOURCE_LABELS: Record<SourceKind, string> = {
 /**
  * Sources that have a filesystem indexer (everything except in-app chat, which is
  * written directly). Single source of truth for the source-filter chips and the
- * per-source reindex buttons — add a new indexer's kind here once and both update.
+ * per-source reindex buttons: add a new indexer's kind here once and both update.
  */
 export const INDEXABLE_SOURCES: SourceKind[] = [
   "claude_code",

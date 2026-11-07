@@ -1,27 +1,20 @@
 // Browser-only entry for mock.html: install the fake Tauri runtime, boot the real app,
 // then apply the scenario params that need the stores loaded. Never part of a build.
 import "./mock-tauri";
-import type { SettingsSection, View } from "../store/ui";
+import type { SettingsSection, SettingsSectionAlias, View } from "../store/ui";
 
-const VIEWS: readonly View[] = [
-  "search",
-  "chat",
-  "coach",
-  "knowledge",
-  "ask",
-  "projects",
-  "stats",
-  "settings",
-];
-const SECTIONS: readonly SettingsSection[] = [
+const VIEWS: readonly View[] = ["today", "search", "chat", "projects", "stats", "settings"];
+// The pre-merge ids ("providers", "knowledge") still open Settings > AI engine.
+const SECTIONS: readonly (SettingsSection | SettingsSectionAlias)[] = [
   "general",
-  "providers",
+  "engine",
   "agents",
   "sources",
   "index",
-  "knowledge",
   "export",
   "updates",
+  "providers",
+  "knowledge",
 ];
 
 await import("../main");
@@ -32,7 +25,7 @@ const section = params.get("section");
 const { useUi } = await import("../store/ui");
 const ui = useUi.getState();
 if (section && (SECTIONS as readonly string[]).includes(section)) {
-  ui.openSettings(section as SettingsSection);
+  ui.openSettings(section as SettingsSection | SettingsSectionAlias);
 } else if (view && (VIEWS as readonly string[]).includes(view)) {
   ui.setView(view as View);
 }
@@ -41,4 +34,12 @@ const onboarding = params.get("onboarding");
 if (onboarding === "partial" || onboarding === "done") {
   const { useChecklist } = await import("../store/checklist");
   useChecklist.getState().show();
+}
+// chatmode=ask: Chat opens in Ask mode; ask=<question> also sends it, for the answered state.
+const chatMode = params.get("chatmode");
+const ask = params.get("ask");
+if (chatMode === "ask" || ask) {
+  const { useChat } = await import("../store/chat");
+  useChat.getState().setMode("ask");
+  if (ask) void useChat.getState().send(ask);
 }

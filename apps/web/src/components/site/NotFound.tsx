@@ -8,7 +8,7 @@ export function NotFound() {
   return (
     <Container className="grid min-h-[60vh] place-items-center py-24 text-center">
       <div className="flex flex-col items-center gap-5">
-        <span className="cat-label text-primary">№ 404 — not in the catalogue</span>
+        <span className="cat-label text-primary">№ 404 · not in the catalogue</span>
         <h1 className="text-balance text-4xl text-foreground sm:text-5xl">
           This card isn't filed here.
         </h1>

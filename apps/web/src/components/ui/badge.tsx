@@ -2,7 +2,7 @@ import type * as React from "react";
 import { type VariantProps, cva } from "class-variance-authority";
 import { cn } from "@/lib/utils";
 
-// Catalogue tag — small, monospaced, lettered. The recurring "filed under" mark.
+// Catalogue tag: small, monospaced, lettered. The recurring "filed under" mark.
 const badgeVariants = cva(
   "inline-flex items-center gap-1.5 rounded-sm border px-2 py-0.5 font-mono text-[0.68rem] uppercase tracking-[0.12em]",
   {

@@ -11,22 +11,22 @@ export function humanizeApiError(raw: string, provider: string, model: string): 
   const s = raw || "";
   // The provider's own human message, if the body carried one.
   const detail = s.match(/"message"\s*:\s*"([^"]+)"/)?.[1];
-  // Underscored ids (e.g. ollama_cloud) don't title-case cleanly — give it its real label.
+  // Underscored ids (e.g. ollama_cloud) don't title-case cleanly, so give it its real label.
   const name = provider === "ollama_cloud" ? "Ollama Cloud" : cap(provider);
 
   switch (classifyError(s)) {
     case "model_unavailable":
-      return `Model "${model}" isn't available on ${name}${detail ? ` — ${detail}` : "."} Pick another from the dropdown.`;
+      return `Model "${model}" isn't available on ${name}${detail ? `: ${detail}` : "."} Pick another from the dropdown.`;
     case "auth_rejected":
-      return `${name} rejected the request — check your API key in Settings.${detail ? ` (${detail})` : ""}`;
+      return `${name} rejected the request: check your API key in Settings.${detail ? ` (${detail})` : ""}`;
     case "missing_key":
       return `No ${name} API key set. Add one in Settings.`;
     case "rate_limited":
-      return `${name} is rate-limited or out of quota — wait a moment and retry.${detail ? ` (${detail})` : ""}`;
+      return `${name} is rate-limited or out of quota: wait a moment and retry.${detail ? ` (${detail})` : ""}`;
     case "network":
       return provider === "ollama"
-        ? "Can't reach Ollama — is it running? (ollama serve)"
-        : `Can't reach ${name} — check your internet connection.`;
+        ? "Can't reach Ollama: is it running? (ollama serve)"
+        : `Can't reach ${name} : check your internet connection.`;
     default:
       // Fallback: the provider message, else the first line, trimmed.
       return detail || s.split("\n")[0].slice(0, 300) || "Something went wrong.";

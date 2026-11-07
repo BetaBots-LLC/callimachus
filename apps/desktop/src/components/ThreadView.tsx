@@ -44,6 +44,7 @@ import {
   ChevronUp,
   CornerDownRight,
   ExternalLink,
+  FolderGit2,
   GitCommitHorizontal,
   MoreHorizontal,
   Star,
@@ -97,6 +98,7 @@ type ThreadNav = {
 export function ThreadView() {
   const threadId = useUi((s) => s.selectedThreadId);
   const setView = useUi((s) => s.setView);
+  const openProject = useUi((s) => s.openProject);
   const target = useUi((s) => s.targetMessageId);
   const matchIds = useUi((s) => s.matchMessageIds);
   const openSeq = useUi((s) => s.openSeq);
@@ -356,6 +358,9 @@ export function ThreadView() {
     );
 
   const title = data.title || "Untitled thread";
+  // The Project page groups by the canonical key (a worktree resolves to its main repo); an
+  // older backend sends only the path.
+  const projectKey = data.projectKey ?? data.projectPath;
   const commitRows = commits.data ?? [];
   const scanning = linkCommits.isPending && linkCommits.variables === data.id;
   const scanned = linkCommits.variables === data.id;
@@ -433,6 +438,12 @@ export function ThreadView() {
                     "Copy context"
                   )}
                 </DropdownMenuItem>
+                {projectKey && (
+                  <DropdownMenuItem onClick={() => openProject(projectKey)}>
+                    <FolderGit2 />
+                    Open project
+                  </DropdownMenuItem>
+                )}
                 <DropdownMenuItem
                   onClick={() => linkCommits.mutate(data.id)}
                   disabled={linkCommits.isPending}
@@ -1181,11 +1192,11 @@ function toggled(prev: ReadonlySet<number>, id: number, on: boolean): ReadonlySe
   return next;
 }
 
-/** Matches get their own hue, the brand sunset (as in Coach and the results' marks), so
- *  they never read as a card border or the gray keyboard focus ring: the current match a
- *  strong ring, other matches a faint ring and tint, findable while scrolling. The tint is
- *  a background image so it lays over the card's fill instead of replacing it. A paired
- *  tool row matches when its call or its result does. */
+/** Matches get their own hue, the brand sunset (as in the Stats heatmap and the results'
+ *  marks), so they never read as a card border or the gray keyboard focus ring: the current
+ *  match a strong ring, other matches a faint ring and tint, findable while scrolling. The
+ *  tint is a background image so it lays over the card's fill instead of replacing it. A
+ *  paired tool row matches when its call or its result does. */
 function ringFor(
   id: number,
   resultId: number | undefined,

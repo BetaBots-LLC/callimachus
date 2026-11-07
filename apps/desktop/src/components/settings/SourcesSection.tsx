@@ -70,7 +70,7 @@ export function SourcesSection() {
   const onIndexed = () => {
     queryClient.invalidateQueries({ queryKey: ["db_stats"] });
     queryClient.invalidateQueries({ queryKey: ["results"] });
-    // index_source emits no index:done, so refresh Stats / Coach / Projects here.
+    // index_source emits no index:done, so refresh Stats / Today / Projects here.
     invalidateIndexDerived();
   };
   const indexOne = useMutation({

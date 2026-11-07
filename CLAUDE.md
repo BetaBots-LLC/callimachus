@@ -87,7 +87,8 @@ env -u CLAUDE_CONFIG_DIR -u CODEX_HOME HOME="$S/home" CALLIMACHUS_DB="$S/index.d
 - `mcp_server::tool_surface_stays_lean_and_annotated`: descriptions <= 220 chars (4,500 total),
   instructions <= 400, annotations on every tool; add a new write tool to its `writes`.
 - `cli_core::docs_only_reference_real_commands`: each `cal <cmd>` in `README.md` and
-  `apps/web/src/routes/{cli,index,desktop}.tsx` is in `COMMANDS` (`USAGE` must list it too).
+  `apps/web/src/routes/{cli,index,desktop,mcp}.tsx` and `apps/web/src/content/faq.ts` is in
+  `COMMANDS` (`USAGE` must list it too); the test fails when one of those files is missing.
 - `integration::every_shipped_skill_is_recognized`: an edit to `resources/recall/SKILL.md` needs
   its printed hash in `SHIPPED_SKILL_HASHES`.
 - `integration::claude_plugin_mirrors_the_app_install`: the plugin's skill is a byte copy of

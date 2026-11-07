@@ -8,7 +8,7 @@ import { CommandBlock } from "@/components/site/CommandBlock";
 export const Route = createFileRoute("/mcp")({
   head: () => ({
     meta: seo({
-      title: "Callimachus MCP server — give agents a memory",
+      title: "Callimachus MCP server: give agents a memory",
       description:
         "An MCP server that exposes your indexed AI coding history to any client. Agents can search your past work and pull the thread they need, on demand.",
       path: "/mcp",
@@ -34,7 +34,7 @@ const TOOLS: { name: string; note: string; write?: boolean }[] = [
   { name: "recall_gotchas", note: "Semantically recall known pitfalls to avoid" },
   {
     name: "find_prior_work",
-    note: "Prior sessions similar to a task — the 'have I done this?' guard",
+    note: "Prior sessions similar to a task: the 'have I done this?' guard",
   },
   {
     name: "project_memory",
@@ -53,7 +53,11 @@ const TOOLS: { name: string; note: string; write?: boolean }[] = [
     name: "load_snapshot",
     note: "A snapshot's carry-forward memory + transcript, trimmed to a budget",
   },
-  { name: "complete_todo", note: "Mark an open TODO done — persists across re-index", write: true },
+  {
+    name: "complete_todo",
+    note: "Mark an open TODO done; it stays done across a re-index",
+    write: true,
+  },
   {
     name: "record_decision",
     note: "Persist a decision (with optional rationale) into memory",
@@ -73,35 +77,39 @@ function McpPage() {
       no="04"
       kicker="MCP server"
       title="Give every agent a memory."
-      description="callimachus-mcp exposes your local history to any MCP client through twenty-two tools — and now reads and writes the memory layer. Instead of re-explaining context, your agent can look it up: searching past sessions, recalling settled decisions and known gotchas, asking your history a cited question, linking threads to the git commits they produced, and pulling the exact thread it needs. It can also write back — closing TODOs, recording new decisions and gotchas, and snapshotting a session for handoff across a context-window compaction or another tool — but only ever touches Callimachus's own index and memory, never your files."
+      description="callimachus-mcp exposes your local history to any MCP client through twenty-two tools that read and write the memory layer. Instead of re-explaining context, your agent can look it up: searching past sessions, recalling settled decisions and known gotchas, asking your history a cited question, linking threads to the git commits they produced, and pulling the exact thread it needs. It can also write back by closing TODOs, recording new decisions and gotchas, and snapshotting a session for handoff across a context-window compaction or another tool. It only ever touches Callimachus's own index and memory, never your files."
     >
       <div className="grid gap-10 lg:grid-cols-2">
-        <div className="flex flex-col gap-4">
+        <div className="flex min-w-0 flex-col gap-4">
           <p className="cat-label">Install &amp; connect</p>
           <p className="text-sm leading-relaxed text-muted-foreground">
             Install the{" "}
             <Link to="/download" className="text-link hover:underline">
               desktop app
             </Link>{" "}
-            and open it once so it indexes your history. Settings → Claude Code → Enable for Claude
-            Code then registers the app itself as Claude Code's MCP server, and Settings → Other
-            agents does the same for Codex, Cursor and Gemini CLI. For any other client, register
-            the npm launcher, which downloads the prebuilt server and checks its SHA-256:
-          </p>
-          <CommandBlock
-            label="register (Claude Code shown)"
-            lines={["claude mcp add callimachus -- npx -y callimachus-mcp"]}
-          />
-          <p className="text-sm leading-relaxed text-muted-foreground">
-            In Claude Code you can instead install the Callimachus plugin, which bundles this server
-            with the <code className="font-mono">/callimachus:recall</code> skill and the memory
-            hooks. On macOS and Linux the app then installs only the CLI the hooks run, so nothing
-            loads twice. On Windows, skip the plugin and connect Claude Code from the app's Settings
-            &gt; Agents: the plugin's hooks need Git Bash there, and the app keeps its own install.
+            and open it once so it indexes your history; the server reads that index. In Claude
+            Code, the quickest way in is the Callimachus plugin, which bundles this server with the{" "}
+            <code className="font-mono">/callimachus:recall</code> skill and the memory hooks.
           </p>
           <CommandBlock
             label="Claude Code plugin (then /plugin install callimachus@callimachus)"
             lines={["claude plugin marketplace add BetaBots-LLC/callimachus"]}
+          />
+          <p className="text-sm leading-relaxed text-muted-foreground">
+            Then click Install the cal CLI in the app's Settings &gt; Agents so the hooks can run.
+            On macOS and Linux the app installs only that CLI while the plugin is on, so nothing
+            loads twice. On Windows, skip the plugin and click Enable for Claude Code there instead:
+            the plugin's hooks need Git Bash, and the app keeps its own install.
+          </p>
+          <p className="text-sm leading-relaxed text-muted-foreground">
+            Without the plugin, Enable for Claude Code (or Connect in the setup checklist) registers
+            the app itself as Claude Code's MCP server, and Other agents in the same section does
+            the same for Codex, Cursor and Gemini CLI. For any other client, register the npm
+            launcher, which downloads the prebuilt server and checks its SHA-256:
+          </p>
+          <CommandBlock
+            label="register (Claude Code shown)"
+            lines={["claude mcp add callimachus -- npx -y callimachus-mcp"]}
           />
           <p className="cat-label pt-2">Or build from source</p>
           <CommandBlock
@@ -111,13 +119,13 @@ function McpPage() {
             ]}
           />
           <p className="text-sm leading-relaxed text-muted-foreground">
-            Reads the same local index as the app — no separate database, no extra indexing. Ships a{" "}
+            Reads the same local index as the app: no separate database, no extra indexing. Ships a{" "}
             <code className="font-mono">/recall</code> skill that teaches agents when to reach for
             it.
           </p>
         </div>
 
-        <div className="flex flex-col gap-4">
+        <div className="flex min-w-0 flex-col gap-4">
           <p className="cat-label">Tools it exposes</p>
           <ul className="border-t border-border">
             {TOOLS.map((t) => (
@@ -143,7 +151,7 @@ function McpPage() {
             <code className="font-mono">record_decision</code>,{" "}
             <code className="font-mono">record_gotcha</code>,{" "}
             <code className="font-mono">snapshot_session</code>) that update Callimachus's own
-            memory — never your project files.
+            memory, never your project files.
           </p>
           <p className="text-sm leading-relaxed text-muted-foreground">
             It also offers <code className="font-mono">recall</code>,{" "}

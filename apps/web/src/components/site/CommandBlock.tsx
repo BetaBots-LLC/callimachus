@@ -1,7 +1,7 @@
 import { cn } from "@/lib/utils";
 
 // A terminal snippet. `lines` render with a faint $ prompt; comment lines (starting
-// with #) read as muted. No copy button by default — keep it calm and legible.
+// with #) read as muted. No copy button by default; keep it calm and legible.
 export function CommandBlock({
   lines,
   label,

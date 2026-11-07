@@ -1,7 +1,7 @@
 {
   "name": "Callimachus",
   "short_name": "Callimachus",
-  "description": "Search your AI coding history across 11 agents — local, fast, private.",
+  "description": "Search your AI coding history across 12 agents: local, fast, private.",
   "start_url": "/",
   "display": "standalone",
   "background_color": "#1c160f",

@@ -3,6 +3,7 @@
 //! can answer "what did this actually cost me?". Prices are approximate published list rates
 //! ($ per million tokens) and are clearly an estimate, not a billing record.
 
+use crate::search::ProjectMatch;
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, ToSql};
 use serde::Serialize;
@@ -126,7 +127,8 @@ static SPEND_CACHE: std::sync::LazyLock<crate::search::cache::AggCache<SpendKey,
     std::sync::LazyLock::new(crate::search::cache::AggCache::new);
 
 /// [`spend`], reused for up to 10 minutes while the thread set is unchanged (see
-/// `search::cache`). For the app's Stats view; `cal spend` and tests read live.
+/// `search::cache`), with `project` an exact key ([`ProjectMatch::Exact`]). For the app's
+/// Stats view and Project page; `cal spend` and tests read live.
 pub fn spend_cached(
     conn: &Connection,
     since: i64,
@@ -139,7 +141,7 @@ pub fn spend_cached(
         top_n,
     );
     SPEND_CACHE.get_or_try(crate::search::cache::index_version(conn)?, key, || {
-        spend(conn, since, project, top_n)
+        spend_matching(conn, since, project, ProjectMatch::Exact, top_n)
     })
 }
 
@@ -155,13 +157,25 @@ struct Usage {
 }
 
 /// Compute spend across messages with captured usage since `since` (epoch secs; 0 = all
-/// time), optionally scoped to a project-path substring.
+/// time), optionally scoped to a project-path substring (`cal spend -p`).
+pub fn spend(conn: &Connection, since: i64, project: Option<&str>, top_n: usize) -> Result<Spend> {
+    spend_matching(conn, since, project, ProjectMatch::Substring, top_n)
+}
+
+/// [`spend`] with the project matched as `mode` says.
 ///
 /// One aggregate pass per (thread, model), served by the covering usage index (migration
 /// 0026), then rolled up per model and per thread in Rust. This used to be two separate
 /// GROUP BY scans that each read every message's trailing usage columns.
-pub fn spend(conn: &Connection, since: i64, project: Option<&str>, top_n: usize) -> Result<Spend> {
-    let rows = usage_by_thread_model(conn, since, project)?;
+pub fn spend_matching(
+    conn: &Connection,
+    since: i64,
+    project: Option<&str>,
+    mode: ProjectMatch,
+    top_n: usize,
+) -> Result<Spend> {
+    let (sql, args) = usage_sql(since, project, mode);
+    let rows = usage_by_thread_model(conn, &sql, &args)?;
 
     let mut per_model: HashMap<String, ModelSpend> = HashMap::new();
     let mut per_thread: HashMap<i64, f64> = HashMap::new();
@@ -216,24 +230,24 @@ pub fn spend(conn: &Connection, since: i64, project: Option<&str>, top_n: usize)
 /// SUM the usage columns per (thread, model). The `ts` filter is only added for a real
 /// window: `ts >= 0` would steer the planner onto the timestamp index and away from the
 /// covering usage index.
-fn usage_by_thread_model(
-    conn: &Connection,
+fn usage_sql(
     since: i64,
     project: Option<&str>,
-) -> Result<Vec<Usage>> {
+    mode: ProjectMatch,
+) -> (String, Vec<Box<dyn ToSql>>) {
     let mut args: Vec<Box<dyn ToSql>> = Vec::new();
     let mut filters = String::new();
     if since > 0 {
+        // `+` keeps the bound off every ts index: with an exact project the planner would
+        // otherwise drive threads -> idx_messages_thread_ts (thread_id, ts), which lacks the
+        // usage columns, and read each message row (overflow pages included) for them.
         args.push(Box::new(since));
-        filters.push_str(&format!(" AND m.ts >= ?{}", args.len()));
+        filters.push_str(&format!(" AND +m.ts >= ?{}", args.len()));
     }
     let join = match project.filter(|p| !p.is_empty()) {
         Some(p) => {
-            args.push(Box::new(format!("%{p}%")));
-            filters.push_str(&format!(
-                " AND COALESCE(t.project_key, t.project_path) LIKE ?{}",
-                args.len()
-            ));
+            let cond = crate::search::project_condition("t", p, mode, &mut args);
+            filters.push_str(&format!(" AND {cond}"));
             " JOIN threads t ON t.id = m.thread_id"
         }
         None => "",
@@ -245,8 +259,17 @@ fn usage_by_thread_model(
          WHERE m.model IS NOT NULL{filters}
          GROUP BY m.thread_id, m.model"
     );
+    (sql, args)
+}
+
+/// Run [`usage_sql`]'s statement.
+fn usage_by_thread_model(
+    conn: &Connection,
+    sql: &str,
+    args: &[Box<dyn ToSql>],
+) -> Result<Vec<Usage>> {
     let arg_refs: Vec<&dyn ToSql> = args.iter().map(|b| b.as_ref()).collect();
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = conn.prepare(sql)?;
     let rows = stmt
         .query_map(arg_refs.as_slice(), |r| {
             Ok(Usage {
@@ -394,5 +417,50 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" | ");
         assert!(plan.contains("COVERING INDEX idx_messages_usage"), "{plan}");
+
+        // A sibling repo whose path starts with this one: `cal spend -p /p` still counts it,
+        // the app's exact key does not.
+        conn.execute(
+            "INSERT INTO threads (source_id, external_id, title, project_path, created_at, updated_at)
+             VALUES (?1, 't2', 'web thread', '/p-web', 1, 1)",
+            [sid],
+        )
+        .unwrap();
+        let web = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO messages (thread_id, seq, role, text, ts, model, input_tokens, output_tokens, cache_write_tokens, cache_read_tokens)
+             VALUES (?1, 0, 'assistant', 'x', 100, 'claude-opus-4-8', 1000000, 0, 0, 0)",
+            [web],
+        )
+        .unwrap();
+        let sub = spend(&conn, 0, Some("/p"), 5).unwrap();
+        assert!((sub.total_cost - 35.0).abs() < 1e-6, "{}", sub.total_cost);
+        let exact = spend_matching(&conn, 0, Some("/p"), ProjectMatch::Exact, 5).unwrap();
+        assert!(
+            (exact.total_cost - 30.0).abs() < 1e-6,
+            "{}",
+            exact.total_cost
+        );
+        assert_eq!(exact.top_threads.len(), 1);
+        // Both scopes stay on the covering usage index, all time and windowed.
+        for (since, project, mode) in [
+            (0, Some("/p"), ProjectMatch::Exact),
+            (50, Some("/p"), ProjectMatch::Exact),
+            (0, Some("/p"), ProjectMatch::Substring),
+            (50, Some("/p"), ProjectMatch::Substring),
+            (50, None, ProjectMatch::Exact),
+        ] {
+            let (sql, args) = usage_sql(since, project, mode);
+            let refs: Vec<&dyn ToSql> = args.iter().map(|b| b.as_ref()).collect();
+            let plan = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap()
+                .query_map(refs.as_slice(), |r| r.get::<_, String>(3))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect::<Vec<_>>()
+                .join(" | ");
+            assert!(plan.contains("COVERING INDEX idx_messages_usage"), "{plan}");
+        }
     }
 }

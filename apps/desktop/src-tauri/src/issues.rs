@@ -4,6 +4,7 @@
 //! collapses the variable parts (paths, line:col, quoted identifiers, hashes) so the SAME error
 //! recurring across runs groups together. Only Callimachus sees this across all your tools.
 
+use crate::search::ProjectMatch;
 use anyhow::Result;
 use rusqlite::{Connection, ToSql};
 use serde::Serialize;
@@ -13,7 +14,8 @@ use std::collections::{HashMap, HashSet};
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IssueCluster {
-    /// A representative raw error line (the first one seen).
+    /// A representative raw error line (the latest raw sighting: candidates are read newest
+    /// first and the first line seen for a signature is kept).
     pub example: String,
     /// How many messages this error appeared in (≈ times you hit it).
     pub count: i64,
@@ -21,6 +23,10 @@ pub struct IssueCluster {
     pub threads: i64,
     pub first_seen: i64,
     pub last_seen: i64,
+    /// The thread of the latest sighting, for the Today view's project label. Not part of
+    /// the JSON that `cal issues`, MCP and the app's lists return.
+    #[serde(skip_serializing)]
+    pub last_thread_id: i64,
 }
 
 /// Pull distinct error signatures out of one message's text. High-precision: a line counts only
@@ -110,8 +116,10 @@ static ISSUES_CACHE: std::sync::LazyLock<
 > = std::sync::LazyLock::new(crate::search::cache::AggCache::new);
 
 /// [`recurring_issues`], reused for up to 10 minutes while the thread set is unchanged
-/// (see `search::cache`). `since` is bucketed to the hour so "now minus 180 days" callers
-/// share an entry. For the app's Coach view; MCP and `cal` read live.
+/// (see `search::cache`), with `project` an exact key ([`ProjectMatch::Exact`]). `since` is
+/// bucketed to the hour so "now minus 180 days" callers share an entry. For the app's
+/// Project page; MCP and `cal` read live, and so does Today (an error hit again in a session
+/// that is still running leaves the thread set unchanged).
 pub fn recurring_issues_cached(
     conn: &Connection,
     project: Option<&str>,
@@ -125,7 +133,7 @@ pub fn recurring_issues_cached(
         limit,
     );
     ISSUES_CACHE.get_or_try(crate::search::cache::index_version(conn)?, key, || {
-        recurring_issues(conn, project, since, limit)
+        recurring_issues_matching(conn, project, ProjectMatch::Exact, since, limit)
     })
 }
 
@@ -134,6 +142,7 @@ pub fn recurring_issues_cached(
 fn candidates_sql(
     conn: &Connection,
     project: Option<&str>,
+    mode: ProjectMatch,
     since: i64,
 ) -> (String, Vec<Box<dyn ToSql>>) {
     // Cap the candidate scan; errors lead the line, so the FTS pre-filter keeps this cheap.
@@ -168,11 +177,8 @@ fn candidates_sql(
         Box::new(since),
     ];
     if let Some(p) = project.filter(|p| !p.is_empty()) {
-        args.push(Box::new(format!("%{p}%")));
-        sql.push_str(&format!(
-            " AND COALESCE(t.project_key, t.project_path) LIKE ?{}",
-            args.len()
-        ));
+        let cond = crate::search::project_condition("t", p, mode, &mut args);
+        sql.push_str(&format!(" AND {cond}"));
     }
     args.push(Box::new(CANDIDATE_CAP));
     sql.push_str(&format!(" ORDER BY m.ts DESC LIMIT ?{}", args.len()));
@@ -180,14 +186,26 @@ fn candidates_sql(
 }
 
 /// Find recurring errors across messages since `since` (epoch secs), optionally scoped to a
-/// project-path substring. Returns clusters seen in >= 2 messages, most-frequent first.
+/// project-path substring (`cal issues -p`, MCP). Returns clusters seen in >= 2 messages,
+/// most-frequent first.
 pub fn recurring_issues(
     conn: &Connection,
     project: Option<&str>,
     since: i64,
     limit: usize,
 ) -> Result<Vec<IssueCluster>> {
-    let (sql, args) = candidates_sql(conn, project, since);
+    recurring_issues_matching(conn, project, ProjectMatch::Substring, since, limit)
+}
+
+/// [`recurring_issues`] with the project matched as `mode` says.
+pub fn recurring_issues_matching(
+    conn: &Connection,
+    project: Option<&str>,
+    mode: ProjectMatch,
+    since: i64,
+    limit: usize,
+) -> Result<Vec<IssueCluster>> {
+    let (sql, args) = candidates_sql(conn, project, mode, since);
 
     struct Acc {
         example: String,
@@ -195,6 +213,7 @@ pub fn recurring_issues(
         threads: HashSet<i64>,
         first_seen: i64,
         last_seen: i64,
+        last_thread_id: i64,
     }
     let mut clusters: HashMap<String, Acc> = HashMap::new();
 
@@ -217,11 +236,15 @@ pub fn recurring_issues(
                 threads: HashSet::new(),
                 first_seen: ts,
                 last_seen: ts,
+                last_thread_id: thread_id,
             });
             acc.count += 1;
             acc.threads.insert(thread_id);
             acc.first_seen = acc.first_seen.min(ts);
-            acc.last_seen = acc.last_seen.max(ts);
+            if ts > acc.last_seen {
+                acc.last_seen = ts;
+                acc.last_thread_id = thread_id;
+            }
         }
     }
 
@@ -234,6 +257,7 @@ pub fn recurring_issues(
             threads: a.threads.len() as i64,
             first_seen: a.first_seen,
             last_seen: a.last_seen,
+            last_thread_id: a.last_thread_id,
         })
         .collect();
     out.sort_by(|a, b| b.count.cmp(&a.count).then(b.last_seen.cmp(&a.last_seen)));
@@ -331,8 +355,12 @@ mod tests {
             let _ = std::fs::remove_file(p.with_extension(ext));
         }
         let conn = crate::db::open(&p).unwrap();
-        for project in [None, Some("proj")] {
-            let (sql, args) = candidates_sql(&conn, project, 0);
+        for (project, mode) in [
+            (None, ProjectMatch::Substring),
+            (Some("proj"), ProjectMatch::Substring),
+            (Some("/r/proj"), ProjectMatch::Exact),
+        ] {
+            let (sql, args) = candidates_sql(&conn, project, mode, 0);
             let plan = plan(&conn, &sql, &args);
             assert!(
                 plan.starts_with("SCAN messages_fts VIRTUAL TABLE"),
@@ -345,7 +373,7 @@ mod tests {
         }
 
         conn.execute_batch("DROP INDEX idx_messages_cover").unwrap();
-        let (sql, _) = candidates_sql(&conn, None, 0);
+        let (sql, _) = candidates_sql(&conn, None, ProjectMatch::Substring, 0);
         assert!(!sql.contains("INDEXED BY"), "{sql}");
         conn.execute(
             "INSERT INTO threads (source_id, external_id, title) VALUES (1, 't', 't')",
@@ -362,6 +390,53 @@ mod tests {
             .unwrap();
         }
         assert_eq!(recurring_issues(&conn, None, 0, 10).unwrap().len(), 1);
+    }
+
+    /// The app's Project page scopes to an exact key, so a sibling repo whose path starts
+    /// with it (`/r/app-web` beside `/r/app`) stays out; `cal issues -p` keeps the substring.
+    #[test]
+    fn the_app_scope_matches_the_project_key_exactly() {
+        let p = std::env::temp_dir().join(format!("calli_issues_exact_{}.db", std::process::id()));
+        for ext in ["db", "db-wal", "db-shm"] {
+            let _ = std::fs::remove_file(p.with_extension(ext));
+        }
+        let conn = crate::db::open(&p).unwrap();
+        for (ext, path, err) in [
+            ("a", "/r/app", "error: linker failed"),
+            ("w", "/r/app-web", "fatal: bad object HEAD"),
+        ] {
+            conn.execute(
+                "INSERT INTO threads (source_id, external_id, title, project_path)
+                 VALUES (1, ?1, 't', ?2)",
+                [ext, path],
+            )
+            .unwrap();
+            let tid = conn.last_insert_rowid();
+            for seq in 0..2 {
+                conn.execute(
+                    "INSERT INTO messages (thread_id, seq, role, text, ts)
+                     VALUES (?1, ?2, 'tool', ?3, 100)",
+                    rusqlite::params![tid, seq, err],
+                )
+                .unwrap();
+            }
+        }
+        assert_eq!(
+            recurring_issues(&conn, Some("/r/app"), 0, 10)
+                .unwrap()
+                .len(),
+            2
+        );
+        let exact =
+            recurring_issues_matching(&conn, Some("/r/app"), ProjectMatch::Exact, 0, 10).unwrap();
+        assert_eq!(exact.len(), 1, "{exact:?}");
+        assert!(exact[0].example.contains("linker"));
+        assert_eq!(
+            recurring_issues_cached(&conn, Some("/r/app"), 0, 10)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]

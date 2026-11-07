@@ -45,13 +45,15 @@ export const useChecklist = create<ChecklistState>((set) => ({
 }));
 
 // The checklist renders in place of the Search view, so opening a thread (a palette recent
-// thread, an Ask citation, a Projects fact, Knowledge, Coach) or running a search from the
-// palette would otherwise land on the checklist and never show what was asked for. Any of
-// those closes it; the palette's "Setup checklist" entry reopens it. selectThread(null)
-// (a deleted thread) is not a navigation, and SearchBar is not mounted while the checklist
-// shows, so a query change here always comes from outside it.
+// thread, an Ask citation, a Projects fact, a Today row) or running a search from the
+// palette or a Stats heatmap day would otherwise land on the checklist and never show what
+// was asked for. Any of those closes it; the palette's "Setup checklist" entry reopens it.
+// selectThread(null) (a deleted thread) is not a navigation, and SearchBar is not mounted
+// while the checklist shows, so a query or scope change here always comes from outside it.
 useUi.subscribe((s, prev) => {
   const openedThread = s.openSeq !== prev.openSeq && s.selectedThreadId !== null;
   const searched = s.query !== prev.query && s.query.trim() !== "";
-  if ((openedThread || searched) && useChecklist.getState().open) useChecklist.getState().close();
+  const scoped = s.after !== prev.after || s.before !== prev.before || s.project !== prev.project;
+  if ((openedThread || searched || scoped) && useChecklist.getState().open)
+    useChecklist.getState().close();
 });

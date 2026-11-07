@@ -1,14 +1,16 @@
-// Epoch seconds -> short relative/absolute label.
+// Epoch seconds -> short relative/absolute label. The hour is "numeric" ("1:04 PM"), as in
+// formatSince: Today shows both side by side, and a 2-digit hour ("01:04 PM") read as a
+// different clock.
 export function formatTime(epochSeconds: number | null): string {
   if (!epochSeconds) return "";
   const d = new Date(epochSeconds * 1000);
   const now = Date.now();
   const diffDays = (now - d.getTime()) / 86_400_000;
   if (diffDays < 1) {
-    return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    return d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
   }
   if (diffDays < 7) {
-    return d.toLocaleDateString([], { weekday: "short", hour: "2-digit", minute: "2-digit" });
+    return d.toLocaleDateString([], { weekday: "short", hour: "numeric", minute: "2-digit" });
   }
   return d.toLocaleDateString([], { year: "numeric", month: "short", day: "numeric" });
 }
@@ -76,4 +78,82 @@ export function shortPath(path: string | null): string {
 /** The last segment of a POSIX or Windows path (a folder or file name). */
 export function baseName(path: string): string {
   return pathSegments(path).pop() ?? path;
+}
+
+/** When a window started, for "Since <time>": the time alone today, "yesterday at" the
+ *  time, the weekday within a week, else the date. */
+export function formatSince(epochSeconds: number, now = Date.now()): string {
+  const d = new Date(epochSeconds * 1000);
+  const time = d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  const startOfToday = new Date(now);
+  startOfToday.setHours(0, 0, 0, 0);
+  const dayStart = new Date(d);
+  dayStart.setHours(0, 0, 0, 0);
+  const daysAgo = Math.round((startOfToday.getTime() - dayStart.getTime()) / 86_400_000);
+  if (daysAgo <= 0) return time;
+  if (daysAgo === 1) return `yesterday at ${time}`;
+  if (daysAgo < 7) return `${d.toLocaleDateString([], { weekday: "long" })} at ${time}`;
+  return d.toLocaleDateString([], {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+
+/** A session length: "under a minute", "42 min", "1 h 5 min", "3 h". */
+export function formatDuration(secs: number): string {
+  if (secs < 60) return "under a minute";
+  const mins = Math.round(secs / 60);
+  if (mins < 60) return `${mins} min`;
+  const h = Math.floor(mins / 60);
+  const m = mins % 60;
+  return m === 0 ? `${h} h` : `${h} h ${m} min`;
+}
+
+// Local days, as the Stats heatmap now buckets them: a day cell sends its local midnight
+// and the second before the next one (`localDayBounds`), so both ends name the same day.
+const shortDate = (epochSeconds: number) =>
+  new Date(epochSeconds * 1000).toLocaleDateString([], { month: "short", day: "numeric" });
+
+/** The local day holding `epochSeconds`, as an inclusive [midnight, next midnight - 1 s]
+ *  range in unix seconds. Built from calendar fields, so a DST day is 23 or 25 hours. */
+export function localDayBounds(epochSeconds: number): { after: number; before: number } {
+  const d = new Date(epochSeconds * 1000);
+  const start = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  const next = new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1);
+  return { after: start.getTime() / 1000, before: next.getTime() / 1000 - 1 };
+}
+
+/** A date range as the end of a sentence ("Nothing in web for <range>."): "on Nov 3",
+ *  "between Nov 3 and Nov 9", "since Nov 3", "before Nov 3". Empty for no range. */
+export function rangePhrase(after: number | null, before: number | null): string {
+  if (after !== null && before !== null) {
+    const a = shortDate(after);
+    const b = shortDate(before);
+    return a === b ? `on ${a}` : `between ${a} and ${b}`;
+  }
+  if (after !== null) return `since ${shortDate(after)}`;
+  if (before !== null) return `before ${shortDate(before)}`;
+  return "";
+}
+
+/** The same range as a short chip label: "Nov 3", "Nov 3 to Nov 9", "since Nov 3". */
+export function rangeLabel(after: number | null, before: number | null): string {
+  if (after !== null && before !== null) {
+    const a = shortDate(after);
+    const b = shortDate(before);
+    return a === b ? a : `${a} to ${b}`;
+  }
+  return rangePhrase(after, before);
+}
+
+/** What captured a snapshot, in words: the hook event of an auto snapshot ("PreCompact"),
+ *  or "manual" for one saved by name (`cal snapshot`). Unknown events show as stored. */
+export function snapshotEventText(event: string): string {
+  const e = event.toLowerCase();
+  if (e === "precompact") return "before compaction";
+  if (e === "sessionend") return "at session end";
+  if (e === "manual") return "saved by hand";
+  return event;
 }

@@ -13,7 +13,7 @@ export const Route = createFileRoute("/vscode")({
     meta: seo({
       title: "Callimachus for VS Code & Cursor",
       description:
-        "Search your AI coding history from inside VS Code, Cursor, or VSCodium. A sidebar and transcript tabs over the same local index — no context-switch.",
+        "Search your AI coding history from inside VS Code, Cursor, or VSCodium. A sidebar and transcript tabs over the same local index, no context-switch.",
       path: "/vscode",
     }),
     links: [{ rel: "canonical", href: `${SITE_URL}/vscode` }],
@@ -28,7 +28,7 @@ function VsCodePage() {
       no="02"
       kicker="VS Code & Cursor"
       title="Search without leaving the editor."
-      description="A Callimachus sidebar and rich transcript tabs, right where you write code. Same local index as the desktop app — so the thread you need is one shortcut away, not one context-switch."
+      description="A Callimachus sidebar and rich transcript tabs, right where you write code. Same local index as the desktop app, so the thread you need is one shortcut away, not one context-switch."
       cta={
         <>
           <a
@@ -53,11 +53,11 @@ function VsCodePage() {
       <div className="grid gap-4 sm:grid-cols-2">
         <FeaturePanel icon={PanelLeft} label="Sidebar" title="Live search & recents">
           A dedicated panel: search the whole index, scope to the open project, browse recent
-          threads, and see corpus stats — themed to your editor's light or dark theme.
+          threads, and see corpus stats, themed to your editor's light or dark theme.
         </FeaturePanel>
         <FeaturePanel icon={ScrollText} label="Transcripts" title="Threads as tabs">
-          Open any thread as a rendered transcript tab — user bubbles, full-markdown assistant
-          turns, collapsible tool calls — styled to match the desktop app.
+          Open any thread as a rendered transcript tab (user bubbles, full-markdown assistant turns,
+          collapsible tool calls), styled to match the desktop app.
         </FeaturePanel>
         <FeaturePanel icon={ClipboardCopy} label="Reuse" title="Insert & copy in a click">
           Drop a thread's context into the active editor or copy it to the clipboard to seed your

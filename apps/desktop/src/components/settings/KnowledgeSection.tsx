@@ -14,7 +14,7 @@ import { Switch } from "@/components/ui/switch";
 import { api, type KnowledgeConfig } from "../../lib/api";
 import { track } from "../../lib/telemetry";
 import { errorText, notify } from "../../lib/toast";
-import { InlineError, Note, SectionHeader, SettingRow, SettingsGroup } from "./shared";
+import { InlineError, Note, SettingRow, SettingsGroup } from "./shared";
 
 /** Base UI Select treats "" as "nothing selected" (placeholder styling, no label), so
  *  auto is a sentinel here and maps back to the stored "". */
@@ -31,10 +31,10 @@ const DISTILL_ENGINES = [
 
 type KnowledgeDraft = { enabled: boolean; provider: string; model: string };
 
-/** Knowledge: open TODOs and Remember are always on; the switch here is only the opt-in LLM
- *  distillation (local Ollama, a logged-in CLI or a cloud key) and its background
- *  auto-distill allowance. */
-export function KnowledgeSection() {
+/** The memory part of Settings > AI engine (EngineSection): open TODOs and Remember are always
+ *  on; the switch here is only the opt-in LLM distillation (local Ollama, a logged-in CLI or a
+ *  cloud key), its engine, and its background auto-distill allowance. */
+export function MemoryEngineSettings() {
   const queryClient = useQueryClient();
   const enabledId = useId();
   const engineId = useId();
@@ -172,157 +172,144 @@ export function KnowledgeSection() {
         : "Uses the first provider you've added a key for. Sends thread text to that provider, on demand per thread.";
 
   return (
-    <>
-      <SectionHeader
-        title="Knowledge"
-        description="Each repo's decisions, gotchas and open TODOs, from your sessions. Distillation runs on local Ollama, a logged-in claude or codex CLI, or your own API key; TODO extraction stays on this machine."
-      />
-      <div className="space-y-8">
-        <SettingsGroup aria-label="Knowledge">
+    <div className="space-y-8">
+      <SettingsGroup title="Memory">
+        <SettingRow
+          htmlFor={enabledId}
+          title="LLM distillation"
+          description="An LLM reads your sessions and keeps each repo's decisions, gotchas and summaries for Ask, recall, Projects and your agents' hooks. Open TODOs and Remember work with it off."
+          control={
+            <Switch
+              id={enabledId}
+              checked={enabled}
+              disabled={cfg.isPending}
+              onCheckedChange={toggle}
+            />
+          }
+        >
+          {enabled && autoPicked && provider === autoPicked.id && (
+            <Note>
+              No API key is saved, so distillation uses {autoPicked.label}, the engine this machine
+              has. Pick another under Memory engine.
+            </Note>
+          )}
+          {cfg.isError && (
+            <InlineError>Couldn't load the memory settings: {errorText(cfg.error)}</InlineError>
+          )}
+          {save.isError && (
+            <InlineError>Couldn't save the memory settings: {errorText(save.error)}</InlineError>
+          )}
+        </SettingRow>
+      </SettingsGroup>
+
+      {enabled && (
+        <SettingsGroup
+          title="Memory engine"
+          description="The LLM that reads your sessions and answers Ask. Distilled threads go only to the engine picked here."
+        >
+          {/* No title: the group names this row, and the two fields carry their labels. */}
+          <SettingRow>
+            <div className="grid grid-cols-2 gap-4">
+              <Field>
+                <FieldLabel htmlFor={engineId}>Engine</FieldLabel>
+                <Select
+                  items={engineItems}
+                  value={provider || AUTO}
+                  onValueChange={(v) => update({ provider: !v || v === AUTO ? "" : v })}
+                >
+                  <SelectTrigger id={engineId} className="w-full">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {engineOptions.map((e) => (
+                      <SelectItem key={e.id} value={e.id}>
+                        {e.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </Field>
+              <Field>
+                <FieldLabel htmlFor={modelId}>{keyless ? "Model" : "Model (optional)"}</FieldLabel>
+                <Input
+                  id={modelId}
+                  key={model}
+                  defaultValue={model}
+                  onBlur={(e) => {
+                    if (e.target.value !== model) update({ model: e.target.value });
+                  }}
+                  placeholder={
+                    local ? "llama3.1" : isCli ? "default for CLI" : "default for engine"
+                  }
+                  spellCheck={false}
+                />
+              </Field>
+            </div>
+            <Note>{privacy}</Note>
+          </SettingRow>
+        </SettingsGroup>
+      )}
+
+      {enabled && (
+        <SettingsGroup title="Auto-distill">
           <SettingRow
-            htmlFor={enabledId}
-            title="LLM distillation"
-            description="An LLM reads your sessions and keeps each repo's decisions, gotchas and summaries for Ask, recall, Projects and your agents' hooks. Open TODOs and Remember work with it off."
+            htmlFor={autoId}
+            title="Auto-distill in the background"
+            description="Distill new and changed threads as they're indexed, so Ask, recall and the Project page stay current. Paced, cancellable, and yields to indexing."
             control={
               <Switch
-                id={enabledId}
-                checked={enabled}
-                disabled={cfg.isPending}
-                onCheckedChange={toggle}
+                id={autoId}
+                checked={autoDistill}
+                disabled={toggleAuto.isPending}
+                onCheckedChange={(v) => toggleAuto.mutate(v)}
               />
             }
           >
-            {enabled && autoPicked && provider === autoPicked.id && (
+            {budget.isPending && <Note>Loading the daily limit…</Note>}
+            {budget.isError && (
+              <InlineError>Couldn't load the daily limit: {errorText(budget.error)}</InlineError>
+            )}
+            {b && (
+              <div className="flex items-center gap-2 text-[13px] text-muted-foreground">
+                <label htmlFor={capId}>Up to</label>
+                <Input
+                  id={capId}
+                  // Keyed on the saved cap so a save (or a rejected entry) resets the field.
+                  key={b.dailyCap}
+                  type="number"
+                  min={0}
+                  step={1}
+                  inputMode="numeric"
+                  defaultValue={b.dailyCap}
+                  onBlur={(e) => {
+                    const cap = Number.parseInt(e.target.value, 10);
+                    if (Number.isFinite(cap) && cap >= 0 && cap !== b.dailyCap) setCap.mutate(cap);
+                    else e.target.value = String(b.dailyCap);
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") e.currentTarget.blur();
+                  }}
+                  disabled={setCap.isPending}
+                  className="w-14 text-right tabular-nums"
+                />
+                <span>threads a day</span>
+              </div>
+            )}
+            {b && (
               <Note>
-                No API key is saved, so distillation uses {autoPicked.label}, the engine this
-                machine has. Pick another under Distillation engine.
+                {b.dailyCap === 0
+                  ? "A daily limit of 0 pauses auto-distill."
+                  : autoDistill
+                    ? `${b.remainingToday} of ${b.dailyCap} left today (resets at midnight UTC) · ${b.eligibleThreads} threads from the last ${b.recentDays} days still to distill.`
+                    : `${b.eligibleThreads} threads from the last ${b.recentDays} days would be distilled, up to ${b.dailyCap} a day.`}
               </Note>
             )}
-            {cfg.isError && (
-              <InlineError>
-                Couldn't load the knowledge settings: {errorText(cfg.error)}
-              </InlineError>
-            )}
-            {save.isError && (
-              <InlineError>
-                Couldn't save the knowledge settings: {errorText(save.error)}
-              </InlineError>
+            {setCap.isError && (
+              <InlineError>Couldn't save the daily limit: {errorText(setCap.error)}</InlineError>
             )}
           </SettingRow>
         </SettingsGroup>
-
-        {enabled && (
-          <SettingsGroup
-            title="Distillation engine"
-            description="The LLM that reads your sessions. Distilled threads go only to the engine picked here."
-          >
-            {/* No title: the group names this row, and the two fields carry their labels. */}
-            <SettingRow>
-              <div className="grid grid-cols-2 gap-4">
-                <Field>
-                  <FieldLabel htmlFor={engineId}>Engine</FieldLabel>
-                  <Select
-                    items={engineItems}
-                    value={provider || AUTO}
-                    onValueChange={(v) => update({ provider: !v || v === AUTO ? "" : v })}
-                  >
-                    <SelectTrigger id={engineId} className="w-full">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {engineOptions.map((e) => (
-                        <SelectItem key={e.id} value={e.id}>
-                          {e.label}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                </Field>
-                <Field>
-                  <FieldLabel htmlFor={modelId}>
-                    {keyless ? "Model" : "Model (optional)"}
-                  </FieldLabel>
-                  <Input
-                    id={modelId}
-                    key={model}
-                    defaultValue={model}
-                    onBlur={(e) => {
-                      if (e.target.value !== model) update({ model: e.target.value });
-                    }}
-                    placeholder={
-                      local ? "llama3.1" : isCli ? "default for CLI" : "default for engine"
-                    }
-                    spellCheck={false}
-                  />
-                </Field>
-              </div>
-              <Note>{privacy}</Note>
-            </SettingRow>
-          </SettingsGroup>
-        )}
-
-        {enabled && (
-          <SettingsGroup title="Auto-distill">
-            <SettingRow
-              htmlFor={autoId}
-              title="Auto-distill in the background"
-              description="Distill new and changed threads as they're indexed, so Ask, recall and Project Memory stay current. Paced, cancellable, and yields to indexing."
-              control={
-                <Switch
-                  id={autoId}
-                  checked={autoDistill}
-                  disabled={toggleAuto.isPending}
-                  onCheckedChange={(v) => toggleAuto.mutate(v)}
-                />
-              }
-            >
-              {budget.isPending && <Note>Loading the daily limit…</Note>}
-              {budget.isError && (
-                <InlineError>Couldn't load the daily limit: {errorText(budget.error)}</InlineError>
-              )}
-              {b && (
-                <div className="flex items-center gap-2 text-[13px] text-muted-foreground">
-                  <label htmlFor={capId}>Up to</label>
-                  <Input
-                    id={capId}
-                    // Keyed on the saved cap so a save (or a rejected entry) resets the field.
-                    key={b.dailyCap}
-                    type="number"
-                    min={0}
-                    step={1}
-                    inputMode="numeric"
-                    defaultValue={b.dailyCap}
-                    onBlur={(e) => {
-                      const cap = Number.parseInt(e.target.value, 10);
-                      if (Number.isFinite(cap) && cap >= 0 && cap !== b.dailyCap)
-                        setCap.mutate(cap);
-                      else e.target.value = String(b.dailyCap);
-                    }}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") e.currentTarget.blur();
-                    }}
-                    disabled={setCap.isPending}
-                    className="w-14 text-right tabular-nums"
-                  />
-                  <span>threads a day</span>
-                </div>
-              )}
-              {b && (
-                <Note>
-                  {b.dailyCap === 0
-                    ? "A daily limit of 0 pauses auto-distill."
-                    : autoDistill
-                      ? `${b.remainingToday} of ${b.dailyCap} left today (resets at midnight UTC) · ${b.eligibleThreads} threads from the last ${b.recentDays} days still to distill.`
-                      : `${b.eligibleThreads} threads from the last ${b.recentDays} days would be distilled, up to ${b.dailyCap} a day.`}
-                </Note>
-              )}
-              {setCap.isError && (
-                <InlineError>Couldn't save the daily limit: {errorText(setCap.error)}</InlineError>
-              )}
-            </SettingRow>
-          </SettingsGroup>
-        )}
-      </div>
-    </>
+      )}
+    </div>
   );
 }

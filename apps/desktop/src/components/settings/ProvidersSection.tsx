@@ -16,24 +16,20 @@ import { api, PROVIDERS } from "../../lib/api";
 import { describeKeySaveError } from "../../lib/errors";
 import { track } from "../../lib/telemetry";
 import { errorText, notify } from "../../lib/toast";
-import { InlineError, SectionHeader, SettingRow, SettingsGroup, StatePill } from "./shared";
+import { InlineError, SettingRow, SettingsGroup, StatePill } from "./shared";
 
-/** API keys (OS keychain) and the Ollama server URLs. */
-export function ProvidersSection() {
+/** The keys part of Settings > AI engine (EngineSection): API keys (OS keychain) and the
+ *  Ollama server URLs, shared by Chat, Ask and distillation. */
+export function ProviderKeys() {
   return (
-    <>
-      <SectionHeader
-        title="Providers"
-        description="Keys for chat, Ask and distillation. They're stored in your OS keychain, never on disk."
-      />
-      <div className="space-y-8">
-        <SettingsGroup title="API keys">
-          {PROVIDERS.map((p) => (
-            <ProviderRow key={p.id} id={p.id} label={p.label} />
-          ))}
-        </SettingsGroup>
-      </div>
-    </>
+    <SettingsGroup
+      title="API keys and servers"
+      description="Stored in your OS keychain, never on disk. A logged-in claude or codex CLI needs no key."
+    >
+      {PROVIDERS.map((p) => (
+        <ProviderRow key={p.id} id={p.id} label={p.label} />
+      ))}
+    </SettingsGroup>
   );
 }
 
@@ -62,8 +58,8 @@ function ProviderRow({ id, label }: { id: string; label: string }) {
     },
   });
 
-  // Local Ollama and Ollama Cloud accept a custom server URL (persisted; shared with the chat
-  // header). Local Ollama is keyless; Ollama Cloud needs a key like any cloud provider.
+  // Local Ollama and Ollama Cloud accept a custom server URL (persisted; Chat and the memory
+  // engine read it). Local Ollama is keyless; Ollama Cloud needs a key like any cloud provider.
   const isOllamaLike = id === "ollama" || id === "ollama_cloud";
   const keyless = id === "ollama";
   const baseUrl = useQuery({
@@ -73,7 +69,7 @@ function ProviderRow({ id, label }: { id: string; label: string }) {
   });
   const saveUrl = useMutation({
     mutationFn: (url: string) => api.setProviderBaseUrl(id, url),
-    // Reflect the new URL immediately (also mirrors to the chat header, same query key); the
+    // Reflect the new URL immediately (Chat's model list reads the same query key); the
     // invalidate reconciles with what the backend actually stored.
     onMutate: (url: string) => queryClient.setQueryData(["providerBaseUrl", id], url),
     onSuccess: () => {

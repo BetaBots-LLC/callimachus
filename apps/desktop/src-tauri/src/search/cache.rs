@@ -1,4 +1,4 @@
-//! Small in-process caches for the analytics views (Coach heatmap, Stats, recurring issues,
+//! Small in-process caches for the analytics views (Stats heatmap, Stats, recurring issues,
 //! spend). Those aggregate over the whole history and took seconds on a large index, yet
 //! barely change minute to minute, and the views refetch every time they open.
 //!

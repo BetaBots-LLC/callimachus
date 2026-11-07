@@ -12,7 +12,7 @@ export const Route = createFileRoute("/download")({
   loader: () => downloadData(),
   head: ({ loaderData }) => ({
     meta: seo({
-      title: "Download Callimachus — macOS, Windows & Linux",
+      title: "Download Callimachus for macOS, Windows & Linux",
       description:
         "Download the Callimachus desktop app for macOS, Windows, or Linux. Free and open source. Also available as a VS Code/Cursor extension, a CLI, and an MCP server.",
       path: "/download",
@@ -35,12 +35,12 @@ function DownloadPage() {
   return (
     <Container className="py-16 sm:py-20">
       <div className="max-w-2xl">
-        <span className="cat-label text-primary">№ — accession</span>
+        <span className="cat-label text-primary">№ · accession</span>
         <h1 className="mt-3 text-balance text-4xl text-foreground sm:text-5xl">
           Take a copy home.
         </h1>
         <p className="mt-4 text-lg leading-relaxed text-muted-foreground">
-          The desktop app bundles everything — the index, the search, and the{" "}
+          The desktop app bundles everything: the index, the search, and the{" "}
           <code className="rounded bg-card px-1.5 py-0.5 font-mono text-[0.85em]">cal</code> CLI.
           Pick your platform; it auto-updates from there.
         </p>

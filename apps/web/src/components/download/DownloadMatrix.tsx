@@ -117,7 +117,7 @@ export function DownloadMatrix({ release }: { release: Release }) {
       <p className="mt-6 max-w-prose text-sm leading-relaxed text-muted-foreground">
         {release.fallback
           ? "Showing the latest published build. "
-          : `Latest build${release.version !== "latest" ? ` — v${release.version}` : ""}. `}
+          : `Latest build${release.version !== "latest" ? `, v${release.version}` : ""}. `}
         The desktop app auto-updates after install. Checksums and release notes live on{" "}
         <a
           href={RELEASES_URL}
