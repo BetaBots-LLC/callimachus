@@ -88,6 +88,8 @@ pub static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
         // 0032: facts.origin_ref, the stable key of a fact imported from an agent's own
         // files (Claude Code auto memory, compaction summaries), replaced by that key.
         M::up(include_str!("../../../migrations/0032_fact_origin_ref.sql")),
+        // 0033: Copilot CLI as a source (one row in `sources`).
+        M::up(include_str!("../../../migrations/0033_copilot_cli.sql")),
     ])
 });
 
@@ -95,9 +97,9 @@ pub static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
 /// column adds and indexes over small tables. When every pending migration is listed here,
 /// `db::migrate` skips its sequential pre-read of the whole file, which costs about 1.2 s
 /// warm (several seconds cold) on a 5.1 GB index, far more than these migrations themselves
-/// (0032 is one ALTER ADD COLUMN and a partial index over `facts`). Add a migration here only
-/// when it touches no large table.
-pub const SCAN_FREE_MIGRATIONS: &[usize] = &[32];
+/// (0032 is one ALTER ADD COLUMN and a partial index over `facts`; 0033 one row in `sources`).
+/// Add a migration here only when it touches no large table.
+pub const SCAN_FREE_MIGRATIONS: &[usize] = &[32, 33];
 
 /// Whether every migration after `applied` (the index's `user_version`) up to `latest` is in
 /// [`SCAN_FREE_MIGRATIONS`].
@@ -113,6 +115,7 @@ mod tests {
     #[test]
     fn scan_free_pending_skips_the_preread() {
         assert!(pending_are_scan_free(31, 32), "0032 alone is cheap");
+        assert!(pending_are_scan_free(31, 33), "so is 0033");
         assert!(
             !pending_are_scan_free(30, 32),
             "0031 builds indexes on messages"

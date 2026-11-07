@@ -16,6 +16,8 @@ pub mod indexer;
 pub mod secrets;
 
 pub mod cleanup;
+// The versioned `cal --json` shapes and their JSON Schemas (`schemas/cal/`).
+pub mod cli_contract;
 pub mod cli_core;
 pub mod context;
 pub mod cost;
@@ -36,6 +38,8 @@ pub mod locks;
 pub mod mcp_server;
 // The first-run checklist's saved answers; GUI only.
 pub mod onboarding;
+#[cfg(test)]
+pub(crate) mod schema_check;
 pub mod search;
 pub mod snapshot;
 pub mod today;
@@ -45,7 +49,7 @@ use search::SearchFilters;
 use serde::Serialize;
 
 /// A thread cited as a source in an "ask your history" answer.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct AskSource {
     #[serde(rename = "threadId")]
     pub thread_id: i64,

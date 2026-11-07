@@ -1,0 +1,142 @@
+{
+  "type": "object",
+  "anyOf": [
+    {
+      "type": "object",
+      "properties": {
+        "facts": {
+          "type": "array",
+          "items": {
+            "required": [
+              "id",
+              "threadId",
+              "kind",
+              "text",
+              "source",
+              "title",
+              "projectPath",
+              "rationale",
+              "similarity",
+              "extractor",
+              "originRef"
+            ],
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "integer"
+              },
+              "threadId": {
+                "type": "integer"
+              },
+              "kind": {
+                "type": "string"
+              },
+              "text": {
+                "type": "string"
+              },
+              "source": {
+                "type": "string"
+              },
+              "title": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "projectPath": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "rationale": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "similarity": {
+                "type": "number"
+              },
+              "extractor": {
+                "type": "string"
+              },
+              "originRef": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            }
+          }
+        },
+        "coverage": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "properties": {
+            "distilledThreads": {
+              "type": "integer"
+            },
+            "threads": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "distilledThreads",
+            "threads"
+          ]
+        },
+        "closestSessions": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "integer"
+              },
+              "title": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "snippet": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "title",
+              "snippet"
+            ]
+          }
+        },
+        "hint": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "facts"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "notice": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "notice"
+      ]
+    }
+  ]
+}

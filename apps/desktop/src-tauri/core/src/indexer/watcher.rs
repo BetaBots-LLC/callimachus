@@ -44,10 +44,12 @@ const EMBED_MAX_WAIT: Duration = Duration::from_secs(10 * 60);
 /// use; coalescing keeps that from turning into a continuous rescan loop. Copilot's scan
 /// walks every workspace of every editor, and a chat being streamed rewrites its session
 /// file many times a second, so it is coalesced too (a backstop to the chatSessions filter).
+/// Copilot CLI appends an event per streamed step to a live session's events.jsonl; its
+/// byte cursor keeps each pass to the new lines, and this keeps the passes to one per 5 s.
 fn min_interval(kind: &str) -> Duration {
     if kind == super::cursor::KIND {
         Duration::from_secs(30)
-    } else if kind == super::copilot::KIND {
+    } else if kind == super::copilot::KIND || kind == super::copilot_cli::KIND {
         Duration::from_secs(5)
     } else {
         Duration::ZERO
@@ -88,6 +90,28 @@ fn in_chat_sessions(path: &Path) -> bool {
     path.components().any(|c| c.as_os_str() == "chatSessions")
 }
 
+/// Cursor's `~/.cursor/projects` filter: each project dir also holds terminal logs, MCP
+/// tool descriptors and other files Cursor rewrites while it runs; only
+/// `<slug>/agent-transcripts/...` holds conversations.
+fn in_agent_transcripts(path: &Path) -> bool {
+    path.components()
+        .any(|c| c.as_os_str() == "agent-transcripts")
+}
+
+/// Cursor's `~/.cursor/chats` filter: the files a CLI chat's content changes in. Every
+/// reader of a store, this indexer included, rewrites its `store.db-shm`, so without this
+/// each Cursor pass fired another one.
+fn is_chat_store_file(path: &Path) -> bool {
+    path.file_name()
+        .is_some_and(|n| n == "store.db" || n == "store.db-wal" || n == "meta.json")
+}
+
+/// Copilot CLI's `session-state` filter: the event journals (`<id>/events.jsonl`, flat
+/// `<id>.jsonl`), not the per-session plans, checkpoints and SQLite todo DB beside them.
+fn is_event_journal(path: &Path) -> bool {
+    path.extension().is_some_and(|e| e == "jsonl")
+}
+
 /// Stores to watch, each tagged with the source kind it belongs to.
 fn watch_targets() -> Vec<Target> {
     let mut v = Vec::new();
@@ -113,6 +137,17 @@ fn watch_targets() -> Vec<Target> {
                 accept: None,
             });
         }
+    }
+    // Cursor's agent transcripts and the CLI's chat stores (see cursor.rs).
+    if let Some(home) = super::cursor::cursor_home() {
+        v.push(Target {
+            accept: Some(in_agent_transcripts),
+            ..Target::new(home.join("projects"), super::cursor::KIND)
+        });
+        v.push(Target {
+            accept: Some(is_chat_store_file),
+            ..Target::new(home.join("chats"), super::cursor::KIND)
+        });
     }
     if let Some(p) = super::gemini::tmp_root() {
         v.push(Target::new(p, super::gemini::KIND));
@@ -152,6 +187,12 @@ fn watch_targets() -> Vec<Target> {
     }
     for p in super::kilo::task_roots() {
         v.push(Target::new(p, super::kilo::KIND));
+    }
+    if let Some(p) = super::copilot_cli::session_root() {
+        v.push(Target {
+            accept: Some(is_event_journal),
+            ..Target::new(p, super::copilot_cli::KIND)
+        });
     }
     // VS Code-native / Copilot chat: each editor's workspaceStorage + emptyWindowChatSessions.
     for p in super::copilot::watch_roots() {
@@ -221,8 +262,15 @@ fn legacy_route(path: &Path) -> Option<&'static str> {
         // Must precede the editor-name checks: these live under <editor>/User,
         // so a Cursor chat path also contains "/Cursor/".
         super::copilot::KIND
-    } else if s.contains("/Cursor/") && s.contains("/state.vscdb") {
+    } else if (s.contains("/Cursor/") && s.contains("/state.vscdb"))
+        || (s.contains("/.cursor/")
+            && (s.contains("/agent-transcripts/")
+                || (s.contains("/chats/") && is_chat_store_file(path))))
+    {
+        // The editor's state DB, or the agent transcripts and CLI chats in ~/.cursor.
         super::cursor::KIND
+    } else if s.contains("/.copilot/session-state/") && s.ends_with(".jsonl") {
+        super::copilot_cli::KIND
     } else if s.contains("/.gemini/") {
         super::gemini::KIND
     } else if s.contains("/.qwen/") {
@@ -714,6 +762,7 @@ fn register_roots<W: notify::Watcher, C: notify_debouncer_full::FileIdCache>(
 ) -> Vec<Target> {
     super::claude::load_config_dir_setting(conn);
     super::codex::load_codex_home_setting(conn);
+    super::copilot_cli::load_copilot_home_setting(conn);
     let targets = watch_targets();
     for t in &targets {
         if watched.contains(&t.path) || !t.path.exists() {
@@ -827,6 +876,27 @@ mod tests {
                 PathBuf::from("/data/claude-work/projects"),
                 super::super::claude::KIND,
             ),
+            Target {
+                accept: Some(in_agent_transcripts),
+                ..Target::new(
+                    PathBuf::from("/home/me/.cursor/projects"),
+                    super::super::cursor::KIND,
+                )
+            },
+            Target {
+                accept: Some(is_event_journal),
+                ..Target::new(
+                    PathBuf::from("/home/me/.copilot/session-state"),
+                    super::super::copilot_cli::KIND,
+                )
+            },
+            Target {
+                accept: Some(is_chat_store_file),
+                ..Target::new(
+                    PathBuf::from("/home/me/.cursor/chats"),
+                    super::super::cursor::KIND,
+                )
+            },
         ]);
         let r = |p: &str| route(Path::new(p), &table);
         let gs = "/home/me/.config/Cursor/User/globalStorage";
@@ -863,6 +933,27 @@ mod tests {
         ] {
             assert_eq!(r(&format!("{ws}/{noise}")), None, "{noise}");
         }
+        // Cursor agent transcripts, not the terminal logs beside them.
+        let cp = "/home/me/.cursor/projects/Users-me-app";
+        assert_eq!(
+            r(&format!("{cp}/agent-transcripts/a/a.jsonl")),
+            Some("cursor")
+        );
+        assert_eq!(r(&format!("{cp}/terminals/1.txt")), None);
+        // CLI chat stores: the store and its WAL, not the -shm every reader rewrites.
+        let ch = "/home/me/.cursor/chats/ab12/c1";
+        assert_eq!(r(&format!("{ch}/store.db-wal")), Some("cursor"));
+        assert_eq!(r(&format!("{ch}/meta.json")), Some("cursor"));
+        assert_eq!(r(&format!("{ch}/store.db-shm")), None);
+        assert_eq!(
+            r("/elsewhere/.cursor/chats/ab12/c1/store.db-shm"),
+            None,
+            "nor through the substring fallback"
+        );
+        // Copilot CLI event journals, not the session's todo DB or checkpoints.
+        let ss = "/home/me/.copilot/session-state/abc";
+        assert_eq!(r(&format!("{ss}/events.jsonl")), Some("copilot_cli"));
+        assert_eq!(r(&format!("{ss}/session.db-wal")), None);
         // A relocated Claude config dir (no "/.claude/" in the path) still routes.
         assert_eq!(
             r("/data/claude-work/projects/-proj/s.jsonl"),
@@ -879,6 +970,10 @@ mod tests {
     fn copilot_scans_are_coalesced() {
         assert_eq!(
             min_interval(super::super::copilot::KIND),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            min_interval(super::super::copilot_cli::KIND),
             Duration::from_secs(5)
         );
         assert_eq!(min_interval(super::super::claude::KIND), Duration::ZERO);

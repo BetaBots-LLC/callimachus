@@ -207,11 +207,11 @@ export function SourcesSection() {
   );
 }
 
-type RootKey = "claudeConfigDir" | "codexHome";
+type RootKey = "claudeConfigDir" | "codexHome" | "copilotHome";
 
 const DATA_ROOTS: {
   key: RootKey;
-  effective: "effectiveClaudeConfigDir" | "effectiveCodexHome";
+  effective: "effectiveClaudeConfigDir" | "effectiveCodexHome" | "effectiveCopilotHome";
   kind: SourceKind;
   label: string;
   fallback: string;
@@ -230,6 +230,13 @@ const DATA_ROOTS: {
     label: "Codex data folder",
     fallback: "~/.codex",
   },
+  {
+    key: "copilotHome",
+    effective: "effectiveCopilotHome",
+    kind: "copilot_cli",
+    label: "Copilot CLI data folder",
+    fallback: "~/.copilot",
+  },
 ];
 
 /** How many parts of the Claude Code integration a status shows installed. */
@@ -241,9 +248,9 @@ function codexRegistered(agents: AgentIntegration[] | undefined): boolean {
   return !!agents?.some((a) => a.id === "codex" && a.registered);
 }
 
-/** Overrides for relocated Claude Code / Codex data. An app opened from the Dock, Finder or
- *  Start menu never sees the shell's CLAUDE_CONFIG_DIR / CODEX_HOME, so without these it
- *  indexes the default folder. A change reindexes that source, since the watcher only
+/** Overrides for relocated Claude Code / Codex / Copilot CLI data. An app opened from the
+ *  Dock, Finder or Start menu never sees the shell's CLAUDE_CONFIG_DIR / CODEX_HOME /
+ *  COPILOT_HOME, so without these it indexes the default folder. A change reindexes that source, since the watcher only
  *  sees new writes. */
 function DataRootFields({ onChanged }: { onChanged: (kind: SourceKind) => void }) {
   const idBase = useId();
@@ -316,8 +323,9 @@ function DataRootFields({ onChanged }: { onChanged: (kind: SourceKind) => void }
       title="Data folders"
       description={
         <>
-          Only if you moved them with <code className="font-mono text-xs">CLAUDE_CONFIG_DIR</code>{" "}
-          or <code className="font-mono text-xs">CODEX_HOME</code>. Leave blank for the default.
+          Only if you moved them with <code className="font-mono text-xs">CLAUDE_CONFIG_DIR</code>,{" "}
+          <code className="font-mono text-xs">CODEX_HOME</code> or{" "}
+          <code className="font-mono text-xs">COPILOT_HOME</code>. Leave blank for the default.
         </>
       }
     >

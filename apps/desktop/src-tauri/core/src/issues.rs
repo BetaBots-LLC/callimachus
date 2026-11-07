@@ -11,7 +11,7 @@ use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 
 /// One recurring error, grouped by its normalized signature.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct IssueCluster {
     /// A representative raw error line (the latest raw sighting: candidates are read newest

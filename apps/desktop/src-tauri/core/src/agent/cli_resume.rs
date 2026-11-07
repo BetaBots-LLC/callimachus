@@ -1,5 +1,5 @@
 //! CLI launchers for indexed threads: "Resume" relaunches the original agent on
-//! its native session (Claude Code / Codex), while "Open in <agent>" seeds a fresh
+//! its native session (Claude Code / Codex / the Cursor CLI), while "Open in <agent>" seeds a fresh
 //! session in any agent CLI with the packed transcript. We derive the command from
 //! the thread's source + external id, then open it in the user's terminal so the
 //! interactive TUI runs there: Terminal.app via osascript on macOS, a new console
@@ -23,13 +23,16 @@ pub struct ResumeCommand {
     pub cwd: Option<String>,
 }
 
-/// Derive the resume command for a thread. Errors for sources that have no CLI
-/// (Cursor is an editor; in_app chats live in this app).
+/// Derive the resume command for a thread. `cursor_cli` says a Cursor thread came from the
+/// Cursor CLI's chat store or an agent transcript (`indexer::cursor::is_cli_thread`), which
+/// `cursor-agent --resume <id>` reopens; an editor composer has no CLI session to resume.
+/// Errors for sources with no resumable CLI (in_app chats live in this app).
 pub fn resume_command(
     source: &str,
     external_id: &str,
     is_subagent: bool,
     project_path: Option<&str>,
+    cursor_cli: bool,
 ) -> Result<ResumeCommand> {
     match source {
         "claude_code" => {
@@ -45,7 +48,14 @@ pub fn resume_command(
             args: vec!["resume".into(), external_id.to_string()],
             cwd: project_path.map(str::to_string),
         }),
-        "cursor" => bail!("Cursor has no resumable CLI — open the thread in Cursor instead"),
+        "cursor" if cursor_cli => Ok(ResumeCommand {
+            program: "cursor-agent".into(),
+            args: vec!["--resume".into(), external_id.to_string()],
+            cwd: project_path.map(str::to_string),
+        }),
+        "cursor" => bail!(
+            "This thread is an editor chat, which the Cursor CLI can't resume. Open it in Cursor instead."
+        ),
         "in_app" => bail!("This is an in-app chat; continue it in the Chat tab"),
         other => bail!("unknown source: {other}"),
     }
@@ -76,8 +86,9 @@ pub fn launch(
     external_id: &str,
     is_subagent: bool,
     project_path: Option<&str>,
+    cursor_cli: bool,
 ) -> Result<()> {
-    let cmd = resume_command(source, external_id, is_subagent, project_path)?;
+    let cmd = resume_command(source, external_id, is_subagent, project_path, cursor_cli)?;
     // A native resume fires SessionStart with source=resume, which `cal hook` already
     // leaves alone, so no skip flag is needed.
     open_in_terminal(&cmd, false)
@@ -362,6 +373,7 @@ mod tests {
             "-Users-me-proj/abc-123.jsonl",
             false,
             Some("/Users/me/proj"),
+            false,
         )
         .unwrap();
         assert_eq!(c.program, "claude");
@@ -376,6 +388,7 @@ mod tests {
             "-Users-me-proj/sess-uuid/subagents/agent-x.jsonl",
             true,
             None,
+            false,
         )
         .unwrap();
         assert_eq!(c.args, vec!["--resume", "sess-uuid"]);
@@ -383,13 +396,15 @@ mod tests {
 
     #[test]
     fn claude_ids_with_windows_separators_still_resume() {
-        let top = resume_command("claude_code", "C--proj\\abc-123.jsonl", false, None).unwrap();
+        let top =
+            resume_command("claude_code", "C--proj\\abc-123.jsonl", false, None, false).unwrap();
         assert_eq!(top.args, vec!["--resume", "abc-123"]);
         let sub = resume_command(
             "claude_code",
             "C--proj\\sess-uuid\\subagents\\agent-x.jsonl",
             true,
             None,
+            false,
         )
         .unwrap();
         assert_eq!(sub.args, vec!["--resume", "sess-uuid"]);
@@ -397,15 +412,20 @@ mod tests {
 
     #[test]
     fn codex_uses_thread_id() {
-        let c = resume_command("codex", "019dc6b0-thread", false, Some("/p")).unwrap();
+        let c = resume_command("codex", "019dc6b0-thread", false, Some("/p"), false).unwrap();
         assert_eq!(c.program, "codex");
         assert_eq!(c.args, vec!["resume", "019dc6b0-thread"]);
     }
 
     #[test]
-    fn cursor_and_in_app_unsupported() {
-        assert!(resume_command("cursor", "x", false, None).is_err());
-        assert!(resume_command("in_app", "x", false, None).is_err());
+    fn cursor_cli_sessions_resume_and_editor_chats_do_not() {
+        let c = resume_command("cursor", "d7a61f15", false, Some("/p"), true).unwrap();
+        assert_eq!(c.program, "cursor-agent");
+        assert_eq!(c.args, vec!["--resume", "d7a61f15"]);
+        assert_eq!(c.cwd.as_deref(), Some("/p"));
+        let err = resume_command("cursor", "x", false, None, false).unwrap_err();
+        assert!(err.to_string().contains("Open it in Cursor"));
+        assert!(resume_command("in_app", "x", false, None, true).is_err());
     }
 
     #[cfg(unix)] // build_shell_command is the POSIX launcher (macOS + Linux)

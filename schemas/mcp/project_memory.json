@@ -1,0 +1,193 @@
+{
+  "type": "object",
+  "anyOf": [
+    {
+      "anyOf": [
+        {
+          "type": "object",
+          "properties": {
+            "project": {
+              "type": "string"
+            },
+            "threadCount": {
+              "type": "integer"
+            },
+            "distilledCount": {
+              "type": "integer"
+            },
+            "pendingCount": {
+              "type": "integer"
+            },
+            "decisions": {
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "integer"
+                  },
+                  "threadId": {
+                    "type": "integer"
+                  },
+                  "text": {
+                    "type": "string"
+                  },
+                  "pinned": {
+                    "type": "boolean"
+                  },
+                  "extractor": {
+                    "type": "string"
+                  },
+                  "originRef": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  }
+                },
+                "required": [
+                  "id",
+                  "threadId",
+                  "text",
+                  "extractor",
+                  "originRef"
+                ]
+              }
+            },
+            "gotchas": {
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "integer"
+                  },
+                  "threadId": {
+                    "type": "integer"
+                  },
+                  "text": {
+                    "type": "string"
+                  },
+                  "pinned": {
+                    "type": "boolean"
+                  },
+                  "extractor": {
+                    "type": "string"
+                  },
+                  "originRef": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  }
+                },
+                "required": [
+                  "id",
+                  "threadId",
+                  "text",
+                  "extractor",
+                  "originRef"
+                ]
+              }
+            },
+            "openTodos": {
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "integer"
+                  },
+                  "threadId": {
+                    "type": "integer"
+                  },
+                  "text": {
+                    "type": "string"
+                  },
+                  "pinned": {
+                    "type": "boolean"
+                  },
+                  "extractor": {
+                    "type": "string"
+                  },
+                  "originRef": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  }
+                },
+                "required": [
+                  "id",
+                  "threadId",
+                  "text",
+                  "extractor",
+                  "originRef"
+                ]
+              }
+            },
+            "coverage": {
+              "type": [
+                "object",
+                "null"
+              ],
+              "properties": {
+                "distilledThreads": {
+                  "type": "integer"
+                },
+                "threads": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "distilledThreads",
+                "threads"
+              ]
+            }
+          },
+          "required": [
+            "project",
+            "threadCount",
+            "distilledCount",
+            "pendingCount"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "project": {
+              "type": "string"
+            },
+            "markdown": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "project",
+            "markdown"
+          ]
+        }
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "notice": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "notice"
+      ]
+    }
+  ]
+}

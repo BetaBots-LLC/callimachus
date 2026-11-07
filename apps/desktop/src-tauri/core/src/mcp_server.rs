@@ -33,6 +33,7 @@ use rmcp::{
 use rusqlite::Connection;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 // ---------------------------------------------------------------------------
 // Limits. Defaults are what an agent gets when it doesn't ask; maximums cap what it can ask
@@ -336,7 +337,7 @@ struct LinkedCommitsArgs {
 
 /// One thread in a search result: the thread's identity once, then its best-matching
 /// snippets. The raw hit list repeats title/source/path for every matching message.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 struct ThreadMatch {
     thread_id: i64,
@@ -351,7 +352,7 @@ struct ThreadMatch {
 
 /// project_memory format=json: counts plus id/threadId/text per fact. Leaves out the per-fact
 /// thread title and createdAt that `knowledge::ProjectMemory` carries for the GUI.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 struct CompactMemory<'a> {
     project: &'a str,
@@ -370,7 +371,7 @@ struct CompactMemory<'a> {
     coverage: Option<DistillCoverage>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 struct CompactFact<'a> {
     id: i64,
@@ -394,7 +395,7 @@ fn is_false(b: &bool) -> bool {
 
 /// Distillation coverage of a scope, over the threads worth distilling
 /// (`knowledge::DISTILLABLE`).
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 struct DistillCoverage {
     distilled_threads: i64,
@@ -414,7 +415,7 @@ struct ThinMemory {
     hint: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 struct ClosestSession {
     id: i64,
@@ -430,7 +431,7 @@ struct NoHits {
     coverage: SearchCoverage,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 struct SearchCoverage {
     sources: Vec<SourceCount>,
@@ -438,7 +439,7 @@ struct SearchCoverage {
     blind_spots: &'static [&'static str],
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 struct SourceCount {
     kind: String,
     threads: i64,
@@ -447,8 +448,205 @@ struct SourceCount {
 /// What no local index can hold, named so an agent doesn't conclude the work never happened.
 const SEARCH_BLIND_SPOTS: &[&str] = &[
     "Cloud sessions (claude.ai/code, claude --cloud) write no local transcript",
-    "Cursor threads carry no project path",
+    "Cursor editor chats with no agent transcript carry no project path",
 ];
+
+// ---------------------------------------------------------------------------
+// Output schemas. Every tool declares the shape of its structuredContent (MCP 2025-06-18+),
+// which is the contract a client can rely on and, in Claude Code and Codex, what the model
+// reads (see [`result_with`]). Any tool may also answer `{"notice": ...}` ([`OrNotice`]).
+// These types only describe the shapes: the tools build them with the result helpers, and
+// `every_tool_answer_matches_its_output_schema` checks each answer against its schema.
+// ---------------------------------------------------------------------------
+
+/// The structuredContent of an answer that is guidance instead of results ([`notice_result`]).
+#[derive(JsonSchema)]
+#[allow(dead_code)]
+struct Notice {
+    notice: String,
+}
+
+/// A tool's payload, or a [`Notice`].
+#[derive(JsonSchema)]
+#[serde(untagged)]
+#[allow(dead_code)]
+enum OrNotice<T> {
+    Payload(T),
+    Notice(Notice),
+}
+
+/// The outputSchema of a tool whose payload is `T`: `T` or a [`Notice`], as `T` serializes
+/// (an `Option` field is required and nullable, a `skip_serializing_if` one optional).
+fn output_schema<T: JsonSchema>() -> Arc<JsonObject> {
+    let mut settings = schemars::generate::SchemaSettings::draft2020_12().for_serialize();
+    // No `$ref` / `$defs`: a client validates with whatever JSON Schema library it has, and an
+    // inlined schema needs none of the reference handling that differs between them.
+    settings.inline_subschemas = true;
+    settings.meta_schema = None;
+    let mut schema = settings
+        .into_generator()
+        .into_root_schema_for::<OrNotice<T>>()
+        .to_value();
+    slim_output_schema(&mut schema);
+    // The TypeScript SDK (Claude Code, Cursor and most clients) pins an outputSchema's root to
+    // `type: "object"` and fails the whole tools/list on anything else, which would drop every
+    // tool; the root here is an `anyOf` of objects, so say so.
+    let mut root = JsonObject::new();
+    root.insert("type".into(), "object".into());
+    if let serde_json::Value::Object(rest) = schema {
+        root.extend(rest);
+    }
+    Arc::new(root)
+}
+
+/// Strip what only documents a schema (`title`, `description`) or what a validator may not
+/// know (`format: "int64"`, an unknown format to a strict Ajv, and the `minimum: 0` schemars
+/// adds to unsigned ints): tools/list is loaded into every session. Property names are kept:
+/// a field called `title` is data, not a keyword.
+fn slim_output_schema(schema: &mut serde_json::Value) {
+    let Some(obj) = schema.as_object_mut() else {
+        return;
+    };
+    for k in ["title", "description", "format", "minimum", "$schema"] {
+        obj.remove(k);
+    }
+    for (k, v) in obj.iter_mut() {
+        match k.as_str() {
+            "properties" | "$defs" => {
+                if let Some(props) = v.as_object_mut() {
+                    props.values_mut().for_each(slim_output_schema);
+                }
+            }
+            "anyOf" | "oneOf" | "allOf" | "prefixItems" => {
+                if let Some(list) = v.as_array_mut() {
+                    list.iter_mut().for_each(slim_output_schema);
+                }
+            }
+            "items" | "additionalProperties" | "not" => slim_output_schema(v),
+            _ => {}
+        }
+    }
+}
+
+/// The payload shapes, one per tool family. Lists sit under a key because structuredContent
+/// must be an object; the text block keeps the bare array.
+#[allow(dead_code)]
+mod out {
+    use super::*;
+    use crate::{gitlink, issues, knowledge, snapshot};
+
+    /// search_threads, search_current_project. `coverage` only with zero hits.
+    #[derive(JsonSchema)]
+    pub struct Search {
+        threads: Vec<ThreadMatch>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        coverage: Option<SearchCoverage>,
+    }
+
+    #[derive(JsonSchema)]
+    #[serde(rename_all = "camelCase")]
+    pub struct ThreadText {
+        thread_id: i64,
+        markdown: String,
+    }
+
+    #[derive(JsonSchema)]
+    pub struct SnapshotText {
+        id: i64,
+        markdown: String,
+    }
+
+    #[derive(JsonSchema)]
+    pub struct Snapshots {
+        snapshots: Vec<snapshot::Snapshot>,
+    }
+
+    #[derive(JsonSchema)]
+    pub struct Commits {
+        commits: Vec<gitlink::CommitLink>,
+    }
+
+    #[derive(JsonSchema)]
+    pub struct Issues {
+        issues: Vec<issues::IssueCluster>,
+    }
+
+    /// recent_threads, threads_for_file.
+    #[derive(JsonSchema)]
+    pub struct Threads {
+        threads: Vec<search::ThreadSummary>,
+    }
+
+    #[derive(JsonSchema)]
+    pub struct Tags {
+        tags: Vec<TagCount>,
+    }
+
+    #[derive(JsonSchema)]
+    pub struct TagCount {
+        tag: String,
+        threads: i64,
+    }
+
+    #[derive(JsonSchema)]
+    pub struct Todos {
+        todos: Vec<knowledge::TodoFact>,
+    }
+
+    /// recall_decisions, recall_gotchas, check_decision: the hits, or in an undistilled scope
+    /// none plus the coverage, the closest sessions and a hint ([`ThinMemory`]).
+    #[derive(JsonSchema)]
+    #[serde(rename_all = "camelCase")]
+    pub struct Facts {
+        facts: Vec<knowledge::RecallHit>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        coverage: Option<DistillCoverage>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        closest_sessions: Option<Vec<ClosestSession>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        hint: Option<String>,
+    }
+
+    #[derive(JsonSchema)]
+    pub struct PriorWork {
+        threads: Vec<knowledge::PriorWork>,
+    }
+
+    /// project_memory: format=json, or the markdown.
+    #[derive(JsonSchema)]
+    #[serde(untagged)]
+    pub enum Memory {
+        Json(CompactMemory<'static>),
+        Markdown(MemoryText),
+    }
+
+    #[derive(JsonSchema)]
+    pub struct MemoryText {
+        project: String,
+        markdown: String,
+    }
+
+    #[derive(JsonSchema)]
+    pub struct TodoDone {
+        id: i64,
+        done: bool,
+    }
+
+    #[derive(JsonSchema)]
+    pub struct Answer {
+        answer: String,
+        sources: Vec<crate::AskSource>,
+    }
+
+    /// record_decision, record_gotcha.
+    #[derive(JsonSchema)]
+    pub struct Recorded {
+        kind: String,
+        project: String,
+        /// What was recorded, plus why it is not searchable by meaning yet when it isn't.
+        message: String,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Prompt arguments. MCP prompt arguments are strings; Claude Code offers each prompt as a
@@ -500,6 +698,7 @@ impl Callimachus {
 
     #[tool(
         description = "Keyword search over the user's past AI coding sessions in every tool (Claude Code, Codex, Cursor, Gemini, Copilot, ...). One entry per thread with snippets; hybrid=true adds semantic matching.",
+        output_schema = output_schema::<out::Search>(),
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn search_threads(
@@ -522,7 +721,8 @@ impl Callimachus {
     }
 
     #[tool(
-        description = "Read one thread as a packed markdown transcript, trimmed to `budget` chars (default 24000). Try get_thread_knowledge first for a short recap; use this when you need the actual discussion.",
+        description = "Read one thread as a packed markdown transcript, trimmed to `budget` chars (default 24000); the text and structured `markdown` both hold it. Try get_thread_knowledge first for a short recap.",
+        output_schema = output_schema::<out::ThreadText>(),
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn get_thread(
@@ -537,11 +737,15 @@ impl Callimachus {
         let packed = context::pack_thread(&conn, args.thread_id, budget)
             .map_err(internal)?
             .ok_or_else(|| ErrorData::invalid_params("thread not found", None))?;
-        Ok(text_result(packed))
+        Ok(markdown_result(
+            packed,
+            json!({ "threadId": args.thread_id }),
+        ))
     }
 
     #[tool(
         description = "Save a resumable checkpoint of a thread (packed transcript plus the project's decisions, gotchas and TODOs) before context compaction or a handoff to another agent. Returns the snapshot id.",
+        output_schema = output_schema::<crate::snapshot::Snapshot>(),
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -564,6 +768,7 @@ impl Callimachus {
 
     #[tool(
         description = "List saved session snapshots, newest first, optionally scoped to a project path substring. Returns ids for load_snapshot.",
+        output_schema = output_schema::<out::Snapshots>(),
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn list_snapshots(
@@ -577,11 +782,12 @@ impl Callimachus {
         let conn = self.lock()?;
         let snaps =
             snapshot::list(&conn, args.project.as_deref(), limit as usize).map_err(internal)?;
-        json_result(&snaps)
+        list_result("snapshots", &snaps)
     }
 
     #[tool(
-        description = "Load a saved snapshot (carried-forward project memory plus transcript) as markdown to continue that session, trimmed to `budget` chars (default 24000). Pass an id from list_snapshots.",
+        description = "Load a saved snapshot (project memory plus transcript) as markdown to continue that session, trimmed to `budget` chars (default 24000); text and structured `markdown` both hold it. Id from list_snapshots.",
+        output_schema = output_schema::<out::SnapshotText>(),
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn load_snapshot(
@@ -599,11 +805,15 @@ impl Callimachus {
         // Snapshots saved before pack_thread learned to redact still hold raw credentials;
         // redact on the way out too (a no-op on already-redacted bodies).
         let body = context::redact_secrets(&snap.body);
-        Ok(text_result(fit_snapshot_body(&body, budget)))
+        Ok(markdown_result(
+            fit_snapshot_body(&body, budget),
+            json!({ "id": args.id }),
+        ))
     }
 
     #[tool(
         description = "Git commits a thread likely produced, inferred by matching its files against git log in the same time window: short SHA, subject, file-overlap count. Empty until the user runs `cal commits` in the repo.",
+        output_schema = output_schema::<out::Commits>(),
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn linked_commits(
@@ -615,11 +825,12 @@ impl Callimachus {
         }
         let conn = self.lock()?;
         let links = crate::gitlink::linked_commits(&conn, args.thread_id).map_err(internal)?;
-        json_result(&links)
+        list_result("commits", &links)
     }
 
     #[tool(
         description = "Errors the user keeps hitting across sessions, grouped by normalized signature with counts and first/last seen. Current repo by default; project=\"*\" for all. Check before retrying an approach.",
+        output_schema = output_schema::<out::Issues>(),
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn recurring_issues(
@@ -642,11 +853,12 @@ impl Callimachus {
         let conn = self.lock()?;
         let clusters = crate::issues::recurring_issues(&conn, project.as_deref(), since, limit)
             .map_err(internal)?;
-        json_result(&clusters)
+        list_result("issues", &clusters)
     }
 
     #[tool(
         description = "The user's most recently updated threads, newest first, filterable by source, project path, starred or tags. Use to see what they worked on lately.",
+        output_schema = output_schema::<out::Threads>(),
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn recent_threads(
@@ -666,11 +878,12 @@ impl Callimachus {
         };
         let conn = self.lock()?;
         let rows = search::recent_threads(&conn, &filters).map_err(internal)?;
-        json_result(&rows)
+        list_result("threads", &rows)
     }
 
     #[tool(
         description = "Keyword search scoped to the git repo this server runs in. Prefer it over search_threads for questions about the current project. One entry per thread; hybrid=true adds semantic matching.",
+        output_schema = output_schema::<out::Search>(),
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn search_current_project(
@@ -699,6 +912,7 @@ impl Callimachus {
 
     #[tool(
         description = "List the user's thread tags with thread counts. Pass a tag to recent_threads to filter by it.",
+        output_schema = output_schema::<out::Tags>(),
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn list_tags(
@@ -710,11 +924,18 @@ impl Callimachus {
         }
         let conn = self.lock()?;
         let tags = search::list_tags(&conn).map_err(internal)?;
-        json_result(&tags)
+        // The text keeps its [tag, count] pairs; structured rows name the fields, since a
+        // tuple schema (prefixItems) is a 2020-12 keyword older validators skip.
+        let rows: Vec<_> = tags
+            .iter()
+            .map(|(tag, threads)| json!({ "tag": tag, "threads": threads }))
+            .collect();
+        result_with(&tags, &json!({ "tags": rows }))
     }
 
     #[tool(
         description = "Open TODOs left in past sessions (task checkboxes, TODO/FIXME markers), newest first, filterable by text, project or source. Each has an id for complete_todo and the threadId it came from.",
+        output_schema = output_schema::<out::Todos>(),
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn list_open_todos(
@@ -740,11 +961,12 @@ impl Callimachus {
             t
         })
         .collect::<Vec<_>>();
-        json_result(&todos)
+        list_result("todos", &todos)
     }
 
     #[tool(
         description = "Short distilled recap of one thread: summary, decisions, gotchas and open TODOs. Much cheaper than get_thread, so try it first. Summary, decisions and gotchas exist only for distilled threads.",
+        output_schema = output_schema::<crate::knowledge::ThreadKnowledge>(),
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn get_thread_knowledge(
@@ -780,6 +1002,7 @@ impl Callimachus {
 
     #[tool(
         description = "Semantic recall of technical decisions the user made in past sessions, with rationale and source threadId. Use before re-deciding something settled. Undistilled scopes return the closest sessions.",
+        output_schema = output_schema::<out::Facts>(),
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn recall_decisions(
@@ -791,6 +1014,7 @@ impl Callimachus {
 
     #[tool(
         description = "Semantic recall of pitfalls and non-obvious constraints found in past sessions, with source threadId. Use to avoid repeating a known mistake. Undistilled scopes return the closest sessions.",
+        output_schema = output_schema::<out::Facts>(),
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn recall_gotchas(
@@ -802,6 +1026,7 @@ impl Callimachus {
 
     #[tool(
         description = "\"Have I done this before?\" Pass a short task description; returns past threads that tackled something similar, each with its best-matching decision or gotcha. Call at the start of a task.",
+        output_schema = output_schema::<out::PriorWork>(),
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn find_prior_work(
@@ -813,18 +1038,19 @@ impl Callimachus {
             return Ok(notice);
         }
         let Some(qv) = embed::embed_query(&self.embedder, &args.query).map_err(internal)? else {
-            return Ok(no_query_vector());
+            return no_query_vector("threads");
         };
         let limit = clamp_limit(args.limit, PRIOR_WORK_DEFAULT, PRIOR_WORK_MAX);
         let conn = self.lock()?;
         let hits =
             crate::knowledge::find_prior_work(&conn, &qv, args.project.as_deref(), limit as usize)
                 .map_err(internal)?;
-        json_result(&hits)
+        list_result("threads", &hits)
     }
 
     #[tool(
         description = "Contradiction guard: pass a decision you are about to make as `proposal` to get settled prior decisions on it, with rationale. Empty means no conflict, closestSessions means undistilled. On a conflict, ask the user.",
+        output_schema = output_schema::<out::Facts>(),
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn check_decision(
@@ -854,11 +1080,12 @@ impl Callimachus {
                 return json_result(&thin);
             }
         }
-        json_result(&hits)
+        list_result("facts", &hits)
     }
 
     #[tool(
         description = "A project's distilled decisions, gotchas and open TODOs as size-budgeted markdown (format=json for data). Skip it when a Callimachus memory block is already in context via CLAUDE.md, AGENTS.md or a hook.",
+        output_schema = output_schema::<out::Memory>(),
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn project_memory(
@@ -884,17 +1111,16 @@ impl Callimachus {
                 kinds.retain_in(&mut mem);
                 json_result(&compact_memory(&mem, kinds))
             }
-            MemoryFormat::Markdown => Ok(text_result(memory_markdown(
-                &conn,
-                &project,
-                kinds,
-                &memory_budget(limit),
-            )?)),
+            MemoryFormat::Markdown => Ok(markdown_result(
+                memory_markdown(&conn, &project, kinds, &memory_budget(limit))?,
+                json!({ "project": project }),
+            )),
         }
     }
 
     #[tool(
         description = "Past threads that mentioned a file path (substring match, e.g. \"embed/mod.rs\"), newest first. Use to find which sessions touched a file before editing it.",
+        output_schema = output_schema::<out::Threads>(),
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn threads_for_file(
@@ -908,11 +1134,12 @@ impl Callimachus {
         let conn = self.lock()?;
         let hits =
             crate::search::threads_with_file(&conn, &args.path, limit as i64).map_err(internal)?;
-        json_result(&hits)
+        list_result("threads", &hits)
     }
 
     #[tool(
         description = "Mark a TODO done (by its id from list_open_todos) so it drops out of the open lists. Persists across re-indexing.",
+        output_schema = output_schema::<out::TodoDone>(),
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -931,13 +1158,17 @@ impl Callimachus {
         if let Err(e) = crate::knowledge::set_todo_done(&conn, args.id, true) {
             return write_error(e);
         }
-        Ok(text_result(format!("TODO {} marked done", args.id)))
+        Ok(with_structured(
+            text_result(format!("TODO {} marked done", args.id)),
+            json!({ "id": args.id, "done": true }),
+        ))
     }
 
     // Read-only as far as the index goes, but the retrieved history is sent to the configured
     // LLM provider, so this is the one tool flagged open-world.
     #[tool(
         description = "Answer a question from the user's own past sessions (RAG) with [thread N] citations and a source list. Use for \"how did we...\" questions instead of reading many threads. Needs an LLM engine set up in the app.",
+        output_schema = output_schema::<out::Answer>(),
         annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn ask_history(
@@ -958,8 +1189,10 @@ impl Callimachus {
             crate::prepare_ask(&conn, &q, qv.as_deref()).map_err(internal)?
         };
         let Some(prep) = prep else {
-            return Ok(text_result(
-                "No relevant threads found in history.".to_string(),
+            const NONE_FOUND: &str = "No relevant threads found in history.";
+            return Ok(with_structured(
+                text_result(NONE_FOUND.to_string()),
+                json!({ "answer": NONE_FOUND, "sources": [] }),
             ));
         };
         let answer = crate::agent::answer(
@@ -972,7 +1205,7 @@ impl Callimachus {
         )
         .await
         .map_err(internal)?;
-        let mut out = answer;
+        let mut out = answer.clone();
         out.push_str("\n\nSources:\n");
         for s in &prep.sources {
             out.push_str(&format!(
@@ -981,11 +1214,13 @@ impl Callimachus {
                 s.title.as_deref().unwrap_or("untitled")
             ));
         }
-        Ok(text_result(out))
+        let structured = redacted_value(&json!({ "answer": answer, "sources": prep.sources }))?;
+        Ok(with_structured(text_result(out), structured))
     }
 
     #[tool(
         description = "Record a decision just made (with `rationale` when known) into the project's memory, so later recall and check_decision see it. Omit `project` to use the current repo.",
+        output_schema = output_schema::<out::Recorded>(),
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1002,6 +1237,7 @@ impl Callimachus {
 
     #[tool(
         description = "Record a pitfall just discovered into the project's memory so later sessions see it. Omit `project` to use the current repo.",
+        output_schema = output_schema::<out::Recorded>(),
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1114,7 +1350,7 @@ impl Callimachus {
     /// The guidance every tool answers with instead of results ([`Self::index_notice`]), as a
     /// tool result.
     fn empty_index_notice(&self) -> Result<Option<CallToolResult>, ErrorData> {
-        Ok(self.index_notice()?.map(text_result))
+        Ok(self.index_notice()?.map(notice_result))
     }
 
     /// Why the index can't answer yet, or None when it can: a schema this binary doesn't match
@@ -1213,7 +1449,7 @@ impl Callimachus {
         // Never write into an index at another schema: the stand-in is read-only, and its
         // columns may not be the ones this binary writes.
         if let Some(notice) = self.schema_notice()? {
-            return Ok(text_result(notice));
+            return Ok(notice_result(notice));
         }
         // Writes still go through on an empty index (the note persists and shows up once the
         // app indexes), but the agent should learn that recall has nothing to search yet.
@@ -1243,7 +1479,11 @@ impl Callimachus {
             msg.push_str("\n\n");
             msg.push_str(EMPTY_INDEX_NOTICE);
         }
-        Ok(text_result(msg))
+        let structured = json!({ "kind": kind, "project": project, "message": msg });
+        Ok(with_structured(
+            text_result(msg),
+            redacted_value(&structured)?,
+        ))
     }
 
     /// Shared recall path for the recall_decisions/recall_gotchas tools: embed the query,
@@ -1266,7 +1506,7 @@ impl Callimachus {
                 return json_result(&thin);
             }
         }
-        json_result(&hits)
+        list_result("facts", &hits)
     }
 
     /// recall_* / check_decision without a query vector. Without the cached model (this
@@ -1283,7 +1523,7 @@ impl Callimachus {
                 return json_result(&thin);
             }
         }
-        Ok(no_query_vector())
+        no_query_vector("facts")
     }
 
     /// The empty-state answer for recall_* and check_decision: when nothing matched in a scope
@@ -1351,7 +1591,7 @@ impl Callimachus {
         filters: &search::SearchFilters,
     ) -> Result<CallToolResult, ErrorData> {
         if !threads.is_empty() {
-            return json_result(&threads);
+            return list_result("threads", &threads);
         }
         let coverage = {
             let conn = self.lock()?;
@@ -1396,7 +1636,7 @@ const INDEX_BUSY_NOTICE: &str =
 /// error; anything else stays an internal error.
 fn write_error(e: anyhow::Error) -> Result<CallToolResult, ErrorData> {
     if crate::db::is_busy(&e) {
-        Ok(text_result(INDEX_BUSY_NOTICE.to_string()))
+        Ok(notice_result(INDEX_BUSY_NOTICE.to_string()))
     } else {
         Err(internal(e))
     }
@@ -1411,18 +1651,19 @@ index once). This is not an empty result. Use search_threads or search_current_p
 keyword search meanwhile.";
 
 /// The result for a semantic tool whose query produced no vector: the notice when the model
-/// is missing, otherwise an empty list (a blank query).
-fn no_query_vector() -> CallToolResult {
+/// is missing, otherwise an empty list under the tool's list `key` (a blank query).
+fn no_query_vector(key: &str) -> Result<CallToolResult, ErrorData> {
     if embed::model_is_cached() {
-        text_result("[]".to_string())
+        list_result(key, &[] as &[serde_json::Value])
     } else {
-        text_result(SEMANTIC_UNAVAILABLE_NOTICE.to_string())
+        Ok(notice_result(SEMANTIC_UNAVAILABLE_NOTICE.to_string()))
     }
 }
 
-/// A plain-text tool result, scrubbed of credential-shaped text.
+/// A plain-text tool result, scrubbed of credential-shaped text, with no structured content
+/// yet: every caller attaches its tool's shape ([`with_structured`]) or is [`notice_result`].
 ///
-/// Every tool answers through here or [`json_result`], and both redact on the way out: the
+/// Every tool answers through here or [`result_with`], and both redact on the way out: the
 /// index stores transcripts raw, so titles, snippets, fact text and error signatures would
 /// otherwise reach the calling agent verbatim. Text that was already packed (and redacted)
 /// passes through unchanged.
@@ -1433,12 +1674,86 @@ fn text_result(mut text: String) -> CallToolResult {
     CallToolResult::success(vec![ContentBlock::text(text)])
 }
 
-/// Compact JSON tool result with every string redacted ([`context::to_redacted_json`]).
-/// Never pretty-printed: indentation was 15-20% of every response and models read minified
-/// JSON just as well.
+/// `result` with `structured` as its structuredContent. MCP requires an object there.
+fn with_structured(mut result: CallToolResult, structured: serde_json::Value) -> CallToolResult {
+    debug_assert!(
+        structured.is_object(),
+        "structuredContent must be an object"
+    );
+    result.structured_content = Some(structured);
+    result
+}
+
+/// Any tool's answer while the index can't give one (no threads yet, a version skew, a busy
+/// write, no embedding model): the guidance as text, and as `{"notice": ...}`, the shape every
+/// output schema allows ([`OrNotice`]).
+fn notice_result(text: String) -> CallToolResult {
+    let result = text_result(text);
+    let notice = result.content[0].as_text().map(|t| t.text.clone());
+    with_structured(result, json!({ "notice": notice }))
+}
+
+/// A markdown tool result (a transcript, a snapshot, project memory): the markdown as text,
+/// and structured as `fields` plus `markdown`. Clients that read structuredContent get the
+/// markdown as a JSON string, which measured 1.3-2.4% more chars than the raw text on ten
+/// 48k-char packed transcripts from the author's index. The response therefore holds the
+/// transcript twice, about 2x `budget` on the wire (the get_thread and load_snapshot
+/// descriptions say so): `budget` bounds what the model reads, since Claude Code and Codex
+/// hand it one of the two, not the bytes a client that sizes the whole result counts.
+fn markdown_result(text: String, mut fields: serde_json::Value) -> CallToolResult {
+    let result = text_result(text);
+    if let (Some(obj), Some(t)) = (fields.as_object_mut(), result.content[0].as_text()) {
+        obj.insert("markdown".into(), t.text.clone().into());
+    }
+    with_structured(result, fields)
+}
+
+/// `value` as JSON with every string redacted ([`context::to_redacted_json`]).
+fn redacted_value<T: Serialize + ?Sized>(value: &T) -> Result<serde_json::Value, ErrorData> {
+    let json = context::to_redacted_json(value).map_err(internal)?;
+    serde_json::from_str(&json).map_err(internal)
+}
+
+/// A JSON tool result: the text block is `text` as compact redacted JSON, exactly what the
+/// tools returned before output schemas (clients that predate structured content read only
+/// that), and structuredContent is `structured`, redacted too. Claude Code and Codex hand the
+/// model structuredContent instead of the text when a result has one (anthropics/claude-code
+/// #45575; codex-rs `CallToolResult::as_function_call_output_payload`), so it is what most
+/// agents read: it must hold everything the text does. Never pretty-printed: indentation was
+/// 15-20% of every response and models read minified JSON just as well.
+fn result_with<T: Serialize + ?Sized, S: Serialize + ?Sized>(
+    text: &T,
+    structured: &S,
+) -> Result<CallToolResult, ErrorData> {
+    let json = context::to_redacted_json(text).map_err(internal)?;
+    let structured = redacted_value(structured)?;
+    Ok(with_structured(
+        CallToolResult::success(vec![ContentBlock::text(json)]),
+        structured,
+    ))
+}
+
+/// An object payload as both the text and the structured content.
 fn json_result<T: Serialize>(value: &T) -> Result<CallToolResult, ErrorData> {
     let json = context::to_redacted_json(value).map_err(internal)?;
-    Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
+    let structured = serde_json::from_str(&json).map_err(internal)?;
+    Ok(with_structured(
+        CallToolResult::success(vec![ContentBlock::text(json)]),
+        structured,
+    ))
+}
+
+/// A list payload: the bare array as text (as before), and `{key: [...]}` as structured
+/// content, since structuredContent must be an object.
+fn list_result<T: Serialize + ?Sized>(key: &str, items: &T) -> Result<CallToolResult, ErrorData> {
+    let json = context::to_redacted_json(items).map_err(internal)?;
+    let list: serde_json::Value = serde_json::from_str(&json).map_err(internal)?;
+    let mut structured = serde_json::Map::new();
+    structured.insert(key.to_string(), list);
+    Ok(with_structured(
+        CallToolResult::success(vec![ContentBlock::text(json)]),
+        serde_json::Value::Object(structured),
+    ))
 }
 
 /// A caller's `limit`, or `default`, kept within 1..=max.
@@ -2003,15 +2318,25 @@ impl ServerHandler for Callimachus {
     }
 
     // Written out (the macro generates this otherwise) to count each answered call in the
-    // value ledger ([`Callimachus::counts_as_help`]).
+    // value ledger ([`Callimachus::counts_as_help`]), and to keep structured content from
+    // clients that predate it.
     async fn call_tool(
         &self,
         request: rmcp::model::CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<rmcp::model::CallToolResponse, ErrorData> {
         let name = request.name.clone();
+        let legacy = context
+            .protocol_version()
+            .is_some_and(|v| v < ProtocolVersion::V_2025_06_18);
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
-        let response = self.tool_router.call(tcc).await;
+        let mut response = self.tool_router.call(tcc).await;
+        // structuredContent arrived in 2025-06-18; an older client reads only the text, which
+        // already carries the whole answer, so don't send it the payload twice.
+        if let (true, Ok(rmcp::model::CallToolResponse::Complete(result))) = (legacy, &mut response)
+        {
+            result.structured_content = None;
+        }
         if let (Some(ledger), Ok(rmcp::model::CallToolResponse::Complete(result))) =
             (&self.ledger, &response)
         {
@@ -2252,6 +2577,15 @@ mod tests {
     }
 
     /// The single text block of a tool result.
+    /// A result's structuredContent as JSON text (every successful answer carries one).
+    fn structured_of(res: &CallToolResult) -> String {
+        let v = res
+            .structured_content
+            .as_ref()
+            .expect("an answer carries structured content");
+        serde_json::to_string(v).unwrap()
+    }
+
     fn text_of(res: &CallToolResult) -> String {
         assert_eq!(res.content.len(), 1, "expected one content block");
         res.content[0].as_text().expect("text content").text.clone()
@@ -2626,6 +2960,9 @@ mod tests {
             }))
             .await
             .unwrap();
+        // Claude Code and Codex hand the model structuredContent rather than the text, so it
+        // takes the same exit ([`redacted_value`] / [`list_result`]).
+        let mut structured = vec![structured_of(&issues)];
         let issues = text_of(&issues);
         assert!(issues.contains("invalid x-api-key [REDACTED]"), "{issues}");
 
@@ -2639,6 +2976,7 @@ mod tests {
             }))
             .await
             .unwrap();
+        structured.push(structured_of(&recent));
         let recent = text_of(&recent);
         assert!(recent.contains("debug auth with [REDACTED]"), "{recent}");
 
@@ -2653,12 +2991,17 @@ mod tests {
             }))
             .await
             .unwrap();
+        structured.push(structured_of(&found));
         let found = text_of(&found);
         assert!(found.contains("debug auth with [REDACTED]"), "{found}");
 
         for body in [&issues, &recent, &found] {
             assert!(!body.contains("sk-ant-api03"), "{body}");
             serde_json::from_str::<serde_json::Value>(body).expect("still valid JSON");
+        }
+        for body in &structured {
+            assert!(!body.contains("sk-ant-api03"), "{body}");
+            assert!(body.contains("[REDACTED]"), "{body}");
         }
     }
 
@@ -3154,6 +3497,75 @@ mod tests {
         assert!(md.starts_with("No Callimachus index yet"), "{md}");
     }
 
+    /// One `tools/call` of `recent_threads` from a client that negotiated `protocol`, over the
+    /// stdio transport, so the hand-written [`ServerHandler::call_tool`] runs as in a session.
+    async fn recent_threads_over_the_wire(protocol: &str) -> serde_json::Value {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let mut conn = empty_db();
+        seed(
+            &mut conn,
+            "a",
+            "index tuning",
+            vec![msg("user", "tune the index", 100)],
+        );
+        let (client, server) = tokio::io::duplex(1 << 16);
+        let (server_rx, server_tx) = tokio::io::split(server);
+        tokio::spawn(async move {
+            if let Ok(svc) = Callimachus::new(conn).serve((server_rx, server_tx)).await {
+                let _ = svc.waiting().await;
+            }
+        });
+        let (client_rx, mut client_tx) = tokio::io::split(client);
+        let mut lines = BufReader::new(client_rx).lines();
+        let messages = [
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+                "protocolVersion": protocol,
+                "capabilities": {},
+                "clientInfo": { "name": "test", "version": "1" }
+            }}),
+            json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+            json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+                "name": "recent_threads", "arguments": {}
+            }}),
+        ];
+        for m in &messages {
+            client_tx
+                .write_all(format!("{m}\n").as_bytes())
+                .await
+                .unwrap();
+        }
+        loop {
+            let line = lines.next_line().await.unwrap().expect("server closed");
+            let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+            if v["id"] == 1 {
+                assert_eq!(v["result"]["protocolVersion"], protocol, "{v}");
+            }
+            if v["id"] == 2 {
+                return v["result"].clone();
+            }
+        }
+    }
+
+    /// structuredContent arrived in MCP 2025-06-18: an older client gets the text alone (which
+    /// holds the whole answer), a current one gets both.
+    #[tokio::test]
+    async fn structured_content_only_reaches_clients_that_know_it() {
+        let legacy = recent_threads_over_the_wire("2025-03-26").await;
+        assert!(legacy.get("structuredContent").is_none(), "{legacy}");
+        assert!(
+            legacy["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("index tuning"),
+            "{legacy}"
+        );
+        let current = recent_threads_over_the_wire("2025-06-18").await;
+        assert_eq!(
+            current["structuredContent"]["threads"][0]["title"], "index tuning",
+            "{current}"
+        );
+    }
+
     /// The prompt and resource handlers are macro- and trait-wired, so drive them the way a
     /// client does: newline-delimited JSON-RPC over the stdio transport.
     #[tokio::test]
@@ -3309,6 +3721,8 @@ mod tests {
             "snapshot_session",
         ];
         let mut total = 0;
+        let mut output_total = 0;
+        assert_eq!(tools.len(), 22, "tool count");
         for t in &tools {
             let desc = t.description.as_deref().unwrap_or("");
             assert!(!desc.is_empty(), "{} has no description", t.name);
@@ -3322,6 +3736,39 @@ mod tests {
 
             assert!(!t.input_schema.contains_key("$schema"), "{} schema", t.name);
             assert!(!t.input_schema.contains_key("title"), "{} schema", t.name);
+
+            // Output schemas: present on every tool, rooted at an object (the TypeScript SDK
+            // rejects the whole tools/list otherwise), inlined and without documentation keys.
+            let out = t
+                .output_schema
+                .as_ref()
+                .unwrap_or_else(|| panic!("{} has no output schema", t.name));
+            assert_eq!(
+                out.get("type"),
+                Some(&json!("object")),
+                "{} output root",
+                t.name
+            );
+            let text = serde_json::to_string(out.as_ref()).unwrap();
+            for key in [
+                "\"$schema\"",
+                "\"$ref\"",
+                "\"$defs\"",
+                "\"format\"",
+                "\"description\"",
+            ] {
+                assert!(
+                    !text.contains(&format!("{key}:")),
+                    "{} output schema has {key}",
+                    t.name
+                );
+            }
+            assert!(
+                text.contains("\"notice\""),
+                "{} output schema allows a notice",
+                t.name
+            );
+            output_total += text.len();
 
             let ann = t
                 .annotations
@@ -3348,11 +3795,403 @@ mod tests {
             total <= 4_500,
             "tool descriptions total {total} chars (max 4500)"
         );
+        // tools/list carries every output schema into each session that loads the tools.
+        assert!(
+            output_total <= OUTPUT_SCHEMAS_MAX_CHARS,
+            "output schemas total {output_total} chars (max {OUTPUT_SCHEMAS_MAX_CHARS})"
+        );
         assert!(
             INSTRUCTIONS.chars().count() <= 400,
             "instructions are {} chars (max 400)",
             INSTRUCTIONS.chars().count()
         );
+    }
+
+    /// The MCP output contract under the same drift check as `schemas/cal/`
+    /// ([`crate::cli_contract::drift`]): each tool's declared output schema is checked in as
+    /// `schemas/mcp/<tool>.json`, with the copy the site serves, so renaming or removing a key
+    /// clients read (`threads`, `facts`, `markdown`) fails here until the diff is committed.
+    /// [`every_tool_answer_matches_its_output_schema`] checks answers against the same
+    /// generated schemas, so it can't catch such a change on its own.
+    #[test]
+    fn mcp_output_schemas_match_the_checked_in_files() {
+        let srv = Callimachus::new(empty_db());
+        let files: Vec<_> = srv
+            .tool_router
+            .list_all()
+            .into_iter()
+            .map(|t| {
+                let schema = t
+                    .output_schema
+                    .unwrap_or_else(|| panic!("{} has no output schema", t.name));
+                (
+                    format!("{}.json", t.name),
+                    serde_json::Value::Object((*schema).clone()),
+                )
+            })
+            .collect();
+        assert_eq!(files.len(), 22, "tool count");
+        let changed = crate::cli_contract::drift::sync(
+            &["schemas/mcp", "apps/web/public/schemas/mcp"],
+            &files,
+            |name| name.ends_with(".json"),
+        );
+        assert!(
+            changed.is_empty(),
+            "an MCP tool's output schema changed; rewrote:\n  {}\nReview the diff and commit \
+             it. Removing or renaming a key breaks clients that read structured content.",
+            changed.join("\n  ")
+        );
+    }
+
+    /// The 22 output schemas measured 13,817 chars of compact JSON when they landed; this
+    /// leaves room for a few fields, not for documentation creeping back in.
+    const OUTPUT_SCHEMAS_MAX_CHARS: usize = 16_000;
+
+    /// A tool's arguments from JSON, the way a client sends them.
+    fn args<T: serde::de::DeserializeOwned>(v: serde_json::Value) -> Parameters<T> {
+        Parameters(serde_json::from_value(v).unwrap())
+    }
+
+    /// Check one answer's structuredContent against the tool's declared output schema. Tool
+    /// errors (`isError`) carry none and are exempt, as MCP allows.
+    fn assert_matches_schema(srv: &Callimachus, tool: &str, res: &CallToolResult) {
+        if res.is_error == Some(true) {
+            return;
+        }
+        let schema = srv
+            .tool_router
+            .list_all()
+            .into_iter()
+            .find(|t| t.name == tool)
+            .and_then(|t| t.output_schema)
+            .unwrap_or_else(|| panic!("{tool} declares no output schema"));
+        let structured = res
+            .structured_content
+            .as_ref()
+            .unwrap_or_else(|| panic!("{tool} returned no structured content"));
+        assert!(structured.is_object(), "{tool}: {structured}");
+        let schema = serde_json::Value::Object((*schema).clone());
+        if let Err(e) = crate::schema_check::validate(&schema, structured) {
+            panic!("{tool}: {e}\nschema: {schema}\nvalue: {structured}");
+        }
+    }
+
+    /// Every tool's answer, in each state a test can reach without the embedding model or an
+    /// LLM, matches the outputSchema it declares, and every tool is exercised at least once:
+    /// the TypeScript SDK fails a call whose structured content doesn't validate.
+    #[tokio::test]
+    async fn every_tool_answer_matches_its_output_schema() {
+        type Answer = Result<CallToolResult, ErrorData>;
+        let mut seen = std::collections::BTreeSet::new();
+        let mut check = |srv: &Callimachus, tool: &'static str, res: Answer| {
+            let res = res.unwrap_or_else(|e| panic!("{tool}: {e:?}"));
+            assert_matches_schema(srv, tool, &res);
+            seen.insert(tool);
+            res
+        };
+
+        // An empty index: every tool answers with a notice (record_* still record).
+        let empty = Callimachus::new(empty_db());
+        let q = json!({ "query": "auth" });
+        check(
+            &empty,
+            "search_threads",
+            empty.search_threads(args(q.clone())).await,
+        );
+        check(
+            &empty,
+            "search_current_project",
+            empty.search_current_project(args(q.clone())).await,
+        );
+        check(
+            &empty,
+            "get_thread",
+            empty.get_thread(args(json!({ "thread_id": 1 }))).await,
+        );
+        check(
+            &empty,
+            "snapshot_session",
+            empty
+                .snapshot_session(args(json!({ "thread_id": 1 })))
+                .await,
+        );
+        check(
+            &empty,
+            "list_snapshots",
+            empty.list_snapshots(args(json!({}))).await,
+        );
+        check(
+            &empty,
+            "load_snapshot",
+            empty.load_snapshot(args(json!({ "id": 1 }))).await,
+        );
+        check(
+            &empty,
+            "linked_commits",
+            empty.linked_commits(args(json!({ "thread_id": 1 }))).await,
+        );
+        check(
+            &empty,
+            "recurring_issues",
+            empty.recurring_issues(args(json!({}))).await,
+        );
+        check(
+            &empty,
+            "recent_threads",
+            empty.recent_threads(args(json!({}))).await,
+        );
+        check(&empty, "list_tags", empty.list_tags(args(json!({}))).await);
+        check(
+            &empty,
+            "list_open_todos",
+            empty.list_open_todos(args(json!({}))).await,
+        );
+        check(
+            &empty,
+            "get_thread_knowledge",
+            empty
+                .get_thread_knowledge(args(json!({ "thread_id": 1 })))
+                .await,
+        );
+        check(
+            &empty,
+            "recall_decisions",
+            empty.recall_decisions(args(q.clone())).await,
+        );
+        check(
+            &empty,
+            "recall_gotchas",
+            empty.recall_gotchas(args(q.clone())).await,
+        );
+        check(
+            &empty,
+            "find_prior_work",
+            empty.find_prior_work(args(q.clone())).await,
+        );
+        check(
+            &empty,
+            "check_decision",
+            empty
+                .check_decision(args(json!({ "proposal": "use WAL" })))
+                .await,
+        );
+        check(
+            &empty,
+            "project_memory",
+            empty.project_memory(args(json!({}))).await,
+        );
+        check(
+            &empty,
+            "threads_for_file",
+            empty
+                .threads_for_file(args(json!({ "path": "a.rs" })))
+                .await,
+        );
+        check(
+            &empty,
+            "complete_todo",
+            empty.complete_todo(args(json!({ "id": 1 }))).await,
+        );
+        check(
+            &empty,
+            "ask_history",
+            empty.ask_history(args(json!({ "question": "why?" }))).await,
+        );
+        let res = check(
+            &empty,
+            "record_gotcha",
+            empty
+                .record_gotcha(args(json!({ "text": "x", "project": "/proj/app" })))
+                .await,
+        );
+        assert!(res.structured_content.unwrap()["message"]
+            .as_str()
+            .unwrap()
+            .contains("No Callimachus index yet"));
+
+        // A seeded index: real payloads.
+        let srv = seeded_server();
+        let res = check(
+            &srv,
+            "recent_threads",
+            srv.recent_threads(args(json!({}))).await,
+        );
+        let id = res.structured_content.unwrap()["threads"][0]["id"]
+            .as_i64()
+            .unwrap();
+        let res = check(
+            &srv,
+            "search_threads",
+            srv.search_threads(args(json!({ "query": "refresh" })))
+                .await,
+        );
+        assert!(
+            text_of(&res).starts_with('['),
+            "the text keeps the bare array"
+        );
+        // Zero hits: the coverage object.
+        let res = check(
+            &srv,
+            "search_threads",
+            srv.search_threads(args(json!({ "query": "zzqx" }))).await,
+        );
+        assert!(res.structured_content.unwrap()["coverage"].is_object());
+        check(
+            &srv,
+            "search_current_project",
+            srv.search_current_project(args(json!({ "query": "refresh" })))
+                .await,
+        );
+        let res = check(
+            &srv,
+            "get_thread",
+            srv.get_thread(args(json!({ "thread_id": id }))).await,
+        );
+        assert_eq!(
+            res.structured_content.clone().unwrap()["markdown"],
+            text_of(&res).as_str()
+        );
+        let res = check(
+            &srv,
+            "snapshot_session",
+            srv.snapshot_session(args(json!({ "thread_id": id }))).await,
+        );
+        let snap = res.structured_content.unwrap()["id"].as_i64().unwrap();
+        check(
+            &srv,
+            "list_snapshots",
+            srv.list_snapshots(args(json!({}))).await,
+        );
+        check(
+            &srv,
+            "load_snapshot",
+            srv.load_snapshot(args(json!({ "id": snap }))).await,
+        );
+        check(
+            &srv,
+            "linked_commits",
+            srv.linked_commits(args(json!({ "thread_id": id }))).await,
+        );
+        check(
+            &srv,
+            "recurring_issues",
+            srv.recurring_issues(args(json!({ "project": "*" }))).await,
+        );
+        srv.lock()
+            .unwrap()
+            .execute("INSERT INTO tags (name) VALUES ('auth')", [])
+            .ok();
+        check(&srv, "list_tags", srv.list_tags(args(json!({}))).await);
+        check(
+            &srv,
+            "list_open_todos",
+            srv.list_open_todos(args(json!({}))).await,
+        );
+        check(
+            &srv,
+            "get_thread_knowledge",
+            srv.get_thread_knowledge(args(json!({ "thread_id": id })))
+                .await,
+        );
+        check(
+            &srv,
+            "record_decision",
+            srv.record_decision(args(
+                json!({ "text": "rotate tokens", "project": "/proj/app", "rationale": "theft" }),
+            ))
+            .await,
+        );
+        let md = json!({ "project": "/proj/app" });
+        check(&srv, "project_memory", srv.project_memory(args(md)).await);
+        let js = json!({ "project": "/proj/app", "format": "json" });
+        check(&srv, "project_memory", srv.project_memory(args(js)).await);
+        check(
+            &srv,
+            "threads_for_file",
+            srv.threads_for_file(args(json!({ "path": "auth" }))).await,
+        );
+        check(
+            &srv,
+            "complete_todo",
+            srv.complete_todo(args(json!({ "id": 999 }))).await,
+        );
+
+        // The semantic tools need the model and ask_history an LLM: check the payloads they
+        // build from the same helpers.
+        let hit = crate::knowledge::RecallHit {
+            id: 1,
+            thread_id: id,
+            kind: "decision".into(),
+            text: "rotate tokens".into(),
+            source: "claude_code".into(),
+            title: None,
+            project_path: Some("/proj/app".into()),
+            rationale: Some("theft".into()),
+            similarity: 0.7,
+            extractor: "agent".into(),
+            origin_ref: None,
+        };
+        for tool in ["recall_decisions", "recall_gotchas", "check_decision"] {
+            assert_matches_schema(&srv, tool, &list_result("facts", &[&hit]).unwrap());
+            assert_matches_schema(&srv, tool, &no_query_vector("facts").unwrap());
+            let thin = ThinMemory {
+                facts: Vec::new(),
+                coverage: DistillCoverage {
+                    distilled_threads: 0,
+                    threads: 4,
+                },
+                closest_sessions: vec![ClosestSession {
+                    id,
+                    title: None,
+                    snippet: "user: refresh".into(),
+                }],
+                hint: "distill".into(),
+            };
+            assert_matches_schema(&srv, tool, &json_result(&thin).unwrap());
+        }
+        let prior = crate::knowledge::PriorWork {
+            thread_id: id,
+            title: None,
+            project_path: None,
+            source: "codex".into(),
+            kind: "gotcha".into(),
+            snippet: "x".into(),
+            similarity: 0.6,
+            matches: 1,
+        };
+        assert_matches_schema(
+            &srv,
+            "find_prior_work",
+            &list_result("threads", &[prior]).unwrap(),
+        );
+        let answer = json!({ "answer": "We rotate [thread 1].", "sources": [crate::AskSource {
+            thread_id: id,
+            title: None,
+            source: "claude_code".into(),
+            project_path: None,
+            message_id: Some(2),
+        }] });
+        let answer = with_structured(text_result("We rotate".into()), answer);
+        assert_matches_schema(&srv, "ask_history", &answer);
+        assert_matches_schema(
+            &srv,
+            "complete_todo",
+            &write_error(anyhow::Error::from(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                None,
+            )))
+            .unwrap(),
+        );
+
+        let all: std::collections::BTreeSet<String> = srv
+            .tool_router
+            .list_all()
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        let seen: std::collections::BTreeSet<String> = seen.into_iter().map(String::from).collect();
+        assert_eq!(all, seen, "every tool is called at least once above");
     }
 
     /// Every tool must be documented where agents and users learn about it: the bundled

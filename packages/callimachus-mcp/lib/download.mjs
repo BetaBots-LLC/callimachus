@@ -1,10 +1,11 @@
 // Resolves (and lazily downloads + caches) the prebuilt `callimachus-mcp`
-// binary that matches this npm package's version and the host platform.
+// binary, or the `cal` CLI for `--install-cal`, that matches this npm package's
+// version and the host platform.
 //
 // The npm package is a thin wrapper: it carries no binary itself, but its
 // version is kept in lockstep with the desktop release (Changesets `fixed`
 // group), so `v<version>` always names a GitHub Release that has the per-target
-// `callimachus-mcp-<triple>` asset this downloads.
+// `callimachus-mcp-<triple>` and `cal-<triple>` assets this downloads.
 //
 // Every download is checked against a SHA-256 manifest before it is made
 // executable. The release workflow writes the manifest (`SHA256SUMS`) into
@@ -22,6 +23,8 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
+  readlinkSync,
+  realpathSync,
   renameSync,
   rmSync,
   statSync,
@@ -30,7 +33,7 @@ import {
 } from "node:fs";
 import { createRequire } from "node:module";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
@@ -39,7 +42,11 @@ const require = createRequire(import.meta.url);
 const { version } = require("../package.json");
 
 const REPO = "BetaBots-LLC/callimachus";
-const RELEASE_BASE = `https://github.com/${REPO}/releases/download/v${version}`;
+export const RELEASE_BASE = `https://github.com/${REPO}/releases/download/v${version}`;
+export { version };
+
+/** The release binaries this launcher fetches: the MCP server and the `cal` CLI. */
+const TOOLS = ["callimachus-mcp", "cal"];
 const BUNDLED_SUMS = fileURLToPath(new URL("./SHA256SUMS", import.meta.url));
 
 // Host platform -> Rust target triple uploaded by .github/workflows/build.yml.
@@ -55,23 +62,30 @@ const TRIPLES = {
 // time with "GLIBC_2.38 not found", so check up front and say why.
 const MIN_GLIBC = [2, 38];
 
-// How to build the server yourself, from the tag matching this launcher. It
-// mirrors the repo's Dockerfile: the server lives in the desktop (Tauri) crate,
-// so Linux needs Tauri's WebKitGTK dev packages, and an empty dist/ stands in
-// for the desktop frontend the MCP server never serves. A source build links
-// the same ONNX Runtime prebuilt as the release binaries, so it can't get past
-// that prebuilt's platform limits (Intel macOS, glibc < 2.38): those errors say
-// so instead of pointing here.
-const BUILD_FROM_SOURCE =
-  `To build it yourself you need Rust and, on Linux, the pkg-config, OpenSSL, ` +
-  `D-Bus and webkit2gtk-4.1 development packages (on Debian/Ubuntu: pkg-config ` +
-  `libssl-dev libdbus-1-dev libwebkit2gtk-4.1-dev):\n` +
-  `  git clone --depth 1 --branch v${version} https://github.com/${REPO}\n` +
-  `  cd callimachus/apps/desktop\n` +
-  `  mkdir dist\n` +
-  `  cargo build --release --locked --manifest-path src-tauri/Cargo.toml -p callimachus-standalone --bin callimachus-mcp\n` +
-  `then set CALLIMACHUS_MCP_BIN to the built src-tauri/target/release/callimachus-mcp. ` +
-  `Or point CALLIMACHUS_MCP_BIN at a binary you already have.`;
+// How to build a binary yourself, from the tag matching this launcher. It
+// mirrors the repo's Dockerfile: both binaries live in the Tauri-free
+// `callimachus-standalone` crate, so Linux needs only the OpenSSL and D-Bus dev
+// packages (no GTK or WebKit, and no desktop frontend build). A source build
+// links the same ONNX Runtime prebuilt as the release binaries, so it can't get
+// past that prebuilt's platform limits (Intel macOS, glibc < 2.38): those errors
+// say so instead of pointing here.
+function buildFromSource(tool) {
+  const use =
+    tool === "cal"
+      ? `then link the built apps/desktop/src-tauri/target/release/cal at ~/.local/bin/cal.`
+      : `then set CALLIMACHUS_MCP_BIN to the built ` +
+        `apps/desktop/src-tauri/target/release/callimachus-mcp. ` +
+        `Or point CALLIMACHUS_MCP_BIN at a binary you already have.`;
+  return (
+    `To build it yourself you need Rust and, on Linux, the pkg-config, OpenSSL ` +
+    `and D-Bus development packages (on Debian/Ubuntu: pkg-config libssl-dev ` +
+    `libdbus-1-dev):\n` +
+    `  git clone --depth 1 --branch v${version} https://github.com/${REPO}\n` +
+    `  cd callimachus\n` +
+    `  cargo build --release --locked --manifest-path apps/desktop/src-tauri/Cargo.toml -p callimachus-standalone --bin ${tool}\n` +
+    use
+  );
+}
 
 // Cached versions other than the running one are removed only when they are
 // older and nothing has used them for this long, so clients pinned to different
@@ -79,15 +93,37 @@ const BUILD_FROM_SOURCE =
 // deleting each other's ~45MB binary.
 const PRUNE_UNUSED_MS = 30 * 24 * 60 * 60 * 1000;
 
+/** Where downloaded binaries are cached, one directory per version. */
+export function defaultCacheRoot() {
+  return join(process.env.XDG_CACHE_HOME || join(homedir(), ".cache"), "callimachus-mcp");
+}
+
 /**
- * Returns an absolute path to a ready-to-exec `callimachus-mcp` binary,
- * downloading it on first run. Throws with an actionable message on an
- * unsupported platform, a failed download, or a checksum mismatch.
+ * The release asset name of `tool` for this host (`cal-aarch64-apple-darwin`,
+ * `callimachus-mcp-x86_64-pc-windows-msvc.exe`), or null on a platform with no
+ * released binary.
  */
-export async function ensureBinary() {
+export function assetName(tool, platform = process.platform, arch = process.arch) {
+  if (!TOOLS.includes(tool)) throw new Error(`unknown release binary ${tool}`);
+  const triple = TRIPLES[`${platform}-${arch}`];
+  if (!triple) return null;
+  return `${tool}-${triple}${platform === "win32" ? ".exe" : ""}`;
+}
+
+/**
+ * Returns an absolute path to a ready-to-exec release binary (`callimachus-mcp`
+ * by default, or `cal`), downloading it on first run. Throws with an actionable
+ * message on an unsupported platform, a failed download, or a checksum mismatch.
+ *
+ * `opts.signal` (an AbortSignal) stops a download in progress; its temp file is
+ * removed and the call rejects. `fetch`, `releaseBase`, `cacheRoot` and `sums`
+ * (a name -> hex Map standing in for the manifest) exist for tests: they
+ * replace the network, the cache location and the bundled SHA256SUMS.
+ */
+export async function ensureBinary(tool = "callimachus-mcp", opts = {}) {
   // Escape hatch: point at an already-installed binary (e.g. one built with
   // `cargo build`, or the standalone binary from the Releases page).
-  const override = process.env.CALLIMACHUS_MCP_BIN;
+  const override = tool === "callimachus-mcp" ? process.env.CALLIMACHUS_MCP_BIN : undefined;
   if (override) {
     if (!existsSync(override)) {
       throw new Error(`CALLIMACHUS_MCP_BIN is set but ${override} does not exist`);
@@ -96,16 +132,12 @@ export async function ensureBinary() {
   }
 
   const key = `${process.platform}-${process.arch}`;
-  const triple = TRIPLES[key];
-  if (!triple) throw new Error(unsupportedPlatformMessage(key));
+  const name = assetName(tool);
+  if (!name) throw new Error(unsupportedPlatformMessage(key, tool));
 
-  const ext = process.platform === "win32" ? ".exe" : "";
-  const name = `callimachus-mcp-${triple}${ext}`;
-
-  const cacheRoot = join(
-    process.env.XDG_CACHE_HOME || join(homedir(), ".cache"),
-    "callimachus-mcp",
-  );
+  const fetchImpl = opts.fetch ?? fetch;
+  const releaseBase = opts.releaseBase ?? RELEASE_BASE;
+  const cacheRoot = opts.cacheRoot ?? defaultCacheRoot();
   const cacheDir = join(cacheRoot, version);
   const binPath = join(cacheDir, name);
   if (existsSync(binPath)) {
@@ -118,20 +150,28 @@ export async function ensureBinary() {
   // and process.report is not free to generate on every MCP server start.
   if (process.platform === "linux") assertGlibc(linuxGlibcVersion());
 
-  const expected = (await loadChecksums()).get(name);
+  const sums = opts.sums ?? (await loadChecksums(fetchImpl, releaseBase, tool));
+  const expected = sums.get(name);
   if (!expected) {
     throw new Error(
       `no SHA-256 checksum for ${name} in the v${version} manifest, refusing to run it.\n` +
-        BUILD_FROM_SOURCE,
+        buildFromSource(tool),
     );
   }
 
   mkdirSync(cacheDir, { recursive: true });
+  removeStaleDownloads(cacheDir, Date.now());
   // Download to a temp name, verify, then rename: a concurrent run never sees a
   // partial file at the final path, and a bad download never becomes executable.
   const tmp = join(cacheDir, `.${name}.${process.pid}.tmp`);
   try {
-    const actual = await downloadTo(`${RELEASE_BASE}/${name}`, tmp, key);
+    const actual = await downloadTo(
+      fetchImpl,
+      `${releaseBase}/${name}`,
+      tmp,
+      `${tool} ${key}`,
+      opts.signal,
+    );
     if (actual !== expected) {
       throw new Error(
         `checksum mismatch for ${name}: expected ${expected}, got ${actual}. ` +
@@ -145,19 +185,85 @@ export async function ensureBinary() {
     throw err;
   }
   process.stderr.write(`callimachus-mcp: installed ${binPath}\n`);
-  pruneOldVersions(cacheRoot, version, Date.now());
+  pruneOldVersions(cacheRoot, version, Date.now(), linkedVersions(cacheRoot));
   return binPath;
 }
 
+/**
+ * Cached versions that `~/.local/bin/cal` (from `--install-cal`) runs from.
+ * Exec'ing a binary never refreshes its directory's mtime, so without this the
+ * pruning below would delete a linked `cal` 30 days after the MCP server moved
+ * to a newer release, and the plugin's hooks would silently stop.
+ */
+export function linkedVersions(cacheRoot, home = homedir()) {
+  const link = join(home, ".local", "bin", "cal");
+  let target;
+  try {
+    target = readlinkSync(link);
+  } catch {
+    return [];
+  }
+  // Resolved against the link's own directory, as inspectCalSlot does: a
+  // relative link into the cache counts as ours there, so it must be kept here.
+  const where = cacheLinkVersion(resolve(dirname(link), target), cacheRoot);
+  return where?.inRoot ? [where.version] : [];
+}
+
+/** `path` with every symlink in it resolved, as far as it exists. */
+function realpathOrSelf(path) {
+  try {
+    return realpathSync(path);
+  } catch {
+    // Dangling: resolve the directory it would be in, so a link into a
+    // symlinked cache (~/.cache -> /data/cache) still compares equal.
+    try {
+      return join(realpathSync(dirname(path)), basename(path));
+    } catch {
+      return path;
+    }
+  }
+}
+
+/** The first path segment of `path` under `root`, or null when it is outside. */
+function versionUnder(root, path) {
+  const rel = relative(root, path);
+  if (rel === "" || rel.startsWith("..") || isAbsolute(rel)) return null;
+  return rel.split(sep)[0];
+}
+
+/**
+ * Whether the absolute path `target` is a binary this launcher cached:
+ * `{ version, inRoot }` or null. `inRoot` is true for a file under `cacheRoot`
+ * (compared with symlinks resolved on both sides, so a symlinked ~/.cache
+ * still matches). A `.../callimachus-mcp/<version>/cal-<triple>` path under
+ * another root also counts, with `inRoot` false: the shell that ran
+ * `--install-cal` may have had another XDG_CACHE_HOME than this process.
+ */
+export function cacheLinkVersion(target, cacheRoot) {
+  const version =
+    versionUnder(cacheRoot, target) ??
+    versionUnder(realpathOrSelf(cacheRoot), realpathOrSelf(target));
+  if (version !== null) return { version, inRoot: true };
+  const versionDir = dirname(target);
+  if (
+    basename(target).startsWith("cal-") &&
+    VERSION_DIR.test(basename(versionDir)) &&
+    basename(dirname(versionDir)) === "callimachus-mcp"
+  ) {
+    return { version: basename(versionDir), inRoot: false };
+  }
+  return null;
+}
+
 /** The error for a platform with no released binary. */
-export function unsupportedPlatformMessage(key) {
+export function unsupportedPlatformMessage(key, tool = "callimachus-mcp") {
   const released = `Released targets: ${Object.keys(TRIPLES).join(", ")}.`;
   if (key === "darwin-x64") {
     // ort (fastembed's ONNX backend) publishes no x86_64-apple-darwin prebuilt,
     // and fastembed always downloads one, so there is nothing to build against.
     return (
       `Intel Macs are not supported. ${released} ` +
-      `A source build fails there too: the ONNX Runtime that callimachus-mcp links ` +
+      `A source build fails there too: the ONNX Runtime that ${tool} links ` +
       `has no Intel macOS build. (On an Apple Silicon Mac this means Node itself is an ` +
       `x64 build running under Rosetta: use an arm64 Node instead.)`
     );
@@ -166,16 +272,16 @@ export function unsupportedPlatformMessage(key) {
   const floor = key.startsWith("linux-")
     ? ` A Linux source build needs glibc ${MIN_GLIBC.join(".")} or newer, like the released binary.`
     : "";
-  return `unsupported platform ${key}. ${released}\n${BUILD_FROM_SOURCE}${floor}`;
+  return `unsupported platform ${key}. ${released}\n${buildFromSource(tool)}${floor}`;
 }
 
 /**
  * Streams `url` into `dest`, hashing as it goes, and returns the hex SHA-256.
  * Prints coarse progress to stderr so a slow first run is visibly alive.
  */
-async function downloadTo(url, dest, label) {
-  process.stderr.write(`callimachus-mcp: downloading v${version} for ${label}...\n`);
-  const res = await fetch(url, { redirect: "follow" });
+async function downloadTo(fetchImpl, url, dest, label, signal) {
+  process.stderr.write(`callimachus-mcp: downloading v${version} ${label}...\n`);
+  const res = await fetchImpl(url, { redirect: "follow", signal });
   if (!res.ok || !res.body) {
     throw new Error(
       `download failed (${res.status} ${res.statusText}) from ${url}\n` +
@@ -200,7 +306,7 @@ async function downloadTo(url, dest, label) {
     },
   });
 
-  await pipeline(Readable.fromWeb(res.body), meter, createWriteStream(dest));
+  await pipeline(Readable.fromWeb(res.body), meter, createWriteStream(dest), { signal });
   return hash.digest("hex");
 }
 
@@ -209,15 +315,15 @@ async function downloadTo(url, dest, label) {
  * package at publish time, or (for an unpublished checkout) the SHA256SUMS
  * asset of the matching GitHub Release.
  */
-async function loadChecksums() {
+async function loadChecksums(fetchImpl, releaseBase, tool) {
   if (existsSync(BUNDLED_SUMS)) return parseChecksums(readFileSync(BUNDLED_SUMS, "utf8"));
 
-  const url = `${RELEASE_BASE}/SHA256SUMS`;
-  const res = await fetch(url, { redirect: "follow" });
+  const url = `${releaseBase}/SHA256SUMS`;
+  const res = await fetchImpl(url, { redirect: "follow" });
   if (!res.ok) {
     throw new Error(
       `could not fetch the checksum manifest (${res.status} ${res.statusText}) from ${url}, ` +
-        `so the binary cannot be verified.\n${BUILD_FROM_SOURCE}`,
+        `so the binary cannot be verified.\n${buildFromSource(tool)}`,
     );
   }
   return parseChecksums(await res.text());
@@ -345,7 +451,7 @@ function lastUsedMs(dir) {
  * still running from a deleted directory keeps working on Unix, and on Windows
  * the delete just fails quietly and is retried next time.
  */
-export function pruneOldVersions(cacheRoot, keep, nowMs) {
+export function pruneOldVersions(cacheRoot, keep, nowMs, linked = []) {
   let entries;
   try {
     entries = readdirSync(cacheRoot, { withFileTypes: true });
@@ -355,12 +461,41 @@ export function pruneOldVersions(cacheRoot, keep, nowMs) {
   for (const entry of entries) {
     // Cheap name checks first, so nothing that isn't a version dir is even stat'ed.
     if (!entry.isDirectory() || entry.name === keep || !VERSION_DIR.test(entry.name)) continue;
+    if (linked.includes(entry.name)) continue;
     const dir = join(cacheRoot, entry.name);
     try {
       if (!shouldPrune(entry.name, keep, lastUsedMs(dir), nowMs)) continue;
       rmSync(dir, { recursive: true, force: true });
     } catch {
       // In use or permission denied: leave it for next time.
+    }
+  }
+}
+
+// A download that has written nothing for this long belongs to a process that
+// died mid-download (killed with its MCP client, say). Live downloads keep their
+// temp file's mtime current with every chunk.
+const STALE_DOWNLOAD_MS = 60 * 60 * 1000;
+
+/**
+ * Removes `.<asset>.<pid>.tmp` leftovers in `dir`. Pruning never visits the
+ * running version's directory, so without this each killed download stayed
+ * there (up to about 40 MB) for good.
+ */
+export function removeStaleDownloads(dir, nowMs) {
+  let entries;
+  try {
+    entries = readdirSync(dir);
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    if (!entry.startsWith(".") || !entry.endsWith(".tmp")) continue;
+    const path = join(dir, entry);
+    try {
+      if (nowMs - statSync(path).mtimeMs >= STALE_DOWNLOAD_MS) unlinkSync(path);
+    } catch {
+      // Finished or removed under us.
     }
   }
 }

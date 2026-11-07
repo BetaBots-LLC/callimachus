@@ -43,6 +43,17 @@ function CliPage() {
             line to add) and places <code className="font-mono">cal.exe</code> next to the app on
             Windows. Same local index, nothing else to set up.
           </p>
+          <p className="cat-label pt-2">Without the app</p>
+          <p className="text-sm leading-relaxed text-muted-foreground">
+            On macOS and Linux, the npm launcher downloads <code className="font-mono">cal</code>{" "}
+            from the same release as the MCP server, checks its SHA-256 and links it at{" "}
+            <code className="font-mono">~/.local/bin/cal</code>. It never replaces another program's{" "}
+            <code className="font-mono">cal</code>.
+          </p>
+          <CommandBlock
+            label="needs Node.js 18 or later"
+            lines={["npx callimachus-mcp --install-cal"]}
+          />
           <p className="cat-label pt-2">Or build from source</p>
           <CommandBlock
             label="from a checkout of the repo (add --force over an earlier source install)"
@@ -104,6 +115,21 @@ function CliPage() {
           <code className="font-mono">cal stats</code> for a corpus overview,{" "}
           <code className="font-mono">cal export</code> to write an Obsidian note, and{" "}
           <code className="font-mono">cal related</code> to find threads near some text.
+        </p>
+        <p className="mt-4 max-w-[60ch] leading-relaxed text-muted-foreground">
+          For a contract you can build on, pass <code className="font-mono">--json-version 1</code>{" "}
+          (or set <code className="font-mono">CAL_JSON_VERSION=1</code> beside{" "}
+          <code className="font-mono">--json</code>). Then search, recent, related, cat, stats,
+          memory, decisions, gotchas, commits, and audit-pr open with{" "}
+          <code className="font-mono">schema_version</code>, a list comes under{" "}
+          <code className="font-mono">results</code>, and each shape has a published JSON Schema at{" "}
+          <code className="font-mono">/schemas/cal/&lt;command&gt;.v1.json</code>, such as{" "}
+          <a href="/schemas/cal/search.v1.json" className="text-link hover:underline">
+            search.v1.json
+          </a>
+          . New fields can appear within a version; a removed or changed one gets a new version.
+          Plain <code className="font-mono">--json</code>, and every other command's JSON, keeps its
+          unversioned shape, which may change in a future major release.
         </p>
         <p className="mt-4 max-w-[60ch] leading-relaxed text-muted-foreground">
           No desktop app on this machine? <code className="font-mono">cal index</code> builds the

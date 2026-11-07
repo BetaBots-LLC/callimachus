@@ -503,14 +503,14 @@ function IndexStep() {
         <div className="space-y-1">
           <p className="text-[13px] font-medium">No threads found</p>
           <p className="text-[13px] leading-normal text-muted-foreground">
-            Callimachus scanned this machine for Claude Code, Codex, Cursor, and 9 more agents but
+            Callimachus scanned this machine for Claude Code, Codex, Cursor, and 10 more agents but
             found no history to index. If you just used one, reindex to pick it up.
           </p>
         </div>
       ) : (
         !busy && (
           <p className="text-[13px] leading-normal text-muted-foreground">
-            Builds one local index from Claude Code, Codex, Cursor, and 9 more agents. Read-only:
+            Builds one local index from Claude Code, Codex, Cursor, and 10 more agents. Read-only:
             your agents' files are never changed.
           </p>
         )
@@ -527,7 +527,7 @@ function IndexStep() {
             </span>
           </Progress>
           <p className="text-xs text-muted-foreground">
-            Scanning Claude Code, Codex, Cursor, and 9 more. Read-only.
+            Scanning Claude Code, Codex, Cursor, and 10 more. Read-only.
           </p>
         </div>
       ) : (

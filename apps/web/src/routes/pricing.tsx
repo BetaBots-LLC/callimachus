@@ -21,7 +21,7 @@ export const Route = createFileRoute("/pricing")({
 
 const OSS = [
   "Every feature: desktop, CLI, editor extension, MCP server",
-  "All 12 agent sources, hybrid search, in-app chat",
+  "All 13 agent sources, hybrid search, in-app chat",
   "Local-first: the index never leaves your machine",
   "Use, modify, and share under AGPL-3.0",
 ];

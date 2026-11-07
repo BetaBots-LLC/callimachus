@@ -1,0 +1,35 @@
+{
+  "type": "object",
+  "anyOf": [
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string"
+        },
+        "project": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "project",
+        "message"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "notice": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "notice"
+      ]
+    }
+  ]
+}

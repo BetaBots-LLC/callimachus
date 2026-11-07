@@ -1,0 +1,97 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://callimachus.app/schemas/cal/decisions.v1.json",
+  "title": "cal decisions --json",
+  "description": "Decisions semantically recalled for a query, best first.",
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "description": "Major version of this payload's shape. A reader refuses a version newer than it knows.",
+      "minimum": 0
+    },
+    "results": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/RecallHit"
+      },
+      "description": "The rows, best match (or newest) first."
+    },
+    "notice": {
+      "type": "string",
+      "description": "Present only when `results` is empty because this machine couldn't run the query (no\nembedding model for `decisions` / `gotchas`), so a reader can tell that from no match."
+    }
+  },
+  "required": [
+    "schema_version",
+    "results"
+  ],
+  "$defs": {
+    "RecallHit": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer"
+        },
+        "threadId": {
+          "type": "integer"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "projectPath": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rationale": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "ADR rationale (\"why\"), when the decision has one. NULL for gotchas/todos."
+        },
+        "similarity": {
+          "type": "number"
+        },
+        "extractor": {
+          "type": "string",
+          "description": "Who wrote it: llm, heuristic, user, agent, or an importer such as claude-memory."
+        },
+        "originRef": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "threadId",
+        "kind",
+        "text",
+        "source",
+        "title",
+        "projectPath",
+        "rationale",
+        "similarity",
+        "extractor",
+        "originRef"
+      ],
+      "description": "A semantically-recalled fact (decision/gotcha) with the thread it came from."
+    }
+  }
+}

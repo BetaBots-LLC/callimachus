@@ -1,0 +1,346 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://callimachus.app/schemas/cal/audit-pr.v1.json",
+  "title": "cal audit-pr --json",
+  "description": "Provenance, per-file history, recurring errors and memory for a pull request.",
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "description": "Major version of this payload's shape. A reader refuses a version newer than it knows.",
+      "minimum": 0
+    },
+    "repo": {
+      "type": "string",
+      "description": "The repo's project key (worktrees resolve to the main repo)."
+    },
+    "bySha": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/AuditSha"
+      },
+      "description": "Per input sha, as given: the threads inferred to have produced it (empty when none)."
+    },
+    "byFile": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/AuditFile"
+      },
+      "description": "Per changed file, as given: prior threads that mentioned it, newest first."
+    },
+    "recurringErrors": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/IssueCluster"
+      },
+      "description": "The repo's recurring errors over the last 180 days."
+    },
+    "projectMemory": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ProjectMemory"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The repo's decisions, gotchas and open TODOs (null when it can't be read)."
+    },
+    "notes": {
+      "$ref": "#/$defs/AuditNotes"
+    }
+  },
+  "required": [
+    "schema_version",
+    "repo",
+    "bySha",
+    "byFile",
+    "recurringErrors",
+    "projectMemory",
+    "notes"
+  ],
+  "$defs": {
+    "AuditSha": {
+      "type": "object",
+      "properties": {
+        "threadsProduced": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AuditCommitThread"
+          }
+        }
+      },
+      "required": [
+        "threadsProduced"
+      ]
+    },
+    "AuditCommitThread": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer"
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "overlap": {
+          "type": "integer",
+          "description": "Files the thread and the commit share (a confidence proxy, not normalized)."
+        },
+        "knowledge": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AuditKnowledge"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "title",
+        "overlap",
+        "knowledge"
+      ]
+    },
+    "AuditKnowledge": {
+      "type": "object",
+      "properties": {
+        "summary": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "decisions": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "gotchas": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "openTodos": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "extracted": {
+          "type": "boolean",
+          "description": "Whether the thread was distilled at all."
+        },
+        "stale": {
+          "type": "boolean",
+          "description": "The thread changed after it was distilled, so its facts predate the latest turns."
+        }
+      },
+      "required": [
+        "summary",
+        "decisions",
+        "gotchas",
+        "openTodos",
+        "extracted",
+        "stale"
+      ],
+      "description": "A thread's distilled reasoning, null when it could not be read."
+    },
+    "AuditFile": {
+      "type": "object",
+      "properties": {
+        "threads": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AuditFileThread"
+          }
+        }
+      },
+      "required": [
+        "threads"
+      ]
+    },
+    "AuditFileThread": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer"
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "knowledge": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AuditKnowledge"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "title",
+        "knowledge"
+      ]
+    },
+    "IssueCluster": {
+      "type": "object",
+      "properties": {
+        "example": {
+          "type": "string",
+          "description": "A representative raw error line (the latest raw sighting: candidates are read newest\nfirst and the first line seen for a signature is kept)."
+        },
+        "count": {
+          "type": "integer",
+          "description": "How many messages this error appeared in (≈ times you hit it)."
+        },
+        "threads": {
+          "type": "integer",
+          "description": "Distinct threads it spans."
+        },
+        "firstSeen": {
+          "type": "integer"
+        },
+        "lastSeen": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "example",
+        "count",
+        "threads",
+        "firstSeen",
+        "lastSeen"
+      ],
+      "description": "One recurring error, grouped by its normalized signature."
+    },
+    "ProjectMemory": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string"
+        },
+        "decisions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MemoryFact"
+          }
+        },
+        "gotchas": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MemoryFact"
+          }
+        },
+        "openTodos": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MemoryFact"
+          }
+        },
+        "threadCount": {
+          "type": "integer"
+        },
+        "distilledCount": {
+          "type": "integer"
+        },
+        "pendingCount": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "project",
+        "decisions",
+        "gotchas",
+        "openTodos",
+        "threadCount",
+        "distilledCount",
+        "pendingCount"
+      ],
+      "description": "Durable, aggregated knowledge for one project: decisions + gotchas + open TODOs\ndistilled across all its threads, plus coverage so callers can prompt to distill more."
+    },
+    "MemoryFact": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer"
+        },
+        "threadId": {
+          "type": "integer"
+        },
+        "text": {
+          "type": "string"
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "createdAt": {
+          "type": "integer"
+        },
+        "pinned": {
+          "type": "boolean"
+        },
+        "extractor": {
+          "type": "string",
+          "description": "Who wrote it: `llm`, `heuristic`, `user`, `agent`, or a harvest origin such as\n`claude-memory`. The SessionStart hook and the managed AGENTS.md / CLAUDE.md block\ndrop `claude-memory` facts, which Claude Code already loads from its own auto memory,\nand so does `.callimachus/memory.md`, a repo file people commit; MCP results and the\nProjects tab keep them."
+        },
+        "originRef": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "threadId",
+        "text",
+        "title",
+        "createdAt",
+        "pinned",
+        "extractor",
+        "originRef"
+      ],
+      "description": "One distilled fact in a project's aggregated memory, with its source thread."
+    },
+    "AuditNotes": {
+      "type": "object",
+      "properties": {
+        "distillationEnabled": {
+          "type": "boolean"
+        },
+        "linksRefreshed": {
+          "type": "integer",
+          "description": "Thread-commit links refreshed for the branch before answering.",
+          "minimum": 0
+        },
+        "threadKnowledgeAvailable": {
+          "type": "boolean",
+          "description": "False when distillation is off: knowledge fields are null, the rest still fills in."
+        }
+      },
+      "required": [
+        "distillationEnabled",
+        "linksRefreshed",
+        "threadKnowledgeAvailable"
+      ]
+    }
+  }
+}

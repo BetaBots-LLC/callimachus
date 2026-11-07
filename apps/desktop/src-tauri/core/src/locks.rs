@@ -4,7 +4,11 @@
 //! two watchers never rescan the same files and race each other's auto-distill rounds
 //! (which spend the user's daily allowance). `cal distill --auto` holds
 //! `<index>.distill.lock` for its drain, and the app's and `cal watch`'s auto-distill kicks
-//! skip while it is live. The locks are named after the index file, not its directory:
+//! skip while it is live. `cal index` holds `<index>.index.lock` for its pass, so the Claude
+//! Code plugin's SessionStart guard (`cal index --if-stale`) never starts a second pass while
+//! one runs (when the last one finished is `jobs::LAST_PASS_AT` in the index, stamped at its
+//! end, not this file's mtime, which a pass that died at once also set). The locks are named
+//! after the index file, not its directory:
 //! `pnpm desktop:dev` keeps `index.dev.db` next to the installed app's `index.db`, and a
 //! shared directory lock made `cal watch` on one index refuse because of an app on the other.
 //!
@@ -28,6 +32,9 @@ pub const GUI_LOCK: &str = "gui.lock";
 pub const WATCH_LOCK: &str = "watch.lock";
 /// Held by `cal distill --auto` for its drain.
 pub const DISTILL_LOCK: &str = "distill.lock";
+/// Held by `cal index` for its pass (run by hand, or in the background by the plugin's
+/// SessionStart guard).
+pub const INDEX_LOCK: &str = "index.lock";
 
 /// A lock this process holds until it drops (or exits).
 #[derive(Debug)]

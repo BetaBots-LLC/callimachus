@@ -70,9 +70,9 @@ function Home() {
             </h1>
             <p className="max-w-[54ch] text-lg leading-relaxed text-muted-foreground">
               Callimachus quietly indexes every conversation your AI agents write, across{" "}
-              <strong className="font-medium text-foreground">twelve tools</strong>, into one fast,
-              local, searchable catalogue, then hands each repo's memory back to the next session.
-              No cloud, no account, and the index never leaves your machine.
+              <strong className="font-medium text-foreground">thirteen tools</strong>, into one
+              fast, local, searchable catalogue, then hands each repo's memory back to the next
+              session. No cloud, no account, and the index never leaves your machine.
             </p>
             <div className="flex flex-col gap-4 pt-2 sm:flex-row sm:items-center">
               <DownloadButton release={release} primaryOs={primaryOs} placement="hero" />
@@ -108,7 +108,7 @@ function Home() {
         </Container>
 
         <Container className="relative pb-12">
-          <p className="cat-label mb-3">Twelve agents, one index</p>
+          <p className="cat-label mb-3">Thirteen agents, one index</p>
           <SourceMarquee />
         </Container>
       </section>

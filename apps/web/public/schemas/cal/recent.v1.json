@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://callimachus.app/schemas/cal/recent.v1.json",
+  "title": "cal recent --json",
+  "description": "Threads, most recently updated first.",
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "description": "Major version of this payload's shape. A reader refuses a version newer than it knows.",
+      "minimum": 0
+    },
+    "results": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ThreadSummary"
+      },
+      "description": "The rows, best match (or newest) first."
+    },
+    "notice": {
+      "type": "string",
+      "description": "Present only when `results` is empty because this machine couldn't run the query (no\nembedding model for `decisions` / `gotchas`), so a reader can tell that from no match."
+    }
+  },
+  "required": [
+    "schema_version",
+    "results"
+  ],
+  "$defs": {
+    "ThreadSummary": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer"
+        },
+        "source": {
+          "type": "string"
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "projectPath": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "messageCount": {
+          "type": "integer"
+        },
+        "updatedAt": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "starred": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "id",
+        "source",
+        "title",
+        "projectPath",
+        "messageCount",
+        "updatedAt",
+        "starred"
+      ],
+      "description": "A thread summary row for lists."
+    }
+  }
+}

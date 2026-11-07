@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://callimachus.app/schemas/cal/cat.v1.json",
+  "title": "cal cat --json",
+  "description": "One thread as a packed markdown transcript.",
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "description": "Major version of this payload's shape. A reader refuses a version newer than it knows.",
+      "minimum": 0
+    },
+    "id": {
+      "type": "integer"
+    },
+    "source": {
+      "type": "string"
+    },
+    "title": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "projectPath": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "updatedAt": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "markdown": {
+      "type": "string",
+      "description": "The packed markdown transcript (secrets redacted), trimmed to the CLI's char budget."
+    }
+  },
+  "required": [
+    "schema_version",
+    "id",
+    "source",
+    "title",
+    "projectPath",
+    "updatedAt",
+    "markdown"
+  ]
+}

@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://callimachus.app/schemas/cal/commits.v1.json",
+  "title": "cal commits --json",
+  "description": "Commits inferred from this repo's threads, newest first.",
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "description": "Major version of this payload's shape. A reader refuses a version newer than it knows.",
+      "minimum": 0
+    },
+    "results": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/TimelineRow"
+      },
+      "description": "The rows, best match (or newest) first."
+    },
+    "notice": {
+      "type": "string",
+      "description": "Present only when `results` is empty because this machine couldn't run the query (no\nembedding model for `decisions` / `gotchas`), so a reader can tell that from no match."
+    }
+  },
+  "required": [
+    "schema_version",
+    "results"
+  ],
+  "$defs": {
+    "TimelineRow": {
+      "type": "object",
+      "properties": {
+        "sha": {
+          "type": "string"
+        },
+        "shortSha": {
+          "type": "string"
+        },
+        "subject": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "committedAt": {
+          "type": "integer"
+        },
+        "bestOverlap": {
+          "type": "integer",
+          "description": "Strongest file-overlap among the linked threads (confidence proxy)."
+        },
+        "threadCount": {
+          "type": "integer",
+          "description": "How many threads link to this commit."
+        }
+      },
+      "required": [
+        "sha",
+        "shortSha",
+        "subject",
+        "committedAt",
+        "bestOverlap",
+        "threadCount"
+      ],
+      "description": "One commit in a project's timeline, grouped across the threads it was inferred from."
+    }
+  }
+}

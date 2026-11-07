@@ -1,6 +1,7 @@
-//! Codex CLI indexer. Thread metadata lives in `~/.codex/state_5.sqlite`
-//! (`threads` table), and the conversation itself in the per-thread rollout file
-//! at `threads.rollout_path` (JSONL of `response_item` / `event_msg` / etc.).
+//! Codex CLI indexer. Thread metadata lives in the state DB `state_<N>.sqlite` (`threads`
+//! table; `state_5` today) under Codex's SQLite home, and the conversation itself in the
+//! per-thread rollout file at `threads.rollout_path` (JSONL of `response_item` /
+//! `event_msg` / etc.).
 
 use super::common::{parse_rfc3339, push_message, truncate_title};
 use super::{
@@ -51,6 +52,87 @@ pub fn codex_root() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".codex"))
 }
 
+/// The directory holding Codex's SQLite state DB. Codex resolves it as `sqlite_home` in
+/// `config.toml`, else `$CODEX_SQLITE_HOME`, else the Codex home
+/// (`cfg.sqlite_home.or(sqlite_home_env).unwrap_or(codex_home)` in
+/// codex-rs/core/src/config/mod.rs, checked 2026-11-07). A relative value is taken from the
+/// Codex home, where the config file lives.
+fn sqlite_home(root: &Path) -> PathBuf {
+    let resolve = |raw: &str| {
+        let p = super::claude::expand_tilde(PathBuf::from(raw.trim()));
+        if p.is_absolute() {
+            p
+        } else {
+            root.join(p)
+        }
+    };
+    let configured = fs::read_to_string(root.join("config.toml"))
+        .ok()
+        .and_then(|text| text.parse::<toml_edit::DocumentMut>().ok())
+        .and_then(|doc| {
+            doc.get("sqlite_home")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+        .filter(|v| !v.trim().is_empty());
+    if let Some(dir) = configured {
+        return resolve(&dir);
+    }
+    if let Some(dir) = std::env::var("CODEX_SQLITE_HOME")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+    {
+        return resolve(&dir);
+    }
+    root.to_path_buf()
+}
+
+/// Every `state_<N>.sqlite` in `dir`, the one Codex wrote last first. Codex bumps N when the
+/// state schema changes (`STATE_DB_FILENAME` in codex-rs/state/src/sqlite.rs) and leaves the
+/// old file behind, so the highest N is usually the live one, but not always: a downgraded
+/// Codex writes its own lower N beside the newer leftover, which then never changes again.
+/// So the order is by last write (the file or its `-wal`, where Codex's writes land until a
+/// checkpoint), with the higher N first on a tie. The rest are fallbacks for when one can't
+/// be read (a schema this indexer doesn't know yet).
+fn state_dbs(dir: &Path) -> Vec<PathBuf> {
+    let modified = |p: &Path| fs::metadata(p).and_then(|m| m.modified()).ok();
+    let mut found: Vec<(Option<std::time::SystemTime>, u32, PathBuf)> = fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name();
+            let n = name
+                .to_str()?
+                .strip_prefix("state_")?
+                .strip_suffix(".sqlite")?
+                .parse::<u32>()
+                .ok()?;
+            let path = e.path();
+            let mut wal = path.clone().into_os_string();
+            wal.push("-wal");
+            let written = modified(&path).max(modified(Path::new(&wal)));
+            Some((written, n, path))
+        })
+        .collect();
+    found.sort_by_key(|f| std::cmp::Reverse((f.0, f.1)));
+    found.into_iter().map(|(_, _, p)| p).collect()
+}
+
+/// A state DB that is busy (Codex mid-migration or mid-checkpoint holds the lock), as
+/// opposed to one this indexer can't read. Busy is worth waiting for: falling back to an
+/// older DB would write its stale titles, and those stick until the rollout next changes.
+fn is_busy(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        c.downcast_ref::<rusqlite::Error>().is_some_and(|e| {
+            matches!(
+                e.sqlite_error_code(),
+                Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+            )
+        })
+    })
+}
+
 struct ThreadMeta {
     id: String,
     title: String,
@@ -64,7 +146,8 @@ struct ThreadMeta {
 
 /// Index Codex history. The Codex CLI, the Desktop app, and the VS Code/IDE
 /// extension (`openai.chatgpt`) all share `~/.codex` (CODEX_HOME). Two passes:
-///   1. the `state_5.sqlite` thread DB (authoritative title/cwd/branch/timestamps), then
+///   1. the newest `state_<N>.sqlite` thread DB under the SQLite home (authoritative
+///      title/cwd/branch/timestamps), then
 ///   2. any `sessions/` + `archived_sessions/` rollout JSONL not already covered.
 ///
 /// Pass 2 exists because a session is not always registered in the thread DB the
@@ -94,10 +177,30 @@ fn scan_in(conn: &mut Connection, root: &Path, tick: &mut dyn FnMut()) -> Result
     // a path spelled any other way just misses here and is deduped by id as before.
     let mut registered: HashSet<PathBuf> = HashSet::new();
 
-    // Pass 1: thread metadata from the state DB, when present.
-    let state_db = root.join("state_5.sqlite");
-    if state_db.exists() {
-        for meta in read_thread_metas(&state_db)? {
+    // Pass 1: thread metadata from the most recently written state DB that reads. Only
+    // when none does (or there is none) does every session fall through to pass 2. A busy
+    // DB ends the pass instead: the next one retries it, rather than indexing from an older
+    // DB's (or no DB's) titles that would then stick.
+    let mut metas = None;
+    for db in state_dbs(&sqlite_home(root)) {
+        match read_thread_metas(&db) {
+            Ok(m) => {
+                metas = Some(m);
+                break;
+            }
+            Err(e) if is_busy(&e) => {
+                app_log!(
+                    "[index] {} is busy, retrying next pass: {e:#}",
+                    db.display()
+                );
+                report.errors += 1;
+                return Ok(report);
+            }
+            Err(e) => app_log!("[index] {}: {e:#}", db.display()),
+        }
+    }
+    if let Some(metas) = metas {
+        for meta in metas {
             tick();
             seen.insert(meta.id.clone());
             registered.insert(PathBuf::from(&meta.rollout_path));
@@ -542,6 +645,148 @@ mod tests {
             vec!["db-id", "loose-id"],
             "no second copy under the header id"
         );
+    }
+
+    /// A state DB with one registered thread whose rollout is `rollout` (a fixture).
+    fn write_state_db(path: &Path, id: &str, title: &str, rollout: &Path) {
+        let state = Connection::open(path).unwrap();
+        state
+            .execute_batch(
+                "CREATE TABLE threads (id TEXT, title TEXT, cwd TEXT, git_branch TEXT,
+                    created_at INTEGER, updated_at INTEGER, rollout_path TEXT,
+                    first_user_message TEXT)",
+            )
+            .unwrap();
+        state
+            .execute(
+                "INSERT INTO threads VALUES (?1, ?2, '/p', NULL, 1, 2, ?3, NULL)",
+                rusqlite::params![id, title, rollout.to_string_lossy()],
+            )
+            .unwrap();
+    }
+
+    /// `sqlite_home` in config.toml moves the state DB, and the last written `state_<N>`
+    /// wins (the higher N on a tie); a DB that can't be read (an unknown schema) falls back
+    /// to the next one.
+    #[test]
+    fn reads_the_newest_state_db_under_sqlite_home() {
+        let root = std::env::temp_dir().join(format!("calli_codex_sqlh_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let day = root.join("sessions/2026/06/01");
+        std::fs::create_dir_all(&day).unwrap();
+        let rollout = day.join("rollout-x.jsonl");
+        std::fs::write(
+            &rollout,
+            format!(
+                "{}\n{}\n",
+                serde_json::json!({"type":"session_meta","payload":{"id":"header","cwd":"/p"}}),
+                serde_json::json!({"type":"response_item","payload":{"type":"message",
+                    "role":"user","content":[{"type":"input_text","text":"hello"}]}}),
+            ),
+        )
+        .unwrap();
+        // Stale DBs in the Codex home itself are ignored once sqlite_home points elsewhere.
+        write_state_db(&root.join("state_9.sqlite"), "stale", "Stale", &rollout);
+        std::fs::write(
+            root.join("config.toml"),
+            "model = \"o4\"\nsqlite_home = \"db\"\n",
+        )
+        .unwrap();
+        let db_dir = root.join("db");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        write_state_db(
+            &db_dir.join("state_5.sqlite"),
+            "old",
+            "Old schema",
+            &rollout,
+        );
+        write_state_db(
+            &db_dir.join("state_12.sqlite"),
+            "new",
+            "New schema",
+            &rollout,
+        );
+        assert_eq!(sqlite_home(&root), db_dir);
+        let set_mtime = |p: &Path, secs: u64| {
+            std::fs::File::options()
+                .write(true)
+                .open(p)
+                .unwrap()
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+                .unwrap();
+        };
+        set_mtime(&db_dir.join("state_5.sqlite"), 1_000);
+        set_mtime(&db_dir.join("state_12.sqlite"), 1_000);
+        assert_eq!(
+            state_dbs(&db_dir),
+            vec![
+                db_dir.join("state_12.sqlite"),
+                db_dir.join("state_5.sqlite")
+            ],
+            "on a tie, numeric order, not string order"
+        );
+        // A downgraded Codex writes state_5 beside the newer leftover: state_5 is live.
+        set_mtime(&db_dir.join("state_5.sqlite"), 2_000);
+        assert_eq!(state_dbs(&db_dir)[0], db_dir.join("state_5.sqlite"));
+        // A -wal write counts as a write to its DB.
+        std::fs::write(db_dir.join("state_12.sqlite-wal"), b"").unwrap();
+        set_mtime(&db_dir.join("state_12.sqlite-wal"), 3_000);
+        assert_eq!(state_dbs(&db_dir)[0], db_dir.join("state_12.sqlite"));
+        std::fs::remove_file(db_dir.join("state_12.sqlite-wal")).unwrap();
+        set_mtime(&db_dir.join("state_12.sqlite"), 4_000);
+
+        let dbp = std::env::temp_dir().join(format!("calli_codex_sqlh_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&dbp);
+        let mut conn = crate::db::open(&dbp).unwrap();
+        scan_in(&mut conn, &root, &mut || {}).unwrap();
+        let title: String = conn
+            .query_row(
+                "SELECT title FROM threads WHERE external_id = 'new'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(title, "New schema");
+
+        // The newest DB stops reading: the next one serves pass 1.
+        std::fs::remove_file(db_dir.join("state_12.sqlite")).unwrap();
+        Connection::open(db_dir.join("state_12.sqlite"))
+            .unwrap()
+            .execute_batch("CREATE TABLE threads_v2 (id TEXT)")
+            .unwrap();
+        let dbp2 =
+            std::env::temp_dir().join(format!("calli_codex_sqlh2_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&dbp2);
+        let mut conn = crate::db::open(&dbp2).unwrap();
+        scan_in(&mut conn, &root, &mut || {}).unwrap();
+        let ids: Vec<String> = conn
+            .prepare("SELECT external_id FROM threads")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(ids, vec!["old"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Busy and locked errors (worth waiting for) are told apart from the rest (worth falling
+    /// back on), through anyhow context too. A live lock rarely surfaces here: the plain
+    /// open waits out rusqlite's busy timeout and then reads `immutable=1`.
+    #[test]
+    fn busy_errors_are_told_apart() {
+        let sqlite = |code: i32| {
+            anyhow::Error::from(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(code),
+                None,
+            ))
+        };
+        assert!(is_busy(&sqlite(rusqlite::ffi::SQLITE_BUSY)));
+        assert!(is_busy(
+            &sqlite(rusqlite::ffi::SQLITE_LOCKED).context("reading threads")
+        ));
+        assert!(!is_busy(&sqlite(rusqlite::ffi::SQLITE_ERROR)));
+        assert!(!is_busy(&anyhow::anyhow!("no such table: threads")));
     }
 
     /// Real-data smoke test. Run with `cargo test -- --ignored real_codex_index --nocapture`.

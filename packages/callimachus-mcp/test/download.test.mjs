@@ -80,10 +80,13 @@ test("the glibc and Intel Mac errors don't send people to a source build that ca
   assert.match(glibcMessage(null), /musl/);
   assert.doesNotMatch(unsupportedPlatformMessage("darwin-x64"), /cargo/);
   assert.match(unsupportedPlatformMessage("darwin-x64"), /Intel Macs are not supported/);
-  // Elsewhere the source-build recipe is offered, including the empty dist dir it needs.
+  // Elsewhere the source-build recipe is offered: the Tauri-free standalone crate, so no
+  // WebKit packages and no desktop frontend build.
   const other = unsupportedPlatformMessage("linux-arm64");
   assert.match(other, /cargo build --release --locked/);
-  assert.match(other, /mkdir dist/);
+  assert.match(other, /-p callimachus-standalone --bin callimachus-mcp/);
+  assert.doesNotMatch(other, /webkit|mkdir dist/i);
+  assert.match(unsupportedPlatformMessage("linux-arm64", "cal"), /--bin cal\n/);
 });
 
 test("pruneOldVersions keeps in-progress downloads and newer versions", (t) => {

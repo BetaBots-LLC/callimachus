@@ -45,7 +45,7 @@ pub struct Link {
 }
 
 /// One commit linked to a thread (for `linked_commits` / the timeline), serialized for the UI.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct CommitLink {
     pub sha: String,
@@ -56,7 +56,7 @@ pub struct CommitLink {
 }
 
 /// One commit in a project's timeline, grouped across the threads it was inferred from.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct TimelineRow {
     pub sha: String,

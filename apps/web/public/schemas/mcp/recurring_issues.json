@@ -1,0 +1,54 @@
+{
+  "type": "object",
+  "anyOf": [
+    {
+      "type": "object",
+      "properties": {
+        "issues": {
+          "type": "array",
+          "items": {
+            "required": [
+              "example",
+              "count",
+              "threads",
+              "firstSeen",
+              "lastSeen"
+            ],
+            "type": "object",
+            "properties": {
+              "example": {
+                "type": "string"
+              },
+              "count": {
+                "type": "integer"
+              },
+              "threads": {
+                "type": "integer"
+              },
+              "firstSeen": {
+                "type": "integer"
+              },
+              "lastSeen": {
+                "type": "integer"
+              }
+            }
+          }
+        }
+      },
+      "required": [
+        "issues"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "notice": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "notice"
+      ]
+    }
+  ]
+}

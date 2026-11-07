@@ -107,6 +107,8 @@ export const SOURCE_LABELS: Record<string, string> = {
   cline: "Cline",
   roo: "Roo Code",
   kilo: "Kilo Code",
+  copilot: "Copilot Chat",
+  copilot_cli: "Copilot CLI",
   in_app: "Chat",
 };
 

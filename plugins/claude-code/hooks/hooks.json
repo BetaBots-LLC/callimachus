@@ -1,5 +1,5 @@
 {
-  "description": "Callimachus memory hooks: inject the repo's memory at session start, keep the compaction summary, and queue an ended session for distillation. Each one exits quietly when the cal CLI is not installed.",
+  "description": "Callimachus memory hooks: inject the repo's memory at session start, keep the index fresh when the desktop app is not running, keep the compaction summary, and queue an ended session for distillation. Each one exits quietly when the cal CLI is not installed.",
   "hooks": {
     "SessionStart": [
       {
@@ -9,6 +9,16 @@
             "type": "command",
             "command": "[ ! -x \"$HOME/.local/bin/cal\" ] || \"$HOME/.local/bin/cal\" hook",
             "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "startup|resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ ! -x \"$HOME/.local/bin/cal\" ] || ! \"$HOME/.local/bin/cal\" help 2>/dev/null | grep -q '^  cal index ' || \"$HOME/.local/bin/cal\" index --if-stale",
+            "timeout": 5
           }
         ]
       }

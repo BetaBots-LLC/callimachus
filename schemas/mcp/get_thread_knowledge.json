@@ -1,0 +1,118 @@
+{
+  "type": "object",
+  "anyOf": [
+    {
+      "type": "object",
+      "properties": {
+        "summary": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "decisions": {
+          "type": "array",
+          "items": {
+            "required": [
+              "id",
+              "text",
+              "pinned"
+            ],
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "integer"
+              },
+              "text": {
+                "type": "string"
+              },
+              "pinned": {
+                "type": "boolean"
+              }
+            }
+          }
+        },
+        "gotchas": {
+          "type": "array",
+          "items": {
+            "required": [
+              "id",
+              "text",
+              "pinned"
+            ],
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "integer"
+              },
+              "text": {
+                "type": "string"
+              },
+              "pinned": {
+                "type": "boolean"
+              }
+            }
+          }
+        },
+        "todos": {
+          "type": "array",
+          "items": {
+            "required": [
+              "id",
+              "text",
+              "pinned"
+            ],
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "integer"
+              },
+              "text": {
+                "type": "string"
+              },
+              "pinned": {
+                "type": "boolean"
+              }
+            }
+          }
+        },
+        "extracted": {
+          "type": "boolean"
+        },
+        "stale": {
+          "type": "boolean"
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "canDistill": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "summary",
+        "decisions",
+        "gotchas",
+        "todos",
+        "extracted",
+        "stale",
+        "error",
+        "canDistill"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "notice": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "notice"
+      ]
+    }
+  ]
+}

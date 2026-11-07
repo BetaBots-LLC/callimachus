@@ -79,7 +79,7 @@ pub(crate) fn project_condition_at(t: &str, mode: ProjectMatch, ph: usize) -> St
 }
 
 /// One message-level search hit.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchHit {
     pub thread_id: i64,
@@ -93,7 +93,7 @@ pub struct SearchHit {
 }
 
 /// A thread summary row for lists.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadSummary {
     pub id: i64,
@@ -1389,7 +1389,7 @@ fn thread_summary(conn: &Connection, id: i64) -> Result<Option<ThreadSummary>> {
 }
 
 /// Aggregate stats over the whole index, for the dashboard / `cal stats`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Stats {
     pub threads: i64,
@@ -1403,7 +1403,7 @@ pub struct Stats {
     pub top_projects: Vec<ProjectStat>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SourceStat {
     pub kind: String,
@@ -1411,14 +1411,14 @@ pub struct SourceStat {
     pub messages: i64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RoleStat {
     pub role: String,
     pub messages: i64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectStat {
     pub project: String,

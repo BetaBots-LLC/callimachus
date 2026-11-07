@@ -1,0 +1,42 @@
+{
+  "type": "object",
+  "anyOf": [
+    {
+      "type": "object",
+      "properties": {
+        "tags": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "tag": {
+                "type": "string"
+              },
+              "threads": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "tag",
+              "threads"
+            ]
+          }
+        }
+      },
+      "required": [
+        "tags"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "notice": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "notice"
+      ]
+    }
+  ]
+}

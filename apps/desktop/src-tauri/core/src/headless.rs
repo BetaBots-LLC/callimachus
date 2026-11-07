@@ -17,7 +17,12 @@
 //!   skips unchanged files, a vector batch is stored only for messages still pending), but
 //!   a Shrink index or Reclaim space in the app holds the write lock for the whole rewrite,
 //!   so a file or batch that waits past the busy timeout fails: run the command again after
-//!   it finishes.
+//!   it finishes. Two `cal index` passes never overlap (`index.lock`).
+//! - `cal index --if-stale` is the Claude Code plugin's SessionStart guard: it starts a
+//!   `cal index` in the background only when nothing else keeps the index fresh, and like
+//!   every hook it prints nothing, exits 0 and never creates the index. Its pass upgrades
+//!   the schema only from the npm launcher's `cal` with no app running, a plugin-only
+//!   setup's one writer (see [`stale_index_gate`]).
 
 use crate::jobs::{self, EventSink, Host, JobFlags, JobHost, Task};
 use crate::{db, embed, indexer, knowledge, locks};
@@ -239,11 +244,36 @@ fn index_once(host: &Arc<CliHost>) -> anyhow::Result<indexer::IndexReport> {
     jobs::run_index_all(&dyn_host, job)
 }
 
+/// `cal index --if-stale`, the plugin's SessionStart guard.
+pub const INDEX_IF_STALE: &str = "--if-stale";
+
 /// `cal index`: one catch-up pass over every source (unchanged files cost a stat each).
 /// Progress goes to stderr, the summary to stdout; exits 1 when the scan failed or any
-/// session could not be indexed.
+/// session could not be indexed. With [`INDEX_IF_STALE`], the plugin's SessionStart guard
+/// instead (see [`index_if_stale`]).
 pub fn cmd_index(args: &[String]) -> anyhow::Result<()> {
-    no_args("index", args)?;
+    if let [flag] = args {
+        if flag == INDEX_IF_STALE {
+            return index_if_stale();
+        }
+    }
+    if let Some(a) = args.first() {
+        anyhow::bail!(
+            "unknown argument '{a}' for `cal index` (it takes none, or {INDEX_IF_STALE}). Run `cal help`."
+        );
+    }
+    let index = db::default_index_path();
+    // A second pass alongside would only repeat the first one's work; the lock also stops
+    // the plugin's guard from starting one while this runs. The guard reads "indexed
+    // recently" from `jobs::LAST_PASS_AT`, which the pass stamps when it finishes.
+    let _lock = match locks::acquire(&index, locks::INDEX_LOCK)? {
+        locks::Acquire::Acquired(lock) => lock,
+        locks::Acquire::Held(pid) => anyhow::bail!(
+            "cal index is already running{} for this index (the Claude Code plugin starts one in \
+             the background at session start); it finishes on its own",
+            locks::pid_note(pid)
+        ),
+    };
     let started = Instant::now();
     let host = open_host(HostOptions {
         readers: false,
@@ -272,6 +302,279 @@ pub fn cmd_index(args: &[String]) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// How recent the last full pass must be for the plugin's SessionStart guard to leave the
+/// index alone. An hour: a catch-up pass costs a stat per session file, which a session start
+/// can afford hourly but not every time (several agents in parallel each start one).
+const STALE_AFTER: Duration = Duration::from_secs(60 * 60);
+
+/// The background pass's log, next to the index (`index.db.index.log`), appended to by each
+/// pass and started over once it passes [`INDEX_LOG_MAX_BYTES`].
+const INDEX_LOG: &str = "index.log";
+/// A pass writes a few hundred bytes (a line per source and the summary), so this keeps the
+/// last several hundred passes.
+const INDEX_LOG_MAX_BYTES: u64 = 256 * 1024;
+
+/// What the SessionStart guard does with the index.
+#[derive(Debug, PartialEq, Eq)]
+enum StaleGate {
+    /// Leave it alone; the reason, for a user who ran the guard by hand.
+    Skip(&'static str),
+    /// Leave it alone because its schema is not this binary's to change, with the line the
+    /// guard writes to the index log (otherwise a stale index would have no visible cause).
+    SchemaHeld(String),
+    /// Start a pass, which first applies this many schema upgrades (0 for none).
+    Run { upgrades: i32 },
+}
+
+/// `cal index --if-stale`: the Claude Code plugin's SessionStart guard, so a machine without
+/// the app still gets a fresh index. Starts `cal index` in the background (detached, its
+/// output appended to `index.db.index.log`) when [`stale_index_gate`] finds nothing else
+/// keeping the index fresh, and returns at once: the session never waits on the pass, and
+/// this session's own memory injection reads the index as it was. Silent as a hook; on a
+/// terminal it says in one line what it did.
+fn index_if_stale() -> anyhow::Result<()> {
+    let result = start_pass_if_stale();
+    match &result {
+        Ok(line) => tell(line),
+        Err(e) => tell(&format!(
+            "cal index --if-stale: could not start a pass: {e:#}"
+        )),
+    }
+    result.map(drop)
+}
+
+/// The guard's work, returning the line [`index_if_stale`] shows on a terminal.
+fn start_pass_if_stale() -> anyhow::Result<String> {
+    let index = db::default_index_path();
+    // Resolved once, before the gate: on macOS `current_exe()` is the path as invoked (the
+    // `~/.local/bin/cal` link), and the launcher's `followLinkedCal`, running at this same
+    // session start, can re-point that link to a newer release. Spawning the link would then
+    // run a `cal index` that migrates an index the gate checked against this binary.
+    let exe = std::fs::canonicalize(std::env::current_exe()?)?;
+    match stale_index_gate(&index, std::time::SystemTime::now(), is_launcher_cal(&exe)) {
+        StaleGate::Skip(why) => Ok(format!("cal index --if-stale: left the index alone: {why}")),
+        StaleGate::SchemaHeld(line) => {
+            append_index_log(&index, &line);
+            Ok(format!(
+                "cal index --if-stale: left the index alone: {line}"
+            ))
+        }
+        StaleGate::Run { upgrades } => {
+            let mut header = "cal index, started by the SessionStart hook".to_string();
+            if upgrades > 0 {
+                header.push_str(&format!(
+                    "; it applies {upgrades} schema upgrade(s) first (the launcher's cal, no app running)"
+                ));
+            }
+            spawn_background_index(&index, &spawn_target(exe), &header)?;
+            Ok(format!(
+                "cal index --if-stale: started cal index in the background; its output goes to {}",
+                locks::lock_path(&index, INDEX_LOG).display()
+            ))
+        }
+    }
+}
+
+/// One line to stderr, only when a person is reading it: as a hook the guard must print
+/// nothing (Claude Code shows hook stderr), but `cal index --if-stale` typed in a terminal
+/// should say why it did nothing.
+fn tell(line: &str) {
+    use std::io::IsTerminal;
+    if std::io::stderr().is_terminal() {
+        note(line);
+    }
+}
+
+/// Whether `exe` (already resolved) is a `cal` the npm launcher downloaded:
+/// `<cache>/callimachus-mcp/<version>/cal-<triple>`. Matched by shape rather than against
+/// the launcher's cache root, which follows `$XDG_CACHE_HOME`: the shell that ran
+/// `npx callimachus-mcp --install-cal` and the agent running this hook can disagree on it.
+fn is_launcher_cal(exe: &std::path::Path) -> bool {
+    let name_of = |p: Option<&std::path::Path>| {
+        p.and_then(std::path::Path::file_name)
+            .and_then(|n| n.to_str())
+            .map(str::to_string)
+    };
+    let version_dir = exe.parent();
+    let is_version = |v: &str| {
+        let core = v.split(['-', '+']).next().unwrap_or_default();
+        let parts: Vec<&str> = core.split('.').collect();
+        parts.len() == 3
+            && parts
+                .iter()
+                .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+    };
+    name_of(Some(exe)).is_some_and(|n| n.starts_with("cal-"))
+        && name_of(version_dir).is_some_and(|v| is_version(&v))
+        && name_of(version_dir.and_then(std::path::Path::parent)).as_deref()
+            == Some("callimachus-mcp")
+}
+
+/// The binary the background pass runs: `exe`, except inside an AppImage, whose mount goes
+/// away when the hook (the AppImage runtime's child) exits, under a pass still running from it.
+fn spawn_target(exe: std::path::PathBuf) -> std::path::PathBuf {
+    if crate::integration::running_from_appimage() {
+        if let Ok(image) = crate::integration::stable_app_exe(&exe) {
+            return image;
+        }
+    }
+    exe
+}
+
+/// What the SessionStart guard does with the index at `index` at `now`. `launcher_cal`: this
+/// binary is the npm launcher's `cal` ([`is_launcher_cal`]), the one `cal` allowed to
+/// upgrade the index's schema from here. Cheapest checks first: most session starts stop at a
+/// lock probe or one `app_config` row.
+fn stale_index_gate(
+    index: &std::path::Path,
+    now: std::time::SystemTime,
+    launcher_cal: bool,
+) -> StaleGate {
+    // Hooks never create the index: the first import is the user's call (`cal index`, or
+    // Index my history in the app's onboarding, which an import from here would skip past).
+    if !index.exists() {
+        return StaleGate::Skip("no index yet");
+    }
+    if locks::holder(index, locks::INDEX_LOCK).is_some() {
+        return StaleGate::Skip("a cal index pass is running");
+    }
+    if locks::holder(index, locks::GUI_LOCK).is_some() {
+        return StaleGate::Skip("the app keeps the index fresh");
+    }
+    if locks::holder(index, locks::WATCH_LOCK).is_some() {
+        return StaleGate::Skip("cal watch keeps the index fresh");
+    }
+    let Ok(conn) = db::open_readonly(index) else {
+        return StaleGate::Skip("the index cannot be read");
+    };
+    // Only the launcher's `cal` may upgrade the schema, and only with no app running
+    // (gui.lock was checked above): it is a plugin-only setup's sole writer, and refusing
+    // left the index on the old schema after every schema-bumping release until the user
+    // ran `cal index` by hand. An app-linked `cal` never does: a `cal` newer than the
+    // installed app would upgrade the index past it (the app then cannot open it), and an
+    // index ahead of this binary cannot be written by it at all.
+    let upgrades = match db::schema_pending(&conn) {
+        Ok(0) => 0,
+        Ok(n) if n > 0 && launcher_cal => n,
+        Ok(n) if n > 0 => {
+            return StaleGate::SchemaHeld(format!(
+                "the index needs {n} schema upgrade(s), which this cal leaves to the Callimachus app; open the app to apply them"
+            ))
+        }
+        Ok(_) => {
+            return StaleGate::SchemaHeld(
+                "a newer Callimachus upgraded the index, which this cal cannot write; update this cal".into(),
+            )
+        }
+        Err(_) => return StaleGate::Skip("the index cannot be read"),
+    };
+    // When the last full pass finished (`jobs::mark_pass_finished`), even one that found
+    // nothing new: a quiet machine's threads all have an old `last_indexed_at`. A point
+    // lookup on app_config's key, where `MAX(threads.last_indexed_at)` scanned the whole
+    // table (1.4 s cold on 21k threads, inside the hook's 5 s). Unset (no pass since this
+    // marker exists, or an app-only history) reads as stale. A pending upgrade does not
+    // wait out the hour: until it runs, the MCP server refuses the index.
+    let now_secs = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    let last_pass = knowledge::app_config::get(&conn, jobs::LAST_PASS_AT)
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<i64>().ok());
+    // A pass "after" now (clock skew) is as fresh as it gets.
+    if upgrades == 0 && last_pass.is_some_and(|at| now_secs - at < STALE_AFTER.as_secs() as i64) {
+        return StaleGate::Skip("a cal index pass finished within the hour");
+    }
+    // An empty index has had no first import yet; that stays the user's call, as above.
+    match conn.query_row("SELECT EXISTS(SELECT 1 FROM threads)", [], |r| {
+        r.get::<_, bool>(0)
+    }) {
+        Ok(true) => StaleGate::Run { upgrades },
+        Ok(false) => StaleGate::Skip("the index is empty"),
+        Err(_) => StaleGate::Skip("the index cannot be read"),
+    }
+}
+
+/// Start `exe index` detached from the hook, with `header` opening its entry in the index log.
+fn spawn_background_index(
+    index: &std::path::Path,
+    exe: &std::path::Path,
+    header: &str,
+) -> anyhow::Result<()> {
+    // Not waited on: the pass outlives this hook, and dropping the handle neither kills nor
+    // waits for it.
+    spawn_detached(exe, &["index"], open_index_log(index, header))?;
+    Ok(())
+}
+
+/// Start `exe args` detached: no stdin, stdout and stderr to `log` (or nowhere), in its own
+/// process group (Unix) or a new one without a console (Windows), so neither Claude Code
+/// waiting on the hook's pipes nor a signal to the hook's group reaches it.
+fn spawn_detached(
+    exe: &std::path::Path,
+    args: &[&str],
+    log: Option<std::fs::File>,
+) -> std::io::Result<std::process::Child> {
+    use std::process::{Command, Stdio};
+    let mut cmd = Command::new(exe);
+    cmd.args(args).stdin(Stdio::null());
+    match log {
+        Some(log) => {
+            cmd.stdout(log.try_clone()?).stderr(log);
+        }
+        None => {
+            cmd.stdout(Stdio::null()).stderr(Stdio::null());
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+    }
+    cmd.spawn()
+}
+
+/// Write one `--- <time> <line>` entry to the index log, for a start the guard declined.
+fn append_index_log(index: &std::path::Path, line: &str) {
+    drop(open_index_log(index, &format!("SessionStart hook: {line}")));
+}
+
+/// The index log opened for appending, with a `--- <time> <header>` line written, or None
+/// when it cannot be written (the pass then runs without a log).
+fn open_index_log(index: &std::path::Path, header: &str) -> Option<std::fs::File> {
+    let path = locks::lock_path(index, INDEX_LOG);
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > INDEX_LOG_MAX_BYTES) {
+        // Emptied, then opened for appending like any other start below: a handle opened
+        // with truncate alone writes at its own offset, so a pass a second session started
+        // at the same moment had its lines overwritten by this one's.
+        let _ = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&path);
+    }
+    // Append, not truncate: two sessions starting at once can both pass the gate, and the
+    // second pass's "already running" line must not wipe the first one's output.
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(&path)
+        .ok()?;
+    writeln!(
+        file,
+        "--- {} {header}",
+        chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+    )
+    .ok()?;
+    Some(file)
 }
 
 /// `cal watch`: the app's watcher loop in the foreground, for a machine without the app.
@@ -520,6 +823,212 @@ mod tests {
             kicks_auto_distill: false,
             progress: Mutex::new(Progress::default()),
         })
+    }
+
+    /// The plugin's SessionStart guard starts a pass only for an existing, non-empty index
+    /// whose last full pass finished more than an hour ago, with no app, `cal watch` or other
+    /// pass keeping it fresh.
+    #[test]
+    fn the_session_start_guard_only_starts_a_pass_for_a_stale_idle_index() {
+        let path = temp_index("stale_gate");
+        let now = std::time::SystemTime::now();
+        let now_secs = chrono::Utc::now().timestamp();
+        let gate = |p: &std::path::Path| stale_index_gate(p, now, false);
+        let run = StaleGate::Run { upgrades: 0 };
+        assert_eq!(gate(&path), StaleGate::Skip("no index yet"));
+        assert!(!path.exists(), "the guard never creates the index");
+
+        let mut conn = db::open(&path).unwrap();
+        assert_eq!(gate(&path), StaleGate::Skip("the index is empty"));
+        let sid = indexer::source_id(&conn, "claude_code").unwrap();
+        indexer::upsert_thread(
+            &mut conn,
+            sid,
+            &indexer::ParsedThread {
+                external_id: "t".into(),
+                messages: vec![indexer::ParsedMessage {
+                    role: "user".into(),
+                    text: "hello".into(),
+                    tool_name: None,
+                    ts: Some(now_secs),
+                }],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // No full pass on record (only the app's watcher wrote threads, say): stale.
+        assert_eq!(gate(&path), run);
+        jobs::mark_pass_finished(&conn, now_secs - 60);
+        assert_eq!(
+            gate(&path),
+            StaleGate::Skip("a cal index pass finished within the hour")
+        );
+        jobs::mark_pass_finished(&conn, now_secs - 2 * 3600);
+        assert_eq!(gate(&path), run, "two hours old, nobody indexing");
+
+        // A pass in progress, the app, or `cal watch`: each keeps it fresh. A pass that
+        // started (took index.lock) but never finished leaves the index stale.
+        for (name, why) in [
+            (locks::INDEX_LOCK, "a cal index pass is running"),
+            (locks::GUI_LOCK, "the app keeps the index fresh"),
+            (locks::WATCH_LOCK, "cal watch keeps the index fresh"),
+        ] {
+            let locks::Acquire::Acquired(lock) = locks::acquire(&path, name).unwrap() else {
+                panic!("{name} is free");
+            };
+            assert_eq!(gate(&path), StaleGate::Skip(why));
+            drop(lock);
+        }
+        assert_eq!(
+            gate(&path),
+            run,
+            "the pass that took index.lock never finished"
+        );
+
+        // A schema behind this binary: only the launcher's cal upgrades it; the app-linked
+        // one leaves it to the app, and nobody writes an index a newer build upgraded.
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        conn.pragma_update(None, "user_version", version - 1)
+            .unwrap();
+        assert!(matches!(gate(&path), StaleGate::SchemaHeld(l) if l.contains("open the app")));
+        // The upgrade runs at once, not an hour after the last pass: the MCP server refuses
+        // the index until it does.
+        jobs::mark_pass_finished(&conn, now_secs - 60);
+        assert_eq!(
+            stale_index_gate(&path, now, true),
+            StaleGate::Run { upgrades: 1 }
+        );
+        jobs::mark_pass_finished(&conn, now_secs - 2 * 3600);
+        conn.pragma_update(None, "user_version", version + 1)
+            .unwrap();
+        for launcher in [false, true] {
+            assert!(
+                matches!(stale_index_gate(&path, now, launcher), StaleGate::SchemaHeld(l) if l.contains("update this cal")),
+                "launcher {launcher}"
+            );
+        }
+        conn.pragma_update(None, "user_version", version).unwrap();
+        assert_eq!(gate(&path), run);
+    }
+
+    /// The guard's freshness read is one row by app_config's primary key, not a scan: it runs
+    /// at every session start inside a 5 s hook timeout, next to `cal hook` reading the index.
+    #[test]
+    fn the_guard_reads_the_last_pass_with_a_point_lookup() {
+        let path = temp_index("last_pass_plan");
+        let conn = db::open(&path).unwrap();
+        let mut stmt = conn
+            .prepare("EXPLAIN QUERY PLAN SELECT value FROM app_config WHERE key = ?1")
+            .unwrap();
+        let plan = stmt
+            .query_map([jobs::LAST_PASS_AT], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join(" | ");
+        assert!(
+            plan.starts_with("SEARCH app_config USING INDEX") && plan.contains("(key=?)"),
+            "{plan}"
+        );
+    }
+
+    #[test]
+    fn only_a_cal_in_the_launchers_cache_counts_as_the_launchers() {
+        let yes = |p: &str| is_launcher_cal(std::path::Path::new(p));
+        assert!(yes(
+            "/home/me/.cache/callimachus-mcp/0.11.4/cal-x86_64-unknown-linux-gnu"
+        ));
+        // Another $XDG_CACHE_HOME than this process sees, and a prerelease.
+        assert!(yes(
+            "/tmp/xdg/callimachus-mcp/1.0.0-rc.1/cal-aarch64-apple-darwin"
+        ));
+        assert!(!yes(
+            "/Applications/Callimachus.app/Contents/MacOS/callimachus"
+        ));
+        assert!(!yes(
+            "/home/me/src/callimachus/apps/desktop/src-tauri/target/release/cal"
+        ));
+        assert!(!yes(
+            "/home/me/.cache/callimachus-mcp/0.11.4/callimachus-mcp-x86_64-unknown-linux-gnu"
+        ));
+        assert!(!yes("/home/me/.cache/callimachus-mcp/latest/cal-x86_64"));
+        assert!(!yes("/home/me/.cache/other/0.11.4/cal-x86_64"));
+    }
+
+    /// The log keeps earlier passes (two sessions starting at once must not wipe each other's
+    /// output) and starts over once it is too big, still appending after that.
+    #[test]
+    fn the_index_log_appends_and_starts_over_when_big() {
+        let path = temp_index("index_log");
+        let log = locks::lock_path(&path, INDEX_LOG);
+        drop(open_index_log(&path, "first").unwrap());
+        append_index_log(&path, "left the index alone");
+        let text = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(text.lines().count(), 2);
+        assert!(text.lines().next().unwrap().ends_with(" first"), "{text}");
+        assert!(
+            text.ends_with(" SessionStart hook: left the index alone\n"),
+            "{text}"
+        );
+
+        std::fs::write(&log, vec![b'x'; INDEX_LOG_MAX_BYTES as usize + 1]).unwrap();
+        let mut ours = open_index_log(&path, "after the reset").unwrap();
+        let text = std::fs::read_to_string(&log).unwrap();
+        assert!(text.starts_with("--- "), "{}", &text[..20]);
+        assert_eq!(text.lines().count(), 1);
+        // Another session's pass appends meanwhile; ours must land after it, not over it.
+        let mut theirs = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+        writeln!(theirs, "their pass").unwrap();
+        writeln!(ours, "our pass").unwrap();
+        let text = std::fs::read_to_string(&log).unwrap();
+        assert!(text.ends_with("their pass\nour pass\n"), "{text}");
+    }
+
+    /// The background pass never holds up the session: the spawn returns while the child
+    /// still runs, the child leads its own process group (a signal to the hook's group does
+    /// not reach it), reads no stdin, and appends its output to the log.
+    #[cfg(unix)]
+    #[test]
+    fn a_background_pass_is_detached_from_the_hook() {
+        let path = temp_index("spawn_detached");
+        let log = locks::lock_path(&path, INDEX_LOG);
+        std::fs::write(&log, "an earlier pass\n").unwrap();
+        let script = "read line; echo \"stdin=$?\"; \
+                      echo \"pid=$$ pgid=$(ps -o pgid= -p $$ | tr -d ' ')\"; \
+                      echo to-stderr >&2; sleep 1; echo done";
+        let started = Instant::now();
+        let mut child = spawn_detached(
+            std::path::Path::new("/bin/sh"),
+            &["-c", script],
+            open_index_log(&path, "test pass"),
+        )
+        .unwrap();
+        assert!(started.elapsed() < Duration::from_millis(900));
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "returned before the child exits"
+        );
+        assert!(child.wait().unwrap().success());
+        let text = std::fs::read_to_string(&log).unwrap();
+        assert!(text.starts_with("an earlier pass\n--- "), "{text}");
+        assert!(text.contains(" test pass\n"), "{text}");
+        assert!(
+            text.contains("stdin=1\n"),
+            "stdin is /dev/null (EOF): {text}"
+        );
+        assert!(
+            text.contains("to-stderr\n") && text.ends_with("done\n"),
+            "{text}"
+        );
+        let ids = text
+            .lines()
+            .find_map(|l| l.strip_prefix("pid="))
+            .expect("the pid line");
+        let (pid, pgid) = ids.split_once(" pgid=").unwrap();
+        assert_eq!(pid, pgid, "the child leads its own process group");
+        assert_ne!(pgid, std::process::id().to_string());
     }
 
     #[test]

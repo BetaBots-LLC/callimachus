@@ -92,6 +92,7 @@ pub const SOURCES: &[&str] = &[
     "roo",
     "kilo",
     "copilot",
+    "copilot_cli",
     "in_app",
 ];
 
@@ -154,7 +155,7 @@ pub const COUNT_BUCKETS: &[&str] = &[
 /// Duration buckets (index runs).
 pub const DURATION_BUCKETS: &[&str] = &["<1s", "1-5s", "5-30s", "30s-2m", "2-10m", "10m+"];
 
-/// Highest source count reported as-is (there are 12 sources today).
+/// Highest source count reported as-is (14 source kinds today: 13 agents plus in_app).
 const MAX_SOURCES: u32 = 64;
 
 /// Return the allowlisted spelling of `value`, or `"other"`. Returning the `'static`

@@ -101,6 +101,20 @@ function McpPage() {
             loads twice. On Windows, skip the plugin and click Enable for Claude Code there instead:
             the plugin's hooks need Git Bash, and the app keeps its own install.
           </p>
+          <p className="cat-label pt-2">The plugin without the app</p>
+          <p className="text-sm leading-relaxed text-muted-foreground">
+            On macOS and Linux the plugin works with no desktop app at all. Install the{" "}
+            <code className="font-mono">cal</code> CLI from the same release and build the index
+            once; after that the plugin's SessionStart hook refreshes the index in the background
+            whenever no full pass finished in the last hour, and{" "}
+            <code className="font-mono">cal watch</code> keeps it fresh to the minute if you want.
+            You give up the app's Projects page, Chat, Settings and the harvest controls, so memory
+            distillation stays off; search, recall and the memory hooks work the same.
+          </p>
+          <CommandBlock
+            label="then cal embed for semantic search (downloads a 128 MB model once)"
+            lines={["npx callimachus-mcp --install-cal", "cal index"]}
+          />
           <p className="text-sm leading-relaxed text-muted-foreground">
             Without the plugin, Enable for Claude Code (or Connect in the setup checklist) registers
             the app itself as Claude Code's MCP server, and Other agents in the same section does
@@ -160,6 +174,19 @@ function McpPage() {
             and project memory as the <code className="font-mono">callimachus://memory</code>{" "}
             resource, and when a repo isn't distilled yet it answers with its closest past sessions
             instead of an empty list.
+          </p>
+          <p className="text-sm leading-relaxed text-muted-foreground">
+            Every tool declares an output schema and returns structured content that matches it, so
+            a client can rely on the shape: lists under a key, markdown under{" "}
+            <code className="font-mono">markdown</code>, and setup guidance as{" "}
+            <code className="font-mono">notice</code> when the index can't answer yet. The schemas
+            are published at <code className="font-mono">/schemas/mcp/&lt;tool&gt;.json</code>, such
+            as{" "}
+            <a href="/schemas/mcp/recall_decisions.json" className="text-link hover:underline">
+              recall_decisions.json
+            </a>
+            . The text block reads the same for every client; one older than MCP 2025-06-18 gets no
+            structured content.
           </p>
         </div>
       </div>

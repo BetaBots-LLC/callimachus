@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://callimachus.app/schemas/cal/search.v1.json",
+  "title": "cal search --json",
+  "description": "Message-level matches for a query, best first. Snippets keep the \\u0001 / \\u0002 match markers around highlighted terms.",
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "description": "Major version of this payload's shape. A reader refuses a version newer than it knows.",
+      "minimum": 0
+    },
+    "results": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/SearchHit"
+      },
+      "description": "The rows, best match (or newest) first."
+    },
+    "notice": {
+      "type": "string",
+      "description": "Present only when `results` is empty because this machine couldn't run the query (no\nembedding model for `decisions` / `gotchas`), so a reader can tell that from no match."
+    }
+  },
+  "required": [
+    "schema_version",
+    "results"
+  ],
+  "$defs": {
+    "SearchHit": {
+      "type": "object",
+      "properties": {
+        "threadId": {
+          "type": "integer"
+        },
+        "messageId": {
+          "type": "integer"
+        },
+        "source": {
+          "type": "string"
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "projectPath": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "role": {
+          "type": "string"
+        },
+        "snippet": {
+          "type": "string"
+        },
+        "ts": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "threadId",
+        "messageId",
+        "source",
+        "title",
+        "projectPath",
+        "role",
+        "snippet",
+        "ts"
+      ],
+      "description": "One message-level search hit."
+    }
+  }
+}

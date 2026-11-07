@@ -274,7 +274,7 @@ fn workspace_folder(hash_dir: &Path) -> Option<String> {
 }
 
 /// `file:///Users/me/proj` -> `/Users/me/proj`; `file:///c%3A/Users` -> `C:/Users`.
-fn uri_to_path(uri: &str) -> Option<String> {
+pub(super) fn uri_to_path(uri: &str) -> Option<String> {
     let decoded = pct_decode(uri.strip_prefix("file://")?);
     let b = decoded.as_bytes();
     // Windows drive: "/C:/Users/.." -> "C:/Users/.."

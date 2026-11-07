@@ -15,7 +15,7 @@ use serde::Serialize;
 const SNAPSHOT_BUDGET_CHARS: usize = context::DEFAULT_BUDGET_CHARS;
 
 /// Snapshot metadata (no body), for lists.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Snapshot {
     pub id: i64,

@@ -16,7 +16,9 @@
       "!**/routeTree.gen.ts",
       "!pnpm-lock.yaml",
       "!**/*.svg",
-      "!**/*.md"
+      "!**/*.md",
+      "!**/schemas/cal/*.json",
+      "!**/schemas/mcp/*.json"
     ]
   },
   "formatter": {

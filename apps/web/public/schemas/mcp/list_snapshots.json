@@ -1,0 +1,71 @@
+{
+  "type": "object",
+  "anyOf": [
+    {
+      "type": "object",
+      "properties": {
+        "snapshots": {
+          "type": "array",
+          "items": {
+            "required": [
+              "id",
+              "threadId",
+              "projectPath",
+              "sourceKind",
+              "label",
+              "tokenEstimate",
+              "createdAt"
+            ],
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "integer"
+              },
+              "threadId": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "projectPath": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "sourceKind": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "label": {
+                "type": "string"
+              },
+              "tokenEstimate": {
+                "type": "integer"
+              },
+              "createdAt": {
+                "type": "integer"
+              }
+            }
+          }
+        }
+      },
+      "required": [
+        "snapshots"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "notice": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "notice"
+      ]
+    }
+  ]
+}
