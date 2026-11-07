@@ -20,7 +20,7 @@ use std::sync::OnceLock;
 /// The `/recall` skill, embedded at compile time from a committed resource (so a fresh checkout
 /// builds; the repo's own `.claude/` is gitignored). Written to the user's skills dir on install,
 /// with a machine-specific note about where `cal` lives (see [`render_skill`]).
-pub const SKILL_MD: &str = include_str!("../resources/recall/SKILL.md");
+pub const SKILL_MD: &str = include_str!("../../resources/recall/SKILL.md");
 
 /// The MCP server name registered in each agent's config.
 const MCP_NAME: &str = "callimachus";
@@ -3874,7 +3874,7 @@ mod tests {
     /// server under our name, and the app's version, which sync-versions.mjs keeps in step.
     #[test]
     fn claude_plugin_mirrors_the_app_install() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../plugins/claude-code");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../../plugins/claude-code");
         let read = |rel: &str| {
             std::fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"))
         };
@@ -3913,7 +3913,7 @@ mod tests {
         assert_eq!(hooks["hooks"], Value::Object(expected));
 
         let mcp: Value = serde_json::from_str(&read(".mcp.json")).unwrap();
-        let version = env!("CARGO_PKG_VERSION");
+        let version = env!("CALLIMACHUS_VERSION");
         assert_eq!(
             mcp["mcpServers"][MCP_NAME],
             json!({"command": "npx", "args": ["-y", format!("callimachus-mcp@{version}")]})

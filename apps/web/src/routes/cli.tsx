@@ -106,6 +106,18 @@ function CliPage() {
           <code className="font-mono">cal related</code> to find threads near some text.
         </p>
         <p className="mt-4 max-w-[60ch] leading-relaxed text-muted-foreground">
+          No desktop app on this machine? <code className="font-mono">cal index</code> builds the
+          index from every agent's history, <code className="font-mono">cal watch</code> keeps it
+          fresh as agents write, <code className="font-mono">cal embed</code> builds the semantic
+          index (it downloads the on-device model once;{" "}
+          <code className="font-mono">--no-download</code> uses only a model already there).{" "}
+          <code className="font-mono">cal distill --auto</code> distills recent sessions under the
+          daily cap with the memory engine you turned on in the app's Settings, so it needs the app
+          once; after that it runs with the app closed. Only one process watches an index:{" "}
+          <code className="font-mono">cal watch</code> won't start while the app is open, and the
+          app leaves live indexing to a running <code className="font-mono">cal watch</code>.
+        </p>
+        <p className="mt-4 max-w-[60ch] leading-relaxed text-muted-foreground">
           <code className="font-mono">cal commits</code> infers, entirely on-device, which git
           commits a thread produced, by overlapping the files a thread discussed with{" "}
           <code className="font-mono">git log</code>'s changed files inside the thread's time

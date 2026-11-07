@@ -44,7 +44,7 @@ pub fn scan(conn: &mut Connection, tick: &mut dyn FnMut()) -> Result<IndexReport
             continue;
         }
         tick();
-        report.record(index_file(conn, sid, &path));
+        report.record_at(&path, index_file(conn, sid, &path));
     }
     Ok(report)
 }

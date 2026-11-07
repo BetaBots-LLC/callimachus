@@ -16,32 +16,30 @@
 # release builds run on Ubuntu 24.04. The runtime stage must not be older than
 # the build stage, or the binary won't load.
 #
-# Two stages: GTK/WebKit are needed to *build* the server (it shares the desktop
-# crate, which depends on Tauri), not to run it. The linker's --as-needed drops
-# them, so the binary needs only libc, libstdc++, libgcc_s, libssl/libcrypto and
-# libdbus at runtime (the DT_NEEDED list of the released Linux binary). The
-# runtime image carries none of the Rust toolchain, -dev packages or target/.
+# Two stages: the build stage has the Rust toolchain and the -dev packages, the
+# runtime stage only what the binary loads: libc, libstdc++, libgcc_s,
+# libssl/libcrypto and libdbus (the DT_NEEDED list of the released Linux binary).
+# The server links only the Tauri-free core crate (callimachus-core), so neither
+# stage needs GTK or WebKit.
 
 FROM rust:1-trixie AS build
 
 WORKDIR /app
 
-# Build-only dependencies. Tauri's -sys crates find GTK/WebKit through pkg-config
-# even though the server never opens a window; libssl-dev is for native-tls and
-# libdbus-1-dev for keyring's Secret Service backend.
+# Build-only dependencies: libssl-dev for native-tls and libdbus-1-dev for
+# keyring's Secret Service backend, both found through pkg-config.
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
-    pkg-config libssl-dev libdbus-1-dev libwebkit2gtk-4.1-dev \
+    pkg-config libssl-dev libdbus-1-dev \
   && rm -rf /var/lib/apt/lists/*
 
-# Only the Rust crate is needed (it is self-contained, with its own Cargo.lock).
+# Only the Rust workspace is needed (self-contained, with its own Cargo.lock): cargo
+# reads every member's manifest, but `-p callimachus-standalone` compiles only it
+# and the core crate, never the Tauri app.
 COPY apps/desktop/src-tauri/ ./
 
-# tauri::generate_context!() resolves frontendDist ("../dist") at compile time;
-# the MCP server never serves it, so an empty placeholder is enough.
 # --locked: build exactly the dependency versions in Cargo.lock.
-RUN mkdir -p /dist \
-  && cargo build --release --locked -p callimachus-standalone --bin callimachus-mcp
+RUN cargo build --release --locked -p callimachus-standalone --bin callimachus-mcp
 
 FROM debian:trixie-slim
 

@@ -101,7 +101,10 @@ fn scan_in(conn: &mut Connection, root: &Path, tick: &mut dyn FnMut()) -> Result
             tick();
             seen.insert(meta.id.clone());
             registered.insert(PathBuf::from(&meta.rollout_path));
-            report.record(index_rollout(conn, sid, &meta));
+            report.record_at(
+                Path::new(&meta.rollout_path),
+                index_rollout(conn, sid, &meta),
+            );
         }
     }
 
@@ -120,7 +123,10 @@ fn scan_in(conn: &mut Connection, root: &Path, tick: &mut dyn FnMut()) -> Result
         if meta.id.is_empty() || !seen.insert(meta.id.clone()) {
             continue; // missing id, or already indexed via the state DB
         }
-        report.record(index_rollout(conn, sid, &meta));
+        report.record_at(
+            Path::new(&meta.rollout_path),
+            index_rollout(conn, sid, &meta),
+        );
     }
     Ok(report)
 }

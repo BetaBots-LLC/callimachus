@@ -61,7 +61,7 @@ pub(super) fn scan_chats(
     collect_chat_jsonl(root, root, &mut files);
     for path in files {
         tick();
-        report.record(index_chat(conn, sid, kind, root, &path, parse));
+        report.record_at(&path, index_chat(conn, sid, kind, root, &path, parse));
     }
     Ok(report)
 }

@@ -58,12 +58,31 @@ scripts/                   version-sync, release tagging
 .changeset/                versioning + changelog
 ```
 
+`apps/desktop/src-tauri` is a Cargo workspace of three crates:
+
+- `core/` (`callimachus-core`): everything that runs without a window: the index (db,
+  indexers, the file watcher, search, embeddings), project memory, the agent
+  integrations, the `cal` CLI (`cli_core.rs`), the MCP server (`mcp_server.rs`) and the
+  background jobs (`jobs.rs`, run by the app and by `cal index` / `watch` / `embed` /
+  `distill --auto` in `headless.rs`). No Tauri, and it never references telemetry.
+- the app crate (`src/`, `callimachus_lib`): the window, tray, Tauri commands (`lib.rs`,
+  thin wrappers over core; `TauriHost` is the jobs' host, emitting through Tauri) and
+  the opt-in telemetry (`telemetry.rs`). It re-exports core's modules, so `crate::db`
+  and friends resolve as before.
+- `standalone/` (`callimachus-standalone`): the release's `cal` and `callimachus-mcp`
+  downloads, which link core only, so they (and the Docker image) build without GTK or
+  WebKit: `cargo build --release -p callimachus-standalone`.
+
+All three are default members, so a bare `cargo test` or `cargo clippy` in
+`apps/desktop/src-tauri` covers every crate (most tests live in core), and
+`tauri dev` still runs the app (`default-run`).
+
 ## Checks before a PR
 
 ```bash
 pnpm check                             # Biome lint + format check
 pnpm typecheck                         # all apps (tsc)
-pnpm build                             # all apps; also creates apps/desktop/dist, which the Rust crate needs to compile
+pnpm build                             # all apps; also creates apps/desktop/dist, which the app crate needs to compile
 node --test packages/callimachus-mcp/test/*.test.mjs   # npm launcher tests
 node --test plugins/test/*.test.mjs                    # Claude Code plugin manifests
 cd apps/desktop/src-tauri
@@ -87,19 +106,20 @@ clear), but please don't add new ones. `apps/web` is already clean, and its
 `lint` script (`biome check .`) runs in the blocking check job, so a Biome error
 there fails CI.
 
-`cargo test -- --ignored` runs every ignored test: real-data smoke tests that
+`cargo test -p callimachus-core -- --ignored` runs every ignored test (they all
+live in core): real-data smoke tests that
 index your own history into a temporary database (your history is only read),
 embedding tests that download the model on first run, a keychain round-trip that
 writes and then deletes a test entry in your OS credential store, and live calls
 through your logged-in `claude` CLI. To run one, name it, e.g.
-`cargo test -- --ignored real_claude_index`.
+`cargo test -p callimachus-core -- --ignored real_claude_index`.
 
 ### Drift guards
 
 `cargo test` also checks that code and docs agree, so some changes need a
 matching edit elsewhere:
 
-- **`cal` subcommand:** document it in `USAGE` (`cal help`) in `cli_core.rs`.
+- **`cal` subcommand:** document it in `USAGE` (`cal help`) in `core/src/cli_core.rs`.
   Every `cal <command>` in `README.md` and the website's `cli`, `index` and
   `desktop` routes must be a real command.
 - **MCP tool:** give it annotations (`readOnlyHint`; write tools also
@@ -107,25 +127,25 @@ matching edit elsewhere:
   for all tools together; the server instructions stay under 400). Mention it in
   backticks in both `README.md` and `resources/recall/SKILL.md`.
 - **`resources/recall/SKILL.md`:** any change needs the new text's hash added to
-  `SHIPPED_SKILL_HASHES` in `integration.rs`. The failing test prints it.
+  `SHIPPED_SKILL_HASHES` in `core/src/integration.rs`. The failing test prints it.
 - **Tauri command:** add a typed wrapper in `apps/desktop/src/lib/api.ts` (or
   `telemetry.ts`). Every wrapper must name a registered command.
 - **Analytics event:** add the `Event` variant, its props and parser in
   `telemetry.rs` (and to the `all` list in `privacy_policy_names_every_event`),
   the mirror in `apps/desktop/src/lib/telemetry.ts`, and its wire name in the
-  privacy policy's event list (`apps/web/src/content/legal.ts`). The CLI, hooks
-  and MCP server (`cli_core.rs`, `mcp_server.rs`, `cli.rs`, `mcp.rs`, `main.rs`)
-  must never reference telemetry.
-- **Indexed source:** see the [indexer README](apps/desktop/src-tauri/src/indexer/README.md).
-  The registry is checked against the `sources` table, `telemetry::SOURCES` and
-  each indexer's tool-output capping.
+  privacy policy's event list (`apps/web/src/content/legal.ts`). The CLI, hooks,
+  MCP server and headless jobs (the whole core crate, `cli.rs`, `mcp.rs`, `main.rs`)
+  must never reference telemetry; the app reaches it through its `JobHost` hooks.
+- **Indexed source:** see the [indexer README](apps/desktop/src-tauri/core/src/indexer/README.md).
+  The registry is checked against the `sources` table, `telemetry::SOURCES` (in the
+  app crate's `telemetry.rs` tests) and each indexer's tool-output capping.
 
 ## Adding support for another agent
 
 Each indexed source is a small, documented contract, usually one indexer module
 + a migration that seeds its `sources` row + a few wiring points (its `SOURCES`
 registry entry, a watcher target, the telemetry allowlist, frontend labels). Start
-at [`apps/desktop/src-tauri/src/indexer/README.md`](apps/desktop/src-tauri/src/indexer/README.md).
+at [`apps/desktop/src-tauri/core/src/indexer/README.md`](apps/desktop/src-tauri/core/src/indexer/README.md).
 
 ## Conventions
 
@@ -145,8 +165,9 @@ at [`apps/desktop/src-tauri/src/indexer/README.md`](apps/desktop/src-tauri/src/i
   event needs its variant, props and parser in `telemetry.rs`, a mirror in
   `apps/desktop/src/lib/telemetry.ts`, and its wire name in the policy's event
   list (`cargo test` fails until it is there).
-- **Migrations:** add a new `migrations/00NN_*.sql` with the next unused number
-  and register it at the end of `MIGRATIONS` in `db/migrations.rs`. Never edit,
+- **Migrations:** add a new `src-tauri/migrations/00NN_*.sql` (the directory
+  stays there, not under `core/`) with the next unused number and register it at
+  the end of `MIGRATIONS` in `core/src/db/migrations.rs`. Never edit,
   renumber or reorder one that has shipped, or that you have already run against
   a real index. The schema version is only a count of applied migrations, so an
   existing index never re-runs an edited file. Add an upgrade test that starts

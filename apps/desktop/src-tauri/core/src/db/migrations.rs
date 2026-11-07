@@ -6,80 +6,88 @@ use std::sync::LazyLock;
 pub static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
     Migrations::new(vec![
         // 0001 — canonical store: sources, threads, messages, FTS5, index_state, providers.
-        M::up(include_str!("../../migrations/0001_init.sql")),
+        M::up(include_str!("../../../migrations/0001_init.sql")),
         // 0002 — is_subagent flag on threads.
-        M::up(include_str!("../../migrations/0002_subagent.sql")),
+        M::up(include_str!("../../../migrations/0002_subagent.sql")),
         // 0003 — embeddings table for semantic search.
-        M::up(include_str!("../../migrations/0003_embeddings.sql")),
+        M::up(include_str!("../../../migrations/0003_embeddings.sql")),
         // 0004 — sqlite-vec vec0 chunk index (replaces the embeddings BLOB table).
-        M::up(include_str!("../../migrations/0004_vec0.sql")),
+        M::up(include_str!("../../../migrations/0004_vec0.sql")),
         // 0005 — Gemini CLI as an indexable source.
-        M::up(include_str!("../../migrations/0005_gemini.sql")),
+        M::up(include_str!("../../../migrations/0005_gemini.sql")),
         // 0006 — Qwen Code, Goose, OpenCode, Continue, Cline sources.
-        M::up(include_str!("../../migrations/0006_more_sources.sql")),
+        M::up(include_str!("../../../migrations/0006_more_sources.sql")),
         // 0007 — Roo Code, Kilo Code (Cline-architecture forks).
-        M::up(include_str!("../../migrations/0007_cline_forks.sql")),
+        M::up(include_str!("../../../migrations/0007_cline_forks.sql")),
         // 0008 — messages.embedded flag + partial index (fast incremental embedding).
-        M::up(include_str!("../../migrations/0008_embed_flag.sql")),
+        M::up(include_str!("../../../migrations/0008_embed_flag.sql")),
         // 0009 — precomputed threads.bytes (fast cleanup list).
-        M::up(include_str!("../../migrations/0009_thread_bytes.sql")),
+        M::up(include_str!("../../../migrations/0009_thread_bytes.sql")),
         // 0010 — stars + free-form tags ("collections").
-        M::up(include_str!("../../migrations/0010_stars_tags.sql")),
+        M::up(include_str!("../../../migrations/0010_stars_tags.sql")),
         // 0011 — distilled knowledge layer (facts: todos now, decisions/gotchas later).
-        M::up(include_str!("../../migrations/0011_knowledge.sql")),
+        M::up(include_str!("../../../migrations/0011_knowledge.sql")),
         // 0012 — opt-in LLM distillation tier: extraction state, fact vectors, config.
-        M::up(include_str!("../../migrations/0012_knowledge_llm.sql")),
+        M::up(include_str!("../../../migrations/0012_knowledge_llm.sql")),
         // 0013 — file-path mentions for code-aware search.
-        M::up(include_str!("../../migrations/0013_file_mentions.sql")),
+        M::up(include_str!("../../../migrations/0013_file_mentions.sql")),
         // 0014 — perf: composite list indexes, facts(thread_id,kind), trigram path FTS.
-        M::up(include_str!("../../migrations/0014_perf.sql")),
+        M::up(include_str!("../../../migrations/0014_perf.sql")),
         // 0015 — fact curation: pin / edit / hide distilled facts.
-        M::up(include_str!("../../migrations/0015_fact_curation.sql")),
+        M::up(include_str!("../../../migrations/0015_fact_curation.sql")),
         // 0016 — canonical project key for stable per-project grouping.
-        M::up(include_str!("../../migrations/0016_project_key.sql")),
+        M::up(include_str!("../../../migrations/0016_project_key.sql")),
         // 0017 — index messages.ts for the Coach activity heatmap range scan.
-        M::up(include_str!("../../migrations/0017_messages_ts.sql")),
+        M::up(include_str!("../../../migrations/0017_messages_ts.sql")),
         // 0018 — track distillable (user/assistant) message count for distill staleness.
-        M::up(include_str!("../../migrations/0018_distillable_count.sql")),
+        M::up(include_str!(
+            "../../../migrations/0018_distillable_count.sql"
+        )),
         // 0019 — agent session snapshots: resumable thread checkpoints for cross-agent handoff.
-        M::up(include_str!("../../migrations/0019_snapshots.sql")),
+        M::up(include_str!("../../../migrations/0019_snapshots.sql")),
         // 0020 — ADR-style decision rationale ("why") for the contradiction guard.
-        M::up(include_str!("../../migrations/0020_decision_rationale.sql")),
+        M::up(include_str!(
+            "../../../migrations/0020_decision_rationale.sql"
+        )),
         // 0021 — git linkage: commits a thread produced (file-overlap within its time window).
-        M::up(include_str!("../../migrations/0021_thread_commits.sql")),
+        M::up(include_str!("../../../migrations/0021_thread_commits.sql")),
         // 0022 — per-message token usage + model, for the cost/spend layer.
-        M::up(include_str!("../../migrations/0022_message_usage.sql")),
+        M::up(include_str!("../../../migrations/0022_message_usage.sql")),
         // 0023 — index thread_commits by sha for the commits_by_sha inverse lookup (cal audit-pr).
         M::up(include_str!(
-            "../../migrations/0023_thread_commits_sha_idx.sql"
+            "../../../migrations/0023_thread_commits_sha_idx.sql"
         )),
         // 0024 — VS Code-native / GitHub Copilot chat as a source (per-turn model).
-        M::up(include_str!("../../migrations/0024_copilot.sql")),
+        M::up(include_str!("../../../migrations/0024_copilot.sql")),
         // 0025 — chunk-rowid -> message map so a message delete removes its vectors by
         // point lookup instead of a full vec0 scan per deleted message.
-        M::up(include_str!("../../migrations/0025_vec_chunk_owner.sql")),
+        M::up(include_str!("../../../migrations/0025_vec_chunk_owner.sql")),
         // 0026 — covering indexes for the embedding-progress / stats / spend aggregates.
-        M::up(include_str!("../../migrations/0026_embed_count_index.sql")),
+        M::up(include_str!(
+            "../../../migrations/0026_embed_count_index.sql"
+        )),
         // 0027 — tombstones so deleted threads are not re-imported by the next scan.
-        M::up(include_str!("../../migrations/0027_deleted_threads.sql")),
+        M::up(include_str!("../../../migrations/0027_deleted_threads.sql")),
         // 0028 — normalize Windows-style Claude Code external ids to forward slashes.
         M::up(include_str!(
-            "../../migrations/0028_claude_forward_slash_ids.sql"
+            "../../../migrations/0028_claude_forward_slash_ids.sql"
         )),
         // 0029: drop tool-call vectors and re-queue prose marked embedded without vectors.
-        M::up(include_str!("../../migrations/0029_embed_prose_only.sql")),
+        M::up(include_str!(
+            "../../../migrations/0029_embed_prose_only.sql"
+        )),
         // 0030: normalize Windows-style Gemini external ids to forward slashes.
         M::up(include_str!(
-            "../../migrations/0030_gemini_forward_slash_ids.sql"
+            "../../../migrations/0030_gemini_forward_slash_ids.sql"
         )),
         // 0031: covering indexes for the FTS join, Coach heatmap and commit linker; drops
         // the redundant (thread_id) index and 0008's unused partial index.
         M::up(include_str!(
-            "../../migrations/0031_messages_cover_indexes.sql"
+            "../../../migrations/0031_messages_cover_indexes.sql"
         )),
         // 0032: facts.origin_ref, the stable key of a fact imported from an agent's own
         // files (Claude Code auto memory, compaction summaries), replaced by that key.
-        M::up(include_str!("../../migrations/0032_fact_origin_ref.sql")),
+        M::up(include_str!("../../../migrations/0032_fact_origin_ref.sql")),
     ])
 });
 

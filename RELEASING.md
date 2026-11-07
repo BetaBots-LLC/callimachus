@@ -314,17 +314,24 @@ git tag v0.5.0 && git push origin v0.5.0    # → build.yml + publish-extension.
   pinned by version and SHA-256; bump those by hand.
 - **Docker image.** `docker.yml` builds the `Dockerfile` (used by MCP registries
   such as Glama to verify the server) and checks it answers `tools/list`. It
-  builds in `rust:1-trixie` and copies only the binary (plus its entrypoint
-  script) into `debian:trixie-slim`
+  builds `-p callimachus-standalone` in `rust:1-trixie` (no GTK or WebKit: the
+  standalone member links only the Tauri-free `callimachus-core`) and copies only
+  the binary (plus its entrypoint script) into `debian:trixie-slim`
   (glibc must stay >= 2.38 for ONNX Runtime). If the server starts linking a new
   shared library, the runtime stage's `ldd` check fails the build: add the
   library's package to that stage's `apt-get install` line.
-- **What each installer holds.** `tauri build` bundles every bin of the app crate,
-  so the app crate has one (`callimachus`, which also serves `cal` and `--mcp`).
-  The standalone `cal` and `callimachus-mcp` are the `callimachus-standalone`
-  workspace member (`apps/desktop/src-tauri/standalone`, built with
-  `cargo build --release -p callimachus-standalone`), so the macOS `.app` and the
-  Linux packages carry only the app binary. Windows installs still put `cal.exe`
+- **What each installer holds.** The Rust workspace in `apps/desktop/src-tauri` has
+  three crates: `core` (`callimachus-core`, everything without Tauri, including
+  `cal`, the MCP server and the background jobs), the app crate (window, Tauri
+  commands, telemetry) and `standalone`. `tauri build` bundles every bin of the app
+  crate, so the app crate has one (`callimachus`, which also serves `cal` and
+  `--mcp`). The standalone `cal` and `callimachus-mcp` are the
+  `callimachus-standalone` workspace member (`apps/desktop/src-tauri/standalone`,
+  built with `cargo build --release -p callimachus-standalone`, linking core only),
+  so the macOS `.app` and the Linux packages carry only the app binary. Neither
+  `core` nor `standalone` is versioned (both stay 0.0.0): core's build.rs stamps
+  the app crate's version into `cal --version` and the MCP server, so
+  `pnpm version-packages` still edits only the app crate's `Cargo.toml`. Windows installs still put `cal.exe`
   and `callimachus-mcp.exe` next to the app: `build.yml` builds the standalone
   bins first, copies them to `src-tauri/binaries/<name>-<triple>.exe`, and passes
   the CI-only `tauri.windows-sidecars.conf.json` overlay (`bundle.externalBin`;

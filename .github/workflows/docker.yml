@@ -3,7 +3,7 @@ name: Docker
 # Builds the MCP-server image (the Dockerfile MCP registries such as Glama use
 # to verify the server) and checks it answers initialize + tools/list over
 # stdio. Runs when the Dockerfile, .dockerignore, docker-entrypoint.sh, the
-# crate's Cargo.toml / Cargo.lock or this workflow change, plus weekly to catch
+# workspace's Cargo.toml files / Cargo.lock or this workflow change, plus weekly to catch
 # base-image drift. A source-only change to the crate is not rebuilt here until
 # the next weekly run. The build context is an allowlist (.dockerignore sends
 # only apps/desktop/src-tauri/ and docker-entrypoint.sh), so anything outside
@@ -16,6 +16,8 @@ on:
       - .dockerignore
       - docker-entrypoint.sh
       - apps/desktop/src-tauri/Cargo.toml
+      - apps/desktop/src-tauri/core/Cargo.toml
+      - apps/desktop/src-tauri/standalone/Cargo.toml
       - apps/desktop/src-tauri/Cargo.lock
       - .github/workflows/docker.yml
   push:
@@ -25,6 +27,8 @@ on:
       - .dockerignore
       - docker-entrypoint.sh
       - apps/desktop/src-tauri/Cargo.toml
+      - apps/desktop/src-tauri/core/Cargo.toml
+      - apps/desktop/src-tauri/standalone/Cargo.toml
       - apps/desktop/src-tauri/Cargo.lock
       - .github/workflows/docker.yml
   schedule:
@@ -70,6 +74,14 @@ jobs:
             echo "tools/list returned $COUNT tools"
             if [ "$COUNT" -lt 1 ]; then
               echo "::error::callimachus-mcp did not answer tools/list"
+              exit 1
+            fi
+            # core/build.rs stamps the app's version into the core crate; a regression there
+            # would ship a server that reports 0.0.0 (core's own manifest version).
+            VERSION="$(jq -r -s '[.[] | select(.id == 1) | .result.serverInfo.version] | first // ""' responses.jsonl)"
+            echo "serverInfo.version is ${VERSION:-<missing>}"
+            if [ -z "$VERSION" ] || [ "$VERSION" = "0.0.0" ]; then
+              echo "::error::callimachus-mcp reports version '${VERSION}' (the app version stamp is missing)"
               exit 1
             fi
           }

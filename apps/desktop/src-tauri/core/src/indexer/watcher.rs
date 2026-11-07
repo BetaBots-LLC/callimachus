@@ -15,6 +15,7 @@
 
 use super::scanner_for;
 use crate::db;
+use crate::jobs::{self, Host};
 use notify::{RecommendedWatcher, RecursiveMode};
 use notify_debouncer_full::{new_debouncer_opt, DebounceEventResult, NoCache};
 use rusqlite::Connection;
@@ -22,7 +23,6 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::RecvTimeoutError;
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Emitter, Manager};
 
 /// How often to look for roots that didn't exist when the watcher started.
 const ROOT_RECHECK: Duration = Duration::from_secs(60);
@@ -30,7 +30,7 @@ const ROOT_RECHECK: Duration = Duration::from_secs(60);
 /// How long to wait before retrying a catch-up deferred by a running reindex or embed build.
 const CATCH_UP_RETRY: Duration = Duration::from_secs(30);
 
-/// Watcher quiet before the semantic-index top-up (`crate::embed_kick`) starts: one agent
+/// Watcher quiet before the semantic-index top-up (`jobs::embed_kick`) starts: one agent
 /// turn writes a burst of debounced batches, and this makes it one build instead of one per
 /// batch.
 const EMBED_QUIET: Duration = Duration::from_secs(60);
@@ -249,9 +249,9 @@ fn legacy_route(path: &Path) -> Option<&'static str> {
 }
 
 /// Spawn the watcher thread. Errors are logged, never fatal.
-pub fn spawn(app: AppHandle) {
+pub fn spawn(host: Host) {
     std::thread::spawn(move || {
-        if let Err(e) = run(app) {
+        if let Err(e) = run(host) {
             app_log!("[watcher] stopped: {e}");
         }
     });
@@ -350,7 +350,22 @@ struct Pending {
     full: bool,
 }
 
-fn run(app: AppHandle) -> anyhow::Result<()> {
+/// The watcher loop, on the calling thread (`cal watch` runs it in the foreground). Returns
+/// when the watch channel closes, or with a [`db::SchemaMismatch`] error once a newer
+/// Callimachus upgraded the index (see [`writer_still_current`]).
+pub fn run(host: Host) -> anyhow::Result<()> {
+    run_loop(host, true)
+}
+
+/// [`run`] for a caller that has just run a full pass over every source itself (`cal
+/// watch` on an empty index imports first): no launch catch-up, which would rescan every
+/// source a second time right away, but the work that follows one (the embed top-up, the
+/// Claude Code memory import, the TODO backfill check) still runs.
+pub fn run_after_full_pass(host: Host) -> anyhow::Result<()> {
+    run_loop(host, false)
+}
+
+fn run_loop(host: Host, launch_catch_up: bool) -> anyhow::Result<()> {
     let (tx, rx) = std::sync::mpsc::channel::<DebounceEventResult>();
     // NoCache instead of the default file-id cache (FileIdMap on macOS and Windows): that
     // cache walks and stats every file under each root on every watch() and rescan, only
@@ -384,33 +399,39 @@ fn run(app: AppHandle) -> anyhow::Result<()> {
 
     // Not on a first run: until something is indexed, indexing waits for the user to start
     // it from onboarding. Roots are already watched, so a write during the pass is queued.
-    let mut catch_up_at = has_threads(&conn).then(Instant::now);
+    let indexed = has_threads(&conn);
+    let mut catch_up_at = (indexed && launch_catch_up).then(Instant::now);
     // Yesterday's hook and MCP counts into Stats before the first view asks for them.
-    crate::ledger_rollup_tick(&conn);
-    if catch_up_at.is_none() {
+    jobs::ledger_rollup_tick(&conn);
+    if !indexed {
         // Nothing indexed yet: every TODO will come from indexing itself, so the one-time
         // backfill for older indexes has nothing to do.
         let _ = crate::knowledge::mark_todos_backfilled(&conn);
+    } else if !launch_catch_up {
+        // The caller's full pass stood in for the catch-up: what follows one.
+        embed_timer.poke(Instant::now());
+        jobs::harvest_claude_memory_tick(&host, &conn);
+        jobs::todo_backfill_kick(&host);
     }
 
     loop {
         if catch_up_at.is_some_and(|at| at <= Instant::now()) {
-            catch_up_at = if catch_up(&app, &mut conn, &mut last_run) {
+            catch_up_at = if catch_up(&host, &mut conn, &mut last_run) {
                 // Sessions written while the app was closed (and anything a sidecar
                 // indexed) may need vectors: top up once things settle.
                 embed_timer.poke(Instant::now());
                 // Then the memory Claude Code wrote meanwhile, once per launch.
-                crate::harvest_claude_memory_tick(&app, &conn);
+                jobs::harvest_claude_memory_tick(&host, &conn);
                 // And the one-time TODO backfill (a no-op after its first full pass), only
                 // now so it never competes with the catch-up for the writer.
-                crate::todo_backfill_kick(&app);
+                jobs::todo_backfill_kick(&host);
                 None
             } else {
                 Some(Instant::now() + CATCH_UP_RETRY)
             };
         }
 
-        if embed_timer.fire(Instant::now()) && crate::embed_kick(&app) == crate::EmbedKick::Busy {
+        if embed_timer.fire(Instant::now()) && jobs::embed_kick(&host) == jobs::EmbedKick::Busy {
             // A reindex, a VACUUM or a build holds the writer: try again after it.
             embed_timer.poke(Instant::now());
         }
@@ -459,15 +480,31 @@ fn run(app: AppHandle) -> anyhow::Result<()> {
             .copied()
             .filter(|k| due_at(k, &last_run) <= now)
             .collect();
+        // Before writing, as on the minute tick: an index a newer binary upgraded meanwhile
+        // must not get this binary's rows. Not current yet (a busy reopen): the work stays
+        // queued for the next pass.
+        if !due.is_empty() && !writer_still_current(&mut conn)? {
+            // The due work makes the next wait zero: pace the retry.
+            std::thread::sleep(Duration::from_secs(1));
+            continue;
+        }
         for kind in due {
             if let Some(work) = pending.remove(kind) {
                 let paths = work.paths.len();
                 let clock = crate::jobclock::JobClock::start();
-                let threads = reindex(&app, &mut conn, kind, work).map_or(0, |r| r.threads_indexed);
+                let Some(report) = reindex(&host, &mut conn, kind, work) else {
+                    // The scan failed (its error is logged): a failed line, not "0 threads".
+                    rollup.record(paths, 0, &clock);
+                    host.watch_batch_failed(kind, paths);
+                    last_run.insert(kind, Instant::now());
+                    continue;
+                };
+                let threads = report.threads_indexed;
                 rollup.record(paths, threads, &clock);
+                host.watch_batch(kind, paths, threads, clock.wall());
                 if threads > 0 {
                     embed_timer.poke(Instant::now());
-                    priority_distill_kick(&app, &conn);
+                    priority_distill_kick(&host, &conn);
                 }
                 last_run.insert(kind, Instant::now());
             }
@@ -476,41 +513,65 @@ fn run(app: AppHandle) -> anyhow::Result<()> {
         // The once-a-minute tick: new roots, the batch log line, idle memory, the ledger
         // rollup and the plugin hand-over.
         if last_root_check.elapsed() >= ROOT_RECHECK {
+            if !writer_still_current(&mut conn)? {
+                last_root_check = Instant::now();
+                continue;
+            }
             if rollup.flush(last_root_check.elapsed()) {
                 // The minute's writes filled this connection's page cache (64 MiB).
                 db::shrink_memory(&conn);
             }
-            crate::embed_reap_tick(&app);
-            auto_distill_idle_tick(&app, &conn, &mut distill_idle_at);
+            jobs::embed_reap_tick(&*host);
+            auto_distill_idle_tick(&host, &conn, &mut distill_idle_at);
             // Here rather than after an indexing pass, so a tray app on an idle day still
             // folds yesterday in. A no-op (one short read) until the ledger holds a line from
             // before today.
-            crate::ledger_rollup_tick(&conn);
-            // The Claude Code plugin can be turned on or off while the app runs: hand the
-            // app's hooks, skill and MCP entry over, or take them back (one small read when
-            // nothing changed).
-            match std::env::current_exe()
-                .map_err(anyhow::Error::from)
-                .and_then(|exe| crate::integration::plugin_handover_tick(&exe))
-            {
-                Ok(true) => app_log!("[integration] Claude Code plugin hand-over updated"),
-                Ok(false) => {}
-                Err(e) => app_log!("[integration] Claude Code plugin hand-over: {e:#}"),
-            }
+            jobs::ledger_rollup_tick(&conn);
+            // The host's own minute work: the app hands its hooks, skill and MCP entry over
+            // to the Claude Code plugin, or takes them back.
+            host.minute_tick();
             // A session that ended while its transcript was already indexed has nothing to
             // index again, so the batch check above never sees its queue entry.
-            priority_distill_kick(&app, &conn);
+            priority_distill_kick(&host, &conn);
             // Claude Code writes auto memory in the middle of a session, a few files at most.
             // Not before the first index: imported facts live in "Recorded memory" threads,
             // which would make the next launch's has_threads skip onboarding's start.
             if has_agent_threads(&conn) {
-                crate::harvest_claude_memory_tick(&app, &conn);
+                jobs::harvest_claude_memory_tick(&host, &conn);
             }
             table = register_roots(&conn, &mut debouncer, &mut watched, &mut warned);
             last_root_check = Instant::now();
         }
     }
     Ok(())
+}
+
+/// Whether the writer may keep writing: the index is still on the schema this binary knows.
+/// `cal watch` runs for days as a login item, and an app update migrates the index at its
+/// launch; this binary's code then no longer matches the tables. One `user_version` read.
+/// When the schema moved, reopen (the long-lived sidecar open, which never migrates): a
+/// schema this binary knows swaps the writer in, and a newer one returns the
+/// [`db::SchemaMismatch`] error so the caller stops (`cal watch` exits 3 and a login item
+/// restarts the updated binary). Ok(false) when the reopen failed for another reason (a
+/// busy index): skip this pass and look again next time.
+fn writer_still_current(conn: &mut Connection) -> anyhow::Result<bool> {
+    match db::schema_pending(conn) {
+        Ok(0) => return Ok(true),
+        Ok(_) => {}
+        // Could not read it (busy): the next pass reads again.
+        Err(_) => return Ok(false),
+    }
+    match db::open_sidecar_current_long_lived(&db::default_index_path()) {
+        Ok(fresh) => {
+            *conn = fresh;
+            Ok(true)
+        }
+        Err(e) if db::is_schema_mismatch(&e) => Err(e),
+        Err(e) => {
+            app_log!("[watcher] reopening the index after a schema change: {e:#}");
+            Ok(false)
+        }
+    }
 }
 
 /// Whether anything has been indexed yet.
@@ -527,13 +588,13 @@ fn has_threads(conn: &Connection) -> bool {
 /// `armed` holds the deadline; once it passes, kick and look again, which re-arms for the
 /// next live thread (or the same one, if it was written again). A kick that finds a writer
 /// job or a distill running loses nothing: those kick again when they end.
-fn auto_distill_idle_tick(app: &AppHandle, conn: &Connection, armed: &mut Option<i64>) {
+fn auto_distill_idle_tick(host: &Host, conn: &Connection, armed: &mut Option<i64>) {
     let now = chrono::Utc::now().timestamp();
     if armed.is_some_and(|at| at > now) {
         return;
     }
     if armed.take().is_some() {
-        crate::auto_distill_kick(app);
+        jobs::auto_distill_kick(host);
     }
     let on = crate::knowledge::get_config(conn).is_ok_and(|c| c.enabled && c.auto_distill);
     if on {
@@ -560,10 +621,10 @@ fn has_agent_threads(conn: &Connection) -> bool {
 /// window. The hook is a separate process and can only write the queue. A no-op unless
 /// distillation and auto-distill are on and today's allowance is not spent; with nothing
 /// queued it is one `app_config` lookup.
-fn priority_distill_kick(app: &AppHandle, conn: &Connection) {
+fn priority_distill_kick(host: &Host, conn: &Connection) {
     let now = chrono::Utc::now().timestamp();
     if crate::knowledge::distill_priority_ready(conn, now).unwrap_or(false) {
-        crate::auto_distill_kick(app);
+        jobs::auto_distill_kick(host);
     }
 }
 
@@ -575,22 +636,20 @@ fn priority_distill_kick(app: &AppHandle, conn: &Connection) {
 /// does. Returns false, having done nothing, when a reindex, an embedding build or a
 /// whole-file rewrite already holds the writer.
 fn catch_up(
-    app: &AppHandle,
+    host: &Host,
     conn: &mut Connection,
     last_run: &mut HashMap<&'static str, Instant>,
 ) -> bool {
     // Cleared on drop, including when a scan panics, so a Reindex never waits on it forever.
-    let Some(job) = crate::JobGuard::try_acquire(&app.state::<crate::CatchUpJob>().0) else {
+    let flags = host.flags();
+    let Some(job) = jobs::JobGuard::try_acquire(&flags.catch_up.0) else {
         return false;
     };
     // Claim, then check: index_all / index_source claim IndexJob and then wait for this
     // flag, and a build claims EmbedJob and then checks this one, so one side of each pair
     // always sees the other and they never write side by side. Checking before the claim
     // left a window where a build and this scan both passed their checks.
-    if app.state::<crate::IndexJob>().0.is_set()
-        || app.state::<crate::EmbedJob>().is_running()
-        || app.state::<crate::CompactJob>().0.is_set()
-    {
+    if flags.index.0.is_set() || flags.embed.is_running() || flags.compact.0.is_set() {
         return false; // a reindex, a semantic build or a VACUUM is running; `job` drops
     }
     let total = crate::jobclock::JobClock::start();
@@ -601,7 +660,7 @@ fn catch_up(
             full: true,
         };
         let clock = crate::jobclock::JobClock::start();
-        if let Some(r) = reindex(app, conn, source.kind, full) {
+        if let Some(r) = reindex(host, conn, source.kind, full) {
             // One line per source that has anything on disk; absent agents stay silent.
             if r.threads_indexed + r.threads_skipped + r.errors > 0 {
                 app_log!(
@@ -632,7 +691,7 @@ fn catch_up(
     // yielded to it, so this kick is what distills the sessions written while the app was
     // closed.
     drop(job);
-    crate::auto_distill_kick(app);
+    jobs::auto_distill_kick(host);
     true
 }
 
@@ -678,7 +737,7 @@ fn register_roots<W: notify::Watcher, C: notify_debouncer_full::FileIdCache>(
 /// shared connection is never blocked across the scan. Returns the report, or None when the
 /// scan failed (logged here).
 fn reindex(
-    app: &AppHandle,
+    host: &Host,
     conn: &mut Connection,
     kind: &'static str,
     work: Pending,
@@ -712,7 +771,7 @@ fn reindex(
             if r.threads_indexed > 0 {
                 // Nudge the UI (payload: the source kind): main.tsx throttles this (~4s) into
                 // refetches of the visible results/stats and marks open threads stale.
-                let _ = app.emit("index:updated", kind);
+                jobs::emit(&**host, "index:updated", kind);
             }
             Some(r)
         }

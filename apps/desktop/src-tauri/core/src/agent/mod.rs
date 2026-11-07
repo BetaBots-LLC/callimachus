@@ -2003,7 +2003,7 @@ mod tests {
     }
 
     /// Live: distill a tiny transcript through the logged-in `claude` CLI (no API key).
-    /// Run with: cargo test -p callimachus --lib cli_distill_smoke -- --ignored --nocapture
+    /// Run with: cargo test -p callimachus-core --lib cli_distill_smoke -- --ignored --nocapture
     #[tokio::test]
     #[ignore]
     async fn cli_distill_smoke() {
@@ -2020,7 +2020,7 @@ mod tests {
     }
 
     /// Live: the Claude CLI streams a reply token-by-token (many `on_token` calls, not one).
-    /// Run with: cargo test -p callimachus --lib cli_stream_smoke -- --ignored --nocapture
+    /// Run with: cargo test -p callimachus-core --lib cli_stream_smoke -- --ignored --nocapture
     #[tokio::test]
     #[ignore]
     async fn cli_stream_smoke() {

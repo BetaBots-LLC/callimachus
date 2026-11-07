@@ -438,6 +438,12 @@ export interface JobsStatus {
   rewrite: boolean;
 }
 
+/** Whether `cal watch` keeps the index fresh, so the app's own watcher is off until it stops. */
+export interface LiveIndexing {
+  cliWatch: boolean;
+  cliWatchPid: number | null;
+}
+
 /** Background auto-distill allowance (UTC day). */
 export interface AutoDistillBudget {
   eligibleThreads: number; // recently active and not yet distilled
@@ -705,6 +711,7 @@ export const api = {
   indexingStatus: () => invoke<boolean>("indexing_status"),
   indexSource: (kind: SourceKind) => invoke<IndexReport>("index_source", { kind }),
   jobsStatus: () => invoke<JobsStatus>("jobs_status"),
+  liveIndexing: () => invoke<LiveIndexing>("live_indexing"),
   searchThreads: (query: string, filters?: SearchFilters) =>
     invoke<SearchResponse>("search_threads", { query, filters }),
   // Fire-and-forget when semantic search is switched on: loads the model (from the cache

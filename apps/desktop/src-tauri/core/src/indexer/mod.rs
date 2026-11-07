@@ -83,6 +83,16 @@ impl IndexReport {
         }
     }
 
+    /// [`record`](Self::record) for one file (or session) `what`, logging a failure with
+    /// it: the count alone made `cal index` exit 1 saying the lines above name the failure
+    /// while nothing did, and left a file that fails on every pass unfindable.
+    pub fn record_at(&mut self, what: &std::path::Path, result: Result<Option<usize>>) {
+        if let Err(e) = &result {
+            app_log!("[index] {}: {e:#}", what.display());
+        }
+        self.record(result);
+    }
+
     /// Fold another pass's tally into this one.
     fn add(&mut self, other: &IndexReport) {
         self.threads_indexed += other.threads_indexed;
@@ -217,7 +227,8 @@ pub fn scan_all_with_progress(
         }) {
             Ok(r) => total.add(&r),
             Err(e) => {
-                eprintln!("[index] source '{name}' failed: {e:#}");
+                // Not eprintln!, which panics on a closed stderr (`cal index 2>&1 | head`).
+                app_log!("[index] source '{name}' failed: {e:#}");
                 total.errors += 1;
             }
         }
@@ -1595,8 +1606,9 @@ mod tests {
     }
 
     /// Every registered kind has its `sources` row (else every scan of it fails with
-    /// "unknown source kind") and is on the telemetry allowlist (else its events report
-    /// "other"), and no kind is registered twice.
+    /// "unknown source kind"), and no kind is registered twice. The telemetry allowlist half
+    /// lives in the app crate (`telemetry::tests::every_source_is_on_the_telemetry_allowlist`),
+    /// since telemetry is GUI only and this crate never references it.
     #[test]
     fn the_source_registry_matches_the_schema_and_telemetry() {
         let conn = temp_db("registry");
@@ -1606,11 +1618,6 @@ mod tests {
             assert!(
                 source_id(&conn, s.kind).is_ok(),
                 "no sources row for {}",
-                s.kind
-            );
-            assert!(
-                crate::telemetry::SOURCES.contains(&s.kind),
-                "{} missing from telemetry::SOURCES",
                 s.kind
             );
             assert!(super::scanner_for(s.kind).is_some());

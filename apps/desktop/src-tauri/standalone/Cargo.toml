@@ -6,10 +6,12 @@
 # every compressed update), and a deb `/usr/bin/cal` that collides with the system calendar.
 # The app binary already acts as `cal` (argv0 or a cal subcommand) and as the MCP server
 # (`--mcp`). Windows installs still ship both as sidecars (build.yml, tauri.windows-sidecars).
+# They depend on callimachus-core only, never on the app crate, so building them (the
+# Docker image, the Linux downloads) needs no Tauri, GTK or WebKit.
 name = "callimachus-standalone"
-# Never published or synced: `cal --version` and the MCP server report callimachus_lib's
-# version (CARGO_PKG_VERSION is expanded inside the lib), and build.rs stamps the Windows
-# version resource from the app crate's Cargo.toml.
+# Never published or synced: `cal --version` and the MCP server report the app crate's
+# version (callimachus-core's build.rs stamps it), and build.rs stamps the Windows version
+# resource from the app crate's Cargo.toml.
 version = "0.0.0"
 publish = false
 description = "Standalone cal CLI and callimachus-mcp server for Callimachus"
@@ -28,11 +30,12 @@ name = "callimachus-mcp"
 path = "src/mcp.rs"
 
 [dependencies]
-callimachus = { path = ".." }
+callimachus-core = { path = "../core" }
 
 # Windows: the icon, version info and Common-Controls v6 manifest that tauri-build gave these
-# bins while they were app bins (the manifest keeps comctl32 imports pulled in through tauri
-# resolvable, or the exe fails to start with STATUS_ENTRYPOINT_NOT_FOUND). static_vcruntime
+# bins while they were app bins (the manifest kept comctl32 imports pulled in through tauri
+# resolvable, or the exe failed to start with STATUS_ENTRYPOINT_NOT_FOUND; tauri is gone from
+# this graph now, and the manifest stays as the safe default). static_vcruntime
 # links the VC runtime statically, as tauri-build does for app bins (staticVCRuntime defaults
 # on): its link args reach only the emitting package's targets, so without it these exes need
 # VCRUNTIME140.dll, which a clean Windows install lacks. Same crates and versions tauri-build

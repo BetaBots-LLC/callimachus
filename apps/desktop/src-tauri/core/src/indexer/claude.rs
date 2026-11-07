@@ -103,7 +103,7 @@ pub(crate) fn expand_tilde(p: PathBuf) -> PathBuf {
 /// hook`) applies the stored value, so a relative or unexpanded path would resolve against
 /// each one's own working directory, and a typo would index nothing without any error.
 /// The errors are shown as is in Settings.
-pub(crate) fn normalize_data_root(raw: &str) -> Result<String> {
+pub fn normalize_data_root(raw: &str) -> Result<String> {
     let raw = raw.trim();
     let path = expand_tilde(PathBuf::from(raw));
     if !path.is_absolute() {
@@ -247,7 +247,8 @@ pub(crate) fn scan_root(
         // Checked on every file, not only in Batch::run: unchanged files never reach run(),
         // so a batch opened by an early changed file would otherwise keep the write lock
         // through the whole rest of the walk (seconds on a cold cache or on Windows).
-        if batch.commit_if_due().is_err() {
+        if let Err(e) = batch.commit_if_due() {
+            app_log!("[index] claude_code: committing a batch failed: {e:#}");
             report.errors += 1;
         }
         // Unchanged files (nearly all of them on a re-scan) are skipped before the batch
@@ -259,13 +260,17 @@ pub(crate) fn scan_root(
                 continue;
             }
             Err(e) => {
-                report.record(Err(e));
+                report.record_at(&path, Err(e));
                 continue;
             }
         };
-        report.record(batch.run(size, |conn| index_file(conn, sid, root, &path)));
+        report.record_at(
+            &path,
+            batch.run(size, |conn| index_file(conn, sid, root, &path)),
+        );
     }
-    if batch.finish().is_err() {
+    if let Err(e) = batch.finish() {
+        app_log!("[index] claude_code: committing the last batch failed: {e:#}");
         report.errors += 1;
     }
     Ok(report)
@@ -431,7 +436,7 @@ pub fn index_paths(conn: &mut Connection, paths: &[PathBuf]) -> Result<IndexRepo
     }
     let sid = source_id(conn, KIND)?;
     for (base, path) in files {
-        report.record(index_file(conn, sid, &base, &path));
+        report.record_at(&path, index_file(conn, sid, &base, &path));
     }
     Ok(report)
 }
