@@ -2,7 +2,7 @@
   "mcpServers": {
     "callimachus": {
       "command": "npx",
-      "args": ["-y", "callimachus-mcp@0.11.3"]
+      "args": ["-y", "callimachus-mcp@0.11.4"]
     }
   }
 }

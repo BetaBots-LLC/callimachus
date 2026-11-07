@@ -12,7 +12,7 @@
         "source": "git-subdir",
         "url": "BetaBots-LLC/callimachus",
         "path": "plugins/claude-code",
-        "ref": "v0.11.3"
+        "ref": "v0.11.4"
       },
       "description": "The /callimachus:recall skill, the Callimachus MCP server and the memory hooks for Claude Code."
     }
