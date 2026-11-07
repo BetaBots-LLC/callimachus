@@ -17,6 +17,7 @@ on:
     paths:
       - apps/desktop/src-tauri/Cargo.toml
       - apps/desktop/src-tauri/standalone/Cargo.toml
+      - apps/desktop/src-tauri/core/Cargo.toml
       - apps/desktop/src-tauri/Cargo.lock
       - .github/workflows/release-cache.yml
   schedule:

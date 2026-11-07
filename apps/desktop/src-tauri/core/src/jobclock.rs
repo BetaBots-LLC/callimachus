@@ -14,14 +14,14 @@
 use std::time::{Duration, Instant};
 
 /// A started job clock.
-pub(crate) struct JobClock {
+pub struct JobClock {
     wall: Instant,
     thread: Option<Duration>,
     process: Option<Duration>,
 }
 
 impl JobClock {
-    pub(crate) fn start() -> Self {
+    pub fn start() -> Self {
         Self {
             wall: Instant::now(),
             thread: cpu::thread(),
@@ -29,27 +29,27 @@ impl JobClock {
         }
     }
 
-    pub(crate) fn wall(&self) -> Duration {
+    pub fn wall(&self) -> Duration {
         self.wall.elapsed()
     }
 
     /// CPU this thread spent since `start`, if the platform reports it.
-    pub(crate) fn thread_cpu(&self) -> Option<Duration> {
+    pub fn thread_cpu(&self) -> Option<Duration> {
         Some(cpu::thread()?.saturating_sub(self.thread?))
     }
 
     /// CPU every thread of the process spent since `start`, if the platform reports it.
-    pub(crate) fn process_cpu(&self) -> Option<Duration> {
+    pub fn process_cpu(&self) -> Option<Duration> {
         Some(cpu::process()?.saturating_sub(self.process?))
     }
 
     /// "812 ms, 640 ms cpu" for work on the calling thread.
-    pub(crate) fn thread_summary(&self) -> String {
+    pub fn thread_summary(&self) -> String {
         summary(self.wall(), self.thread_cpu(), "cpu")
     }
 
     /// "4.1 s, 61.0 s cpu (process)" for work that fans out to other threads.
-    pub(crate) fn process_summary(&self) -> String {
+    pub fn process_summary(&self) -> String {
         summary(self.wall(), self.process_cpu(), "cpu (process)")
     }
 }
@@ -62,7 +62,7 @@ fn summary(wall: Duration, cpu: Option<Duration>, label: &str) -> String {
 }
 
 /// Milliseconds under 10 s, seconds with one decimal above.
-pub(crate) fn fmt_duration(d: Duration) -> String {
+pub fn fmt_duration(d: Duration) -> String {
     if d < Duration::from_secs(10) {
         format!("{} ms", d.as_millis())
     } else {

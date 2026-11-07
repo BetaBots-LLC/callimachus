@@ -279,10 +279,11 @@ jobs:
         run: echo "$APPLE_API_KEY_BASE64" | base64 --decode > "$RUNNER_TEMP/apple_api_key.p8"
 
       # Standalone `cal` + `callimachus-mcp` binaries for CLI/MCP-only users (no GUI
-      # app). They are the `callimachus-standalone` workspace member, not bins of the
-      # app crate, because `tauri build` bundles every bin of the app crate: that put
-      # two unused 27-29 MB copies of the backend into the macOS .app and the Linux
-      # packages (the app binary already serves `cal` and `--mcp`). Built before the
+      # app). They are the `callimachus-standalone` workspace member, which links only
+      # the Tauri-free `callimachus-core`. They are not bins of the app crate because
+      # `tauri build` bundles every bin of the app crate: that put two unused 27-29 MB
+      # copies of the backend into the macOS .app and the Linux packages (the app
+      # binary already serves `cal` and `--mcp`). Built before the
       # app so the Windows leg can bundle them: Windows installs keep `cal.exe` (and
       # `callimachus-mcp.exe`) next to the app as sidecars, through the CI-only
       # src-tauri/tauri.windows-sidecars.conf.json overlay, which reads them from
@@ -293,8 +294,9 @@ jobs:
         working-directory: apps/desktop/src-tauri
         run: |
           set -euo pipefail
-          # The lib embeds apps/desktop/dist at compile time and the frontend isn't
-          # built until tauri-action runs; these bins never serve it, so empty is fine.
+          # A dispatched tag from before the core crate built these bins from the app
+          # lib, which embeds apps/desktop/dist at compile time (the frontend isn't built
+          # until tauri-action runs; empty is fine). callimachus-core needs no dist.
           mkdir -p ../dist
           # A dispatched older tag (sources from the tag, this workflow from main) still
           # has the two bins in the app crate, where the bundler picks them up itself.
@@ -312,6 +314,16 @@ jobs:
           fi
           EXT=""
           [ "${{ runner.os }}" = "Windows" ] && EXT=".exe"
+          # core/build.rs stamps the app crate's version by parsing ../Cargo.toml, so a
+          # reformatted or moved `version` line would ship a wrong `cal --version` and MCP
+          # serverInfo; every leg runs its own binary natively, so check it here.
+          PKGID="$(cargo pkgid --locked -p callimachus)"
+          WANT="callimachus ${PKGID##*[#@]}"
+          GOT="$("$OUT/cal$EXT" --version | tr -d '\r')"
+          if [ "$GOT" != "$WANT" ]; then
+            echo "::error::standalone cal --version printed '$GOT', expected '$WANT'"
+            exit 1
+          fi
           STAGE="$RUNNER_TEMP/cli-bins"
           mkdir -p "$STAGE"
           cp "$OUT/cal$EXT"             "$STAGE/cal-$TRIPLE$EXT"

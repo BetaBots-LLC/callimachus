@@ -3,7 +3,7 @@
 //   http://localhost:1420/mock.html?view=settings&section=engine&theme=light
 // Params: theme, consent, memory (alias: knowledge), engines, agents, agenthooks, plugin, claude, keys,
 // update, jobs, semantic, searchMs, onboarding, ledger, chats, projectdata, lastproject, muted,
-// sections, today, scope (see SCENARIO below). mock-entry.ts also reads view, section,
+// sections, today, scope, cliwatch (see SCENARIO below). mock-entry.ts also reads view, section,
 // chatmode=ask and ask=<question> (sends it on load). Dev-only.
 import type {
   AgentHooksStatus,
@@ -1539,6 +1539,11 @@ const handlers: Record<string, Handler> = {
       }),
     ),
   jobs_status: () => ({ ...jobs }),
+  // `?cliwatch=1` (any value) shows Settings > Index with `cal watch` holding live indexing.
+  live_indexing: () => ({
+    cliWatch: params.has("cliwatch"),
+    cliWatchPid: params.has("cliwatch") ? 48213 : null,
+  }),
   embedding_status: () => ({ ...embed }),
   build_embeddings: () => {
     void runEmbeddings();

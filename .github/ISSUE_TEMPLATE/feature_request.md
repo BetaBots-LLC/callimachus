@@ -13,7 +13,7 @@ What you'd like to see.
 
 **New source?**
 If you're requesting support for another agent/tool, where does it store its
-history (path + format)? See the [indexer guide](../../apps/desktop/src-tauri/src/indexer/README.md).
+history (path + format)? See the [indexer guide](../../apps/desktop/src-tauri/core/src/indexer/README.md).
 
 **Alternatives**
 Anything you've tried or considered.

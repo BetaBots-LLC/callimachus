@@ -53,6 +53,9 @@ pub const COMMANDS: &[&str] = &[
     "recall-now",
     "session-end",
     "audit-pr",
+    "index",
+    "watch",
+    "embed",
     "version",
     "--version",
 ];
@@ -77,6 +80,9 @@ USAGE:
                                 distilled summary/decisions/gotchas for a thread
   cal distill <thread-id>       extract knowledge for a thread (needs distillation
                                 enabled in the app: local Ollama or an API key)
+  cal distill --auto            one drain of the auto-distill worklist under the
+                                daily cap (needs auto-distill on in Settings; not
+                                while the app or `cal watch` runs)
   cal decisions <query…> [-p PROJECT] [-n LIMIT] [--json]
   cal gotchas <query…> [-p PROJECT] [-n LIMIT] [--json]
                                 semantic recall of distilled decisions/gotchas
@@ -128,6 +134,12 @@ USAGE:
   cal resume <snapshot-id> [-a AGENT]
                                 relaunch an agent CLI seeded with a snapshot (cross-tool
                                 handoff; AGENT defaults to claude, e.g. -a codex)
+  cal index                     one pass over every agent's history into the index
+                                (for machines without the app; exit 1 on errors)
+  cal watch                     keep the index fresh as agents write (the app's
+                                watcher; refuses while the app runs)
+  cal embed [--no-download]     build the semantic index; may download the model
+                                (about 128 MB) unless --no-download
   cal version                    print the Callimachus version (also --version)
   cal help
 
@@ -275,10 +287,13 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
         "recall-now" => cmd_recall_now(rest),
         "session-end" => cmd_session_end(rest),
         "audit-pr" => cmd_audit_pr(rest),
+        "index" => crate::headless::cmd_index(rest),
+        "watch" => crate::headless::cmd_watch(rest),
+        "embed" => crate::headless::cmd_embed(rest),
         // A cheap, explicit signature for tools probing whether a `cal` on PATH is ours
         // (the VS Code extension; the system calendar's `cal` prints a calendar instead).
         "version" | "--version" | "-v" => {
-            println!("callimachus {}", env!("CARGO_PKG_VERSION"));
+            println!("callimachus {}", env!("CALLIMACHUS_VERSION"));
             Ok(())
         }
         "help" | "-h" | "--help" => {
@@ -718,6 +733,10 @@ fn cmd_knowledge(args: &[String]) -> anyhow::Result<()> {
 }
 
 fn cmd_distill(args: &[String]) -> anyhow::Result<()> {
+    if args.iter().any(|a| a == "--auto") {
+        let rest: Vec<String> = args.iter().filter(|a| *a != "--auto").cloned().collect();
+        return crate::headless::cmd_distill_auto(&rest);
+    }
     let o = parse(args)?;
     let id = thread_id_arg(&o, "distill")?;
     let mut conn = open_db_write()?;
@@ -3845,18 +3864,27 @@ mod tests {
             .chain(std::iter::once("help"))
             .collect();
         let docs = [
-            concat!(env!("CARGO_MANIFEST_DIR"), "/../../../README.md"),
-            concat!(env!("CARGO_MANIFEST_DIR"), "/../../web/src/routes/cli.tsx"),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../../../README.md"),
             concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/../../web/src/routes/index.tsx"
+                "/../../../web/src/routes/cli.tsx"
             ),
             concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/../../web/src/routes/desktop.tsx"
+                "/../../../web/src/routes/index.tsx"
             ),
-            concat!(env!("CARGO_MANIFEST_DIR"), "/../../web/src/routes/mcp.tsx"),
-            concat!(env!("CARGO_MANIFEST_DIR"), "/../../web/src/content/faq.ts"),
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../../web/src/routes/desktop.tsx"
+            ),
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../../web/src/routes/mcp.tsx"
+            ),
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../../web/src/content/faq.ts"
+            ),
         ];
         for path in docs {
             // A renamed or moved page must fail here, not pass by checking nothing.

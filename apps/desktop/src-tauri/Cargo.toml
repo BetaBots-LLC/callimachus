@@ -5,6 +5,9 @@ description = "Local index & search for AI agent threads"
 authors = ["Ari Shaller"]
 license = "AGPL-3.0-or-later"
 edition = "2021"
+# `tauri dev` runs a bare `cargo run`, which would otherwise have three default members' bins
+# to choose from (see `[workspace]`).
+default-run = "callimachus"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -20,81 +23,49 @@ name = "callimachus_lib"
 crate-type = ["rlib"]
 
 # The app crate has exactly one bin (src/main.rs), because `tauri build` bundles every bin of
-# this package. The standalone `cal` and `callimachus-mcp` are the `standalone` member:
-# `cargo build --release -p callimachus-standalone`. Not a default member, so `cargo run`
-# (tauri dev) and `tauri build` stay on the app; CI lints and tests with `--workspace`.
+# this package. Three crates: `core` (callimachus-core, everything without Tauri), this app
+# crate (the window, tray, Tauri commands and telemetry), and `standalone` (the `cal` and
+# `callimachus-mcp` downloads, `cargo build --release -p callimachus-standalone`, which link
+# core only, so they build without GTK or WebKit). All three are default members, so a plain
+# `cargo test` or `cargo clippy` here covers every crate (most tests live in core). `tauri dev`
+# still runs the app (`default-run`), and `tauri build` (`cargo build --bins`) also compiles
+# the standalone bins, which the release job built just before, but bundles only this
+# package's bin.
 [workspace]
-members = ["standalone"]
+members = ["core", "standalone"]
+default-members = [".", "core", "standalone"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+# Everything Tauri-free (index, search, memory, integrations, cal, the MCP server, the jobs).
+callimachus-core = { path = "core" }
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-opener = "2"
 # native-tls (OS TLS), NOT rustls: rustls pulls aws-lc-sys/ring, which need libclang_rt.osx.a
 # at link time — absent in recent macos-latest Xcodes. native-tls keeps CI on macos-latest.
 tauri-plugin-updater = { version = "2", default-features = false, features = ["native-tls", "zip"] }
 tauri-plugin-process = "2"
+# What lib.rs and telemetry.rs use directly; the version pins and their reasons live in
+# core/Cargo.toml, and these resolve to the same copies.
 serde = { version = "1", features = ["derive"] }
-# preserve_order: integration edits of ~/.claude.json / settings.json keep the user's key
-# order instead of re-sorting the file on every write (tauri-utils enables it already; named
-# here so the integration code doesn't depend on that).
 serde_json = { version = "1", features = ["preserve_order"] }
-# Format-preserving TOML edit for Codex's ~/.codex/config.toml MCP registration.
-# 0.25 matches the copy tauri already pulls in, so the graph carries one fewer toml_edit.
-toml_edit = "0.25"
-# Canonical store: bundled SQLite (FTS5 is compiled into the bundled amalgamation).
 rusqlite = { version = "0.40", features = ["bundled", "functions"] }
 rusqlite_migration = "2.6"
 chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1"
 thiserror = "2"
-notify = "8.2.0"
-notify-debouncer-full = "0.7.0"
-# Exact pin: 5.17.4+ moves ort to 2.0.0-rc.13 (ONNX Runtime 1.28, DirectML/CoreML linkage), which
-# needs its own clean-VM and embedding-drift checks, so a plain `cargo update` must not pull it in.
-# 7.5 (ort rc.15, ONNX Runtime 1.31) measured: no drift (1 - min cosine 2.4e-7 over 1,003 stored
-# chunks, `embed::tests::embedding_drift_against_stored_vectors`), but its macOS prebuilt is
-# compiled for macOS 13.4 (we ship 11.0) and its CoreML objects need compiler-rt's
-# `__isPlatformVersionAtLeast`, so a release link fails without libclang_rt.osx.a (see reqwest).
-# Default features are off to drop `image-models` (image/rav1e/exr/tiff/...): only TextEmbedding is
-# used. Keep the ort prebuilt download and the hf-hub model fetch, both over native-tls (see reqwest).
-fastembed = { version = "=5.17.2", default-features = false, features = ["ort-download-binaries-native-tls", "hf-hub-native-tls"] }
 # "sync" + "time": telemetry.rs uses tokio::sync::{mpsc, oneshot} and tokio::time directly, so
 # name them here instead of relying on tauri/reqwest happening to enable them.
 tokio = { version = "1.52.3", features = ["rt", "macros", "rt-multi-thread", "io-std", "process", "sync", "time"] }
-futures-util = "0.3.32"
-# default-features off: reqwest's `default-tls` is rustls (-> aws-lc-sys/ring -> clang_rt.osx,
-# which breaks linking on recent macos-latest Xcodes). Use native-tls + the rest of the defaults.
+# Telemetry's PostHog client; native-tls for the reason in core/Cargo.toml.
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "stream", "native-tls", "charset", "http2", "system-proxy"] }
-# Cross-platform OS credential store: macOS Keychain, Windows Credential Manager,
-# Linux Secret Service (pure-Rust zbus + crypto-rust, no system libsecret or libdbus).
-# 4 moved the stores into their own crates; the default `v1` feature picks the native one per
-# platform and keeps 3's item naming (service/account, `{user}.{service}` on Windows), so keys
-# saved by older builds still resolve.
-keyring = "4"
-sqlite-vec = "0.1.9"
-zerocopy = "0.8.52"
 genai = { version = "0.7.2", default-features = false, features = ["native-tls", "system-proxy"] }
-rmcp = { version = "3.8.0", features = ["server", "transport-io", "macros"] }
-schemars = "1"
 tokio-util = "0.7.18"
-r2d2 = "0.8.10"
 # Random anonymous install id for opt-in analytics (telemetry.rs). Already in the lock graph.
 uuid = { version = "1", features = ["v4"] }
-# Cross-platform per-user dirs (data/home). macOS values match the prior
-# hardcoded ~/Library/Application Support path exactly; Windows resolves to
-# %LOCALAPPDATA% / %USERPROFILE% (the old code assumed a Unix $HOME and crashed
-# on Windows). Used by db::default_index_path and the per-agent indexers.
-# 7 only moved `preference_dir` on Windows (unused here) and matches the copy tauri pulls in.
 dirs = "7"
-
-# Free-space probe before Reclaim space / Shrink index rewrites the file (cleanup.rs
-# `volume_space`). Already in the lock graph through tauri and keyring; this only turns on the
-# FileSystem bindings (GetDiskFreeSpaceExW, GetVolumePathNameW).
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
 [profile.release]
 # Smaller, faster release binaries (the app, `cal` and `callimachus-mcp`) at the cost of longer

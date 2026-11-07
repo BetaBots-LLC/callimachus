@@ -80,17 +80,18 @@ const SEARCH_HITS_PER_THREAD: u32 = 3;
 const SNAPSHOT_DIVIDER: &str = "\n\n---\n\n";
 
 /// Returned by every read tool while the index holds no threads. The standalone server (npx,
-/// MCP registry) only reads the index; without the desktop app nothing ever fills it, and a
-/// bare `[]` would read to the agent as "the user has no prior work".
+/// MCP registry) only reads the index; the desktop app or `cal index` / `cal watch` fill it,
+/// and a bare `[]` would read to the agent as "the user has no prior work".
 const EMPTY_INDEX_NOTICE: &str =
     "No Callimachus index yet: no conversation threads have been indexed. \
-This MCP server only reads the index; the Callimachus desktop app builds it. Install the app \
-(https://github.com/BetaBots-LLC/callimachus/releases/latest), open it once to index your agent \
-history (or click Reindex in Settings), then retry. If the app is already installed and indexed, \
-point this server at its index with the CALLIMACHUS_DB environment variable.";
+This MCP server only reads the index; the Callimachus desktop app builds it, or run `cal index` \
+(once) or `cal watch` (keeps it fresh) without the app. Install the app or the standalone cal \
+(https://github.com/BetaBots-LLC/callimachus/releases/latest), index your agent history (open \
+the app once, or click Reindex in Settings), then retry. If an index already exists elsewhere, \
+point this server at it with the CALLIMACHUS_DB environment variable.";
 
 /// This server's release: the app version a behind index needs, and the one in the notices.
-const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
+const SERVER_VERSION: &str = env!("CALLIMACHUS_VERSION");
 
 /// app_config: the app version that last launched on this index, which the GUI records at
 /// every launch (only locally, consent or not). Read here, never written: when the index is
@@ -1975,7 +1976,7 @@ impl ServerHandler for Callimachus {
         let mut server_info = Implementation::from_build_env();
         server_info.name = "callimachus".into();
         server_info.title = Some("Callimachus".into());
-        server_info.version = env!("CARGO_PKG_VERSION").into();
+        server_info.version = env!("CALLIMACHUS_VERSION").into();
         server_info.description =
             Some("Search the user's indexed AI agent conversation history".into());
         // The default is ProtocolVersion::LATEST, which has no initialize handshake; name the
@@ -2175,7 +2176,7 @@ fn newer_app_version(conn: &Connection) -> Option<String> {
 }
 
 /// The server-log line for a missing index, or None when `index_path` exists. Only the
-/// desktop app indexes, so without it (an npx / MCP-registry install, or CALLIMACHUS_DB
+/// desktop app and `cal index` / `cal watch` index, so without them (an npx / MCP-registry install, or CALLIMACHUS_DB
 /// pointing somewhere new) the server starts on an empty index; the tools also answer with
 /// [`EMPTY_INDEX_NOTICE`] until threads show up. Worded for both entry points: the app's own
 /// `--mcp` mode can hit this too, when it was never opened or CALLIMACHUS_DB moved the index.
@@ -2186,8 +2187,8 @@ fn no_index_notice(prog: &str, index_path: &Path) -> Option<String> {
     Some(format!(
         "{prog}: no index at {}; starting with an empty one. The Callimachus desktop app builds \
          the index: open it to index your agent history (install it from \
-         https://github.com/BetaBots-LLC/callimachus/releases/latest), or set CALLIMACHUS_DB to \
-         an existing index.db.",
+         https://github.com/BetaBots-LLC/callimachus/releases/latest), or run `cal index`, or \
+         set CALLIMACHUS_DB to an existing index.db.",
         index_path.display()
     ))
 }
@@ -2317,6 +2318,9 @@ mod tests {
         assert!(notice.starts_with("callimachus --mcp: no index at "));
         assert!(notice.contains(&path.display().to_string()));
         assert!(notice.contains("CALLIMACHUS_DB"));
+        // A plugin-only user has no app to install first: both notices name `cal index`.
+        assert!(notice.contains("`cal index`"));
+        assert!(EMPTY_INDEX_NOTICE.contains("`cal index`"));
         std::fs::write(&path, b"").unwrap();
         assert_eq!(no_index_notice("callimachus-mcp", &path), None);
         let _ = std::fs::remove_dir_all(&dir);
@@ -3362,8 +3366,8 @@ mod tests {
             .map(|t| t.name.to_string())
             .collect();
         let docs = [
-            concat!(env!("CARGO_MANIFEST_DIR"), "/resources/recall/SKILL.md"),
-            concat!(env!("CARGO_MANIFEST_DIR"), "/../../../README.md"),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../resources/recall/SKILL.md"),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../../../README.md"),
         ];
         let mut checked = 0;
         for path in docs {

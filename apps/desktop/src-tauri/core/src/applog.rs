@@ -20,7 +20,9 @@ const MAX_BYTES: u64 = 1024 * 1024;
 /// The log file, once `init` ran. The mutex serializes append + rotate across threads.
 static LOG: OnceLock<Mutex<PathBuf>> = OnceLock::new();
 
-/// Log a formatted line to stderr and, in the GUI, to the persistent log file.
+/// Log a formatted line to stderr and, in the GUI, to the persistent log file. Exported so the
+/// app crate (`#[macro_use] extern crate callimachus_core`) logs through the same file.
+#[macro_export]
 macro_rules! app_log {
     ($($arg:tt)*) => {
         $crate::applog::write_line(&format!($($arg)*))

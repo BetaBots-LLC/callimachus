@@ -29,7 +29,7 @@ The same release also carries standalone `cal-<target>` and `callimachus-mcp-<ta
 
 ## What it does
 
-- **Indexes** every conversation from 12 coding agents into one local SQLite store: Claude Code, Codex, Cursor, Gemini CLI, Qwen Code, Goose, OpenCode, Continue, Cline, Roo Code, Kilo Code, and Copilot Chat (the built-in chat panel of VS Code, Cursor, VSCodium and Windsurf). Adding another source is a [small, documented contract](apps/desktop/src-tauri/src/indexer/README.md).
+- **Indexes** every conversation from 12 coding agents into one local SQLite store: Claude Code, Codex, Cursor, Gemini CLI, Qwen Code, Goose, OpenCode, Continue, Cline, Roo Code, Kilo Code, and Copilot Chat (the built-in chat panel of VS Code, Cursor, VSCodium and Windsurf). Adding another source is a [small, documented contract](apps/desktop/src-tauri/core/src/indexer/README.md).
 - **Searches** them with hybrid ranking: keyword (SQLite FTS5 / BM25) fused with on-device semantic similarity (sqlite-vec KNN, no cloud) via Reciprocal Rank Fusion. Filter by source, project, subagents, starred, and tags.
 - **Finds code-aware**: type `file:embed/mod.rs` in the search bar (or `cal files <path>`) to find every thread that touched a path; backed by a file-mention index built at index time.
 - **Distills knowledge**: free heuristic TODO extraction (always on, no LLM), plus LLM distillation of decisions, gotchas, and summaries behind one consent click that names the engine and where transcripts go (the Turn on memory card in Projects or Chat's Ask mode preselects a detected Claude Code or Codex CLI, then local Ollama, then a saved key; Settings > AI engine has the same switch), with cross-thread semantic recall of past decisions/gotchas. Optional **auto-distillation** works through threads active in the last 30 days in the background, up to a daily limit you set next to its toggle (50 threads by default, 0 pauses it; Settings shows what's left today), so memory self-populates without an open-ended bill. Runs on local Ollama (keyless), your logged-in **Claude Code or Codex CLI** (keyless, billed to whatever that CLI is signed in with), or a cloud API key.
@@ -58,7 +58,7 @@ The same release also carries standalone `cal-<target>` and `callimachus-mcp-<ta
 - **Watcher:** `notify` + debouncer
 - **Chat:** multi-provider via the `genai` crate (Anthropic / OpenAI / Gemini / OpenRouter / Ollama local + Ollama Cloud), each with a configurable base URL, streaming tokens over a Tauri Channel, cancellable, with agent tool-calls (history search + approved shell)
 - **Secrets:** OS credential store via the cross-platform `keyring` crate: macOS Keychain, Windows Credential Manager, Linux Secret Service
-- **Entry points:** the app binary also runs as `cal` (through the `~/.local/bin/cal` link or `cal.exe`) and as the MCP server (`--mcp`); the standalone `cal` and `callimachus-mcp` release binaries are the same code built on their own. All of them reuse the desktop core lib against the same `index.db`
+- **Entry points:** the app binary also runs as `cal` (through the `~/.local/bin/cal` link or `cal.exe`) and as the MCP server (`--mcp`); the standalone `cal` and `callimachus-mcp` release binaries are the same code built on their own. All of them run the Tauri-free core crate (`callimachus-core`, which the standalone binaries link without Tauri, GTK or WebKit) against the same `index.db`
 - **Editor:** a VS Code / Cursor extension (`apps/vscode`, published to the Marketplace + Open VSX) that shells out to `cal`
 
 ## Monorepo
@@ -67,7 +67,8 @@ This is a [Turborepo](https://turborepo.com) + pnpm workspace.
 
 ```
 apps/
-  desktop/            # the Tauri 2 desktop app + the cal CLI and MCP server (src-tauri)
+  desktop/            # the Tauri 2 desktop app; src-tauri/core is the Tauri-free core (index,
+                      # cal, MCP server, jobs), src-tauri/standalone the cal + callimachus-mcp bins
   vscode/             # VS Code / Cursor extension (search history from the editor)
   web/                # callimachus.app, the marketing + download site (TanStack Start)
 packages/
@@ -95,8 +96,8 @@ First launch: the index is empty, so the Search screen offers **Index my history
 
 ```bash
 cd apps/desktop/src-tauri
-cargo test                                   # fast unit tests
-cargo test -- --ignored --nocapture          # real-data + model + keychain smoke tests
+cargo test                                   # fast unit tests, every crate in the workspace
+cargo test -p callimachus-core -- --ignored --nocapture   # real-data + model + keychain smoke tests
 ```
 
 The `--ignored` tests touch live data on this machine: each source has a `real_<source>_index` smoke test that indexes your real history read-only (`~/.claude`, `~/.codex`, Cursor, `~/.gemini`, `~/.qwen`, Goose, OpenCode, Continue, Cline/Roo/Kilo), plus the embedding-model download (first run, needs network) and a Keychain round-trip.
@@ -115,7 +116,7 @@ claude plugin marketplace add BetaBots-LLC/callimachus
 
 The hooks run the `cal` CLI at `~/.local/bin/cal`, so open the desktop app (which builds the index) and click **Install the cal CLI** in **Settings → Agents** once (the Claude Code button's label while the plugin is enabled): that installs only `cal` and removes the app's own skill, MCP entry and hooks, so memory is never injected twice and only one server starts; Settings then says the integration is managed by the plugin. Until `cal` exists the hooks do nothing. The plugin needs the app at 0.11.4 or later: the marketplace serves it from the latest release tag, with the MCP server pinned to that release, so keep the app on the latest release too. **On Windows, use Settings → Agents instead of the plugin**: Claude Code runs plugin hooks through Git Bash (or PowerShell, where they fail with a hook error), and the app keeps its own skill, MCP entry and hooks there, so the plugin would load them twice.
 
-**MCP server**: let any agent search its own past work mid-session. It reads the index the desktop app builds and does not index anything by itself, so install the app and let it index once first. The quickest way to register it is `npx` (it downloads the prebuilt binary on first run and verifies its SHA-256); it's also listed on the official [MCP registry](https://registry.modelcontextprotocol.io) as `io.github.BetaBots-LLC/callimachus`:
+**MCP server**: let any agent search its own past work mid-session. It reads the index the desktop app builds and does not index anything by itself, so install the app and let it index once first (or, without the app, run `cal index`; see below). The quickest way to register it is `npx` (it downloads the prebuilt binary on first run and verifies its SHA-256); it's also listed on the official [MCP registry](https://registry.modelcontextprotocol.io) as `io.github.BetaBots-LLC/callimachus`:
 
 ```bash
 claude mcp add callimachus -- npx -y callimachus-mcp    # or any MCP client
@@ -158,6 +159,20 @@ cal hook --explain --for codex             # the same for a Codex session (also 
 
 `star`, `tag`, `tags`, `todos`, `knowledge`, `distill`, `decisions`, `gotchas`, `related`, and `similar` (the "have I done this before?" check) also exist. Run `cal help` for the full list.
 
+**Without the app** (a server, a CI box, with the standalone `cal` above): `cal` runs the app's background jobs itself, against the same index and with the same rules.
+
+```bash
+cal index                  # one pass over every agent's history (creates the index; exit 1 on errors)
+cal watch                  # keep it fresh as agents write: the app's watcher, one line per batch
+cal embed                  # build the semantic index (downloads the ~128 MB model once)
+cal embed --no-download    # the same, only with a model already on this machine
+cal distill --auto         # one drain of the auto-distill worklist under the daily cap
+```
+
+`cal index` and `cal watch` build and refresh the index with no app at all. `cal distill --auto` (and the drain `cal watch` runs when auto-distill is on) needs memory turned on with an engine, which only the app's **Settings → AI engine** does today. Once that is done it drains with the app closed: a logged-in `claude` or `codex` CLI and local Ollama need nothing more, and an API key is read from the OS keychain where the app saved it. On a machine that never ran the app, `cal distill --auto` says memory is off.
+
+Only one process watches an index at a time: the app holds `index.db.gui.lock` next to the index while it runs and `cal watch` holds `index.db.watch.lock`. `cal watch` refuses to start while the app runs, and the app keeps its own watcher off while `cal watch` runs (Settings → Index says so) and takes over within a minute after it stops (a second app open on the same index waits for the first the same way). `cal distill --auto` refuses while either runs, since both distill on their own, and the app starts no auto-distill round while `cal watch` or `cal distill --auto` runs. `cal index` and `cal embed` are safe alongside either. These four may create and upgrade the index; `cal embed` without `--no-download` is the only `cal` command that downloads the model, and hooks and the MCP server still never do. `cal distill --auto` holds `index.db.distill.lock` and needs auto-distill on in Settings → AI engine. `cal index` and `cal embed` do not yield to the app's Shrink index or Reclaim space, and the app refuses those two while `cal watch` or `cal distill --auto` runs; rerun the command afterwards if one interrupted it.
+
 **VS Code / Cursor**: the extension adds a "Callimachus History" sidebar, a status-bar search button, and commands to search / insert / copy threads (it shells out to `cal`). Install from the **[VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=BetaBotsLLC.callimachus-vscode)** or **[Open VSX](https://open-vsx.org/extension/BetaBotsLLC/callimachus-vscode)** (the registry **Cursor** and VSCodium use), or grab the `.vsix` from [Releases](../../releases). See [apps/vscode/README.md](apps/vscode/README.md).
 
 ## Notes / limitations
@@ -169,11 +184,11 @@ cal hook --explain --for codex             # the same for a Codex session (also 
 - Moved your Claude Code or Codex data (`CLAUDE_CONFIG_DIR` / `CODEX_HOME`)? An app opened from the Dock, Finder or Start menu doesn't see shell variables, so set those folders under **Settings → Sources** (changing one reindexes that source).
 - Large first index is a one-time cost (the Claude corpus here was ~90k messages in ~25s); subsequent passes skip unchanged files.
 - The index (`index.db`), the embedding model (`models/`) and the app's diagnostics log (`callimachus.log`) live together in the per-user app data folder `dev.shaller.callimachus` (`~/Library/Application Support` on macOS, `%LOCALAPPDATA%` on Windows, `~/.local/share` on Linux). Attach `callimachus.log` to a bug report.
-- More sources (Charm Crush, Factory Droid, and the standalone Copilot CLI) are scoped but not yet integrated; Copilot Chat in VS Code-family editors is already indexed. See [the indexer guide](apps/desktop/src-tauri/src/indexer/README.md).
+- More sources (Charm Crush, Factory Droid, and the standalone Copilot CLI) are scoped but not yet integrated; Copilot Chat in VS Code-family editors is already indexed. See [the indexer guide](apps/desktop/src-tauri/core/src/indexer/README.md).
 
 ## Contributing
 
-Issues and PRs welcome. [CONTRIBUTING.md](CONTRIBUTING.md) covers local setup, conventions, and the release flow. Adding support for another agent is a [small, documented contract](apps/desktop/src-tauri/src/indexer/README.md), usually one indexer module + a migration + a few wiring points.
+Issues and PRs welcome. [CONTRIBUTING.md](CONTRIBUTING.md) covers local setup, conventions, and the release flow. Adding support for another agent is a [small, documented contract](apps/desktop/src-tauri/core/src/indexer/README.md), usually one indexer module + a migration + a few wiring points.
 
 ## Security & privacy
 

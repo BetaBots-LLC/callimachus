@@ -64,8 +64,11 @@ Specifically:
   time you build the semantic index, and again at launch only if you have a
   semantic index but the model is missing from its cache
   (`<app data>/dev.shaller.callimachus/models`, or `$HF_HOME` /
-  `$FASTEMBED_CACHE_DIR` when set). The `cal` CLI, the hooks and the MCP server
-  never download it; without it they fall back to keyword search.
+  `$FASTEMBED_CACHE_DIR` when set). The hooks, the MCP server and every `cal`
+  command but one never download it; without it they fall back to keyword search.
+  The exception is `cal embed`, which builds the semantic index on a machine
+  without the app and fetches the same model the same way the first time
+  (`cal embed --no-download` never does).
 - **Opt-in usage analytics (desktop app only).** The desktop app can send
   anonymous usage analytics to PostHog (US): event names, app version, OS, CPU
   architecture and language, and a few properties picked from fixed lists (such

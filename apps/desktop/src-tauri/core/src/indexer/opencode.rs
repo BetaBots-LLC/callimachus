@@ -137,7 +137,7 @@ fn scan_combined(
                 continue;
             }
 
-            report.record(index_session(conn, sid, root, &sf));
+            report.record_at(&sf, index_session(conn, sid, root, &sf));
         }
     }
 
@@ -297,7 +297,7 @@ fn scan_root(conn: &mut Connection, root: &Path, tick: &mut dyn FnMut()) -> Resu
 
     for sf in session_files {
         tick();
-        report.record(index_session(conn, sid, root, &sf));
+        report.record_at(&sf, index_session(conn, sid, root, &sf));
     }
     Ok(report)
 }

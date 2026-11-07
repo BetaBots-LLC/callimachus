@@ -102,7 +102,7 @@ fn index_dir(
             continue;
         }
         tick();
-        report.record(index_session(conn, sid, &path, project));
+        report.record_at(&path, index_session(conn, sid, &path, project));
     }
 }
 

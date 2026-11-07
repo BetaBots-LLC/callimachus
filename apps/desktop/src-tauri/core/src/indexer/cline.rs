@@ -86,7 +86,7 @@ pub fn scan_ext(
             if !dir.is_dir() {
                 continue;
             }
-            report.record(index_task(conn, sid, kind, &editor, &dir));
+            report.record_at(&dir, index_task(conn, sid, kind, &editor, &dir));
         }
     }
     Ok(report)

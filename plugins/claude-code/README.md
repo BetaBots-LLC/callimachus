@@ -11,8 +11,9 @@ The Callimachus plugin gives Claude Code your past AI coding sessions as memory:
 
 ## What it needs
 
-- **The Callimachus desktop app, 0.11.4 or later** (https://callimachus.app). Only the app
-  indexes your agent history; the plugin reads the index it builds. Older apps lack the
+- **The Callimachus desktop app, 0.11.4 or later** (https://callimachus.app). The app indexes
+  your agent history and the plugin reads that index (`cal index` and `cal watch` can also
+  build it without the app, see the main README's CLI section). Older apps lack the
   `cal session-end` command the SessionEnd hook runs and do not step aside for the plugin, so
   memory would be injected twice. Keep the app updated: the marketplace serves the plugin from
   the latest release's tag, and its MCP server is pinned to that release.

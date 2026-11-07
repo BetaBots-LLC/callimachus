@@ -116,6 +116,13 @@ export function IndexSection() {
  *  repair the Spend card and a stale list point at is reachable without the palette. */
 function ReindexRow() {
   const reindex = useReindex();
+  // `cal watch` and the app never watch at once: while it holds the index, the app's watcher
+  // waits and looks again every minute.
+  const live = useQuery({
+    queryKey: ["live_indexing"],
+    queryFn: api.liveIndexing,
+    refetchInterval: 60_000,
+  });
   const starting = useReindexStarting();
   const running = userReindexing(useJobsStatus().data);
   const indexError = useIndexError();
@@ -138,6 +145,13 @@ function ReindexRow() {
         </Button>
       }
     >
+      {live.data?.cliWatch && (
+        <Note>
+          Live indexing is off: <code>cal watch</code>
+          {live.data.cliWatchPid != null && ` (process ${live.data.cliWatchPid})`} is keeping this
+          index up to date. Stop it and the app takes over within a minute.
+        </Note>
+      )}
       {indexError && !busy && (
         <InlineError>The last reindex stopped: {indexError}. Reindex again to retry.</InlineError>
       )}

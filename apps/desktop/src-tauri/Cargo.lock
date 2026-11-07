@@ -463,6 +463,31 @@ name = "callimachus"
 version = "0.11.3"
 dependencies = [
  "anyhow",
+ "callimachus-core",
+ "chrono",
+ "dirs 7.0.0",
+ "genai",
+ "reqwest 0.13.5",
+ "rusqlite",
+ "rusqlite_migration",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-opener",
+ "tauri-plugin-process",
+ "tauri-plugin-updater",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+ "uuid",
+]
+
+[[package]]
+name = "callimachus-core"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
  "chrono",
  "dirs 7.0.0",
  "fastembed",
@@ -480,16 +505,10 @@ dependencies = [
  "serde",
  "serde_json",
  "sqlite-vec",
- "tauri",
- "tauri-build",
- "tauri-plugin-opener",
- "tauri-plugin-process",
- "tauri-plugin-updater",
  "thiserror 2.0.21",
  "tokio",
  "tokio-util",
  "toml_edit 0.25.17+spec-1.1.0",
- "uuid",
  "windows-sys 0.61.2",
  "zerocopy",
 ]
@@ -498,7 +517,7 @@ dependencies = [
 name = "callimachus-standalone"
 version = "0.0.0"
 dependencies = [
- "callimachus",
+ "callimachus-core",
  "static_vcruntime",
  "tauri-winres",
 ]

@@ -25,7 +25,7 @@ The \`cal\` CLI is \`~/.local/bin/cal\` (on Windows, \`cal.exe\` next to the Cal
 
 /** The `cal` subcommands, parsed from `COMMANDS` in cli_core.rs (the dispatcher's list). */
 function calCommands() {
-  const src = read(root, "apps", "desktop", "src-tauri", "src", "cli_core.rs");
+  const src = read(root, "apps", "desktop", "src-tauri", "core", "src", "cli_core.rs");
   const block = src.match(/pub const COMMANDS: &\[&str\] = &\[([\s\S]*?)\];/);
   assert.ok(block, "COMMANDS not found in cli_core.rs");
   return new Set([...block[1].matchAll(/"([^"]+)"/g)].map((m) => m[1]));

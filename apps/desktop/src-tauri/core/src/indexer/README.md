@@ -44,15 +44,15 @@ pub struct ParsedMessage {
 
 ## Six steps to add a source
 
-1. **Migration** — `migrations/00NN_*.sql`: `INSERT OR IGNORE INTO sources (kind) VALUES ('<kind>');` and register it in `db/migrations.rs`.
-2. **Indexer** — `indexer/<kind>.rs` with `KIND` + `scan()`. Parse to `ParsedThread`, call `upsert_thread`. Skip unchanged work (see change-detection below). The small shared helpers (titles, timestamps, text parts, `push_message`) are in `indexer/common.rs`, and `IndexReport::record` tallies each file.
-3. **Register** — add `pub mod <kind>;` and a `Source { kind, scan, caps_tool_output }` entry to `SOURCES` in `indexer/mod.rs`. The full reindex, the per-source reindex command (`index_source` in `lib.rs`), the watcher's dispatch and tool-output cleanup all read this one list; tests check it against the `sources` table, `telemetry::SOURCES` and whether the indexer calls `cap_tool_text`. Add your indexer's file to the `match` in `caps_tool_output_matches_the_indexers` as well; until you do, that test panics with "add <kind>'s indexer source here".
-4. **Watcher** — `indexer/watcher.rs`: add the store dir to `watch_targets` (routing is by root, so no classifier branch is needed).
-5. **Telemetry** — add the kind to `telemetry::SOURCES` (a test checks it against `SOURCES`). Nothing in `apps/desktop/src/lib/telemetry.ts` needs to change: its `thread_opened` event takes `SourceKind` from `api.ts`, which step 6 extends.
-6. **Frontend** — extend `SourceKind`, `SOURCE_LABELS`, and `INDEXABLE_SOURCES` in `apps/desktop/src/lib/api.ts` (the filter chips and reindex buttons derive from the last one). Optionally add to `OPEN_TARGETS` / `cli_resume` if the CLI is launchable.
+1. **Migration**: `migrations/00NN_*.sql` (in `apps/desktop/src-tauri`): `INSERT OR IGNORE INTO sources (kind) VALUES ('<kind>');` and register it in `db/migrations.rs`.
+2. **Indexer**: `indexer/<kind>.rs` with `KIND` + `scan()`. Parse to `ParsedThread`, call `upsert_thread`. Skip unchanged work (see change-detection below). The small shared helpers (titles, timestamps, text parts, `push_message`) are in `indexer/common.rs`, and `IndexReport::record` tallies each file.
+3. **Register**: add `pub mod <kind>;` and a `Source { kind, scan, caps_tool_output }` entry to `SOURCES` in `indexer/mod.rs`. The full reindex, the per-source reindex (`jobs::index_source`, behind the app's `index_source` command), the watcher's dispatch and tool-output cleanup all read this one list; tests check it against the `sources` table, `telemetry::SOURCES` and whether the indexer calls `cap_tool_text`. Add your indexer's file to the `match` in `caps_tool_output_matches_the_indexers` as well; until you do, that test panics with "add <kind>'s indexer source here".
+4. **Watcher**: `indexer/watcher.rs`: add the store dir to `watch_targets` (routing is by root, so no classifier branch is needed).
+5. **Telemetry**: add the kind to `telemetry::SOURCES` in the app crate (`src-tauri/src/telemetry.rs`; its `every_source_is_on_the_telemetry_allowlist` test checks it against `SOURCES`). Nothing in `apps/desktop/src/lib/telemetry.ts` needs to change: its `thread_opened` event takes `SourceKind` from `api.ts`, which step 6 extends.
+6. **Frontend**: extend `SourceKind`, `SOURCE_LABELS`, and `INDEXABLE_SOURCES` in `apps/desktop/src/lib/api.ts` (the filter chips and reindex buttons derive from the last one). Optionally add to `OPEN_TARGETS` / `cli_resume` if the CLI is launchable.
 
 Tests: a parse test over a synthetic sample, a search round-trip, and an
-`#[ignore]`d real-data smoke test (`cargo test -- --ignored real_<kind>_index`).
+`#[ignore]`d real-data smoke test (`cargo test -p callimachus-core -- --ignored real_<kind>_index`).
 
 ## Change detection (don't re-embed unchanged threads)
 

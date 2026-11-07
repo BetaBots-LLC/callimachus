@@ -1,0 +1,77 @@
+[package]
+# Everything Callimachus does without a window: the index (db, indexer, search, embed), project
+# memory (knowledge, export, context), the agent integrations, the `cal` CLI and the MCP server,
+# and the background jobs (`jobs`). No Tauri: the app crate (`..`) and the standalone `cal` /
+# `callimachus-mcp` (`../standalone`) both link it, so a CLI or MCP-only build (the Docker
+# image, the Linux standalone downloads) no longer needs GTK or WebKit to compile.
+name = "callimachus-core"
+# Never published or synced, like the standalone member: build.rs reads the app crate's
+# version (the one `pnpm version-packages` keeps in sync) for `cal --version` and the MCP
+# server, so this crate stays at 0.0.0 and the sync script never needs to know about it.
+version = "0.0.0"
+publish = false
+description = "The Tauri-free core of Callimachus: index, search, memory, cal and the MCP server"
+authors = ["Ari Shaller"]
+license = "AGPL-3.0-or-later"
+edition = "2021"
+
+[lib]
+name = "callimachus_core"
+crate-type = ["rlib"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+# preserve_order: integration edits of ~/.claude.json / settings.json keep the user's key
+# order instead of re-sorting the file on every write. Named here because tauri-utils, which
+# used to enable it for the whole graph, is no longer in a standalone build.
+serde_json = { version = "1", features = ["preserve_order"] }
+# Format-preserving TOML edit for Codex's ~/.codex/config.toml MCP registration.
+# 0.25 matches the copy tauri pulls in for the app, so the graph carries one fewer toml_edit.
+toml_edit = "0.25"
+# Canonical store: bundled SQLite (FTS5 is compiled into the bundled amalgamation).
+rusqlite = { version = "0.40", features = ["bundled", "functions"] }
+rusqlite_migration = "2.6"
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1"
+thiserror = "2"
+notify = "8.2.0"
+notify-debouncer-full = "0.7.0"
+# Exact pin: 5.17.4+ moves ort to 2.0.0-rc.13 (ONNX Runtime 1.28, DirectML/CoreML linkage), which
+# needs its own clean-VM and embedding-drift checks, so a plain `cargo update` must not pull it in.
+# 7.5 (ort rc.15, ONNX Runtime 1.31) measured: no drift (1 - min cosine 2.4e-7 over 1,003 stored
+# chunks, `embed::tests::embedding_drift_against_stored_vectors`), but its macOS prebuilt is
+# compiled for macOS 13.4 (we ship 11.0) and its CoreML objects need compiler-rt's
+# `__isPlatformVersionAtLeast`, so a release link fails without libclang_rt.osx.a (see reqwest).
+# Default features are off to drop `image-models` (image/rav1e/exr/tiff/...): only TextEmbedding is
+# used. Keep the ort prebuilt download and the hf-hub model fetch, both over native-tls (see reqwest).
+fastembed = { version = "=5.17.2", default-features = false, features = ["ort-download-binaries-native-tls", "hf-hub-native-tls"] }
+tokio = { version = "1.52.3", features = ["rt", "macros", "rt-multi-thread", "io-std", "process", "sync", "time"] }
+futures-util = "0.3.32"
+# default-features off: reqwest's `default-tls` is rustls (-> aws-lc-sys/ring -> clang_rt.osx,
+# which breaks linking on recent macos-latest Xcodes). Use native-tls + the rest of the defaults.
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "stream", "native-tls", "charset", "http2", "system-proxy"] }
+# Cross-platform OS credential store: macOS Keychain, Windows Credential Manager,
+# Linux Secret Service (pure-Rust zbus + crypto-rust, no system libsecret or libdbus).
+# 4 moved the stores into their own crates; the default `v1` feature picks the native one per
+# platform and keeps 3's item naming (service/account, `{user}.{service}` on Windows), so keys
+# saved by older builds still resolve.
+keyring = "4"
+sqlite-vec = "0.1.9"
+zerocopy = "0.8.52"
+genai = { version = "0.7.2", default-features = false, features = ["native-tls", "system-proxy"] }
+rmcp = { version = "3.8.0", features = ["server", "transport-io", "macros"] }
+schemars = "1"
+tokio-util = "0.7.18"
+r2d2 = "0.8.10"
+# Cross-platform per-user dirs (data/home). macOS values match the prior
+# hardcoded ~/Library/Application Support path exactly; Windows resolves to
+# %LOCALAPPDATA% / %USERPROFILE% (the old code assumed a Unix $HOME and crashed
+# on Windows). Used by db::default_index_path and the per-agent indexers.
+# 7 only moved `preference_dir` on Windows (unused here) and matches the copy tauri pulls in.
+dirs = "7"
+
+# Free-space probe before Reclaim space / Shrink index rewrites the file (cleanup.rs
+# `volume_space`). Already in the lock graph through keyring; this only turns on the
+# FileSystem bindings (GetDiskFreeSpaceExW, GetVolumePathNameW).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
