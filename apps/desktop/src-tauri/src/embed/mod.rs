@@ -399,7 +399,14 @@ pub struct Embedder {
     /// Log loads and unloads to the app log (the GUI's embedders only: a sidecar's stderr
     /// is the agent's MCP log or terminal).
     log: bool,
+    /// The last few query vectors, newest last ([`QUERY_VECTOR_CACHE`]).
+    recent_queries: Mutex<std::collections::VecDeque<(String, Vec<f32>)>>,
 }
+
+/// Query vectors an embedder keeps. Each search box query is embedded by the hybrid search
+/// and again by the facts lookup beside it (`search_facts`), at the same moment; a hit here
+/// spares the second ONNX inference (tens of ms, behind the same model lock).
+const QUERY_VECTOR_CACHE: usize = 8;
 
 impl Default for Embedder {
     /// The app's shared embedder, for queries, recall and fact embeds: downloads the model
@@ -426,6 +433,7 @@ impl Embedder {
             intra_threads,
             idle_unload: None,
             log: false,
+            recent_queries: Mutex::new(std::collections::VecDeque::new()),
         }
     }
 
@@ -648,6 +656,52 @@ impl Embedder {
 
     /// Interactive inference (queries): registers as waiting so the bulk path steps aside
     /// after its current sub-batch, then runs in a single call.
+    /// One query's vector (`query` trimmed, without the prefix), from the recent-query cache
+    /// when this embedder already embedded it. Checked again once the model lock is held:
+    /// the two callers of one keystroke usually arrive together, and the second waits there
+    /// while the first embeds.
+    fn infer_query(
+        &self,
+        model: &Mutex<TextEmbedding>,
+        query: &str,
+    ) -> Result<Option<Vec<f32>>, EmbedError> {
+        let cached = || {
+            self.recent_queries
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .find(|(q, _)| q == query)
+                .map(|(_, v)| v.clone())
+        };
+        if let Some(v) = cached() {
+            return Ok(Some(v));
+        }
+        let _ticket = InteractiveTicket::enter(&self.interactive);
+        let mut guard = lock_model(model);
+        if let Some(v) = cached() {
+            return Ok(Some(v));
+        }
+        let text = format!("{QUERY_PREFIX}{query}");
+        let out = guard
+            .embed(std::slice::from_ref(&text), None)
+            .map_err(inference_error)?;
+        drop(guard);
+        let Some(v) = out.into_iter().next() else {
+            return Ok(None);
+        };
+        let mut recent = self
+            .recent_queries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if recent.len() >= QUERY_VECTOR_CACHE {
+            recent.pop_front();
+        }
+        recent.push_back((query.to_string(), v.clone()));
+        Ok(Some(v))
+    }
+
+    /// Embed texts as an interactive caller, uncached (the bulk-vs-query equivalence test).
+    #[cfg(test)]
     fn infer_interactive(
         &self,
         model: &Mutex<TextEmbedding>,
@@ -1141,8 +1195,7 @@ pub fn embed_query_no_wait(
         return Ok(None);
     }
     let model = embedder.load(LoadMode::CachedNoWait)?;
-    let qv = embedder.infer_interactive(&model, &[format!("{QUERY_PREFIX}{query}")])?;
-    Ok(qv.into_iter().next())
+    embedder.infer_query(&model, query)
 }
 
 fn query_vector(embedder: &Embedder, query: &str, mode: LoadMode) -> Result<Option<Vec<f32>>> {
@@ -1156,8 +1209,7 @@ fn query_vector(embedder: &Embedder, query: &str, mode: LoadMode) -> Result<Opti
         Err(e) if mode == LoadMode::CachedNoWait && e.is_model_unavailable() => return Ok(None),
         Err(e) => return Err(e.into()),
     };
-    let qv = embedder.infer_interactive(&model, &[format!("{QUERY_PREFIX}{query}")])?;
-    Ok(qv.into_iter().next())
+    Ok(embedder.infer_query(&model, query)?)
 }
 
 /// Semantic KNN over chunk embeddings, deduped to message level, with source/
@@ -1211,6 +1263,8 @@ pub struct KnnScope<'a> {
     pub include_subagents: bool,
     pub sources: &'a [String],
     pub project: Option<&'a str>,
+    /// How `project` matches (the app's searches are exact, see `search::ProjectMatch`).
+    pub project_match: crate::search::ProjectMatch,
     /// Some(true) = only starred threads, Some(false) = only unstarred.
     pub starred: Option<bool>,
     /// Threads having ANY of these tags; empty = all.
@@ -1227,6 +1281,7 @@ impl Default for KnnScope<'_> {
             include_subagents: false,
             sources: &[],
             project: None,
+            project_match: crate::search::ProjectMatch::Substring,
             starred: None,
             tags: &[],
             after: None,
@@ -1243,6 +1298,7 @@ impl<'a> KnnScope<'a> {
             include_subagents: filters.include_subagents,
             sources: &filters.sources,
             project: filters.project.as_deref(),
+            project_match: filters.project_match,
             starred: filters.starred,
             tags: &filters.tags,
             after: filters.after,
@@ -1319,7 +1375,10 @@ fn semantic_knn_sql(
         args.push(v);
         args.len()
     };
-    let project_ph = project.map(|p| bind(Box::new(format!("%{p}%"))));
+    let project_cond = project.map(|p| {
+        let ph = bind(crate::search::project_value(p, scope.project_match));
+        crate::search::project_condition_at("t", scope.project_match, ph)
+    });
     let source_list = sources
         .iter()
         .map(|s| format!("?{}", bind(Box::new(s.clone()))))
@@ -1338,10 +1397,8 @@ fn semantic_knn_sql(
     // The thread and message conditions (threads `t`, messages `m`), shared by the
     // pre-filter and the outer query. Sources are added per query: they need `sources s`.
     let mut conds = Vec::new();
-    if let Some(ph) = project_ph {
-        conds.push(format!(
-            "COALESCE(t.project_key, t.project_path) LIKE ?{ph}"
-        ));
+    if let Some(cond) = project_cond {
+        conds.push(cond);
     }
     if let Some(ph) = starred_ph {
         conds.push(format!("t.starred = ?{ph}"));
@@ -1672,6 +1729,32 @@ mod tests {
         for (a, b) in few.iter().zip(&many) {
             assert!(cosine(a, b) > 0.99999, "cosine {}", cosine(a, b));
         }
+    }
+
+    /// Needs a downloaded model. The facts lookup and the hybrid search embed the same
+    /// query; the second gets the cached vector, identical to a fresh one, and the cache
+    /// stays bounded.
+    #[test]
+    #[ignore]
+    fn a_repeated_query_reuses_its_vector() {
+        let e = Embedder::cached_only();
+        e.ensure_loaded().unwrap();
+        let first = embed_query_cached_only(&e, " pin the rust toolchain ")
+            .unwrap()
+            .unwrap();
+        let again = embed_query_no_wait(&e, "pin the rust toolchain")
+            .unwrap()
+            .unwrap();
+        assert_eq!(first, again);
+        let model = e.loaded().unwrap();
+        let fresh = e
+            .infer_interactive(&model, &[format!("{QUERY_PREFIX}pin the rust toolchain")])
+            .unwrap();
+        assert!(cosine(&first, &fresh[0]) > 0.99999);
+        for i in 0..20 {
+            embed_query_cached_only(&e, &format!("query {i}")).unwrap();
+        }
+        assert_eq!(e.recent_queries.lock().unwrap().len(), QUERY_VECTOR_CACHE);
     }
 
     /// Needs a downloaded model. Bulk inference runs in length order; every vector must
@@ -2250,7 +2333,7 @@ mod tests {
         }
     }
 
-    /// Starred, tag and date scopes ride the same `rowid IN` pre-filter, and building
+    /// Starred, tag, date and exact-project scopes ride the same `rowid IN` pre-filter, and building
     /// their list never walks the messages table either.
     #[test]
     fn collection_and_date_filters_prefilter_the_knn() {
@@ -2268,6 +2351,12 @@ mod tests {
             KnnScope {
                 after: Some(1),
                 before: Some(2),
+                ..KnnScope::default()
+            },
+            // The app's exact project key rides the same pre-filter.
+            KnnScope {
+                project: Some("/r/cal"),
+                project_match: crate::search::ProjectMatch::Exact,
                 ..KnnScope::default()
             },
         ];

@@ -1837,7 +1837,7 @@ fn thin_memory_hint(scoped: bool, coverage: DistillCoverage, distill_on: bool) -
         coverage.distilled_threads, coverage.threads
     );
     if !distill_on {
-        hint.push_str(" Turn on memory in Callimachus Settings > Knowledge.");
+        hint.push_str(" Turn on memory in Callimachus Settings > AI engine.");
     }
     hint
 }
@@ -2799,7 +2799,7 @@ mod tests {
             v["hint"]
                 .as_str()
                 .unwrap()
-                .ends_with("Turn on memory in Callimachus Settings > Knowledge."),
+                .ends_with("Turn on memory in Callimachus Settings > AI engine."),
             "{v}"
         );
         // A scope with no threads, and an unscoped call, behave like the project scope does;

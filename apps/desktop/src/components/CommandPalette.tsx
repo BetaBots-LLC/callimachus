@@ -3,11 +3,10 @@ import { useQuery } from "@tanstack/react-query";
 import { defaultFilter } from "cmdk";
 import {
   BarChart3,
-  Compass,
+  CalendarDays,
   Database,
   FolderGit2,
   History,
-  Lightbulb,
   ListChecks,
   MessagesSquare,
   Moon,
@@ -35,20 +34,25 @@ import {
 import { api } from "../lib/api";
 import { formatTime } from "../lib/format";
 import { useBuildSemanticIndex, useIndexRewriting, useReindex } from "../lib/queries";
+import { useChat } from "../store/chat";
 import { useChecklist } from "../store/checklist";
 import { useUi, type View } from "../store/ui";
 import { useTheme } from "../store/theme";
 import { useUpdater } from "../store/updater";
 
-// Labels match the tab bar (App.tsx TABS); keywords keep the longer names findable.
+// Labels match the tab bar (App.tsx TABS); keywords keep the longer names findable, and
+// the names of the tabs that merged away (Coach, Knowledge) lead to where their parts went.
 const NAV: { id: View; label: string; icon: typeof Search; keywords?: string[] }[] = [
+  { id: "today", label: "Today", icon: CalendarDays, keywords: ["since last open", "standup"] },
   { id: "search", label: "Search", icon: Search },
   { id: "chat", label: "Chat", icon: MessagesSquare },
-  { id: "coach", label: "Coach", icon: Compass },
-  { id: "knowledge", label: "Knowledge", icon: Lightbulb },
-  { id: "ask", label: "Ask", icon: Sparkles, keywords: ["ask your history", "question"] },
-  { id: "projects", label: "Projects", icon: FolderGit2, keywords: ["project memory"] },
-  { id: "stats", label: "Stats", icon: BarChart3 },
+  {
+    id: "projects",
+    label: "Projects",
+    icon: FolderGit2,
+    keywords: ["project memory", "knowledge", "todos", "recurring errors"],
+  },
+  { id: "stats", label: "Stats", icon: BarChart3, keywords: ["activity", "heatmap", "coach"] },
   { id: "settings", label: "Settings", icon: Settings },
 ];
 
@@ -56,6 +60,7 @@ const SEARCH_VALUE = "search for typed text";
 const THREAD_PREFIX = "thread:";
 
 const ACTIONS = {
+  ask: "ask your history question cited answer",
   reindex: "reindex history",
   build: "build semantic index embeddings",
   theme: "toggle theme dark light",
@@ -90,8 +95,8 @@ export function CommandPalette() {
   const open = useUi((s) => s.commandOpen);
   const setOpen = useUi((s) => s.setCommandOpen);
   const setView = useUi((s) => s.setView);
-  const setQuery = useUi((s) => s.setQuery);
-  const selectThread = useUi((s) => s.selectThread);
+  const openSearch = useUi((s) => s.openSearch);
+  const openThread = useUi((s) => s.openThread);
   // The palette's own text, kept so "Search for" can hand it to the Search view. Reset
   // during the render that opens it (any open path), not in an effect after, so the first
   // frame never shows the last draft; not on close, where the fading dialog would flash
@@ -149,12 +154,7 @@ export function CommandPalette() {
           key={t.id}
           value={`${THREAD_PREFIX}${t.id}`}
           keywords={[t.title]}
-          onSelect={() =>
-            run(() => {
-              selectThread(t.id);
-              setView("search");
-            })
-          }
+          onSelect={() => run(() => openThread(t.id))}
         >
           <History />
           <span className="min-w-0 flex-1 truncate">{t.title}</span>
@@ -183,6 +183,23 @@ export function CommandPalette() {
   );
   const actionsGroup = (
     <CommandGroup key="actions" heading="Actions">
+      <CommandItem
+        value={ACTIONS.ask}
+        onSelect={() =>
+          run(() => {
+            // Ask is a mode of Chat: a new conversation whose first question it answers.
+            const chat = useChat.getState();
+            if (!chat.isStreaming) {
+              if (chat.messages.length > 0) chat.newChat();
+              chat.setMode("ask");
+            }
+            setView("chat");
+          })
+        }
+      >
+        <Sparkles />
+        <span>Ask your history</span>
+      </CommandItem>
       <CommandItem
         value={ACTIONS.reindex}
         disabled={rewriting}
@@ -289,8 +306,7 @@ export function CommandPalette() {
                   onSelect={() =>
                     run(() => {
                       useChecklist.getState().close();
-                      setQuery(typed.trim());
-                      setView("search");
+                      openSearch({ query: typed.trim() });
                     })
                   }
                 >

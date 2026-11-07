@@ -227,3 +227,10 @@
   0% { transform: translateX(-100%); }
   100% { transform: translateX(300%); }
 }
+
+/* [thread N] citations in Chat and Ask answers. CitedMarkdown (AskAnswer.tsx) rewrites them to
+   these in-page links so the sanitizing pipeline keeps them; a click opens the thread. Drawn as
+   compact chips rather than underlined prose links, so a cited sentence still reads cleanly. */
+.cited-markdown a[href^="#cal-thread-"] {
+  @apply mx-px inline-flex items-center rounded-md border bg-muted px-1.5 align-baseline text-[0.78em] leading-[1.45] font-medium whitespace-nowrap text-foreground no-underline tabular-nums transition-colors duration-150 outline-none hover:bg-accent hover:text-foreground focus-visible:ring-3 focus-visible:ring-ring/50;
+}

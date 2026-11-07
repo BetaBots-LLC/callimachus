@@ -8,6 +8,7 @@ use anyhow::{bail, Result};
 use rusqlite::{Connection, Transaction, TransactionBehavior};
 use serde::Serialize;
 use std::collections::HashSet;
+use std::time::Instant;
 
 /// Field/record separators embedded in the `git log --pretty` format (unlikely in commit text).
 const RS: char = '\u{1e}'; // record (per-commit) separator
@@ -201,19 +202,25 @@ fn plain_path(p: &str) -> String {
     p.strip_prefix(r"\\?\").unwrap_or(p).to_string()
 }
 
-/// Run `git log` over `repo` since `since` (epoch secs), returning raw output for `parse_git_log`.
-fn run_git_log(repo: &str, since: i64) -> Result<String> {
+/// The `git log` over `repo` since `since` (epoch secs) whose output `parse_git_log` reads.
+fn git_log_command(repo: &str, since: i64) -> std::process::Command {
     let since_iso = chrono::DateTime::from_timestamp(since.max(0), 0)
         .map(|d| d.to_rfc3339())
         .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
-    let out = git_command()
-        .arg("-C")
+    let mut cmd = git_command();
+    cmd.arg("-C")
         .arg(plain_path(repo))
         .arg("log")
         .arg("--no-merges")
         .arg(format!("--since={since_iso}"))
         .arg("--name-only")
-        .arg(format!("--pretty=format:{RS}COMMIT{US}%H{US}%ct{US}%s"))
+        .arg(format!("--pretty=format:{RS}COMMIT{US}%H{US}%ct{US}%s"));
+    cmd
+}
+
+/// Run `git log` over `repo` since `since` (epoch secs), returning raw output for `parse_git_log`.
+fn run_git_log(repo: &str, since: i64) -> Result<String> {
+    let out = git_log_command(repo, since)
         .output()
         .map_err(|e| anyhow::anyhow!("running git: {e} (is git installed?)"))?;
     if !out.status.success() {
@@ -281,14 +288,38 @@ pub fn link_project(conn: &Connection, repo_path: &str) -> Result<usize> {
     // project with zero links mid-run, and 600 links commit once instead of 600 times (about
     // 250 ms of write-lock time down to a few ms). git ran above, outside the lock.
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-    // Clear ALL of the project's links first (including any stale ones from threads we no longer
-    // consider, e.g. subagents), then reinsert the fresh set — so a re-run never stacks or strands.
-    tx.execute(
-        "DELETE FROM thread_commits WHERE thread_id IN (
-            SELECT id FROM threads WHERE COALESCE(project_key, project_path) = ?1
-         )",
-        [&key],
-    )?;
+    // Drop only the project's links to commits this log contains that no longer match, then
+    // reinsert the fresh set. A link to a commit outside this log (one found by a worktree
+    // scan, which this checkout's `git log` never walks) is kept: clearing everything used to
+    // wipe those links on every whole-repo scan.
+    {
+        let fresh: HashSet<(i64, String)> =
+            links.iter().map(|l| (l.thread_id, l.sha.clone())).collect();
+        let in_log: HashSet<&str> = commits.iter().map(|c| c.sha.as_str()).collect();
+        let stale: Vec<(i64, String)> = {
+            let mut sel = tx.prepare(
+                "SELECT thread_id, sha FROM thread_commits WHERE thread_id IN (
+                    SELECT id FROM threads WHERE COALESCE(project_key, project_path) = ?1
+                 )",
+            )?;
+            // Collected first: the row iterator borrows `sel`, which ends with this block,
+            // while the block's value outlives it.
+            let rows = sel
+                .query_map([&key], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows.into_iter()
+                .filter(|(tid, sha)| {
+                    in_log.contains(sha.as_str()) && !fresh.contains(&(*tid, sha.clone()))
+                })
+                .collect()
+        };
+        let mut del = tx.prepare("DELETE FROM thread_commits WHERE thread_id = ?1 AND sha = ?2")?;
+        for (tid, sha) in &stale {
+            del.execute(rusqlite::params![tid, sha])?;
+        }
+    }
     {
         let mut ins = tx.prepare(
             "INSERT OR REPLACE INTO thread_commits
@@ -309,6 +340,163 @@ pub fn link_project(conn: &Connection, repo_path: &str) -> Result<usize> {
     }
     tx.commit()?;
     Ok(links.len())
+}
+
+/// [`run_git_log`] that gives up at `deadline`: None when git had not finished by then (the
+/// process is killed). For the Today view, which must answer in bounded time however big
+/// the repo is.
+pub(crate) fn run_git_log_until(
+    repo: &str,
+    since: i64,
+    deadline: Instant,
+) -> Result<Option<String>> {
+    use std::io::Read;
+    use std::process::Stdio;
+    let mut child = git_log_command(repo, since)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("running git: {e} (is git installed?)"))?;
+    // Drain stdout on a helper thread: a log bigger than the pipe buffer would otherwise
+    // block git on write and it would never exit.
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        buf
+    });
+    loop {
+        let polled = match child.try_wait() {
+            Ok(polled) => polled,
+            Err(e) => {
+                // Reap git before giving up, or it and the reader thread keep running.
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(anyhow::anyhow!("waiting for git in {repo}: {e}"));
+            }
+        };
+        if let Some(status) = polled {
+            let out = reader.join().unwrap_or_default();
+            if !status.success() {
+                bail!("git log failed in {repo}");
+            }
+            return Ok(Some(String::from_utf8_lossy(&out).into_owned()));
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(None);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// First and last message time of one thread, from the (thread_id, ts, role) index.
+pub(crate) const THREAD_WINDOW_SQL: &str =
+    "SELECT MIN(ts), MAX(ts) FROM messages WHERE thread_id = ?1 AND ts IS NOT NULL";
+
+/// [`link_project`] for a few threads of the checkout at `repo_path` (the Today view's
+/// recent sessions), so `git log` reads only their window instead of the project's whole
+/// history. Adds the links found and drops only these threads' links to commits that this
+/// log holds and that no longer match; a link to a commit outside it (found by
+/// `link_thread_commits` in a worktree, whose branch this checkout's log does not walk) is
+/// kept. None when `deadline` passed before git finished (nothing is written then).
+pub fn link_threads(
+    conn: &Connection,
+    repo_path: &str,
+    thread_ids: &[i64],
+    deadline: Instant,
+) -> Result<Option<usize>> {
+    link_threads_with(conn, repo_path, thread_ids, deadline, run_git_log_until)
+}
+
+/// [`link_threads`] with the `git log` runner injected: (repo, since, deadline) to the log,
+/// or None past the deadline. Tests pass a fake log.
+pub(crate) fn link_threads_with(
+    conn: &Connection,
+    repo_path: &str,
+    thread_ids: &[i64],
+    deadline: Instant,
+    mut git_log: impl FnMut(&str, i64, Instant) -> Result<Option<String>>,
+) -> Result<Option<usize>> {
+    let mut windows = Vec::new();
+    {
+        let mut win = conn.prepare_cached(THREAD_WINDOW_SQL)?;
+        let mut ms = conn.prepare_cached("SELECT path FROM file_mentions WHERE thread_id = ?1")?;
+        for &id in thread_ids {
+            let (start, end): (Option<i64>, Option<i64>) =
+                win.query_row([id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            let (Some(start), Some(end)) = (start, end) else {
+                continue;
+            };
+            let mentions: HashSet<String> = ms
+                .query_map([id], |r| r.get::<_, String>(0))?
+                .filter_map(rusqlite::Result::ok)
+                .map(|p| p.to_ascii_lowercase())
+                .collect();
+            if !mentions.is_empty() {
+                windows.push(ThreadWindow {
+                    thread_id: id,
+                    start,
+                    end,
+                    mentions,
+                });
+            }
+        }
+    }
+    if windows.is_empty() {
+        return Ok(Some(0));
+    }
+    let earliest = windows.iter().map(|w| w.start).min().unwrap_or(0);
+    let Some(log) = git_log(repo_path, earliest - SLACK_BEFORE, deadline)? else {
+        return Ok(None);
+    };
+    let commits = parse_git_log(&log);
+    let links = correlate(&windows, &commits);
+    let in_log: HashSet<&str> = commits.iter().map(|c| c.sha.as_str()).collect();
+    let fresh: HashSet<(i64, &str)> = links
+        .iter()
+        .map(|l| (l.thread_id, l.sha.as_str()))
+        .collect();
+    let now = chrono::Utc::now().timestamp();
+    // git ran above, outside the write lock; the update is one short transaction.
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    {
+        let mut existing = tx.prepare("SELECT sha FROM thread_commits WHERE thread_id = ?1")?;
+        let mut del = tx.prepare("DELETE FROM thread_commits WHERE thread_id = ?1 AND sha = ?2")?;
+        for w in &windows {
+            let stale: Vec<String> = existing
+                .query_map([w.thread_id], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+                .into_iter()
+                .filter(|sha| {
+                    in_log.contains(sha.as_str()) && !fresh.contains(&(w.thread_id, sha.as_str()))
+                })
+                .collect();
+            for sha in stale {
+                del.execute(rusqlite::params![w.thread_id, sha])?;
+            }
+        }
+        let mut ins = tx.prepare(
+            "INSERT OR REPLACE INTO thread_commits
+                (thread_id, sha, short_sha, subject, committed_at, overlap, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )?;
+        for l in &links {
+            ins.execute(rusqlite::params![
+                l.thread_id,
+                l.sha,
+                l.short_sha,
+                l.subject,
+                l.committed_at,
+                l.overlap as i64,
+                now,
+            ])?;
+        }
+    }
+    tx.commit()?;
+    Ok(Some(links.len()))
 }
 
 /// One thread inferred to have produced a given commit (the inverse of `linked_commits`).

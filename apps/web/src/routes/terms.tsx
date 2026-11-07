@@ -7,7 +7,7 @@ import { LegalPage } from "@/components/site/LegalPage";
 export const Route = createFileRoute("/terms")({
   head: () => ({
     meta: seo({
-      title: "Terms — Callimachus",
+      title: "Terms · Callimachus",
       description:
         "Terms for using the Callimachus website and software. Free and open under AGPL-3.0, provided as-is, with a commercial license available.",
       path: "/terms",

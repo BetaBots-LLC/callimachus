@@ -21,7 +21,7 @@ export interface Release {
 }
 
 // Fallback when the GitHub API is unreachable. Asset names embed the version, so a
-// fixed `releases/latest/download/<name>` URL can't be hardcoded reliably — send
+// fixed `releases/latest/download/<name>` URL can't be hardcoded reliably; send
 // users to the latest release page instead, which never 404s.
 const RELEASES_LATEST = `https://github.com/${REPO}/releases/latest`;
 function staticAssets(): ReleaseAssets {
@@ -72,9 +72,9 @@ export const getLatestRelease = createServerFn({ method: "GET" }).handler(
         publishedAt: json.published_at ?? null,
         fallback: false,
         assets: {
-          // macOS is Apple Silicon only (no x86_64 ONNX prebuilt — see build.yml).
+          // macOS is Apple Silicon only (no x86_64 ONNX prebuilt; see build.yml).
           mac_arm: url(/(aarch64|arm64).*\.dmg$/i, fb.mac_arm),
-          // Serve Tauri's NSIS installer `*_x64-setup.exe` — a per-user installer
+          // Serve Tauri's NSIS installer `*_x64-setup.exe`, a per-user installer
           // (no admin prompt), the better default than the WiX `*_en-US.msi` (which
           // also ships, for enterprise/admin installs). Both self-update via the
           // updater's install-type-aware keys.
@@ -99,7 +99,7 @@ export const getLatestRelease = createServerFn({ method: "GET" }).handler(
   },
 );
 
-/** The visitor's OS, detected server-side from the request User-Agent — so the
+/** The visitor's OS, detected server-side from the request User-Agent, so the
  * primary download CTA is correct in the SSR'd HTML with no client work. */
 export const getPrimaryOs = createServerFn({ method: "GET" }).handler(
   async (): Promise<OsKey> => osFromUserAgent(getRequestHeader("user-agent") ?? ""),

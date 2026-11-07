@@ -89,15 +89,15 @@ function providerName(e: MemoryEngine): string {
 /**
  * The one-click "turn on memory" consent: the engines this machine already has, as a
  * radio list with the saved engine (else the recommended one) preselected, each naming
- * where transcripts go. It replaces the old "Enable in Settings" teaser on Ask and sits
- * inline on Projects and the Knowledge tab's recall modes while LLM distillation is off.
+ * where transcripts go. It sits above Chat's composer in Ask mode and inline on Projects
+ * while LLM distillation is off.
  *
  * `whenDismissed`: "hide" removes it after Not now; "button" leaves a small button that
  * brings it back (for a view that has nothing else to show while memory is off).
  * `embedded`: the setup checklist's memory step, which carries the title and the unlock line
  * itself and records Not now as a skipped step (`onSkip`) instead of a session dismissal.
  * `checklistLink`: while the setup checklist is open, point at its memory step instead of
- * offering a second copy of the same choice (Ask and Projects).
+ * offering a second copy of the same choice (Chat's Ask mode and Projects).
  */
 export function MemorySetupCard({
   whenDismissed = "hide",
@@ -173,7 +173,7 @@ export function MemorySetupCard({
       ])
         void qc.invalidateQueries({ queryKey: [key] });
       notify.success("Memory is on", {
-        description: `Distilling recent sessions with ${engineLabel(engine)} in the background. Change the engine in Settings > Knowledge.`,
+        description: `Distilling recent sessions with ${engineLabel(engine)} in the background. Change the engine in Settings > AI engine.`,
       });
     },
   });
@@ -249,7 +249,7 @@ export function MemorySetupCard({
         </p>
       ) : setup.isError ? (
         <p role="alert" className="text-[13px] text-destructive">
-          Couldn't check for engines: {errorText(setup.error)}. Pick one in Settings &gt; Knowledge
+          Couldn't check for engines: {errorText(setup.error)}. Pick one in Settings &gt; AI engine
           instead.
         </p>
       ) : detected.length === 0 ? (
@@ -260,7 +260,7 @@ export function MemorySetupCard({
               Sign in to the <code>claude</code> or <code>codex</code> CLI.
             </li>
             <li>Run Ollama locally, so transcripts stay on this machine.</li>
-            <li>Save an API key for a provider in Settings &gt; Providers.</li>
+            <li>Save an API key for a provider in Settings &gt; AI engine.</li>
           </ul>
         </div>
       ) : (
@@ -347,13 +347,13 @@ export function MemorySetupCard({
             {enable.isPending ? "Turning on…" : "Turn on memory"}
           </Button>
         ) : setup.isError ? (
-          <Button size="sm" onClick={() => openSettings("knowledge")}>
-            Open Knowledge settings
+          <Button size="sm" onClick={() => openSettings("engine")}>
+            Open AI engine settings
           </Button>
         ) : (
           !setup.isPending && (
-            <Button size="sm" onClick={() => openSettings("providers")}>
-              Open Providers
+            <Button size="sm" onClick={() => openSettings("engine")}>
+              Add an API key
             </Button>
           )
         )}

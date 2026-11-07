@@ -7,7 +7,7 @@ import { LegalPage } from "@/components/site/LegalPage";
 export const Route = createFileRoute("/privacy")({
   head: () => ({
     meta: seo({
-      title: "Privacy — Callimachus",
+      title: "Privacy · Callimachus",
       description:
         "Callimachus is local-first: your history stays on your machine, and the app's usage analytics are opt-in and never include your content. This website uses cookieless analytics: no tracking cookies, no advertising, no cross-site profiles.",
       path: "/privacy",

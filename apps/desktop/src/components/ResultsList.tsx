@@ -1,6 +1,8 @@
 import {
   type ReactNode,
+  type Ref,
   type UIEvent,
+  useCallback,
   useEffect,
   useLayoutEffect,
   useMemo,
@@ -11,13 +13,21 @@ import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tansta
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
   api,
+  type FactHit,
   SOURCE_LABELS,
   type SearchHit,
   type SearchResponse,
   type ThreadDetail,
   type ThreadSummary,
 } from "../lib/api";
-import { RESULTS_LIST_ID, resultOptionId, resultsNav, useUi } from "../store/ui";
+import {
+  type DatePreset,
+  RESULTS_LIST_ID,
+  resultOptionId,
+  resultsNav,
+  searchRange,
+  useUi,
+} from "../store/ui";
 import {
   MAX_HITS_PER_THREAD,
   resultsKey,
@@ -30,11 +40,12 @@ import {
   useReindexStarting,
   userReindexing,
 } from "../lib/queries";
-import { baseName, formatTime, leadToMatch, renderSnippet } from "../lib/format";
+import { baseName, formatTime, leadToMatch, rangePhrase, renderSnippet } from "../lib/format";
 import { commitSearch, noteSearch } from "../lib/telemetry";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
-import { Star } from "lucide-react";
+import { Pin, Star } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Loading } from "./Loading";
 
@@ -44,6 +55,12 @@ type ResultItem = SearchHit | ThreadSummary;
  *  any result "Tool output:"); read it when a backend sends one so a tool hit can say
  *  "Bash output:" instead. */
 type Hit = SearchHit & { toolName?: string | null };
+
+// The facts group stays a short preface to the thread rows, never a second result list.
+const MAX_FACTS = 5;
+// With a date range the facts are filtered here by when they were distilled (search_facts
+// takes no range), so a wider page is asked for to still fill the group.
+const FACTS_FETCH_DATED = 40;
 
 /** One list row: a thread (recent list, `file:` lookup) or a thread's best search hit
  *  plus every matched message of that thread, in rank order. */
@@ -117,6 +134,11 @@ export function ResultsList() {
   const hybrid = useUi((s) => s.hybrid);
   const starredOnly = useUi((s) => s.starredOnly);
   const selectedTags = useUi((s) => s.selectedTags);
+  const project = useUi((s) => s.project);
+  const datePreset = useUi((s) => s.datePreset);
+  const after = useUi((s) => s.after);
+  const before = useUi((s) => s.before);
+  const scopeReady = useUi((s) => s.scopeReady);
   const selectedThreadId = useUi((s) => s.selectedThreadId);
   const selectThread = useUi((s) => s.selectThread);
   const searchActivityAt = useUi((s) => s.searchActivityAt);
@@ -128,6 +150,9 @@ export function ResultsList() {
   // limit, so it never pages.
   const fileFilter = query.startsWith("file:") ? query.slice(5).trim() : null;
   const searching = query.length > 0 && fileFilter === null;
+  // The recent list ignores the semantic switch, so it stays out of that list's key: the
+  // switch turning itself on at launch must not refetch (or reset) the recent threads.
+  const hybridKey = searching && hybrid;
 
   // The full page applies only to the query + filters it was asked for, so any change
   // starts over at the cheap first page without an effect to reset it.
@@ -135,21 +160,29 @@ export function ResultsList() {
     query,
     sources,
     includeSubagents,
-    hybrid,
+    hybridKey,
     starredOnly,
     selectedTags,
+    project,
+    datePreset,
+    after,
+    before,
   ]);
   const [expandedFor, setExpandedFor] = useState<string | null>(null);
   const limit = fileFilter === null && expandedFor === filterKey ? FULL_PAGE : FIRST_PAGE;
 
-  const filters = {
+  // A preset's bound is taken when the search runs (searchRange), so a refetch tomorrow
+  // still means "the last 24 hours"; the key holds the preset name, not the bound.
+  const filters = () => ({
     sources,
     includeSubagents,
     hybrid,
     limit,
     starred: starredOnly ? true : null,
     tags: selectedTags,
-  };
+    project,
+    ...searchRange({ datePreset, after, before }),
+  });
 
   const qc = useQueryClient();
   const { data, isLoading, isFetching, isPlaceholderData, error, dataUpdatedAt, refetch } =
@@ -158,16 +191,23 @@ export function ResultsList() {
         query,
         sources,
         includeSubagents,
-        hybrid,
+        hybridKey,
         starredOnly,
         selectedTags,
+        project,
+        datePreset,
+        after,
+        before,
         fileFilter === null ? limit : null,
       ),
+      // Not before the remembered repo scope is known: an unscoped first page would show
+      // and then be replaced by the scoped one.
+      enabled: scopeReady,
       queryFn: async ({ queryKey }) => {
         if (fileFilter) return { hits: await api.searchByFile(fileFilter), semanticSkipped: null };
-        if (!searching) return { hits: await api.recentThreads(filters), semanticSkipped: null };
-        const res = await api.searchThreads(query, filters);
-        if (filters.hybrid && !res.superseded) {
+        if (!searching) return { hits: await api.recentThreads(filters()), semanticSkipped: null };
+        const res = await api.searchThreads(query, filters());
+        if (hybrid && !res.superseded) {
           semanticUnavailable = res.semanticSkipped === "unavailable";
         }
         // A newer search interrupted this one, so its empty result must not stand in for
@@ -207,7 +247,13 @@ export function ResultsList() {
     if (!searching || !data || isPlaceholderData) return;
     noteSearch(filterKey, {
       hybrid,
-      has_filters: sources.length > 0 || starredOnly || selectedTags.length > 0 || includeSubagents,
+      has_filters:
+        sources.length > 0 ||
+        starredOnly ||
+        selectedTags.length > 0 ||
+        includeSubagents ||
+        project !== null ||
+        datePreset !== "all",
       results: data.hits.length,
     });
   }, [
@@ -220,38 +266,107 @@ export function ResultsList() {
     hybrid,
     starredOnly,
     selectedTags,
+    project,
+    datePreset,
   ]);
+
+  // Decisions and gotchas matching the query in the same repo scope, shown above the
+  // threads. Keyword-only and cheap (search_facts answers in milliseconds); an older
+  // backend without the command rejects, and the group simply does not show. A fact has no
+  // source, star or tag of its own, so with a source chip, Starred or a tag narrowing the
+  // threads the group is left out rather than shown from outside that scope.
+  const narrowed = sources.length > 0 || starredOnly || selectedTags.length > 0;
+  const factsOn = searching && scopeReady && !narrowed;
+  const dated = datePreset !== "all";
+  const factsQuery = useQuery({
+    queryKey: ["search_facts", query, project, dated],
+    queryFn: () => api.searchFacts(query, project, dated ? FACTS_FETCH_DATED : MAX_FACTS),
+    enabled: factsOn,
+    placeholderData: keepPreviousData,
+    staleTime: 5_000,
+    retry: false,
+  });
+  // The date range applies by when a fact was distilled. A hit without `createdAt` (an
+  // older backend) cannot be placed in the range, so it is left out while one is set.
+  const factRange = searchRange({ datePreset, after, before });
+  const inFactRange = (f: FactHit) =>
+    !dated ||
+    (f.createdAt != null &&
+      (factRange.after === null || f.createdAt >= factRange.after) &&
+      (factRange.before === null || f.createdAt <= factRange.before));
+  const facts: FactHit[] =
+    factsOn && !factsQuery.isError
+      ? (factsQuery.data ?? []).filter(inFactRange).slice(0, MAX_FACTS)
+      : [];
+  // The keys wait for this query's facts as they wait for its rows: otherwise index 0 is a
+  // fact one moment and a thread the next.
+  const factsSettled =
+    !factsOn || factsQuery.isError || (factsQuery.isSuccess && !factsQuery.isPlaceholderData);
 
   const parentRef = useRef<HTMLDivElement>(null);
   const items = data?.hits ?? [];
   const rows = useMemo(() => groupRows(data?.hits ?? []), [data]);
+  // The facts group sits above the virtual rows inside the same scroller, so the
+  // virtualizer offsets every row by its measured height.
+  // A callback ref, since the group's element changes between the empty and list layouts.
+  const [factsHeight, setFactsHeight] = useState(0);
+  const factsRef = useCallback((el: HTMLDivElement | null) => {
+    if (!el) return;
+    const update = () => setFactsHeight(el.offsetHeight);
+    update();
+    const ro = new ResizeObserver(update);
+    ro.observe(el);
+    return () => {
+      ro.disconnect();
+      setFactsHeight(0);
+    };
+  }, []);
   const virtualizer = useVirtualizer({
     count: rows.length,
     getScrollElement: () => parentRef.current,
+    scrollMargin: factsHeight,
     // Two lines at py-2: about 56 px, so about 10 rows fit a 760 px window (was 7 at 84).
     estimateSize: () => 56,
     overscan: 10,
   });
 
+  // Keyboard indices run through the facts first, then the thread rows.
+  const factCount = factsSettled ? facts.length : 0;
   // Opening a row: the thread, scrolled to its best match, with every match for the
   // thread's match navigation. The highlight follows, so the arrow keys go on from here.
+  // A fact opens its thread at the message it came from, when known.
   function openRow(index: number) {
-    const row = rows[index];
+    if (index < factCount) {
+      const fact = facts[index];
+      commitSearch();
+      setHighlightedIndex(index);
+      selectThread(fact.threadId, fact.sourceMessageId ?? null);
+      return;
+    }
+    const row = rows[index - factCount];
     if (!row) return;
     commitSearch(); // opening a result means the search was "performed"
     setHighlightedIndex(index);
     if (row.kind === "hit") selectThread(row.hit.threadId, row.hit.messageId, row.matchIds);
     else selectThread(row.thread.id);
   }
+  // Enter with no row highlighted opens the top thread: the facts are a preface to the
+  // results, not the result the query asked for. With no thread rows, the top fact.
+  const openTop = () => openRow(rows.length > 0 ? factCount : 0);
   // Placeholder rows are another query's: the keys must not act on them (ArrowDown+Enter
   // right after typing opened the previous query's top thread). The full page loading for
   // the same query and filters is the exception, since its first rows are the ones shown.
   const freshFor = useRef<string | null>(null);
   if (data && !isPlaceholderData) freshFor.current = filterKey;
-  const fresh = !isLoading && !error && (!isPlaceholderData || freshFor.current === filterKey);
+  const fresh =
+    scopeReady &&
+    !isLoading &&
+    !error &&
+    (!isPlaceholderData || freshFor.current === filterKey) &&
+    factsSettled;
   // SearchBar's arrow keys clamp to the row count and Enter opens through resultsNav. Both
   // are withdrawn while the list is hidden (Activity cleans effects up) or unmounted.
-  const rowCount = fresh ? rows.length : 0;
+  const rowCount = fresh ? factCount + rows.length : 0;
   useEffect(() => {
     setResultCount(rowCount);
     return () => setResultCount(0);
@@ -262,14 +377,16 @@ export function ResultsList() {
   useEffect(() => {
     if (!openFirstPending || !(fresh || error)) return;
     setOpenFirstPending(false);
-    if (rowCount > 0) openRow(0);
+    if (rowCount > 0) openTop();
   });
   useEffect(() => {
     resultsNav.open = openRow;
+    resultsNav.openTop = openTop;
   });
   useEffect(
     () => () => {
       resultsNav.open = () => {};
+      resultsNav.openTop = () => {};
     },
     [],
   );
@@ -279,10 +396,14 @@ export function ResultsList() {
   useEffect(() => {
     if (scrolledToIndex.current === highlightedIndex) return;
     scrolledToIndex.current = highlightedIndex;
-    if (highlightedIndex >= 0 && highlightedIndex < rows.length) {
-      virtualizer.scrollToIndex(highlightedIndex, { align: "auto" });
+    if (highlightedIndex >= 0 && highlightedIndex < factCount) {
+      document
+        .getElementById(resultOptionId(highlightedIndex))
+        ?.scrollIntoView({ block: "nearest" });
+    } else if (highlightedIndex >= factCount && highlightedIndex < factCount + rows.length) {
+      virtualizer.scrollToIndex(highlightedIndex - factCount, { align: "auto" });
     }
-  }, [highlightedIndex, rows.length, virtualizer]);
+  }, [highlightedIndex, factCount, rows.length, virtualizer]);
 
   // A different query or filter starts at the top. Without this the list kept the old
   // scroll offset, and a shorter new list then clamped it to the very end. Compared with
@@ -327,7 +448,7 @@ export function ResultsList() {
     if (top + el.clientHeight >= el.scrollHeight - NEAR_END_PX) setExpandedFor(filterKey);
   }
 
-  if (isLoading) return <Loading label={searching ? "Searching…" : "Loading…"} />;
+  if (!scopeReady || isLoading) return <Loading label={searching ? "Searching…" : "Loading…"} />;
   if (error) return <div className="p-6 text-sm text-destructive">{String(error)}</div>;
   // Above the empty state too: a keyword-only "No matches" is exactly when the reader needs
   // to know the semantic pass did not run, and how to make it run.
@@ -341,10 +462,30 @@ export function ResultsList() {
       {semanticSkipped(data) === "unavailable" && <SemanticUnavailable />}
     </>
   );
+  const factsGroup = facts.length > 0 && (
+    <FactsGroup
+      ref={factsRef}
+      facts={facts}
+      navigable={factCount > 0}
+      highlightedIndex={highlightedIndex}
+      showProject={project === null}
+      onOpen={openRow}
+    />
+  );
   if (items.length === 0) {
     return (
       <div className="flex h-full flex-col">
         {banners}
+        {factsGroup && (
+          <div
+            id={RESULTS_LIST_ID}
+            role="listbox"
+            aria-label="Search results"
+            className="max-h-[50%] shrink-0 overflow-y-auto"
+          >
+            {factsGroup}
+          </div>
+        )}
         <EmptyResults searching={searching} fileFilter={fileFilter} />
       </div>
     );
@@ -380,104 +521,110 @@ export function ResultsList() {
             id={RESULTS_LIST_ID}
             role="listbox"
             aria-label={searching ? "Search results" : "Recent threads"}
-            className="relative w-full"
-            style={{ height: virtualizer.getTotalSize() }}
           >
-            {virtualizer.getVirtualItems().map((vrow) => {
-              const row = rows[vrow.index];
-              const item = row.kind === "hit" ? row.hit : row.thread;
-              const threadId = row.kind === "hit" ? row.hit.threadId : row.thread.id;
-              const ts = row.kind === "hit" ? row.hit.ts : row.thread.updatedAt;
-              const project = item.projectPath ? baseName(item.projectPath) : null;
-              const active = threadId === selectedThreadId;
-              const highlighted = vrow.index === highlightedIndex;
-              // Light muted text on the darker selected background measures under 4.5:1,
-              // so the selected row's meta text steps up to foreground/70 there.
-              const meta = active
-                ? "text-foreground/70 dark:text-muted-foreground"
-                : "text-muted-foreground";
-              return (
-                <div
-                  key={vrow.key}
-                  data-index={vrow.index}
-                  ref={virtualizer.measureElement}
-                  role="presentation"
-                  className="group absolute left-0 top-0 w-full"
-                  style={{ transform: `translateY(${vrow.start}px)` }}
-                >
-                  <button
-                    type="button"
-                    id={resultOptionId(vrow.index)}
-                    role="option"
-                    aria-selected={highlighted}
-                    onClick={() => openRow(vrow.index)}
-                    className={cn(
-                      "block w-full cursor-pointer border-b px-4 py-2 text-left outline-none hover:bg-muted/50 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/60",
-                      // Room for the star button, which only thread rows have.
-                      row.kind === "thread" && "pr-9",
-                      // The open row is marked by its background alone. The keyboard ring
-                      // is for the row the arrows are on, so it never sits on the open
-                      // row, where it read as a stuck focus ring after a click.
-                      active &&
-                        "bg-foreground/[0.07] hover:bg-foreground/[0.08] dark:bg-muted dark:hover:bg-muted",
-                      highlighted && !active && "bg-muted/60 ring-2 ring-inset ring-ring/60",
-                    )}
+            {factsGroup}
+            <div
+              className="relative w-full"
+              // getTotalSize already leaves out the scroll margin (the facts group).
+              style={{ height: virtualizer.getTotalSize() }}
+            >
+              {virtualizer.getVirtualItems().map((vrow) => {
+                const row = rows[vrow.index];
+                const item = row.kind === "hit" ? row.hit : row.thread;
+                const threadId = row.kind === "hit" ? row.hit.threadId : row.thread.id;
+                const ts = row.kind === "hit" ? row.hit.ts : row.thread.updatedAt;
+                const project = item.projectPath ? baseName(item.projectPath) : null;
+                const active = threadId === selectedThreadId;
+                const optionIndex = factCount + vrow.index;
+                const highlighted = optionIndex === highlightedIndex;
+                // Light muted text on the darker selected background measures under 4.5:1,
+                // so the selected row's meta text steps up to foreground/70 there.
+                const meta = active
+                  ? "text-foreground/70 dark:text-muted-foreground"
+                  : "text-muted-foreground";
+                return (
+                  <div
+                    key={vrow.key}
+                    data-index={vrow.index}
+                    ref={virtualizer.measureElement}
+                    role="presentation"
+                    className="group absolute left-0 top-0 w-full"
+                    style={{ transform: `translateY(${vrow.start - factsHeight}px)` }}
                   >
-                    <div className="flex items-baseline gap-2">
-                      <span className="min-w-0 flex-1 truncate text-sm font-medium">
-                        {item.title || "Untitled thread"}
-                      </span>
-                      {row.kind === "hit" && row.matchIds.length > 1 && (
-                        <span className={cn("shrink-0 text-xs", meta)}>
-                          {row.matchIds.length >= MAX_HITS_PER_THREAD
-                            ? `${MAX_HITS_PER_THREAD}+`
-                            : row.matchIds.length}{" "}
-                          matches
-                        </span>
+                    <button
+                      type="button"
+                      id={resultOptionId(optionIndex)}
+                      role="option"
+                      aria-selected={highlighted}
+                      onClick={() => openRow(optionIndex)}
+                      className={cn(
+                        "block w-full cursor-pointer border-b px-4 py-2 text-left outline-none hover:bg-muted/50 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/60",
+                        // Room for the star button, which only thread rows have.
+                        row.kind === "thread" && "pr-9",
+                        // The open row is marked by its background alone. The keyboard ring
+                        // is for the row the arrows are on, so it never sits on the open
+                        // row, where it read as a stuck focus ring after a click.
+                        active &&
+                          "bg-foreground/[0.07] hover:bg-foreground/[0.08] dark:bg-muted dark:hover:bg-muted",
+                        highlighted && !active && "bg-muted/60 ring-2 ring-inset ring-ring/60",
                       )}
-                      <span className={cn("shrink-0 text-xs tabular-nums", meta)}>
-                        {formatTime(ts)}
-                      </span>
-                    </div>
-                    {row.kind === "hit" ? (
-                      <div className={cn("mt-0.5 flex gap-1 text-[13px]", meta)}>
-                        <span className="min-w-0 flex-1 truncate">
-                          <span className="text-foreground/70">{hitOrigin(row.hit)}</span>{" "}
-                          <span
-                            className="[&_mark]:rounded-sm [&_mark]:bg-primary/25 [&_mark]:text-foreground"
-                            // biome-ignore lint/security/noDangerouslySetInnerHtml: renderSnippet escapes &, < and > first and only adds <mark> tags
-                            dangerouslySetInnerHTML={{
-                              __html: renderSnippet(leadToMatch(row.hit.snippet)),
-                            }}
-                          />
+                    >
+                      <div className="flex items-baseline gap-2">
+                        <span className="min-w-0 flex-1 truncate text-sm font-medium">
+                          {item.title || "Untitled thread"}
                         </span>
-                        {project && (
-                          <span className="shrink-0" title={item.projectPath ?? undefined}>
-                            · {project}
+                        {row.kind === "hit" && row.matchIds.length > 1 && (
+                          <span className={cn("shrink-0 text-xs", meta)}>
+                            {row.matchIds.length >= MAX_HITS_PER_THREAD
+                              ? `${MAX_HITS_PER_THREAD}+`
+                              : row.matchIds.length}{" "}
+                            matches
                           </span>
                         )}
+                        <span className={cn("shrink-0 text-xs tabular-nums", meta)}>
+                          {formatTime(ts)}
+                        </span>
                       </div>
-                    ) : (
-                      <div
-                        className={cn("mt-0.5 truncate text-[13px]", meta)}
-                        title={item.projectPath ?? undefined}
-                      >
-                        {[
-                          project,
-                          SOURCE_LABELS[item.source],
-                          `${row.thread.messageCount} ${row.thread.messageCount === 1 ? "msg" : "msgs"}`,
-                        ]
-                          .filter(Boolean)
-                          .join(" · ")}
-                      </div>
+                      {row.kind === "hit" ? (
+                        <div className={cn("mt-0.5 flex gap-1 text-[13px]", meta)}>
+                          <span className="min-w-0 flex-1 truncate">
+                            <span className="text-foreground/70">{hitOrigin(row.hit)}</span>{" "}
+                            <span
+                              className="[&_mark]:rounded-sm [&_mark]:bg-primary/25 [&_mark]:text-foreground"
+                              // biome-ignore lint/security/noDangerouslySetInnerHtml: renderSnippet escapes &, < and > first and only adds <mark> tags
+                              dangerouslySetInnerHTML={{
+                                __html: renderSnippet(leadToMatch(row.hit.snippet)),
+                              }}
+                            />
+                          </span>
+                          {project && (
+                            <span className="shrink-0" title={item.projectPath ?? undefined}>
+                              · {project}
+                            </span>
+                          )}
+                        </div>
+                      ) : (
+                        <div
+                          className={cn("mt-0.5 truncate text-[13px]", meta)}
+                          title={item.projectPath ?? undefined}
+                        >
+                          {[
+                            project,
+                            SOURCE_LABELS[item.source],
+                            `${row.thread.messageCount} ${row.thread.messageCount === 1 ? "msg" : "msgs"}`,
+                          ]
+                            .filter(Boolean)
+                            .join(" · ")}
+                        </div>
+                      )}
+                    </button>
+                    {row.kind === "thread" && (
+                      <StarButton threadId={row.thread.id} starred={row.thread.starred} />
                     )}
-                  </button>
-                  {row.kind === "thread" && (
-                    <StarButton threadId={row.thread.id} starred={row.thread.starred} />
-                  )}
-                </div>
-              );
-            })}
+                  </div>
+                );
+              })}
+            </div>
           </div>
           {capped && (
             <p className="px-4 py-3 text-center text-xs text-muted-foreground">
@@ -491,6 +638,98 @@ export function ResultsList() {
     </div>
   );
 }
+
+/** Decisions and gotchas matching the query: options of the results listbox ahead of the
+ *  thread rows, so the arrow keys run from the facts into the threads. */
+function FactsGroup({
+  ref,
+  facts,
+  navigable,
+  highlightedIndex,
+  showProject,
+  onOpen,
+}: {
+  ref: Ref<HTMLDivElement>;
+  facts: FactHit[];
+  /** False while the facts on screen are the previous query's (placeholder). */
+  navigable: boolean;
+  highlightedIndex: number;
+  /** Off when the search is scoped to one repo: every fact is from it. */
+  showProject: boolean;
+  onOpen: (index: number) => void;
+}) {
+  return (
+    // biome-ignore lint/a11y/useSemanticElements: an ARIA group of options inside the results listbox (listbox > group > option); a fieldset groups form controls, not options
+    <div
+      ref={ref}
+      role="group"
+      aria-labelledby="facts-group-label"
+      className="border-b bg-muted/30"
+    >
+      <div
+        id="facts-group-label"
+        className="px-4 pt-2 pb-1 text-xs font-medium text-muted-foreground"
+      >
+        Decisions and gotchas
+      </div>
+      {facts.map((fact, i) => {
+        const highlighted = navigable && i === highlightedIndex;
+        const gotcha = fact.kind === "gotcha";
+        return (
+          <button
+            key={fact.id}
+            type="button"
+            id={navigable ? resultOptionId(i) : undefined}
+            role="option"
+            aria-selected={highlighted}
+            // The previous query's facts, still shown while this query's load: they are not
+            // this list's options, so they are visibly inert until replaced.
+            disabled={!navigable}
+            aria-disabled={!navigable || undefined}
+            onClick={() => onOpen(i)}
+            title={navigable ? "Open the thread this came from" : undefined}
+            className={cn(
+              "flex w-full items-start gap-2 px-4 py-1.5 text-left outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/60",
+              navigable ? "cursor-pointer hover:bg-muted/60" : "cursor-default opacity-60",
+              highlighted && "bg-muted/70 ring-2 ring-inset ring-ring/60",
+            )}
+          >
+            <Badge
+              variant="outline"
+              className={cn(
+                "mt-px w-[4.5rem] shrink-0 font-normal",
+                gotcha && "border-amber-500/40 text-amber-700 dark:text-amber-400",
+              )}
+            >
+              {gotcha ? "Gotcha" : "Decision"}
+            </Badge>
+            <span className="line-clamp-2 min-w-0 flex-1 text-[13px] leading-snug">
+              {fact.text}
+            </span>
+            {(fact.pinned || (showProject && fact.project)) && (
+              <span className="mt-px flex shrink-0 items-center gap-1.5 text-xs text-muted-foreground">
+                {showProject && fact.project && (
+                  <span className="max-w-[12ch] truncate" title={fact.project}>
+                    {baseName(fact.project)}
+                  </span>
+                )}
+                {fact.pinned && (
+                  <Pin className="size-3 fill-current text-primary" aria-label="Pinned" />
+                )}
+              </span>
+            )}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+const PRESET_PHRASE: Record<Exclude<DatePreset, "custom" | "all">, string> = {
+  "24h": "for the last 24 hours",
+  "7d": "for the last 7 days",
+  "30d": "for the last 30 days",
+};
 
 /** Nothing to show: name what narrowed the list and offer the way out (clear the filters,
  *  try semantic search, or reindex an empty index). */
@@ -509,6 +748,12 @@ function EmptyResults({
   const toggleHybrid = useUi((s) => s.toggleHybrid);
   const clearCollectionFilters = useUi((s) => s.clearCollectionFilters);
   const clearSources = useUi((s) => s.clearSources);
+  const project = useUi((s) => s.project);
+  const setProject = useUi((s) => s.setProject);
+  const datePreset = useUi((s) => s.datePreset);
+  const after = useUi((s) => s.after);
+  const before = useUi((s) => s.before);
+  const setDatePreset = useUi((s) => s.setDatePreset);
   const reindex = useReindex();
   const reindexStarting = useReindexStarting();
   const indexing = userReindexing(useJobsStatus().data);
@@ -524,10 +769,22 @@ function EmptyResults({
     ...(starredOnly ? ["starred"] : []),
     ...selectedTags.map((t) => `#${t}`),
   ];
-  const scope = filters.length > 0 ? ` in ${filters.join(", ")}` : "";
-  // Published while shown, so the toolbar Reindex steps back to outline and this one is
-  // the only primary action.
-  const nothingIndexed = fileFilter === null && !searching && filters.length === 0;
+  // "Nothing in payments-api for the last 7 days.": the repo first, then any other filter,
+  // then the period, so the sentence names everything that narrowed the list.
+  const where = [...(project ? [baseName(project)] : []), ...filters];
+  const scope = where.length > 0 ? ` in ${where.join(", ")}` : "";
+  const dated = datePreset !== "all";
+  const period =
+    datePreset === "custom"
+      ? rangePhrase(after, before)
+      : datePreset === "all"
+        ? ""
+        : PRESET_PHRASE[datePreset];
+  const when = period ? ` ${period}` : "";
+  // Published while shown: this Reindex is then the one action, and the thread pane has
+  // nothing to point at.
+  const nothingIndexed =
+    fileFilter === null && !searching && filters.length === 0 && !project && !dated;
   const setIndexEmpty = useUi((s) => s.setIndexEmpty);
   useEffect(() => {
     if (!nothingIndexed) return;
@@ -547,14 +804,31 @@ function EmptyResults({
     </Button>
   );
 
+  // Widening the scope is the likeliest way to a result, so it comes first.
+  const widen = (
+    <>
+      {project && (
+        <Button size="xs" variant="outline" onClick={() => setProject(null)}>
+          Search all repos
+        </Button>
+      )}
+      {dated && (
+        <Button size="xs" variant="outline" onClick={() => setDatePreset("all")}>
+          Search all time
+        </Button>
+      )}
+    </>
+  );
+
   let message: string;
   let actions: ReactNode = null;
   if (fileFilter !== null) {
     message = `No threads mention ${fileFilter || "that file"}.`;
   } else if (searching) {
-    message = `No matches for "${query}"${scope}.`;
+    message = `No matches for "${query}"${scope}${when}.`;
     actions = (
       <>
+        {widen}
         {clearFilters}
         {!hybrid && semanticReady && (
           <Button size="xs" variant="outline" onClick={toggleHybrid}>
@@ -563,9 +837,14 @@ function EmptyResults({
         )}
       </>
     );
-  } else if (filters.length > 0) {
-    message = `No threads${scope}.`;
-    actions = clearFilters;
+  } else if (where.length > 0 || dated) {
+    message = `Nothing${scope}${when}.`;
+    actions = (
+      <>
+        {widen}
+        {clearFilters}
+      </>
+    );
   } else {
     message = "Nothing indexed yet. Reindex to scan your agents' history.";
     actions = (

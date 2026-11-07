@@ -77,7 +77,7 @@ export function useBuildSemanticIndex() {
   });
 }
 
-/** Start a full reindex in the background (the search bar's Reindex button, and the
+/** Start a full reindex in the background (the command palette's Reindex history, and the
  *  empty-index state of the results list). It never blocks the UI: callers reflect the
  *  job flag, and main.tsx refreshes results and stats on index:done and toasts. */
 export function useReindex() {

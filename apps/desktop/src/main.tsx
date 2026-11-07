@@ -178,7 +178,15 @@ void listen<IndexReport | null>("index:done", (e) => {
  * In-app chats (["chats"]) are not watcher-indexed, so they are left alone.
  */
 const LIVE_UPDATE_THROTTLE_MS = 4_000;
-const LIVE_KEYS = ["results", "db_stats", "index_stats", "thread_commits"] as const;
+// project_recent is the Project page's Recent sessions: a cheap ordered read of 10 threads,
+// and the list an agent working in that repo changes.
+const LIVE_KEYS = [
+  "results",
+  "db_stats",
+  "index_stats",
+  "thread_commits",
+  "project_recent",
+] as const;
 let liveTimer: ReturnType<typeof setTimeout> | null = null;
 let liveLastRun = 0;
 let missedWhileHidden = false;
@@ -213,7 +221,7 @@ function refreshAfterWatcherUpdate() {
   ) {
     useUi.getState().noteSearchActivity();
   }
-  for (const key of ["db_stats", "index_stats", "thread_commits"]) {
+  for (const key of ["db_stats", "index_stats", "thread_commits", "project_recent"]) {
     void queryClient.invalidateQueries({ queryKey: [key], refetchType: "active" });
   }
 }

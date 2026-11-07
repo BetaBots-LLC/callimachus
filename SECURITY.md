@@ -27,13 +27,13 @@ Specifically:
   fetch; (2) **Knowledge distillation** (`agent::distill`) of decisions, gotchas,
   and summaries, including background auto-distill when you turn it on (threads
   active in the last 30 days, up to the daily limit you set, 50 by default);
-  (3) **Ask your history / RAG** (`agent::answer`, also reachable as `cal ask`
-  and the `ask_history` MCP tool); (4) the Projects tab's **Synthesize brief**,
+  (3) **Ask your history / RAG** (Chat's Ask mode, `agent::answer`, also reachable
+  as `cal ask` and the `ask_history` MCP tool); (4) the Project page's **Synthesize brief**,
   **Write memory file** and **Review conflicts** (`agent::project_brief`,
   `agent::find_conflicts`), which send the project's path and the notes already
   distilled from it; and (5) the **AI-summarized Obsidian export**
   (`agent::synthesize`, also `cal export --synthesize`), which sends the thread
-  to the engine picked under **Settings → Obsidian export** (for the CLI, the
+  to the engine picked under **Settings → Export** (for the CLI, the
   first provider with a key).
   The request goes directly from your machine to that provider with your own key,
   after common secret formats in it are replaced with `[REDACTED]` (see

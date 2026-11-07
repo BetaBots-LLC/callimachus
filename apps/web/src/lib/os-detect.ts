@@ -1,6 +1,6 @@
 // Pure OS helpers. Detection runs server-side from the request User-Agent (see
 // `getPrimaryOs` in server/releases.ts), so the right download is chosen before
-// the first byte — no client state, no effect, no hydration flash.
+// the first byte: no client state, no effect, no hydration flash.
 
 export type OsKey = "mac_arm" | "win" | "linux_appimage" | "linux_deb";
 

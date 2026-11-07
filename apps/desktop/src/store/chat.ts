@@ -1,8 +1,8 @@
 import { create } from "zustand";
-import { api, type ChatChunk, type ChatMessage } from "../lib/api";
+import { type AskSource, api, type ChatChunk, type ChatMessage } from "../lib/api";
 import { humanizeApiError } from "../lib/errors";
 import { invalidateIndexDerived, queryClient } from "../lib/queryClient";
-import { trackError } from "../lib/telemetry";
+import { classifyError, trackError } from "../lib/telemetry";
 
 /** Where an injected context message came from, for the attachment chip. */
 export interface ContextMeta {
@@ -12,10 +12,23 @@ export interface ContextMeta {
   truncated: boolean; // the body was elided to fit MAX_CONTEXT_CHARS
 }
 
+/** An answer that came from "Ask your history" (ask_history): the threads it drew on. Only
+ *  the turn answered in this window has them; a saved chat reloads as plain messages, and
+ *  its [thread N] citations still render as chips. */
+export interface AskMeta {
+  sources: AskSource[];
+}
+
 // A committed message with a stable id (keeps React subtree identity stable across
-// the streaming→committed transition, so memoized bubbles don't remount). `context` is
-// UI-only metadata and is stripped before the message goes to the backend.
-export type StoredMessage = ChatMessage & { id: string; context?: ContextMeta };
+// the streaming→committed transition, so memoized bubbles don't remount). `context` and
+// `ask` are UI-only metadata and are stripped before the message goes to the backend.
+export type StoredMessage = ChatMessage & { id: string; context?: ContextMeta; ask?: AskMeta };
+
+/** How the next message is answered. "chat": the chat provider, with the history-search
+ *  tool. "ask": one retrieval-grounded answer from ask_history on the memory engine, with
+ *  [thread N] citations; the mode then returns to "chat", so follow-ups are a normal chat
+ *  over the same conversation. */
+export type ChatMode = "chat" | "ask";
 
 // A tool the agent invoked during a turn (shown live as a step).
 export interface ToolStep {
@@ -50,6 +63,9 @@ interface ChatState {
   threadId: string;
   provider: string;
   model: string;
+  mode: ChatMode;
+  // What the in-flight turn is: a streamed chat reply, or an Ask (one request, no stream).
+  pending: ChatMode | null;
   messages: StoredMessage[];
   reasoning: string; // in-progress "thinking" text
   parts: StreamPart[]; // in-progress answer, interleaved text + tool steps
@@ -62,6 +78,7 @@ interface ChatState {
 
   setProvider: (p: string, defaultModel: string) => void;
   setModel: (m: string) => void;
+  setMode: (m: ChatMode) => void;
   newChat: () => void;
   loadChat: (threadId: string, messages: ChatMessage[]) => void;
   pushUser: (content: string) => void;
@@ -75,11 +92,38 @@ interface ChatState {
   finishAssistant: (full: string) => void;
   setError: (e: string | null) => void;
   setLoadingThread: (v: boolean) => void;
-  /** Send a user message and stream the reply into `parts`. */
+  /** Send a user message: in chat mode stream the reply into `parts`, in ask mode answer
+   *  it with ask_history. */
   send: (text: string, opts?: { baseUrl?: string | null }) => Promise<void>;
   /** Stop the in-flight reply. The partial reply is still committed and saved. */
   stop: () => void;
 }
+
+// Chat's provider and model are the app's chat default (Settings > AI engine edits the same
+// values), so they survive a restart. Storage can be blocked (a locked-down webview, a
+// private profile): reads then fall back to the built-in default and writes are dropped.
+const CHAT_PROVIDER_KEY = "callimachus.chatProvider";
+const CHAT_MODEL_KEY = "callimachus.chatModel";
+const DEFAULT_PROVIDER = "anthropic";
+const DEFAULT_MODEL = "claude-opus-4-8";
+function readStored(key: string): string | null {
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+function writeStored(key: string, value: string) {
+  try {
+    localStorage.setItem(key, value);
+  } catch {
+    /* storage blocked: the choice lasts for this session */
+  }
+}
+const storedProvider = readStored(CHAT_PROVIDER_KEY);
+const initialProvider = storedProvider || DEFAULT_PROVIDER;
+// A stored model belongs to the stored provider; without one, the built-in pair.
+const initialModel = storedProvider ? (readStored(CHAT_MODEL_KEY) ?? "") : DEFAULT_MODEL;
 
 const newId = () =>
   globalThis.crypto?.randomUUID?.() ?? `chat-${Math.random().toString(36).slice(2)}`;
@@ -96,6 +140,34 @@ const toWire = (m: StoredMessage): ChatMessage => ({ role: m.role, content: m.co
  *  saved chat): providers such as Anthropic reject them anywhere but the final position,
  *  so sending one would fail every later message in that chat. */
 const isSendable = (m: StoredMessage) => m.role !== "assistant" || m.content.trim() !== "";
+
+/**
+ * A failed Ask in words. Ask runs on the memory engine, which may be a CLI login (no key)
+ * or "the first saved API key" (no provider named), so Chat's copy ("No  API key set.",
+ * "Pick another from the dropdown") named the wrong thing or a control Ask does not have.
+ * Every branch points at Settings > AI engine, where that engine is set. A backend message
+ * that already names the fix (memory is off) is shown as it is.
+ */
+export function askErrorText(raw: string): string {
+  const s = raw.replace(/^Error:\s*/, "");
+  if (s.includes("Settings > AI engine")) return s.split("\n")[0];
+  const detail = s.match(/"message"\s*:\s*"([^"]+)"/)?.[1];
+  const more = detail ? ` (${detail})` : "";
+  switch (classifyError(s)) {
+    case "model_unavailable":
+      return `The memory engine's model isn't available${more}. Pick another model in Settings > AI engine.`;
+    case "auth_rejected":
+      return `The memory engine rejected the request${more}. Check its login or API key in Settings > AI engine.`;
+    case "missing_key":
+      return "The memory engine has no API key. Add one, or pick another engine, in Settings > AI engine.";
+    case "rate_limited":
+      return `The memory engine is rate-limited or out of quota${more}. Wait a moment, then ask again.`;
+    case "network":
+      return "Couldn't reach the memory engine. Check the connection (for Ollama, that it is running), then ask again.";
+    default:
+      return detail || s.split("\n")[0].slice(0, 300) || "Ask failed. Try again.";
+  }
+}
 
 export const isContextMessage = (m: Pick<StoredMessage, "role" | "content" | "context">) =>
   m.role === "user" && (m.context != null || m.content.startsWith(CONTEXT_PREFIX));
@@ -163,14 +235,86 @@ export const useChat = create<ChatState>((set, get) => {
   const abandonActiveStream = () => {
     if (!activeStream) return;
     activeStream = 0;
+    // An Ask has no stream to cancel (and cancelling would hit a chat stream still
+    // unwinding from earlier); dropping its result is enough.
+    if (get().pending === "ask") return;
     denyPendingApprovals(get().parts);
     void api.cancelChat().catch(() => {});
   };
 
+  /** One Ask turn: ask_history retrieves past sessions and answers on the memory engine.
+   *  The answer is saved into this chat (with any earlier turns) only once it is shown, so
+   *  it lists with the saved chats and a follow-up continues the same conversation. An Ask
+   *  stopped or abandoned before it lands saves nothing: persist_chat replaces the whole
+   *  thread, so a late save would wipe the turns sent after the Stop. */
+  const askTurn = async (text: string) => {
+    const gen = ++streamSeq;
+    activeStream = gen;
+    const { threadId } = get();
+    set((s) => ({
+      messages: [...s.messages, { role: "user", content: text, id: newId() }],
+      isStreaming: true,
+      pending: "ask",
+      error: null,
+      reasoning: "",
+      parts: [],
+    }));
+    const isCurrent = () => activeStream === gen && get().threadId === threadId;
+    try {
+      const res = await api.askHistory(text);
+      if (!isCurrent()) return;
+      // The text with its sources footer is what is shown, saved and re-sent, so a reopened
+      // chat and a follow-up both still know which threads the answer cited.
+      const reply = res.answerWithSources ?? res.answer;
+      const turns = get().messages.filter(isSendable).map(toWire);
+      set((s) => ({
+        messages: [
+          ...s.messages,
+          { role: "assistant", content: reply, id: newId(), ask: { sources: res.sources } },
+        ],
+        // Follow-ups are a normal chat over this conversation, with the history tool.
+        mode: "chat",
+      }));
+      // The next send waits for this save (as for a settling stream), so its own save of
+      // the longer conversation always lands last.
+      const save = api.saveChat(threadId, turns, reply);
+      inflight = save;
+      void save
+        .then(
+          () => {
+            void queryClient.invalidateQueries({ queryKey: ["chats"] });
+            void queryClient.invalidateQueries({ queryKey: ["db_stats"] });
+            invalidateIndexDerived();
+          },
+          (e) => {
+            if (get().threadId === threadId) {
+              set({ error: `Couldn't save this answer to your chats: ${String(e)}` });
+            }
+          },
+        )
+        .finally(() => {
+          if (inflight === save) inflight = null;
+        });
+    } catch (e) {
+      if (isCurrent()) {
+        // Ask runs on the memory engine, not the chat provider: its own copy.
+        set({ error: askErrorText(String(e)) });
+        trackError(e);
+      }
+    } finally {
+      if (activeStream === gen) {
+        activeStream = 0;
+        set({ isStreaming: false, pending: null });
+      }
+    }
+  };
+
   return {
     threadId: newId(),
-    provider: "anthropic",
-    model: "claude-opus-4-8",
+    provider: initialProvider,
+    model: initialModel,
+    mode: "chat",
+    pending: null,
     messages: [],
     reasoning: "",
     parts: [],
@@ -178,8 +322,16 @@ export const useChat = create<ChatState>((set, get) => {
     loadingThread: false,
     error: null,
 
-    setProvider: (provider, defaultModel) => set({ provider, model: defaultModel }),
-    setModel: (model) => set({ model }),
+    setProvider: (provider, defaultModel) => {
+      writeStored(CHAT_PROVIDER_KEY, provider);
+      writeStored(CHAT_MODEL_KEY, defaultModel);
+      set({ provider, model: defaultModel });
+    },
+    setModel: (model) => {
+      writeStored(CHAT_MODEL_KEY, model);
+      set({ model });
+    },
+    setMode: (mode) => set({ mode }),
     newChat: () => {
       abandonActiveStream();
       set({
@@ -189,6 +341,7 @@ export const useChat = create<ChatState>((set, get) => {
         parts: [],
         error: null,
         isStreaming: false,
+        pending: null,
       });
     },
     loadChat: (threadId, messages) => {
@@ -202,6 +355,9 @@ export const useChat = create<ChatState>((set, get) => {
         parts: [],
         error: null,
         isStreaming: false,
+        pending: null,
+        // A saved conversation continues as a chat; Ask is picked per question.
+        mode: "chat",
       });
     },
     pushUser: (content) =>
@@ -217,9 +373,15 @@ export const useChat = create<ChatState>((set, get) => {
       const duplicate = contexts.some(
         (m) => (threadId != null && m.context?.threadId === threadId) || m.content === content,
       );
-      if (duplicate) return "duplicate";
+      // Ask answers from retrieval alone and ignores every earlier turn, so a send in Ask
+      // mode would silently drop the context just attached: attaching switches to Chat.
+      if (duplicate) {
+        set({ mode: "chat" });
+        return "duplicate";
+      }
       if (contexts.length >= MAX_CONTEXTS) return "limit";
       set({
+        mode: "chat",
         messages: [
           ...s.messages,
           {
@@ -302,20 +464,23 @@ export const useChat = create<ChatState>((set, get) => {
         reasoning: "",
         parts: [],
         isStreaming: false,
+        pending: null,
       })),
-    setError: (error) => set({ error, isStreaming: false }),
+    setError: (error) => set({ error, isStreaming: false, pending: null }),
     setLoadingThread: (loadingThread) => set({ loadingThread }),
 
     send: async (raw, opts) => {
       const text = raw.trim();
       const start = get();
       if (!text || start.isStreaming) return;
+      if (start.mode === "ask") return askTurn(text);
       const gen = ++streamSeq;
       activeStream = gen;
       const { threadId, provider, model } = start;
       set((s) => ({
         messages: [...s.messages, { role: "user", content: text, id: newId() }],
         isStreaming: true,
+        pending: "chat",
         error: null,
         reasoning: "",
         parts: [],
@@ -395,7 +560,7 @@ export const useChat = create<ChatState>((set, get) => {
           void queryClient.invalidateQueries({ queryKey: ["db_stats"] });
         }
         // Saved either way (an abandoned stream still persists its partial reply). The
-        // chat is a thread, so Stats / Coach / Projects / Spend count it too.
+        // chat is a thread, so Stats / Today / Projects / Spend count it too.
         void queryClient.invalidateQueries({ queryKey: ["chats"] });
         invalidateIndexDerived();
       } catch (e) {
@@ -409,13 +574,20 @@ export const useChat = create<ChatState>((set, get) => {
         if (inflight === call) inflight = null;
         if (activeStream === gen) {
           activeStream = 0;
-          set({ isStreaming: false });
+          set({ isStreaming: false, pending: null });
         }
       }
     },
 
     stop: () => {
       if (!get().isStreaming) return;
+      if (get().pending === "ask") {
+        // ask_history is one request with nothing to cancel: stop waiting for it. Its answer
+        // is dropped when it lands and never saved (askTurn saves only a current answer).
+        activeStream = 0;
+        set({ isStreaming: false, pending: null });
+        return;
+      }
       stopRequested = activeStream;
       denyPendingApprovals(get().parts);
       void api.cancelChat().catch(() => {});

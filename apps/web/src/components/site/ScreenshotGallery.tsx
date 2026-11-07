@@ -6,7 +6,7 @@ import { cn } from "@/lib/utils";
 const PLATE_SHADOW = "shadow-[0_24px_60px_-20px_oklch(0.1_0.02_50/0.7)]";
 
 /**
- * The "plates" — product figures as a featured hero plate plus a two-up grid, each click-to-enlarge
+ * The "plates": product figures as a featured hero plate plus a two-up grid, each click-to-enlarge
  * into a lightbox for exact detail. The lightbox carries legibility, so the grid can stay compact
  * without the screens becoming unreadable. Styled as catalogue figures (mono figure number, serif
  * title, one-line description below the plate) to match the reading-room aesthetic.

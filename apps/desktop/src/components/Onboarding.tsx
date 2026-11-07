@@ -823,7 +823,7 @@ function MemoryStep({ done, onSkip }: { done: boolean; onSkip?: () => void }) {
     return (
       <p className="text-[13px] text-muted-foreground">
         Memory is on. Recent sessions are distilled in the background; change the engine in Settings
-        &gt; Knowledge.
+        &gt; AI engine.
       </p>
     );
   }

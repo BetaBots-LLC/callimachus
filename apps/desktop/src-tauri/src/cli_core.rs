@@ -999,7 +999,7 @@ struct HookRequest<'a> {
 
 /// The hook's result: the text it prints, or why it prints nothing.
 #[derive(Debug, PartialEq, Eq)]
-enum HookOutcome {
+pub enum HookOutcome {
     Print(String),
     Silent(String),
 }
@@ -1024,12 +1024,8 @@ fn hook_outcome(req: &HookRequest, index: &std::path::Path) -> anyhow::Result<Ho
             "CALLIMACHUS_SKIP_HOOK=1 is set (a launcher already put the memory in context)".into(),
         ));
     }
-    if let Some(file) = managed_block_for(req.agent, req.cwd) {
-        return Ok(HookOutcome::Silent(format!(
-            "managed block found in {} ({} already loads this memory)",
-            file.display(),
-            req.agent.label()
-        )));
+    if let Some(silent) = managed_block_silence(req) {
+        return Ok(silent);
     }
     // Never create an index from inside a hook.
     if !index.exists() {
@@ -1040,6 +1036,80 @@ fn hook_outcome(req: &HookRequest, index: &std::path::Path) -> anyhow::Result<Ho
     }
     let conn = db::open_readonly(index)?;
     hook_output(&conn, req)
+}
+
+/// Silent when a context file the agent loads for `req.cwd` already carries the managed block.
+fn managed_block_silence(req: &HookRequest) -> Option<HookOutcome> {
+    managed_block_for(req.agent, req.cwd).map(|file| {
+        HookOutcome::Silent(format!(
+            "managed block found in {} ({} already loads this memory)",
+            file.display(),
+            req.agent.label()
+        ))
+    })
+}
+
+/// What Claude Code's SessionStart hook would inject into a new (`startup`) session in
+/// `project` (a canonical key, which is the repo's path), for the app's "What agents see"
+/// pane. The same managed-block check and [`hook_output`] the hook runs, on the app's
+/// connection, so the preview cannot drift from the hook. Only the launcher's
+/// `CALLIMACHUS_SKIP_HOOK` check is left out: it describes one launched session, not the repo.
+pub fn hook_preview(conn: &Connection, project: &str) -> anyhow::Result<HookOutcome> {
+    let req = HookRequest {
+        agent: HookAgent::Claude,
+        source: "startup",
+        cwd: std::path::Path::new(project),
+        project,
+        limit: None,
+        max_chars: None,
+    };
+    if let Some(silent) = managed_block_silence(&req) {
+        return Ok(silent);
+    }
+    hook_output(conn, &req)
+}
+
+/// Whether a repo's agent context file holds the managed memory block, for the app's "What
+/// agents see" pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentsFileState {
+    /// No AGENTS.md / CLAUDE.md the repo's agents read holds the block.
+    Absent,
+    /// The block there is what Update AGENTS.md would write now.
+    Current,
+    /// The block there is older than the memory (Update AGENTS.md refreshes it).
+    Stale,
+}
+
+/// [`AgentsFileState`] for `project` (a repo path) against `body`, the block body
+/// `export::agents_file_body` renders now. Looks in the files Update AGENTS.md and `cal
+/// agents` write (AGENTS.md, CLAUDE.md at the root) and wherever Claude Code's hook finds
+/// the block ([`managed_block_for`]: `.claude/CLAUDE.md`, `CLAUDE.local.md`, imports). A
+/// block counts as current when rewriting it would change nothing, the writer's own test.
+pub fn agents_file_state(project: &str, body: &str) -> AgentsFileState {
+    let root = std::path::Path::new(project);
+    let mut files = vec![root.join("AGENTS.md"), root.join("CLAUDE.md")];
+    if let Some(found) = managed_block_for(HookAgent::Claude, root) {
+        if !files.contains(&found) {
+            files.push(found);
+        }
+    }
+    let blocks: Vec<String> = files
+        .iter()
+        .filter_map(|f| read_small_text(f))
+        .filter(|t| t.contains(export::MANAGED_START))
+        .collect();
+    if blocks.is_empty() {
+        AgentsFileState::Absent
+    } else if blocks
+        .iter()
+        .any(|t| export::upsert_managed_block(t, body) == *t)
+    {
+        AgentsFileState::Current
+    } else {
+        AgentsFileState::Stale
+    }
 }
 
 /// Remaining chars past the facts below which the hook appends no digest: three sessions
@@ -1157,7 +1227,7 @@ fn label_harvested(mut mem: knowledge::ProjectMemory) -> knowledge::ProjectMemor
 }
 
 /// Claude Code's cap on a hook's injected context, past which the agent sees a preview.
-const HOOK_OUTPUT_CAP: usize = 10_000;
+pub const HOOK_OUTPUT_CAP: usize = 10_000;
 
 /// `cal hook --explain [path] [--for AGENT]`: the exact text a `startup` session in `path`
 /// (default: the current directory) would get, before the agent's envelope, then its size,
@@ -1549,23 +1619,15 @@ fn cmd_agents(args: &[String]) -> anyhow::Result<()> {
     };
     let filename = o.out.clone().unwrap_or_else(|| "AGENTS.md".into());
     let conn = open_db()?;
-    let budget = export::MemoryBudget::AGENTS_FILE;
-    // Claude Code loads its own auto memory and reads this file too: no second copy.
-    let mem = knowledge::get_project_memory_excluding(
-        &conn,
-        &project,
-        budget.fetch_limit(),
-        knowledge::harvest::EXTRACTOR_CLAUDE_MEMORY,
-    )?;
-    let body = export::agent_memory_md_budgeted(&project, &mem, None, &budget);
+    // The same body the app writes and previews (`export::agents_file_body`).
+    let body = export::agents_file_body(&conn, &project)?;
+    let (threads, distilled) = knowledge::project_coverage(&conn, &project)?;
     let path = std::path::Path::new(&dir).join(&filename);
     let changed = export::write_managed_block_file(&path, &body)?;
     eprintln!(
-        "{} {} ({}/{} threads distilled)",
+        "{} {} ({distilled}/{threads} threads distilled)",
         if changed { "wrote" } else { "unchanged:" },
         path.display(),
-        mem.distilled_count,
-        mem.thread_count
     );
     Ok(())
 }
@@ -2178,8 +2240,11 @@ fn cmd_snapshots(args: &[String]) -> anyhow::Result<()> {
 /// inherited stdio (no new Terminal window). On Windows it opens in a new console window
 /// instead: `cal.exe` is the GUI-subsystem app exe, which cmd and PowerShell don't wait for,
 /// so an agent TUI run in place would fight the shell's prompt for the same keystrokes.
-/// Either way the session gets `CALLIMACHUS_SKIP_HOOK=1`: the snapshot already carries the
-/// project's memory block, so the SessionStart hook must not inject a second copy.
+/// Either way the session gets `CALLIMACHUS_SKIP_HOOK=1` only when the snapshot carries the
+/// project's memory block (the hook must not inject a second copy); a snapshot of a repo
+/// with no facts has none, and the hook then still gives the session memory and the digest.
+/// The body is redacted first, as the app's resume and `load_snapshot` do: older snapshots
+/// were saved before packing redacted, and the body goes to the agent's provider.
 fn cmd_resume(args: &[String]) -> anyhow::Result<()> {
     let o = parse(args)?;
     let id: i64 = o
@@ -2193,11 +2258,14 @@ fn cmd_resume(args: &[String]) -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("no snapshot #{id} (see `cal snapshots`)"))?;
     drop(conn);
     let agent = o.agent.as_deref().unwrap_or("claude");
+    let body = context::redact_secrets(&snap.body);
+    let skip_hook = snapshot::carries_memory(&body);
     if cfg!(windows) {
-        let file = agent::cli_resume::launch_with_context(
+        let file = agent::cli_resume::launch_with_context_memory(
             agent,
-            &snap.body,
+            &body,
             snap.meta.project_path.as_deref(),
+            skip_hook,
         )?;
         eprintln!(
             "Opened snapshot #{id} (\"{}\") in {agent} in a new window. Context: {file}",
@@ -2205,26 +2273,31 @@ fn cmd_resume(args: &[String]) -> anyhow::Result<()> {
         );
         return Ok(());
     }
-    let file = agent::cli_resume::write_context_file(&snap.body)?;
+    let file = agent::cli_resume::write_context_file(&body)?;
     let prompt = agent::cli_resume::context_prompt(&file);
     eprintln!(
         "Resuming snapshot #{id} (\"{}\") in {agent}. Context: {}",
         snap.meta.label,
         file.display()
     );
-    run_agent_here(agent, &prompt, snap.meta.project_path.as_deref())?;
+    run_agent_here(agent, &prompt, snap.meta.project_path.as_deref(), skip_hook)?;
     Ok(())
 }
 
-/// Run an agent CLI in this terminal (inherited stdio) and wait for it to exit.
+/// Run an agent CLI in this terminal (inherited stdio) and wait for it to exit, with the
+/// SessionStart hook skipped when `skip_hook` (the context already carries memory).
 fn run_agent_here(
     agent: &str,
     prompt: &str,
     cwd: Option<&str>,
+    skip_hook: bool,
 ) -> anyhow::Result<std::process::ExitStatus> {
     let command = |program: &str| {
         let mut c = std::process::Command::new(program);
-        c.arg(prompt).env(agent::cli_resume::SKIP_HOOK_ENV, "1");
+        c.arg(prompt);
+        if skip_hook {
+            c.env(agent::cli_resume::SKIP_HOOK_ENV, "1");
+        }
         if let Some(dir) = cwd.filter(|d| std::path::Path::new(d).is_dir()) {
             c.current_dir(dir);
         }
@@ -3031,6 +3104,84 @@ mod tests {
     }
 
     #[test]
+    fn hook_preview_is_the_startup_hook_output_and_honors_the_managed_block() {
+        let dir = std::env::temp_dir().join(format!(
+            "calli_preview_{}_{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let project = knowledge::project_key(&dir.to_string_lossy());
+        let mut conn = dts::temp_db("preview");
+        let tid = dts::session(
+            &mut conn,
+            "p1",
+            &project,
+            "Ship it",
+            600,
+            &["tag the release"],
+        );
+        dts::fact(&conn, tid, "decision", "Release from main only", "llm");
+        dts::fact(
+            &conn,
+            tid,
+            "gotcha",
+            "Imported from Claude memory",
+            "claude-memory",
+        );
+        let req = HookRequest {
+            agent: HookAgent::Claude,
+            source: "startup",
+            cwd: std::path::Path::new(&project),
+            project: &project,
+            limit: None,
+            max_chars: None,
+        };
+        let preview = printed(hook_preview(&conn, &project).unwrap());
+        assert_eq!(preview, printed(hook_output(&conn, &req).unwrap()));
+        assert!(preview.contains("Release from main only"), "{preview}");
+        // The same exclusion as the hook: Claude Code already loads its auto memory.
+        assert!(
+            !preview.contains("Imported from Claude memory"),
+            "{preview}"
+        );
+
+        std::fs::write(
+            std::path::Path::new(&project).join("CLAUDE.md"),
+            export::upsert_managed_block("# Repo", "B"),
+        )
+        .unwrap();
+        assert!(silent(hook_preview(&conn, &project).unwrap()).starts_with("managed block found"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn agents_file_state_tells_absent_current_and_stale_blocks_apart() {
+        let dir = std::env::temp_dir().join(format!(
+            "calli_agents_state_{}_{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let project = dir.to_string_lossy().into_owned();
+        assert_eq!(agents_file_state(&project, "A"), AgentsFileState::Absent);
+        // A file without the block is still absent.
+        std::fs::write(dir.join("AGENTS.md"), "# Repo\n").unwrap();
+        assert_eq!(agents_file_state(&project, "A"), AgentsFileState::Absent);
+        export::write_managed_block_file(&dir.join("AGENTS.md"), "A").unwrap();
+        assert_eq!(agents_file_state(&project, "A"), AgentsFileState::Current);
+        assert_eq!(agents_file_state(&project, "B"), AgentsFileState::Stale);
+        // Either root file counts: an up-to-date CLAUDE.md beside a stale AGENTS.md.
+        export::write_managed_block_file(&dir.join("CLAUDE.md"), "B").unwrap();
+        assert_eq!(agents_file_state(&project, "B"), AgentsFileState::Current);
+        assert_eq!(
+            serde_json::to_string(&AgentsFileState::Stale).unwrap(),
+            "\"stale\""
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn hook_falls_back_to_the_digest_when_there_are_no_facts() {
         let (conn, _) = hook_conn();
         let out = printed(hook_output(&conn, &hook_req("startup")).unwrap());
@@ -3704,13 +3855,14 @@ mod tests {
                 env!("CARGO_MANIFEST_DIR"),
                 "/../../web/src/routes/desktop.tsx"
             ),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../web/src/routes/mcp.tsx"),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../web/src/content/faq.ts"),
         ];
-        let mut checked = 0;
         for path in docs {
-            let Ok(text) = std::fs::read_to_string(path) else {
-                continue;
-            };
-            checked += 1;
+            // A renamed or moved page must fail here, not pass by checking nothing.
+            let text = std::fs::read_to_string(path).unwrap_or_else(|e| {
+                panic!("{path}: {e}. Renamed or moved? Update this list to the new path.")
+            });
             for cmd in cal_commands_in(&text) {
                 assert!(
                     known.contains(cmd.as_str()),
@@ -3718,9 +3870,5 @@ mod tests {
                 );
             }
         }
-        assert!(
-            checked > 0,
-            "no docs found to cross-check — are the relative paths right?"
-        );
     }
 }

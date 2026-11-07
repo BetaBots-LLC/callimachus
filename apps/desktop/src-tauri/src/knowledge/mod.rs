@@ -851,6 +851,163 @@ pub fn recall(
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+/// A decision or gotcha matching a search, for the Search view's "Decisions and gotchas"
+/// group.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FactHit {
+    pub id: i64,
+    pub kind: String,
+    pub text: String,
+    /// The fact's canonical project key ("" when its thread has none).
+    pub project: String,
+    pub thread_id: i64,
+    /// The message the fact was extracted from, so a hit can open the thread there.
+    pub source_message_id: Option<i64>,
+    pub title: Option<String>,
+    pub pinned: bool,
+    pub extractor: String,
+    /// When the fact was recorded (unix seconds), so Search's date presets apply to facts.
+    pub created_at: i64,
+}
+
+/// Query words the keyword match uses at most; more only slow the scan.
+const FACT_SEARCH_MAX_WORDS: usize = 8;
+
+/// Columns of a [`FactHit`] over `facts f JOIN threads t`, in `fact_hit_row` order.
+const FACT_HIT_COLS: &str = "f.id, f.kind, f.text, COALESCE(t.project_key, t.project_path, ''),
+     f.thread_id, f.source_message_id, t.title, f.pinned, f.extractor, f.created_at";
+
+fn fact_hit_row(r: &rusqlite::Row) -> rusqlite::Result<FactHit> {
+    Ok(FactHit {
+        id: r.get(0)?,
+        kind: r.get(1)?,
+        text: r.get(2)?,
+        project: r.get(3)?,
+        thread_id: r.get(4)?,
+        source_message_id: r.get(5)?,
+        title: r.get(6)?,
+        pinned: r.get::<_, i64>(7)? != 0,
+        extractor: r.get(8)?,
+        created_at: r.get(9)?,
+    })
+}
+
+/// `s` as a LIKE pattern matching it anywhere, with `%`, `_` and the escape char escaped.
+fn like_contains(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('%');
+    for c in s.chars() {
+        if matches!(c, '%' | '_' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('%');
+    out
+}
+
+/// Visible decisions and gotchas whose text holds every term of `query` (case-insensitive;
+/// phrases, stopwords and punctuation as the search box parses them, see
+/// `search::like_terms`), pinned first then newest, optionally in one project (its canonical
+/// key, exact). Same visibility rule as the Project page: hidden facts never, subagent facts
+/// only when pinned. `semantic` adds the [`recall`] hits for a query vector, ahead of the
+/// keyword ones and deduped by id; it still answers a query of stopwords alone.
+pub fn search_facts(
+    conn: &Connection,
+    query: &str,
+    project: Option<&str>,
+    limit: usize,
+    semantic: Option<&[f32]>,
+) -> Result<Vec<FactHit>> {
+    if query.trim().is_empty() || limit == 0 {
+        return Ok(Vec::new());
+    }
+    let words: Vec<String> = crate::search::like_terms(query)
+        .into_iter()
+        .take(FACT_SEARCH_MAX_WORDS)
+        .map(|w| w.to_lowercase())
+        .collect();
+    let project = project.map(str::trim).filter(|p| !p.is_empty());
+    let mut out: Vec<FactHit> = Vec::new();
+    if let Some(qv) = semantic {
+        let mut hits: Vec<RecallHit> = Vec::new();
+        for kind in ["decision", "gotcha"] {
+            // Semantic hits are a bonus on top of the keyword match, which still answers if
+            // the vector table can't be read.
+            if let Ok(found) = recall(conn, qv, kind, project, limit) {
+                hits.extend(found);
+            }
+        }
+        hits.sort_by(|a, b| b.similarity.total_cmp(&a.similarity));
+        let mut by_id = conn.prepare_cached(&format!(
+            "SELECT {FACT_HIT_COLS} FROM facts f JOIN threads t ON t.id = f.thread_id
+             WHERE f.id = ?1 AND (t.is_subagent = 0 OR f.pinned = 1)"
+        ))?;
+        for h in hits {
+            let Some(hit) = by_id.query_row([h.id], fact_hit_row).optional()? else {
+                continue;
+            };
+            // `recall` scopes by substring; keep only the exact project.
+            if project.is_some_and(|p| hit.project != p) || out.iter().any(|o| o.id == hit.id) {
+                continue;
+            }
+            out.push(hit);
+            if out.len() >= limit {
+                return Ok(out);
+            }
+        }
+    }
+    if words.is_empty() {
+        return Ok(out);
+    }
+    let (sql, args) = fact_search_sql(&words, project, limit + out.len());
+    let arg_refs: Vec<&dyn rusqlite::ToSql> = args.iter().map(|b| b.as_ref()).collect();
+    let mut stmt = conn.prepare(&sql)?;
+    for hit in stmt.query_map(arg_refs.as_slice(), fact_hit_row)? {
+        let hit = hit?;
+        if !out.iter().any(|o| o.id == hit.id) {
+            out.push(hit);
+            if out.len() >= limit {
+                break;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The keyword arm of [`search_facts`]: every term a LIKE, off the kind index (about 2k
+/// decisions and gotchas on a 21k-thread index, each thread row by its key), sorted.
+fn fact_search_sql(
+    words: &[String],
+    project: Option<&str>,
+    limit: usize,
+) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
+    let mut sql = format!(
+        "SELECT {FACT_HIT_COLS} FROM facts f JOIN threads t ON t.id = f.thread_id
+         WHERE f.kind IN ('decision', 'gotcha') AND f.hidden = 0
+           AND (t.is_subagent = 0 OR f.pinned = 1)"
+    );
+    let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    for w in words {
+        args.push(Box::new(like_contains(w)));
+        sql.push_str(&format!(" AND f.text LIKE ?{} ESCAPE '\\'", args.len()));
+    }
+    if let Some(p) = project {
+        args.push(Box::new(p.to_string()));
+        sql.push_str(&format!(
+            " AND COALESCE(t.project_key, t.project_path) = ?{}",
+            args.len()
+        ));
+    }
+    args.push(Box::new(limit as i64));
+    sql.push_str(&format!(
+        " ORDER BY f.pinned DESC, f.created_at DESC, f.id DESC LIMIT ?{}",
+        args.len()
+    ));
+    (sql, args)
+}
+
 /// One past session relevant to what you're about to do — the "you solved this before"
 /// guard. Distinct from `recall` (which returns individual decision/gotcha facts): this
 /// rolls the matching facts UP to their thread, so the answer is a short list of prior
@@ -1112,6 +1269,13 @@ fn project_memory(
     exclude: Option<&str>,
 ) -> Result<ProjectMemory> {
     let mut mem = project_memory_facts(conn, project, per_kind, exclude)?;
+    (mem.thread_count, mem.distilled_count) = project_coverage(conn, project)?;
+    mem.pending_count = (mem.thread_count - mem.distilled_count).max(0);
+    Ok(mem)
+}
+
+/// A project's distillable thread count and how many of them are distilled.
+pub fn project_coverage(conn: &Connection, project: &str) -> Result<(i64, i64)> {
     let count = |extra: &str| -> Result<i64> {
         Ok(conn.query_row(
             &format!(
@@ -1122,10 +1286,7 @@ fn project_memory(
             |r| r.get(0),
         )?)
     };
-    mem.thread_count = count("")?;
-    mem.distilled_count = count(" AND knowledge_extracted = 1")?;
-    mem.pending_count = (mem.thread_count - mem.distilled_count).max(0);
-    Ok(mem)
+    Ok((count("")?, count(" AND knowledge_extracted = 1")?))
 }
 
 /// [`get_project_memory`] without the coverage counts, which stay 0: just the facts. For
@@ -1623,6 +1784,107 @@ pub fn rekey_project_keys(conn: &Connection) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn search_facts_matches_every_word_pinned_first_in_one_project() {
+        use crate::export::digest_test_support as dts;
+        let mut conn = dts::temp_db("search_facts");
+        let app = dts::session(&mut conn, "f1", "/r/app", "app", 600, &["go"]);
+        let web = dts::session(&mut conn, "f2", "/r/app-web", "web", 600, &["go"]);
+        let ins = |tid: i64, kind: &str, text: &str, at: i64, pinned: i64, hidden: i64| {
+            conn.execute(
+                "INSERT INTO facts (thread_id, kind, text, extractor, created_at, pinned, hidden)
+                 VALUES (?1, ?2, ?3, 'llm', ?4, ?5, ?6)",
+                params![tid, kind, text, at, pinned, hidden],
+            )
+            .unwrap();
+            conn.last_insert_rowid()
+        };
+        let newer = ins(
+            app,
+            "decision",
+            "Use Postgres for the Auth store",
+            300,
+            0,
+            0,
+        );
+        let pinned = ins(
+            app,
+            "gotcha",
+            "auth tokens expire; refresh in Postgres job",
+            100,
+            1,
+            0,
+        );
+        ins(app, "decision", "Use Redis for auth sessions", 400, 0, 0);
+        ins(app, "decision", "postgres auth (hidden)", 500, 0, 1);
+        ins(app, "todo", "postgres auth todo", 500, 0, 0);
+        let other = ins(web, "decision", "Postgres auth for web", 600, 0, 0);
+
+        let ids = |hits: Vec<FactHit>| hits.into_iter().map(|h| h.id).collect::<Vec<_>>();
+        // Every word, any case; pinned first, then newest; hidden facts and TODOs never.
+        let hits = search_facts(&conn, "POSTGRES auth", Some("/r/app"), 10, None).unwrap();
+        assert_eq!(hits[0].project, "/r/app");
+        assert_eq!(ids(hits), [pinned, newer]);
+        // The project is matched exactly: `/r/app` is not `/r/app-web`.
+        assert_eq!(
+            ids(search_facts(&conn, "postgres auth", None, 10, None).unwrap()),
+            [pinned, other, newer]
+        );
+        assert_eq!(
+            ids(search_facts(&conn, "postgres auth", None, 1, None).unwrap()),
+            [pinned]
+        );
+        // LIKE wildcards in the query are literal.
+        assert!(search_facts(&conn, "postgres%auth", None, 10, None)
+            .unwrap()
+            .is_empty());
+        assert!(search_facts(&conn, "postgres_auth", None, 10, None)
+            .unwrap()
+            .is_empty());
+        assert!(search_facts(&conn, "   ", None, 10, None)
+            .unwrap()
+            .is_empty());
+        // Parsed like the search box: stopwords and punctuation drop out, a quoted phrase
+        // must appear whole, and a query of stopwords alone finds nothing by keyword.
+        assert_eq!(
+            ids(search_facts(&conn, "how did we use postgres?", Some("/r/app"), 10, None).unwrap()),
+            [newer]
+        );
+        assert_eq!(
+            ids(search_facts(&conn, "\"refresh in postgres\"", None, 10, None).unwrap()),
+            [pinned]
+        );
+        assert!(search_facts(&conn, "\"postgres refresh\"", None, 10, None)
+            .unwrap()
+            .is_empty());
+        assert!(search_facts(&conn, "how did we", None, 10, None)
+            .unwrap()
+            .is_empty());
+
+        // Off the kind index with each thread by its key, never a scan of facts or threads.
+        for project in [None, Some("/r/app")] {
+            let (sql, args) = fact_search_sql(&["postgres".into(), "auth".into()], project, 10);
+            let refs: Vec<&dyn rusqlite::ToSql> = args.iter().map(|b| b.as_ref()).collect();
+            let plan = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap()
+                .query_map(refs.as_slice(), |r| r.get::<_, String>(3))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+                .join(" | ");
+            assert!(
+                plan.contains("SEARCH f USING INDEX idx_facts_kind (kind=?)"),
+                "{plan}"
+            );
+            assert!(
+                plan.contains("SEARCH t USING INTEGER PRIMARY KEY"),
+                "{plan}"
+            );
+            assert!(!plan.contains("SCAN"), "{plan}");
+        }
+    }
 
     #[test]
     fn extracts_markers_and_tasks_only() {

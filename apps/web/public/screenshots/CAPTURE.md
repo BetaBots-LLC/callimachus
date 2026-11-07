@@ -1,28 +1,38 @@
-# App screenshots — capture spec
+# App screenshots: capture spec
 
-Screenshots shown on the marketing site (`/desktop`, via `ScreenshotGallery`). Drop the captured
-files here, then add an entry in `src/content/screenshots.ts` (uncomment the matching block).
+Screenshots shown on the marketing site (`/` and `/desktop`, via `ScreenshotGallery`). Drop the
+captured files here, then add or update the entry in `src/content/screenshots.ts`.
 
 ## How to capture
 
 1. Run the desktop app with a real (non-sensitive) index: `pnpm desktop:dev`.
-2. Use the **dark** theme — it matches the site's aesthetic.
+2. Use the **dark** theme: it matches the site's aesthetic.
 3. Resize the window to a clean 16:10-ish shape (~1440×900).
-4. macOS: `Cmd+Shift+4`, then `Space`, then click the window → captures the window at 2x retina.
+4. macOS: `Cmd+Shift+4`, then `Space`, then click the window to capture it at 2x retina.
 5. Scrub anything private (repo paths, secrets, client names) before exporting.
 6. Optimize to **webp** (keep it crisp, target < ~250 KB each):
    `cwebp -q 82 shot.png -o shot.webp`  (or `pnpm dlx @squoosh/cli --webp auto shot.png`)
-7. Save with the names below, then enable the entry in `src/content/screenshots.ts`.
+7. Save with the names below, then update the entry in `src/content/screenshots.ts` (caption
+   and alt text describe what the new image shows).
 
 ## Shot list (priority order)
 
-| file              | screen                                              | span | caption                       |
-| ----------------- | --------------------------------------------------- | ---- | ----------------------------- |
-| `search.webp`     | Search results with source/project/tag filters      | 12   | fig. 1 — the reading room     |
-| `projects.webp`   | Projects tab: decisions/gotchas/TODOs + LLM brief   | 7    | fig. 2 — per-project memory   |
-| `chat.webp`       | In-app chat answering over the user's own history    | 5    | fig. 3 — ask your history     |
-| `commits.webp`    | Thread → inferred git commits timeline              | 7    | fig. 4 — thread to commits    |
-| `stats.webp`      | Stats dashboard: per-source counts + spend by model | 5    | fig. 5 — know your corpus     |
+Every plate captured before the Today / Search / Chat / Projects tab bar shows the retired
+Coach, Knowledge and Ask tabs, so all of these need a new capture.
+
+| file             | screen                                                                          | caption                       |
+| ---------------- | ------------------------------------------------------------------------------- | ----------------------------- |
+| `/hero.png`      | Home hero: the Today view, sessions by repo since the last open, commits, Copy as standup (replaces the brand banner; update its alt and size) | the catalogue (hero label, not a gallery figure) |
+| `search.webp`    | Search scoped to a repo and 7 days, a "Decisions and gotchas" group on top      | fig. 1 · the reading room     |
+| `projects.webp`  | The Project page: picker, Recent sessions, Memory, Snapshots                    | fig. 2 · per-project memory   |
+| `ask.webp`       | Chat in Ask mode: a cited answer with [thread N] chips                          | fig. 3 · ask your history     |
+| `agents.webp`    | The Project page's What agents see: the hook text and the AGENTS.md block       | fig. 4 · what agents see (replaces `coach.webp`) |
+| `stats.webp`     | Stats: activity heatmap, "What Callimachus did for your agents", spend          | fig. 5 · know your corpus     |
+| `chat.webp`      | Chat on a keyless CLI engine, the Chat / Ask control in the header              | fig. 6 · talk to your archive |
+
+The hero is the Today view, so the gallery has no separate Today plate. The home page labels
+the hero "fig. 1 · the catalogue" (`src/routes/index.tsx`), which collides with the gallery's
+fig. 1 on the same page; when the hero is reshot, give it a label outside the figure numbers.
 
 ## Specs
 
@@ -30,6 +40,4 @@ files here, then add an entry in `src/content/screenshots.ts` (uncomment the mat
 - **Resolution:** 2x retina; ~2880×1800 source, displayed responsive.
 - **Aspect:** keep consistent (16:10) so the grid stays tidy.
 - **Theme:** dark UI.
-- **Alt text:** describe the screen — it's the SEO/accessibility text (set in `screenshots.ts`).
-
-`fig. 1` currently falls back to `/hero.png` until `search.webp` lands.
+- **Alt text:** describe the screen; it's the SEO and accessibility text (set in `screenshots.ts`).

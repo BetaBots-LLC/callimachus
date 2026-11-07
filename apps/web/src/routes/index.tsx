@@ -32,7 +32,7 @@ import { cn } from "@/lib/utils";
 export const Route = createFileRoute("/")({
   loader: () => downloadData(),
   head: ({ loaderData }) => ({
-    meta: seo({ title: `Callimachus — ${TAGLINE}`, description: DESCRIPTION, path: "/" }),
+    meta: seo({ title: `Callimachus: ${TAGLINE}`, description: DESCRIPTION, path: "/" }),
     links: [{ rel: "canonical", href: `${SITE_URL}/` }],
     scripts: [
       ldScript(organizationLd()),
@@ -63,16 +63,16 @@ function Home() {
         <Container className="relative grid gap-14 py-20 lg:grid-cols-[1.05fr_0.95fr] lg:items-center lg:py-28">
           <div className="flex flex-col items-start gap-6">
             <span className="cat-label inline-flex items-center gap-2 text-primary">
-              № 001 — the card catalogue for AI coding history
+              № 001 · the card catalogue for AI coding history
             </span>
             <h1 className="text-balance text-[clamp(2.6rem,7vw,4.6rem)] leading-[1.02] text-foreground">
               You already solved this. Find which thread.
             </h1>
             <p className="max-w-[54ch] text-lg leading-relaxed text-muted-foreground">
-              Callimachus quietly indexes every conversation your AI agents write — across{" "}
-              <strong className="font-medium text-foreground">twelve tools</strong> — into one fast,
-              local, searchable catalogue. Keyword and meaning. No cloud, no account, and your
-              history never leaves your machine.
+              Callimachus quietly indexes every conversation your AI agents write, across{" "}
+              <strong className="font-medium text-foreground">twelve tools</strong>, into one fast,
+              local, searchable catalogue, then hands each repo's memory back to the next session.
+              No cloud, no account, and the index never leaves your machine.
             </p>
             <div className="flex flex-col gap-4 pt-2 sm:flex-row sm:items-center">
               <DownloadButton release={release} primaryOs={primaryOs} placement="hero" />
@@ -88,19 +88,21 @@ function Home() {
             </div>
           </div>
 
-          {/* Hero plate — tilted like a card pulled from a drawer */}
+          {/* Hero plate, tilted like a card pulled from a drawer. TODO(screenshots): this is
+              the brand banner (its tagline bakes in an em-dash), not an app capture; replace it
+              with the Today view and update the alt text and size. */}
           <div className="relative">
             <div className="rotate-[1.4deg] rounded-xl border border-border bg-card p-2 shadow-[0_24px_60px_-20px_oklch(0.1_0.02_50/0.7)] transition-transform duration-500 ease-[var(--ease-out-quint)] hover:rotate-0">
               <img
                 src="/hero.png"
-                alt="The Callimachus desktop app showing a searched, catalogued list of AI coding threads"
-                width={1200}
-                height={750}
+                alt="The Callimachus banner: a parchment scroll beside the name and the line “the catalogue for your AI coding history”"
+                width={2560}
+                height={880}
                 className="rounded-lg"
               />
             </div>
             <span className="absolute -bottom-3 left-4 rounded-sm border border-border bg-background px-2 py-1 font-mono text-[0.65rem] text-muted-foreground">
-              fig. 1 — the reading room
+              fig. 1 · the catalogue
             </span>
           </div>
         </Container>
@@ -115,18 +117,18 @@ function Home() {
       <section className="border-b border-border">
         <Container className="py-20 sm:py-24">
           <p className="max-w-4xl text-balance font-display text-2xl leading-[1.35] text-foreground sm:text-[2rem]">
-            Your best debugging session is three tools and two weeks ago. The fix is in there — in a
-            Claude Code thread, or was it Cursor? Callimachus is the index card that finds it in a
+            Your best debugging session is three tools and two weeks ago. The fix is in there, in a
+            Claude Code thread. Or was it Cursor? Callimachus is the index card that finds it in a
             keystroke, so you stop re-explaining yourself to robots.
           </p>
         </Container>
       </section>
 
-      {/* Features — deliberately uneven grid */}
+      {/* Features: a deliberately uneven grid */}
       <section className="border-b border-border">
         <Container className="py-20 sm:py-28">
           <SectionHeading
-            label="№ 002 — what's on the shelves"
+            label="№ 002 · what's on the shelves"
             title="Filed, cross-referenced, instant."
             intro="One local index behind every surface. Built for the way you actually go looking for something you half-remember."
           />
@@ -138,10 +140,12 @@ function Home() {
               className="lg:col-span-7"
             >
               Keyword search (SQLite FTS5) fused with on-device semantic similarity, so a vague
-              memory — “that vector index migration” — surfaces the right thread even when you've
-              forgotten the exact words. Filter by source, project, recency, starred, or tag — or
-              type <code className="font-mono">file:embed/mod.rs</code> to find every thread that
-              touched a path. Subagent transcripts stay out of the way until you ask for them.
+              memory like “that vector index migration” surfaces the right thread even when you've
+              forgotten the exact words. Scope it to one repo and the last day, week or month,
+              filter by source, starred or tag, or type{" "}
+              <code className="font-mono">file:embed/mod.rs</code> to find every thread that touched
+              a path. Matching decisions and gotchas sit above the threads, and subagent transcripts
+              stay out of the way until you ask for them.
             </FeaturePanel>
             <FeaturePanel
               icon={ShieldCheck}
@@ -159,8 +163,9 @@ function Home() {
               className="lg:col-span-5"
             >
               A background watcher catalogues new sessions as you work, and each launch catches up
-              on the ones your agents wrote while the app was closed. Reindex any source on demand;
-              forget it's running the rest of the time.
+              on the ones your agents wrote while the app was closed. The Today tab opens on what
+              happened since you last looked: sessions by repo, the commits they produced, new
+              TODOs, and a copy-as-standup button.
             </FeaturePanel>
             <FeaturePanel
               icon={Share2}
@@ -174,14 +179,14 @@ function Home() {
             </FeaturePanel>
             <FeaturePanel
               icon={Lightbulb}
-              label="Knowledge layer"
-              title="Distill the lessons, not just the logs"
+              label="Project memory"
+              title="Memory that starts on day one"
               className="lg:col-span-7"
             >
-              Free heuristic TODO extraction, plus opt-in LLM distillation of decisions, gotchas,
-              and summaries — with cross-thread semantic recall of past decisions and gotchas. Runs
-              on local Ollama (keyless), your logged-in Claude Code or Codex CLI, or a cloud API
-              key.
+              Every repo starts with a digest of its recent sessions and its open TODOs, no LLM
+              needed. Turn on memory and it fills with decisions, gotchas and summaries distilled by
+              the engine you pick: your logged-in Claude Code or Codex CLI, local Ollama, or a cloud
+              API key. Claude Code, Codex and Gemini CLI get it injected as each session starts.
             </FeaturePanel>
             <FeaturePanel
               icon={MessageCircleQuestion}
@@ -189,9 +194,9 @@ function Home() {
               title="A cited answer over your own threads"
               className="lg:col-span-5"
             >
-              Ask a question and get a synthesized, cited answer drawn from your own sessions, with
+              Switch Chat to Ask and get a synthesized answer drawn from your own sessions, with
               [thread N] citations back to the sources it used. Retrieval-augmented over the local
-              index; needs an LLM engine enabled.
+              index, on the same engine as memory.
             </FeaturePanel>
             <FeaturePanel
               icon={GitCommitVertical}
@@ -199,9 +204,9 @@ function Home() {
               title="See which commits a conversation produced"
               className="lg:col-span-7"
             >
-              Callimachus infers — entirely on-device — which commits a thread shipped, by
-              overlapping the files it discussed with <code className="font-mono">git log</code>{" "}
-              inside the thread's time window. Walk the thread-to-commit timeline from the app or{" "}
+              Callimachus infers which commits a thread shipped, entirely on-device, by overlapping
+              the files it discussed with <code className="font-mono">git log</code> inside the
+              thread's time window. See them on a project's page, in Today, or with{" "}
               <code className="font-mono">cal commits</code>, and ask “which commit came out of this
               conversation?” straight from an agent.
             </FeaturePanel>
@@ -211,10 +216,10 @@ function Home() {
               title="Resumable cross-tool handoff"
               className="lg:col-span-5"
             >
-              Durable checkpoints of a thread — packed transcript plus carry-forward project memory
-              — so work survives a context-window compaction or a jump to another tool.
-              Auto-captured by a Claude Code hook right before a context compaction, or snapshot and
-              resume by hand.
+              Durable checkpoints of a thread (the packed transcript plus carry-forward project
+              memory), so work survives a context-window compaction or a jump to another tool.
+              Claude Code and Codex hooks capture one right before compaction; load, resume or
+              delete them from a project's page.
             </FeaturePanel>
             <FeaturePanel
               icon={Scale}
@@ -224,8 +229,8 @@ function Home() {
             >
               Record a decision with the rationale behind it, then let the guard surface settled
               calls on a topic before an agent quietly re-litigates one. Check a proposal against
-              your own history — from <code className="font-mono">cal check</code> or the MCP — so
-              the past gets a vote before the code does.
+              your own history, from <code className="font-mono">cal check</code> or the MCP server,
+              so the past gets a vote before the code does.
             </FeaturePanel>
             <FeaturePanel
               icon={Terminal}
@@ -234,9 +239,9 @@ function Home() {
               className="lg:col-span-7"
             >
               Distillation, Ask, and the in-app chat can run on your logged-in{" "}
-              <strong>Claude Code or Codex CLI</strong> instead of a cloud API key. Pick it in
-              Settings or the chat provider menu; Callimachus shells out to the CLI you already pay
-              for, nothing new to configure.
+              <strong>Claude Code or Codex CLI</strong> instead of a cloud API key. Pick it once in
+              the setup checklist or Settings &gt; AI engine; Callimachus shells out to the CLI you
+              already pay for, nothing new to configure.
             </FeaturePanel>
             <FeaturePanel
               icon={ShieldCheck}
@@ -259,7 +264,7 @@ function Home() {
       <section className="border-b border-border">
         <Container className="py-20 sm:py-28">
           <SectionHeading
-            label="№ 003 — reading desks"
+            label="№ 003 · reading desks"
             title="Four ways into the same catalogue."
             intro="One index, read from wherever you already are."
           />
@@ -292,7 +297,7 @@ function Home() {
       {/* Privacy band */}
       <section className="border-b border-border bg-card">
         <Container className="flex flex-col gap-6 py-20 sm:py-24">
-          <span className="cat-label text-primary">№ 004 — house rules</span>
+          <span className="cat-label text-primary">№ 004 · house rules</span>
           <h2 className="max-w-3xl text-balance text-3xl text-foreground sm:text-4xl">
             A library that doesn't read over your shoulder.
           </h2>
@@ -300,8 +305,8 @@ function Home() {
             Cookieless analytics on this site: no cookies, no cross-site profiles. In the app,
             anonymous usage analytics are off unless you choose to share them, and never include
             your conversations, file paths or prompts. Your conversations are indexed where they
-            already live, on your machine, and stay there. Open source under AGPL-3.0, so you never
-            have to take our word for it.
+            already live, on your machine, and stay there unless you send them to an AI provider you
+            pick. Open source under AGPL-3.0, so you never have to take our word for it.
           </p>
           <div className="flex flex-wrap gap-3">
             <a
@@ -323,7 +328,7 @@ function Home() {
       {/* FAQ */}
       <section className="border-b border-border">
         <Container className="grid gap-12 py-20 sm:py-28 lg:grid-cols-[0.8fr_1.2fr]">
-          <SectionHeading label="№ 005 — at the desk" title="Questions, briefly answered." />
+          <SectionHeading label="№ 005 · at the desk" title="Questions, briefly answered." />
           <div>
             <FaqAccordion items={FAQ} />
           </div>
@@ -337,8 +342,8 @@ function Home() {
             Open the catalogue.
           </h2>
           <p className="max-w-[48ch] text-lg text-muted-foreground">
-            Free, local, and quietly yours. Run the app once and every thread you've ever written is
-            a keystroke away.
+            Free, local, and quietly yours. Index once, connect your agents, and every thread you've
+            ever written is a keystroke away.
           </p>
           <DownloadButton
             release={release}

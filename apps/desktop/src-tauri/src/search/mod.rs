@@ -16,7 +16,7 @@ use std::sync::{Mutex, PoisonError};
 #[serde(default, rename_all = "camelCase")]
 pub struct SearchFilters {
     pub sources: Vec<String>,    // source kinds; empty = all
-    pub project: Option<String>, // substring match on project_path
+    pub project: Option<String>, // see `project_match`
     pub after: Option<i64>,      // epoch seconds, inclusive
     pub before: Option<i64>,     // epoch seconds, inclusive
     pub limit: Option<u32>,
@@ -24,6 +24,58 @@ pub struct SearchFilters {
     pub hybrid: bool,            // default false: fuse keyword + semantic results
     pub starred: Option<bool>,   // Some(true) = only starred; None = all
     pub tags: Vec<String>,       // empty = all; else threads having ANY of these tags
+    /// How `project` matches. Never read from the JSON: the app's commands set
+    /// [`ProjectMatch::Exact`] themselves, and `cal` / MCP keep the substring default.
+    #[serde(skip)]
+    pub project_match: ProjectMatch,
+}
+
+/// How a project filter matches a thread's canonical project
+/// (`COALESCE(project_key, project_path)`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ProjectMatch {
+    /// A case-sensitive substring: `cal -p app` and MCP's `project` take a repo name or a
+    /// path fragment.
+    #[default]
+    Substring,
+    /// Exactly this key. The app's chips and Project page hold the key `list_projects`
+    /// returned, and a substring scoped `/r/app` to `/r/app-web`'s sessions, spend and
+    /// errors too (and `_` matched any character).
+    Exact,
+}
+
+/// The SQL condition (no leading AND) scoping `{t}` (a threads alias) to `project`, with the
+/// value pushed onto `args`. See [`project_condition_at`].
+pub(crate) fn project_condition(
+    t: &str,
+    project: &str,
+    mode: ProjectMatch,
+    args: &mut Vec<Box<dyn ToSql>>,
+) -> String {
+    args.push(project_value(project, mode));
+    project_condition_at(t, mode, args.len())
+}
+
+/// The bind value for [`project_condition_at`]: the key itself, or `%key%` for a substring.
+pub(crate) fn project_value(project: &str, mode: ProjectMatch) -> Box<dyn ToSql> {
+    match mode {
+        ProjectMatch::Substring => Box::new(format!("%{project}%")),
+        ProjectMatch::Exact => Box::new(project.to_string()),
+    }
+}
+
+/// The project condition on `{t}` with its value bound at `?{ph}`. Exact is spelled as an
+/// OR on the columns, not `COALESCE(..) =`, so idx_threads_project_key / idx_threads_project
+/// stay usable when a plan wants them; the two forms select the same rows.
+pub(crate) fn project_condition_at(t: &str, mode: ProjectMatch, ph: usize) -> String {
+    match mode {
+        ProjectMatch::Substring => {
+            format!("COALESCE({t}.project_key, {t}.project_path) LIKE ?{ph}")
+        }
+        ProjectMatch::Exact => format!(
+            "({t}.project_key = ?{ph} OR ({t}.project_key IS NULL AND {t}.project_path = ?{ph}))"
+        ),
+    }
 }
 
 /// One message-level search hit.
@@ -51,6 +103,32 @@ pub struct ThreadSummary {
     pub message_count: i64,
     pub updated_at: Option<i64>,
     pub starred: bool,
+    /// The branch the session ran on. Never in this struct's JSON: `cal --json` and MCP's
+    /// `recent_threads` rows stay as lean as they were (the tool-surface budget measures
+    /// them), and the app gets it through [`AppThreadSummary`].
+    #[serde(skip)]
+    pub git_branch: Option<String>,
+}
+
+/// A [`ThreadSummary`] plus its git branch, for the app's lists (the Project page's recent
+/// sessions show it). Omitted from the JSON when unknown.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppThreadSummary {
+    #[serde(flatten)]
+    pub summary: ThreadSummary,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_branch: Option<String>,
+}
+
+impl From<ThreadSummary> for AppThreadSummary {
+    fn from(mut summary: ThreadSummary) -> Self {
+        let git_branch = summary.git_branch.take();
+        Self {
+            summary,
+            git_branch,
+        }
+    }
 }
 
 /// A single message in the thread viewer.
@@ -79,6 +157,11 @@ pub struct ThreadDetail {
     pub external_id: String,
     pub title: Option<String>,
     pub project_path: Option<String>,
+    /// The canonical project the thread belongs to (worktrees resolve to the main repo),
+    /// the key the Projects page and project memory group by. Omitted when the thread has
+    /// no project.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_key: Option<String>,
     pub git_branch: Option<String>,
     pub created_at: Option<i64>,
     pub updated_at: Option<i64>,
@@ -283,6 +366,40 @@ impl FtsQuery {
         };
         Some(Self { strict, loose })
     }
+}
+
+/// The substrings a keyword LIKE match must all contain for `query` (the search box's facts
+/// lookup, `knowledge::search_facts`), parsed as [`FtsQuery::parse`] parses it: balanced
+/// `"..."` phrases whole (whitespace collapsed), the other tokens without their surrounding
+/// punctuation, and no stopwords or lone letters. Requiring every raw token made "how did
+/// we pin rust" need "how", "did" and "we" in the fact, and `"tauri build"` look for the
+/// literal `"tauri`, so natural-language and phrase queries never found a fact. Empty when
+/// nothing narrows (a query of stopwords).
+pub(crate) fn like_terms(query: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = Vec::new();
+    if query.contains('"') && query.matches('"').count().is_multiple_of(2) {
+        for (i, part) in query.split('"').enumerate() {
+            if i % 2 == 1 {
+                let inner = part.split_whitespace().collect::<Vec<_>>().join(" ");
+                if !terms(&inner).is_empty() {
+                    out.push(inner);
+                }
+            } else {
+                rest.push(part);
+            }
+        }
+    } else {
+        rest.push(query);
+    }
+    let rest = rest.join(" ");
+    out.extend(
+        terms(&rest)
+            .into_iter()
+            .filter(|t| !is_stopword(t) && !is_lone_ascii(t))
+            .map(str::to_string),
+    );
+    out
 }
 
 /// A query's tokens by their core, without leading/trailing punctuation, which the FTS
@@ -517,12 +634,9 @@ fn fts_from_where(
         }
     }
     if let Some(project) = &filters.project {
-        args.push(Box::new(format!("%{project}%")));
         // Scope the same way facts/threads aggregate (COALESCE), matching the semantic arm.
-        sql.push_str(&format!(
-            " AND COALESCE(t.project_key, t.project_path) LIKE ?{}",
-            args.len()
-        ));
+        let cond = project_condition("t", project, filters.project_match, &mut args);
+        sql.push_str(&format!(" AND {cond}"));
     }
     if let Some(after) = filters.after {
         args.push(Box::new(after));
@@ -1043,11 +1157,41 @@ fn hit_for_message(conn: &Connection, message_id: i64) -> Result<Option<SearchHi
     Ok(hit)
 }
 
-/// Most recently updated threads, optionally filtered by source/project.
+/// Most recently updated threads, optionally filtered by source/project, collections and a
+/// date range. `after` alone is on the thread's last activity (`updated_at`: the Search date
+/// presets ask for "threads active in the last 7 days" when no query is typed), as is
+/// `before` alone. A bounded range (`after` and `before`, a Stats heatmap day) lists the
+/// threads with a message inside it ([`recent_threads_sql`]): on `updated_at`, a day's
+/// threads that were continued later dropped out, so a cell counting 300 messages opened
+/// "Nothing on Nov 3".
 pub fn recent_threads(conn: &Connection, filters: &SearchFilters) -> Result<Vec<ThreadSummary>> {
+    let (sql, args) = recent_threads_sql(filters);
+    let args_ref: Vec<&dyn ToSql> = args.iter().map(|b| b.as_ref()).collect();
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(args_ref.as_slice(), |r| {
+        Ok(ThreadSummary {
+            id: r.get(0)?,
+            source: r.get(1)?,
+            title: r.get(2)?,
+            project_path: r.get(3)?,
+            message_count: r.get(4)?,
+            updated_at: r.get(5)?,
+            starred: r.get::<_, i64>(6)? != 0,
+            git_branch: r.get(7)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// The statement behind [`recent_threads`], split out so tests can pin its plans. The
+/// bounded range is an `IN` list built off idx_messages_ts, so it reads one day's messages
+/// rather than probing every thread: the busiest day of a 21k-thread index (27k messages)
+/// lists in 15 ms warm, 360 ms cold.
+pub(crate) fn recent_threads_sql(filters: &SearchFilters) -> (String, Vec<Box<dyn ToSql>>) {
     let limit = filters.limit.unwrap_or(100).min(500) as i64;
     let mut sql = String::from(
-        "SELECT t.id, s.kind, t.title, t.project_path, t.message_count, t.updated_at, t.starred
+        "SELECT t.id, s.kind, t.title, t.project_path, t.message_count, t.updated_at, t.starred,
+                t.git_branch
          FROM threads t JOIN sources s ON s.id = t.source_id WHERE 1=1",
     );
     if !filters.include_subagents {
@@ -1064,31 +1208,38 @@ pub fn recent_threads(conn: &Connection, filters: &SearchFilters) -> Result<Vec<
         }
     }
     if let Some(project) = &filters.project {
-        args.push(Box::new(format!("%{project}%")));
         // Scope the same way facts/threads aggregate (COALESCE), matching the semantic arm.
-        sql.push_str(&format!(
-            " AND COALESCE(t.project_key, t.project_path) LIKE ?{}",
-            args.len()
-        ));
+        let cond = project_condition("t", project, filters.project_match, &mut args);
+        sql.push_str(&format!(" AND {cond}"));
+    }
+    match (filters.after, filters.before) {
+        (Some(after), Some(before)) => {
+            args.push(Box::new(after));
+            let a = args.len();
+            args.push(Box::new(before));
+            let b = args.len();
+            sql.push_str(&format!(
+                " AND t.id IN (SELECT m.thread_id FROM messages m
+                               WHERE m.ts >= ?{a} AND m.ts <= ?{b})"
+            ));
+        }
+        (Some(after), None) => {
+            args.push(Box::new(after));
+            sql.push_str(&format!(" AND t.updated_at >= ?{}", args.len()));
+        }
+        (None, Some(before)) => {
+            args.push(Box::new(before));
+            sql.push_str(&format!(" AND t.updated_at <= ?{}", args.len()));
+        }
+        (None, None) => {}
     }
     push_collection_filters(&mut sql, &mut args, filters);
-    sql.push_str(" ORDER BY t.updated_at DESC LIMIT ?");
     args.push(Box::new(limit));
-
-    let args_ref: Vec<&dyn ToSql> = args.iter().map(|b| b.as_ref()).collect();
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(args_ref.as_slice(), |r| {
-        Ok(ThreadSummary {
-            id: r.get(0)?,
-            source: r.get(1)?,
-            title: r.get(2)?,
-            project_path: r.get(3)?,
-            message_count: r.get(4)?,
-            updated_at: r.get(5)?,
-            starred: r.get::<_, i64>(6)? != 0,
-        })
-    })?;
-    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    sql.push_str(&format!(
+        " ORDER BY t.updated_at DESC LIMIT ?{}",
+        args.len()
+    ));
+    (sql, args)
 }
 
 /// Threads most semantically related to arbitrary context text (a code selection,
@@ -1123,6 +1274,7 @@ fn related_vec(
         include_subagents: filters.include_subagents,
         sources: &filters.sources,
         project: filters.project.as_deref(),
+        project_match: filters.project_match,
         ..embed::KnnScope::default()
     };
     // Over-fetch message hits so dedup-to-thread still leaves `limit` threads.
@@ -1140,7 +1292,13 @@ fn related_vec(
             continue; // a better-ranked message already claimed this thread
         }
         if let Some(summary) = thread_summary(conn, thread_id)? {
-            if let Some(p) = &filters.project {
+            // An exact scope was already applied by the KNN on the canonical key; a worktree
+            // thread's own path need not contain it.
+            if let Some(p) = filters
+                .project
+                .as_ref()
+                .filter(|_| filters.project_match == ProjectMatch::Substring)
+            {
                 if !summary
                     .project_path
                     .as_deref()
@@ -1181,7 +1339,8 @@ pub fn threads_with_file(conn: &Connection, path: &str, limit: i64) -> Result<Ve
         )
     };
     let sql = format!(
-        "SELECT t.id, s.kind, t.title, t.project_path, t.message_count, t.updated_at, t.starred
+        "SELECT t.id, s.kind, t.title, t.project_path, t.message_count, t.updated_at, t.starred,
+                t.git_branch
          FROM threads t
          JOIN sources s ON s.id = t.source_id
          WHERE t.is_subagent = 0 AND t.id IN ({id_clause})
@@ -1198,6 +1357,7 @@ pub fn threads_with_file(conn: &Connection, path: &str, limit: i64) -> Result<Ve
             message_count: r.get(4)?,
             updated_at: r.get(5)?,
             starred: r.get::<_, i64>(6)? != 0,
+            git_branch: r.get(7)?,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -1206,7 +1366,8 @@ pub fn threads_with_file(conn: &Connection, path: &str, limit: i64) -> Result<Ve
 /// One thread's summary row, or None if the id is unknown.
 fn thread_summary(conn: &Connection, id: i64) -> Result<Option<ThreadSummary>> {
     let mut stmt = conn.prepare(
-        "SELECT t.id, s.kind, t.title, t.project_path, t.message_count, t.updated_at, t.starred
+        "SELECT t.id, s.kind, t.title, t.project_path, t.message_count, t.updated_at, t.starred,
+                t.git_branch
          FROM threads t JOIN sources s ON s.id = t.source_id WHERE t.id = ?1",
     )?;
     let mut rows = stmt.query_map([id], |r| {
@@ -1218,6 +1379,7 @@ fn thread_summary(conn: &Connection, id: i64) -> Result<Option<ThreadSummary>> {
             message_count: r.get(4)?,
             updated_at: r.get(5)?,
             starred: r.get::<_, i64>(6)? != 0,
+            git_branch: r.get(7)?,
         })
     })?;
     match rows.next() {
@@ -1338,11 +1500,17 @@ pub fn stats(conn: &Connection) -> Result<Stats> {
     })
 }
 
-/// One day's message activity, for the Coach coding heatmap.
+/// One day's message activity, for the Stats activity heatmap.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DayActivity {
-    pub day: i64, // unix seconds at UTC midnight
+    /// The local calendar day, "YYYY-MM-DD" (the machine's time zone, as the app shows it).
+    pub day: String,
+    /// Unix seconds of that day's local midnight.
+    pub start: i64,
+    /// Unix seconds of the day's last second (inclusive), so `start..=end` is exactly the
+    /// messages counted, also across a DST change (a 23 or 25 hour day).
+    pub end: i64,
     pub messages: i64,
 }
 
@@ -1377,7 +1545,11 @@ pub fn coach_overview(conn: &Connection, now: i64) -> Result<CoachOverview> {
     Ok(overview)
 }
 
-/// Daily user/assistant message counts since `?1`, for the Coach heatmap.
+/// Daily user/assistant message counts since `?1`, for the Stats heatmap, bucketed by local
+/// day: UTC buckets put evening work west of Greenwich on the next day's cell, and the day a
+/// click opened in Search disagreed with its label. `strftime('%s', day, 'utc')` reads the
+/// day as local midnight. The localtime conversion costs about 30 ms on 178k rows of a
+/// 21k-thread index (40 -> 72 ms warm), and the result is cached.
 ///
 /// Human-facing activity only: skip subagent transcripts and tool/system rows so the grid
 /// reflects sessions you drove, not machine chatter (mirrors the app's lists).
@@ -1389,11 +1561,14 @@ pub fn coach_overview(conn: &Connection, now: i64) -> Result<CoachOverview> {
 /// idx_messages_thread_ts (0031), which also carries ts and role, so the whole query is
 /// index-only (7-8 s down to ~0.2 s from a cold cache). Pinned by
 /// `coach_heatmap_plan_avoids_the_role_index`.
-const HEATMAP_SQL: &str = "SELECT (m.ts / 86400) * 86400 AS day, COUNT(*)
-     FROM messages m JOIN threads t ON t.id = m.thread_id
-     WHERE m.ts IS NOT NULL AND m.ts >= ?1
-       AND t.is_subagent = 0 AND +m.role IN ('user', 'assistant')
-     GROUP BY day ORDER BY day";
+const HEATMAP_SQL: &str = "SELECT day, CAST(strftime('%s', day, 'utc') AS INTEGER),
+            CAST(strftime('%s', day, '+1 day', 'utc') AS INTEGER) - 1, n
+     FROM (SELECT date(m.ts, 'unixepoch', 'localtime') AS day, COUNT(*) AS n
+           FROM messages m JOIN threads t ON t.id = m.thread_id
+           WHERE m.ts IS NOT NULL AND m.ts >= ?1
+             AND t.is_subagent = 0 AND +m.role IN ('user', 'assistant')
+           GROUP BY day)
+     ORDER BY day";
 
 /// ~52 weeks of daily user/assistant message counts ending at `now`.
 fn coach_heatmap(conn: &Connection, now: i64) -> Result<Vec<DayActivity>> {
@@ -1404,7 +1579,9 @@ fn coach_heatmap(conn: &Connection, now: i64) -> Result<Vec<DayActivity>> {
             .query_map([heatmap_since], |r| {
                 Ok(DayActivity {
                     day: r.get(0)?,
-                    messages: r.get(1)?,
+                    start: r.get(1)?,
+                    end: r.get(2)?,
+                    messages: r.get(3)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1449,7 +1626,7 @@ fn coach_overview_facts(conn: &Connection, now: i64) -> Result<CoachOverview> {
 
 static STATS_CACHE: std::sync::LazyLock<cache::AggCache<(), Stats>> =
     std::sync::LazyLock::new(cache::AggCache::new);
-static HEATMAP_CACHE: std::sync::LazyLock<cache::AggCache<i64, Vec<DayActivity>>> =
+static HEATMAP_CACHE: std::sync::LazyLock<cache::AggCache<String, Vec<DayActivity>>> =
     std::sync::LazyLock::new(cache::AggCache::new);
 
 /// [`stats`], reused for up to [`cache::ANALYTICS_TTL`] while the thread set is unchanged.
@@ -1465,11 +1642,18 @@ pub fn stats_cached(conn: &Connection) -> Result<Stats> {
 }
 
 /// [`coach_overview`] with the year-long activity heatmap (a GROUP BY over most of the
-/// messages table) cached per day for up to [`cache::ANALYTICS_TTL`]. The week's decisions
+/// messages table) cached per local day for up to [`cache::ANALYTICS_TTL`]. The week's decisions
 /// and gotchas are cheap and always read live, so a fact the user just hid or edited
 /// disappears from the digest immediately.
 pub fn coach_overview_cached(conn: &Connection, now: i64) -> Result<CoachOverview> {
-    let day = now.div_euclid(86_400);
+    // Keyed by the local date, as the buckets are: a cached grid never outlives its today.
+    let day = chrono::DateTime::from_timestamp(now, 0)
+        .map(|t| {
+            t.with_timezone(&chrono::Local)
+                .format("%Y-%m-%d")
+                .to_string()
+        })
+        .unwrap_or_default();
     let heatmap = HEATMAP_CACHE.get_or_try(cache::index_version(conn)?, day, || {
         coach_heatmap(conn, now)
     })?;
@@ -1502,7 +1686,8 @@ fn thread_detail_with(
 ) -> Result<Option<ThreadDetail>> {
     let head = conn.query_row(
         "SELECT t.id, s.kind, t.external_id, t.title, t.project_path, t.git_branch,
-                t.created_at, t.updated_at, t.starred
+                t.created_at, t.updated_at, t.starred,
+                NULLIF(COALESCE(t.project_key, t.project_path), '')
          FROM threads t JOIN sources s ON s.id = t.source_id WHERE t.id = ?1",
         [thread_id],
         |r| {
@@ -1512,6 +1697,7 @@ fn thread_detail_with(
                 external_id: r.get(2)?,
                 title: r.get(3)?,
                 project_path: r.get(4)?,
+                project_key: r.get(9)?,
                 git_branch: r.get(5)?,
                 created_at: r.get(6)?,
                 updated_at: r.get(7)?,
@@ -1838,6 +2024,175 @@ mod tests {
             .find(|p| p.project == "/proj/a")
             .unwrap();
         assert_eq!(proj.threads, 2);
+    }
+
+    #[test]
+    fn recent_threads_honors_the_date_range() {
+        let mut conn = temp_db();
+        let sid = source_id(&conn, "claude_code").unwrap();
+        // "new" started with "old" but was continued later.
+        for (ext, updated, last) in [("old", 200, 200), ("new", 400, 400)] {
+            let t = ParsedThread {
+                external_id: ext.into(),
+                title: Some(ext.into()),
+                created_at: Some(100),
+                updated_at: Some(updated),
+                messages: vec![msg("user", "hello", 100), msg("assistant", "hi", last)],
+                ..Default::default()
+            };
+            upsert_thread(&mut conn, sid, &t).unwrap();
+        }
+        let titles = |after: Option<i64>, before: Option<i64>| -> Vec<String> {
+            recent_threads(
+                &conn,
+                &SearchFilters {
+                    after,
+                    before,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .into_iter()
+            .filter_map(|t| t.title)
+            .collect()
+        };
+        assert_eq!(titles(None, None), ["new", "old"]);
+        // One bound: the thread's last activity.
+        assert_eq!(titles(Some(300), None), ["new"]);
+        assert_eq!(titles(None, Some(300)), ["old"]);
+        assert!(titles(Some(500), None).is_empty());
+        // Both bounds (a heatmap day): threads with a message inside, newest first, so the
+        // one continued later still lists for the day it started.
+        assert_eq!(titles(Some(50), Some(150)), ["new", "old"]);
+        assert_eq!(
+            titles(Some(200), Some(200)),
+            ["old"],
+            "both bounds inclusive"
+        );
+        assert_eq!(titles(Some(350), Some(450)), ["new"]);
+        assert!(titles(Some(250), Some(350)).is_empty());
+    }
+
+    /// A bounded range reads the range's messages off idx_messages_ts, never every thread's
+    /// messages; the exact project scope keeps recent_threads on its ordered index.
+    #[test]
+    fn recent_threads_plans_for_a_day_and_an_exact_project() {
+        let conn = temp_db();
+        let day = SearchFilters {
+            after: Some(100),
+            before: Some(200),
+            ..Default::default()
+        };
+        let (sql, args) = recent_threads_sql(&day);
+        let plan = plan_of(&conn, &sql, &args);
+        assert!(
+            plan.contains("SEARCH m USING INDEX idx_messages_ts (ts>? AND ts<?)"),
+            "{plan}"
+        );
+        assert!(!plan.contains("SCAN m"), "{plan}");
+        let scoped = SearchFilters {
+            project: Some("/r/app".into()),
+            project_match: ProjectMatch::Exact,
+            ..Default::default()
+        };
+        let (sql, args) = recent_threads_sql(&scoped);
+        let plan = plan_of(&conn, &sql, &args);
+        assert!(
+            plan.contains("SEARCH t USING INDEX idx_threads_subagent_updated"),
+            "{plan}"
+        );
+        assert!(!plan.contains("TEMP B-TREE"), "{plan}");
+    }
+
+    /// The app's project chip holds an exact key: `/r/app` must not list `/r/app-web` (nor
+    /// treat `_` as a wildcard), while `cal -p` keeps the substring match. Threads with no
+    /// key of their own match on their path.
+    #[test]
+    fn the_app_project_scope_is_exact_and_cal_keeps_the_substring() {
+        let mut conn = temp_db();
+        let sid = source_id(&conn, "claude_code").unwrap();
+        for (ext, path) in [("app", "/r/app"), ("web", "/r/app-web"), ("ux", "/r/apX")] {
+            let t = ParsedThread {
+                external_id: ext.into(),
+                title: Some(ext.into()),
+                project_path: Some(path.into()),
+                updated_at: Some(100),
+                messages: vec![msg("user", "deploy the webhook", 100)],
+                ..Default::default()
+            };
+            upsert_thread(&mut conn, sid, &t).unwrap();
+        }
+        conn.execute(
+            "UPDATE threads SET project_key = NULL WHERE external_id = 'ux'",
+            [],
+        )
+        .unwrap();
+        let run = |project: &str, mode: ProjectMatch| -> (Vec<String>, Vec<String>) {
+            let f = SearchFilters {
+                project: Some(project.into()),
+                project_match: mode,
+                ..Default::default()
+            };
+            let mut recent: Vec<String> = recent_threads(&conn, &f)
+                .unwrap()
+                .into_iter()
+                .filter_map(|t| t.title)
+                .collect();
+            let mut found: Vec<String> = search(&conn, "webhook", &f)
+                .unwrap()
+                .into_iter()
+                .filter_map(|h| h.title)
+                .collect();
+            recent.sort();
+            found.sort();
+            (recent, found)
+        };
+        let (recent, found) = run("/r/app", ProjectMatch::Exact);
+        assert_eq!(recent, ["app"]);
+        assert_eq!(found, ["app"]);
+        assert_eq!(run("/r/ap_", ProjectMatch::Exact).0, Vec::<String>::new());
+        assert_eq!(run("/r/apX", ProjectMatch::Exact).0, ["ux"]);
+        let (recent, found) = run("/r/app", ProjectMatch::Substring);
+        assert_eq!(recent, ["app", "web"]);
+        assert_eq!(found, ["app", "web"]);
+    }
+
+    /// Heatmap days are local calendar days, each with the unix range Search opens for it.
+    #[test]
+    fn coach_heatmap_buckets_by_local_day() {
+        let mut conn = temp_db();
+        let sid = source_id(&conn, "claude_code").unwrap();
+        let ts = chrono::Utc::now().timestamp() - 3 * 86_400;
+        let t = ParsedThread {
+            external_id: "h".into(),
+            title: Some("h".into()),
+            updated_at: Some(ts),
+            messages: vec![msg("user", "a", ts), msg("assistant", "b", ts + 1)],
+            ..Default::default()
+        };
+        upsert_thread(&mut conn, sid, &t).unwrap();
+        let days = coach_heatmap(&conn, ts + 10).unwrap();
+        assert_eq!(days.len(), 1, "{days:?}");
+        let d = &days[0];
+        let local = chrono::DateTime::from_timestamp(ts, 0)
+            .unwrap()
+            .with_timezone(&chrono::Local);
+        assert_eq!(d.day, local.format("%Y-%m-%d").to_string());
+        assert_eq!(d.messages, 2);
+        assert!(d.start <= ts && ts <= d.end, "{d:?}");
+        assert!(
+            [82_799, 86_399, 89_999].contains(&(d.end - d.start)),
+            "{d:?}"
+        );
+        let midnight = local.date_naive().and_hms_opt(0, 0, 0).unwrap();
+        assert_eq!(
+            midnight
+                .and_local_timezone(chrono::Local)
+                .earliest()
+                .unwrap()
+                .timestamp(),
+            d.start
+        );
     }
 
     #[test]

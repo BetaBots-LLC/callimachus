@@ -41,9 +41,13 @@ import {
   unmarkUserStarted,
   useEmbedError,
   useEmbedStatus,
+  useIndexError,
   useIndexRewriting,
   useJobsStatus,
   usePushed,
+  useReindex,
+  useReindexStarting,
+  userReindexing,
 } from "../../lib/queries";
 import { invalidateIndexDerived } from "../../lib/queryClient";
 import { errorText, notify } from "../../lib/toast";
@@ -88,21 +92,59 @@ function savedNote(s: CompactSummary): string {
   return `${saved}.`;
 }
 
-/** The semantic index, and the disk space the history takes: shrink, reclaim, delete. */
+/** The history index and the semantic index behind search, and the disk space the history
+ *  takes: shrink, reclaim, delete. */
 export function IndexSection() {
   return (
     <>
       <SectionHeader
         title="Index & storage"
-        description="The semantic index behind natural-language search, and the space your history takes on disk."
+        description="The index behind search, and the space your history takes on disk."
       />
       <div className="space-y-8">
-        <SettingsGroup aria-label="Semantic index">
+        <SettingsGroup aria-label="Search index">
+          <ReindexRow />
           <SemanticIndexRow />
         </SettingsGroup>
         <StorageGroup />
       </div>
     </>
+  );
+}
+
+/** A full reindex, the same start as the palette's "Reindex history" (useReindex), so the
+ *  repair the Spend card and a stale list point at is reachable without the palette. */
+function ReindexRow() {
+  const reindex = useReindex();
+  const starting = useReindexStarting();
+  const running = userReindexing(useJobsStatus().data);
+  const indexError = useIndexError();
+  // Reindex returns without doing anything while Shrink index / Reclaim space runs.
+  const rewriting = useIndexRewriting();
+  const busy = starting || running;
+  return (
+    <SettingRow
+      title="History index"
+      description="Reads every agent's history again from its source files: new sessions, token usage and anything the watcher missed. Search keeps working while it runs."
+      control={
+        <Button
+          size="sm"
+          variant="outline"
+          onClick={() => reindex.mutate()}
+          disabled={busy || rewriting}
+        >
+          {busy && <Spinner data-icon="inline-start" />}
+          {busy ? "Reindexing…" : "Reindex everything"}
+        </Button>
+      }
+    >
+      {indexError && !busy && (
+        <InlineError>The last reindex stopped: {indexError}. Reindex again to retry.</InlineError>
+      )}
+      {reindex.isError && (
+        <InlineError>Couldn't start the reindex: {errorText(reindex.error)}</InlineError>
+      )}
+    </SettingRow>
   );
 }
 
@@ -234,7 +276,7 @@ function StorageGroup() {
     for (const key of ["db_stats", "results", "recent"]) {
       queryClient.invalidateQueries({ queryKey: [key] });
     }
-    // delete_threads emits no index:done, so Stats / Coach / Projects (5-minute stale
+    // delete_threads emits no index:done, so Stats / Today / Projects (5-minute stale
     // window) would keep listing the deleted threads without this.
     invalidateIndexDerived();
   }

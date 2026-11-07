@@ -1,4 +1,4 @@
-/* Callimachus — "The Catalogue" theme.
+/* Callimachus: "The Catalogue" theme.
  * A warm, dark-first archive: terracotta ink on lamplit umber, parchment text.
  * Single dark theme (the product is read at night, in a terminal, by developers).
  * OKLCH throughout; every neutral is tinted toward the terracotta hue (~55) so the
@@ -50,7 +50,7 @@
 :root {
   --radius: 0.375rem;
 
-  /* Lamplit umber — never pure black. */
+  /* Lamplit umber, never pure black. */
   --background: oklch(0.185 0.013 56);
   --foreground: oklch(0.93 0.014 78);
 
@@ -60,7 +60,7 @@
   --popover: oklch(0.245 0.017 56);
   --popover-foreground: oklch(0.94 0.013 78);
 
-  /* Terracotta — the one loud color. ~#C16E2C. */
+  /* Terracotta, the one loud color. ~#C16E2C. */
   --primary: oklch(0.645 0.132 51);
   --primary-foreground: oklch(0.16 0.02 52);
 
@@ -70,7 +70,7 @@
   --muted: oklch(0.255 0.014 56);
   --muted-foreground: oklch(0.71 0.022 66);
 
-  /* Sun-gold accent — used sparingly. */
+  /* Sun-gold accent, used sparingly. */
   --accent: oklch(0.8 0.116 82);
   --accent-foreground: oklch(0.2 0.03 64);
 
@@ -155,7 +155,7 @@
 }
 
 @layer components {
-  /* Catalogue label — small monospaced caps with a № prefix, the recurring motif. */
+  /* Catalogue label: small monospaced caps with a № prefix, the recurring motif. */
   .cat-label {
     font-family: var(--font-mono);
     font-size: 0.7rem;

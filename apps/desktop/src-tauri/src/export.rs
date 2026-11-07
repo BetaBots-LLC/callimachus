@@ -746,6 +746,15 @@ struct DigestThread {
     project_path: Option<String>,
 }
 
+/// The digest footer's latest snapshot for a project key. Walks the (small) snapshots table
+/// newest first and checks each one's thread by primary key: the earlier
+/// `thread_id IN (SELECT id FROM threads WHERE COALESCE(..) = ?1)` scanned every thread: on a
+/// 21k-thread index 174 ms on a cold cache and 3.4 ms warm, against 0.15 ms now.
+const DIGEST_SNAPSHOT_SQL: &str = "SELECT s.id, s.label FROM snapshots s
+     LEFT JOIN threads t ON t.id = s.thread_id
+     WHERE s.project_path = ?1 OR COALESCE(t.project_key, t.project_path) = ?1
+     ORDER BY s.created_at DESC, s.id DESC LIMIT 1";
+
 /// A day-one digest of a repo's recent sessions, for surfaces whose distilled memory is
 /// still empty (the SessionStart hook, MCP `project_memory`): each of the last
 /// `opts.max_sessions` non-subagent sessions with its source, branch, age, gist, touched
@@ -783,13 +792,7 @@ pub fn session_digest(
     // offer a snapshot from `/x/app-web`. A snapshot whose thread was pruned still matches on
     // its own stored path.
     let footer = conn
-        .prepare_cached(
-            "SELECT id, label FROM snapshots
-             WHERE project_path = ?1
-                OR thread_id IN (SELECT id FROM threads
-                                 WHERE COALESCE(project_key, project_path) = ?1)
-             ORDER BY created_at DESC, id DESC LIMIT 1",
-        )?
+        .prepare_cached(DIGEST_SNAPSHOT_SQL)?
         .query_row([project], |r| {
             Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))
         })
@@ -928,6 +931,21 @@ pub mod hook_settings {
             muted_projects: muted_projects(conn)?,
         })
     }
+}
+
+/// The managed AGENTS.md / CLAUDE.md block body for `project` (a canonical key), at the
+/// AGENTS_FILE budget. One function for `cal agents`, the app's Update AGENTS.md button and
+/// its "What agents see" preview, so the preview is what gets written. Claude Code loads its
+/// own auto memory and reads this file too, so harvested `claude-memory` facts stay out.
+pub fn agents_file_body(conn: &rusqlite::Connection, project: &str) -> anyhow::Result<String> {
+    let budget = MemoryBudget::AGENTS_FILE;
+    let mem = crate::knowledge::get_project_memory_facts_excluding(
+        conn,
+        project,
+        budget.fetch_limit(),
+        crate::knowledge::harvest::EXTRACTOR_CLAUDE_MEMORY,
+    )?;
+    Ok(agent_memory_md_budgeted(project, &mem, None, &budget))
 }
 
 /// HTML-comment markers wrapping the Callimachus-managed section of an agent file.
@@ -1233,6 +1251,7 @@ mod tests {
             external_id: "abc/sess.jsonl".into(),
             title: Some("Add FTS5: search/index".into()),
             project_path: Some("/Users/me/proj".into()),
+            project_key: Some("/Users/me/proj".into()),
             git_branch: Some("main".into()),
             created_at: Some(1_780_000_000),
             updated_at: Some(1_780_000_500),
@@ -1997,6 +2016,18 @@ mod tests {
     }
 
     #[test]
+    fn agents_file_body_leaves_harvested_claude_memory_out() {
+        let mut conn = dts::temp_db("agents_body");
+        let tid = dts::session(&mut conn, "a1", PROJ, "work", 600, &["go"]);
+        dts::fact(&conn, tid, "decision", "Keep the API versioned", "llm");
+        dts::fact(&conn, tid, "gotcha", "From auto memory", "claude-memory");
+        let body = agents_file_body(&conn, PROJ).unwrap();
+        assert!(body.contains("Keep the API versioned"), "{body}");
+        assert!(!body.contains("From auto memory"), "{body}");
+        assert!(body.chars().count() <= MemoryBudget::AGENTS_FILE.max_chars);
+    }
+
+    #[test]
     fn digest_query_reads_threads_by_project_index() {
         let conn = dts::temp_db("plan");
         let mut stmt = conn
@@ -2027,6 +2058,22 @@ mod tests {
         // Rows arrive sorted from the index: no sort over a long thread's user rows.
         assert!(plan.contains("idx_messages_thread_ts"), "{plan}");
         assert!(!plan.contains("TEMP B-TREE"), "{plan}");
+
+        let mut stmt = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {DIGEST_SNAPSHOT_SQL}"))
+            .unwrap();
+        let plan = stmt
+            .query_map([PROJ], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join(" | ");
+        // Each snapshot's thread by primary key, never a scan of every thread.
+        assert!(
+            plan.contains("SEARCH t USING INTEGER PRIMARY KEY"),
+            "{plan}"
+        );
+        assert!(!plan.contains("SCAN t"), "{plan}");
     }
 
     #[test]

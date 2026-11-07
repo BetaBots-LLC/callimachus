@@ -4,9 +4,9 @@ The Callimachus marketing + download site. Server-rendered, SEO-optimized.
 
 ## Stack
 
-- **TanStack Start** (Vite + Nitro) — SSR, file-based routing, server functions
+- **TanStack Start** (Vite + Nitro): SSR, file-based routing, server functions
 - **React 19** + **Tailwind v4** (`@tailwindcss/vite`)
-- Type: **Young Serif** (display) · **Geist** (body) · **Geist Mono** (labels) — self-hosted via `@fontsource`
+- Type: **Young Serif** (display) · **Geist** (body) · **Geist Mono** (labels), self-hosted via `@fontsource`
 - **Nitro** server build (the `nitro()` Vite plugin) → `.output/server/index.mjs`, runnable on any
   Node host. On **Vercel**, Nitro auto-detects the environment and emits the Build Output API dir.
 
@@ -23,8 +23,8 @@ so `tsc` (which CI runs before `build`) can find it.
 
 ## Environment
 
-- `VITE_SITE_URL` — canonical origin for SEO/OG/sitemap. Defaults to `https://callimachus.app`.
-- `GITHUB_TOKEN` — optional; raises the GitHub API rate limit used by the smart-download server
+- `VITE_SITE_URL`: the canonical origin for SEO/OG/sitemap. Defaults to `https://callimachus.app`.
+- `GITHUB_TOKEN`: optional; raises the GitHub API rate limit used by the smart-download server
   function (`src/server/releases.ts`). The page falls back to static `releases/latest/download` URLs
   if the API is unavailable, so this is not required.
 - `VITE_PUBLIC_POSTHOG_KEY`: the PostHog project token for site analytics. Optional: when it is

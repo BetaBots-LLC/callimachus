@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useDebouncedCallback } from "@tanstack/react-pacer";
 import {
@@ -8,7 +8,15 @@ import {
   SOURCE_LABELS,
   type SourceKind,
 } from "../lib/api";
-import { RESULTS_LIST_ID, resultOptionId, resultsNav, SEARCH_INPUT_ID, useUi } from "../store/ui";
+import {
+  type DatePreset,
+  RESULTS_LIST_ID,
+  resultOptionId,
+  resultsNav,
+  SEARCH_INPUT_ID,
+  useUi,
+} from "../store/ui";
+import { baseName, rangeLabel } from "../lib/format";
 import {
   embedStatusQuery,
   useBuildSemanticIndex,
@@ -17,10 +25,9 @@ import {
   useIndexError,
   useIndexRewriting,
   useJobsStatus,
-  useReindex,
-  useReindexStarting,
   userReindexing,
 } from "../lib/queries";
+import { AGGREGATE_STALE_MS } from "../lib/queryClient";
 import { CatchUpNote, JobProgress } from "./JobProgress";
 import {
   InputGroup,
@@ -30,15 +37,20 @@ import {
 } from "@/components/ui/input-group";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
-import { Spinner } from "@/components/ui/spinner";
 import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { Check, ChevronDown, Star, X } from "lucide-react";
+import { Check, ChevronDown, FolderGit2, Star, X } from "lucide-react";
 import { cn } from "@/lib/utils";
+
+// The repo picker is a Base UI combobox, which the entry bundle otherwise leaves to the
+// thread pane's lazy chunk (App.tsx); it loads right after first paint instead.
+const ProjectScope = lazy(() =>
+  import("./ProjectScope").then((m) => ({ default: m.ProjectScope })),
+);
 
 // The three most-used sources get top-level chips; the rest live under "More".
 const PRIMARY: SourceKind[] = ["claude_code", "codex", "cursor"];
@@ -50,6 +62,16 @@ const EMBED_RUNNING: EmbedStatus = { done: 0, total: 0, running: true };
 function embedSummary(s: EmbedStatus): EmbedStatus {
   return s.running ? EMBED_RUNNING : s;
 }
+
+// Semantic search turns itself on once this share of messages is embedded: below it, a
+// hybrid query mostly fuses keyword hits with a partial vector index, and the build
+// button in this bar is the better nudge.
+const AUTO_HYBRID_COVERAGE = 0.9;
+
+// The model loads on the first hybrid query of a session, not when the switch turns
+// itself on at launch: loading ONNX for a window that never searches would undo the
+// idle-memory work. Warmed once per session on the first keystroke instead.
+let semanticWarmed = false;
 
 export function SearchBar() {
   const setQuery = useUi((s) => s.setQuery);
@@ -67,15 +89,50 @@ export function SearchBar() {
   const setHighlightedIndex = useUi((s) => s.setHighlightedIndex);
   const resultCount = useUi((s) => s.resultCount);
   const setOpenFirstPending = useUi((s) => s.setOpenFirstPending);
-  const indexEmpty = useUi((s) => s.indexEmpty);
 
   const tags = useQuery({ queryKey: ["list_tags"], queryFn: api.listTags, staleTime: 60_000 });
+
+  // The scope defaults to the repo the Project page last showed, unless the user picked or
+  // cleared one this session. An older backend without the command rejects: no default.
+  const scopeReady = useUi((s) => s.scopeReady);
+  const applyDefaultProject = useUi((s) => s.applyDefaultProject);
+  const lastProject = useQuery({
+    queryKey: ["last_project"],
+    queryFn: api.lastProject,
+    staleTime: Number.POSITIVE_INFINITY,
+    retry: false,
+    enabled: !scopeReady,
+  });
+  // Applied only while it is still a listed repo, as the Project page checks it: a renamed,
+  // deleted or re-keyed repo (or a worktree path) would otherwise scope every launch to
+  // "Nothing in X". Same key as ProjectScope and the Project page, so it is fetched once.
+  // "*" is the Project page's "All projects" sentinel, which is no scope for Search.
+  const remembered = lastProject.data && lastProject.data !== "*" ? lastProject.data : null;
+  const projects = useQuery({
+    queryKey: ["projects"],
+    queryFn: api.listProjects,
+    staleTime: AGGREGATE_STALE_MS,
+    enabled: !scopeReady && remembered !== null,
+  });
+  useEffect(() => {
+    if (scopeReady || lastProject.isPending) return;
+    if (remembered === null) return applyDefaultProject(null);
+    if (projects.isPending) return;
+    applyDefaultProject(projects.data?.some((p) => p.project === remembered) ? remembered : null);
+  }, [
+    scopeReady,
+    lastProject.isPending,
+    remembered,
+    projects.isPending,
+    projects.data,
+    applyDefaultProject,
+  ]);
 
   // Seed from the committed query: this bar remounts after Onboarding gives way to the
   // index, and the results list keeps filtering by the stored query, so the box must show
   // it again.
   const [text, setText] = useState(() => useUi.getState().query);
-  // The committed query can also change from outside this bar (a Coach error row, the
+  // The committed query can also change from outside this bar (a Stats heatmap day, the
   // palette's "Search for"), and the bar now stays mounted, so mirror those into the box.
   // Its own commits are debounced, so only a value this bar did not just commit counts.
   const query = useUi((s) => s.query);
@@ -104,6 +161,10 @@ export function SearchBar() {
 
   function onChange(value: string) {
     setText(value);
+    if (!semanticWarmed && useUi.getState().hybrid) {
+      semanticWarmed = true;
+      api.warmSemantic().catch(() => {}); // an older backend without it just rejects
+    }
     setOpenFirstPending(false); // an Enter pressed for the shorter text no longer applies
     commitQuery(value);
   }
@@ -130,13 +191,10 @@ export function SearchBar() {
     setQuery("");
   }
 
-  // Reindex runs in the BACKGROUND now: the button just kicks it off and reflects the
-  // job flag, so it never blocks the UI. main.tsx refreshes results/stats on index:done.
-  // Only a user-started reindex counts: the launch catch-up scan is its own job and stays
-  // quiet (CatchUpNote), so it no longer flashes "Indexing…" on every launch.
+  // A user-started reindex (palette, Settings) runs in the background; while it does, the
+  // build button waits and a failure shows here. The launch catch-up scan is its own job and
+  // stays quiet (CatchUpNote).
   const indexing = userReindexing(useJobsStatus().data);
-  const reindex = useReindex();
-  const reindexStarting = useReindexStarting();
 
   // Event-driven; never polls while idle (see lib/queries.ts). Selected down to what this
   // bar shows, so a running build's per-batch embed:progress (which only JobProgress
@@ -152,6 +210,13 @@ export function SearchBar() {
 
   const embedPct =
     embed.data && embed.data.total > 0 ? Math.round((embed.data.done / embed.data.total) * 100) : 0;
+  // Hybrid by default once the semantic index covers enough; the switch still turns it off
+  // (and from then on this session keeps the user's choice).
+  const autoHybrid = useUi((s) => s.autoHybrid);
+  const coverage = embed.data && embed.data.total > 0 ? embed.data.done / embed.data.total : 0;
+  useEffect(() => {
+    if (coverage >= AUTO_HYBRID_COVERAGE) autoHybrid();
+  }, [coverage, autoHybrid]);
 
   // How many "More" sources are active, surfaced on the dropdown so a hidden
   // filter is never silently in effect.
@@ -204,10 +269,10 @@ export function SearchBar() {
                 // typed text exist, ResultsList opens the top row once they arrive.
                 if (commitTextNow() || count === 0) {
                   setOpenFirstPending(true);
+                } else if (highlightedIndex >= 0 && highlightedIndex < count) {
+                  resultsNav.open(highlightedIndex);
                 } else {
-                  resultsNav.open(
-                    highlightedIndex >= 0 && highlightedIndex < count ? highlightedIndex : 0,
-                  );
+                  resultsNav.openTop();
                 }
               }
             }}
@@ -220,20 +285,14 @@ export function SearchBar() {
             </InputGroupAddon>
           )}
         </InputGroup>
-        <Button
-          // On an empty index the empty state's Reindex is the one primary action.
-          variant={indexEmpty ? "outline" : "secondary"}
-          onClick={() => reindex.mutate()}
-          disabled={indexing || reindexStarting || embed.data?.running || rewriting}
-        >
-          {indexing ? (
-            <>
-              <Spinner /> Indexing…
-            </>
-          ) : (
-            "Reindex"
-          )}
-        </Button>
+        <Suspense fallback={<ProjectScopeFallback />}>
+          <ProjectScope />
+        </Suspense>
+        <DateScope />
+        {/* No Reindex button here: the watcher indexes new sessions as they land, so a full
+            reindex is a repair, kept in the command palette (Settings > Sources reindexes
+            one source, and the empty index has its own button). A running one still shows
+            in JobProgress. */}
       </div>
 
       <div className="flex flex-wrap items-center gap-2">
@@ -339,6 +398,93 @@ export function SearchBar() {
 
       <JobProgress />
     </div>
+  );
+}
+
+/** Stands in for the repo picker while its chunk loads (right after first paint): the same
+ *  button, inert for those few milliseconds. */
+function ProjectScopeFallback() {
+  const project = useUi((s) => s.project);
+  return (
+    <div className="flex shrink-0 items-center" aria-hidden>
+      <Button
+        variant={project ? "secondary" : "outline"}
+        className={cn("max-w-48", project && "rounded-r-none")}
+        tabIndex={-1}
+      >
+        <FolderGit2 />
+        <span className="truncate">{project ? baseName(project) : "All repos"}</span>
+        <ChevronDown className="size-3.5 opacity-60" />
+      </Button>
+      {project && (
+        <Button
+          variant="secondary"
+          size="icon"
+          className="rounded-l-none border-l border-background/60"
+          tabIndex={-1}
+        >
+          <X />
+        </Button>
+      )}
+    </div>
+  );
+}
+
+const PRESETS: { id: Exclude<DatePreset, "custom" | "all">; label: string; title: string }[] = [
+  { id: "24h", label: "24h", title: "Active in the last 24 hours" },
+  { id: "7d", label: "7d", title: "Active in the last 7 days" },
+  { id: "30d", label: "30d", title: "Active in the last 30 days" },
+];
+
+/** Date presets. A range set from elsewhere (a Stats heatmap day) shows as its own
+ *  pressed chip, and clicking it goes back to any time. */
+function DateScope() {
+  const preset = useUi((s) => s.datePreset);
+  const after = useUi((s) => s.after);
+  const before = useUi((s) => s.before);
+  const setDatePreset = useUi((s) => s.setDatePreset);
+  return (
+    <fieldset
+      aria-label="Date range"
+      className="m-0 flex h-8 min-w-0 shrink-0 items-center gap-0.5 rounded-lg border p-[3px]"
+    >
+      {preset === "custom" && (
+        // Not a toggle: activating it clears the range, so its name says that.
+        <Button
+          size="xs"
+          variant="secondary"
+          onClick={() => setDatePreset("all")}
+          aria-label={`Clear date range ${rangeLabel(after, before)}`}
+          title="Clear the date range"
+        >
+          {rangeLabel(after, before)}
+          <X aria-hidden />
+        </Button>
+      )}
+      {PRESETS.map((p) => (
+        <Button
+          key={p.id}
+          size="xs"
+          variant={preset === p.id ? "secondary" : "ghost"}
+          aria-pressed={preset === p.id}
+          title={p.title}
+          className={cn("tabular-nums", preset !== p.id && "text-muted-foreground")}
+          onClick={() => setDatePreset(preset === p.id ? "all" : p.id)}
+        >
+          {p.label}
+        </Button>
+      ))}
+      <Button
+        size="xs"
+        variant={preset === "all" ? "secondary" : "ghost"}
+        aria-pressed={preset === "all"}
+        title="Any time"
+        className={cn(preset !== "all" && "text-muted-foreground")}
+        onClick={() => setDatePreset("all")}
+      >
+        All
+      </Button>
+    </fieldset>
   );
 }
 

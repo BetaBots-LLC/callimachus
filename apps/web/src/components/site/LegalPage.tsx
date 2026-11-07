@@ -12,7 +12,7 @@ export function LegalPage({ doc }: { doc: LegalDoc }) {
   return (
     <Container className="py-16 sm:py-20">
       <article className="mx-auto max-w-[68ch]">
-        <span className="cat-label text-primary">№ — on the record</span>
+        <span className="cat-label text-primary">№ · on the record</span>
         <h1 className="mt-3 text-4xl text-foreground sm:text-5xl">{doc.title}</h1>
         <p className="mt-2 font-mono text-xs text-muted-foreground">Last updated {doc.updated}</p>
 

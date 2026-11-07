@@ -8,9 +8,9 @@ import { CommandBlock } from "@/components/site/CommandBlock";
 export const Route = createFileRoute("/cli")({
   head: () => ({
     meta: seo({
-      title: "cal — the Callimachus CLI",
+      title: "cal: the Callimachus CLI",
       description:
-        "Search your AI coding history from the terminal. cal search, recent, cat, ask, files, commits, memory, remember, check, snapshot, resume, stats, and export — pipe-friendly, reading the same local index as the desktop app.",
+        "Search your AI coding history from the terminal. cal search, recent, cat, ask, files, commits, memory, remember, check, snapshot, resume, stats, and export. Pipe-friendly, and it reads the same local index as the desktop app.",
       path: "/cli",
     }),
     links: [{ rel: "canonical", href: `${SITE_URL}/cli` }],
@@ -28,14 +28,15 @@ function CliPage() {
       description="A small, fast terminal client over the same local index. Grep your past sessions, pull a packed transcript to stdout, and feed it straight into the next agent."
     >
       <div className="grid gap-10 lg:grid-cols-2">
-        <div className="flex flex-col gap-4">
+        <div className="flex min-w-0 flex-col gap-4">
           <p className="cat-label">Install</p>
           <p className="text-sm leading-relaxed text-muted-foreground">
             Easiest path: install the{" "}
             <Link to="/download" className="text-link hover:underline">
               desktop app
             </Link>{" "}
-            and click Settings → Claude Code → Enable for Claude Code. That links{" "}
+            and click Enable for Claude Code in Settings &gt; Agents (Install the cal CLI when the
+            Claude Code plugin is on), or Connect in its setup checklist. That links{" "}
             <code className="font-mono">cal</code> at{" "}
             <code className="font-mono">~/.local/bin/cal</code> on macOS and Linux (stock macOS
             leaves <code className="font-mono">~/.local/bin</code> off your PATH; Settings shows the
@@ -49,7 +50,7 @@ function CliPage() {
           />
         </div>
 
-        <div className="flex flex-col gap-4">
+        <div className="flex min-w-0 flex-col gap-4">
           <p className="cat-label">Use it</p>
           <CommandBlock
             label="examples"
@@ -58,7 +59,7 @@ function CliPage() {
               'cal search "vector index migration" -y',
               "# the most recent threads",
               "cal recent -n 10",
-              "# packed transcript to stdout — pipe it anywhere",
+              "# packed transcript to stdout, ready to pipe anywhere",
               "cal cat 42 | pbcopy",
               "# seed another agent with past context",
               'claude "$(cal cat 42)"',
@@ -66,7 +67,7 @@ function CliPage() {
               'cal ask "how did we handle the write-lock contention?"',
               "# every thread that touched a file path",
               "cal files embed/mod.rs",
-              "# the thread→commit timeline — which commits each conversation produced",
+              "# the thread→commit timeline: which commits each conversation produced",
               "cal commits",
               "# recurring errors you keep hitting across every tool (last 180 days)",
               "cal issues",
@@ -86,6 +87,8 @@ function CliPage() {
               "cal done 137",
               "# inject the repo's memory into AGENTS.md so any agent reads it",
               "cal agents",
+              "# what a new agent session in this repo gets injected, or why it gets nothing",
+              "cal hook --explain",
             ]}
           />
         </div>
@@ -93,7 +96,7 @@ function CliPage() {
 
       <div className="mt-12 border-t border-border pt-8">
         <p className="max-w-[60ch] leading-relaxed text-muted-foreground">
-          Every command takes <code className="font-mono">--json</code> for scripting,{" "}
+          The query commands take <code className="font-mono">--json</code> for scripting,{" "}
           <code className="font-mono">-s</code> to filter by source, and{" "}
           <code className="font-mono">-p</code> to scope to a project; search, recent, and related
           also take <code className="font-mono">--starred</code> and{" "}
@@ -104,7 +107,7 @@ function CliPage() {
         </p>
         <p className="mt-4 max-w-[60ch] leading-relaxed text-muted-foreground">
           <code className="font-mono">cal commits</code> infers, entirely on-device, which git
-          commits a thread produced — overlapping the files a thread discussed with{" "}
+          commits a thread produced, by overlapping the files a thread discussed with{" "}
           <code className="font-mono">git log</code>'s changed files inside the thread's time
           window, where the shared-file count is the confidence. Run it inside a git repo or pass a
           path; it prints the thread→commit timeline, one row per commit with its linked-thread
@@ -114,8 +117,9 @@ function CliPage() {
           Curate as you go with <code className="font-mono">cal star</code>,{" "}
           <code className="font-mono">cal tag</code>, and{" "}
           <code className="font-mono">cal tags</code>; surface leftover work with{" "}
-          <code className="font-mono">cal todos</code>. With distillation enabled (local Ollama or
-          an API key), <code className="font-mono">cal distill</code> and{" "}
+          <code className="font-mono">cal todos</code>. With memory turned on in the app (your
+          logged-in Claude Code or Codex CLI, local Ollama, or an API key),{" "}
+          <code className="font-mono">cal distill</code> and{" "}
           <code className="font-mono">cal knowledge</code> pull a thread's summary, decisions, and
           gotchas, and <code className="font-mono">cal decisions</code> /{" "}
           <code className="font-mono">cal gotchas</code> recall them semantically across your whole
@@ -123,8 +127,10 @@ function CliPage() {
         </p>
         <p className="mt-4 max-w-[60ch] leading-relaxed text-muted-foreground">
           Each project keeps a durable memory: <code className="font-mono">cal memory</code> prints
-          its aggregated decisions, gotchas, and open TODOs (defaults to the current repo). And it
-          writes back too — <code className="font-mono">cal remember decision|gotcha</code> pins a
+          its aggregated decisions, gotchas, and open TODOs (defaults to the current repo), and{" "}
+          <code className="font-mono">cal hook --explain</code> shows what a new agent session there
+          would get: that memory, or a digest of the repo's recent sessions while it has none. It
+          writes back too: <code className="font-mono">cal remember decision|gotcha</code> pins a
           new fact into that memory (add <code className="font-mono">--because "&lt;why&gt;"</code>{" "}
           to a decision to keep its rationale), and <code className="font-mono">cal done</code>{" "}
           closes a leftover TODO. These only ever touch Callimachus's own index and memory, never
@@ -136,8 +142,8 @@ function CliPage() {
           decisions on a topic before one gets re-litigated. And for handoff across a context-window
           compaction or between tools,{" "}
           <code className="font-mono">cal snapshot &lt;thread-id&gt;</code> (optionally{" "}
-          <code className="font-mono">-l LABEL</code>) saves a durable, resumable checkpoint — a
-          packed transcript plus carry-forward project memory;{" "}
+          <code className="font-mono">-l LABEL</code>) saves a durable, resumable checkpoint (a
+          packed transcript plus carry-forward project memory);{" "}
           <code className="font-mono">cal snapshots</code> lists them and{" "}
           <code className="font-mono">cal resume &lt;id&gt;</code> (optionally{" "}
           <code className="font-mono">-a AGENT</code>) picks one back up.

@@ -54,7 +54,7 @@ export const PRODUCTS: Product[] = [
     name: "Desktop app",
     tagline: "The reading room.",
     blurb:
-      "A native app for macOS, Windows, and Linux. Browse, search, and read every thread; chat over your own history; export to Obsidian. Auto-updates.",
+      "A native app for macOS, Windows, and Linux. Today, Search, Chat and Projects over every thread, with the per-repo memory your agents start from. Auto-updates.",
   },
   {
     slug: "vscode",
@@ -70,7 +70,7 @@ export const PRODUCTS: Product[] = [
     name: "cal CLI",
     tagline: "Your history, pipeable.",
     blurb:
-      "`cal search`, `cal recent`, `cal cat` — grep your past sessions from the terminal and pipe context straight into the next agent.",
+      "`cal search`, `cal recent`, `cal cat`: grep your past sessions from the terminal and pipe context straight into the next agent.",
   },
   {
     slug: "mcp",

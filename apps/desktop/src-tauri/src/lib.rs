@@ -28,6 +28,7 @@ pub mod mcp_server;
 mod onboarding;
 pub mod search;
 pub mod snapshot;
+pub mod today;
 // Opt-in analytics, GUI only: constructed in `run()` and nowhere else (see its module docs).
 pub mod telemetry;
 
@@ -608,8 +609,9 @@ async fn index_stats(pool: tauri::State<'_, db::ReadPool>) -> AppResult<search::
     read_blocking(&pool, search::stats_cached).await
 }
 
-/// Proactive Coach dashboard: a daily-activity heatmap + the last week's distilled
-/// decisions and gotchas. The heatmap is cached; the week's facts are read live.
+/// The Stats activity heatmap (the retired Coach tab's data, hence the name) plus the last
+/// week's distilled decisions and gotchas. The heatmap is cached; the week's facts are read
+/// live.
 #[tauri::command]
 async fn coach_overview(pool: tauri::State<'_, db::ReadPool>) -> AppResult<search::CoachOverview> {
     read_blocking(&pool, |conn| {
@@ -631,14 +633,16 @@ async fn recurring_issues(
     .await
 }
 
-/// Estimated $ spend by model + the priciest threads (all-time), from captured token usage.
+/// Estimated $ spend by model + the priciest threads from captured token usage, all time or
+/// since `since` (epoch secs; the Project page shows its last 30 days next to all time).
 #[tauri::command]
 async fn spend(
     pool: tauri::State<'_, db::ReadPool>,
     project: Option<String>,
+    since: Option<i64>,
 ) -> AppResult<cost::Spend> {
     read_blocking(&pool, move |conn| {
-        cost::spend_cached(conn, 0, project.as_deref(), 8)
+        cost::spend_cached(conn, since.unwrap_or(0).max(0), project.as_deref(), 8)
     })
     .await
 }
@@ -1083,7 +1087,7 @@ async fn search_threads(
     query: String,
     filters: Option<SearchFilters>,
 ) -> AppResult<search::SearchResponse> {
-    let filters = filters.unwrap_or_default();
+    let filters = app_filters(filters);
     // Taken in invocation order, before the blocking pool: this interrupts the searches
     // that this keystroke made stale.
     let gen = gens.begin();
@@ -1736,13 +1740,23 @@ mod embed_build_tests {
     }
 }
 
+/// The app's search filters: its project chip and pages hold an exact key from
+/// `list_projects`, so the project matches exactly (`cal` and MCP keep the substring).
+fn app_filters(filters: Option<SearchFilters>) -> SearchFilters {
+    SearchFilters {
+        project_match: search::ProjectMatch::Exact,
+        ..filters.unwrap_or_default()
+    }
+}
+
 #[tauri::command]
 async fn recent_threads(
     pool: tauri::State<'_, db::ReadPool>,
     filters: Option<SearchFilters>,
-) -> AppResult<Vec<ThreadSummary>> {
+) -> AppResult<Vec<search::AppThreadSummary>> {
     read_blocking(&pool, move |conn| {
-        search::recent_threads(conn, &filters.unwrap_or_default())
+        let rows = search::recent_threads(conn, &app_filters(filters))?;
+        Ok(rows.into_iter().map(Into::into).collect())
     })
     .await
 }
@@ -2122,7 +2136,7 @@ async fn enable_memory(
     let check = provider.clone();
     if !blocking(move || Ok(memory_engine_listed(&check))).await? {
         return Err(anyhow::anyhow!(
-            "{provider} is not an available memory engine: pick one the card lists, or save its API key in Settings > Providers"
+            "{provider} is not an available memory engine: pick one the card lists, or save its API key in Settings > AI engine"
         )
         .into());
     }
@@ -2509,15 +2523,7 @@ async fn write_agent_memory_file(
     filename: String,
 ) -> AppResult<String> {
     read_blocking(&pool, move |conn| {
-        let budget = export::MemoryBudget::AGENTS_FILE;
-        // Claude Code loads its own auto memory and reads this file too: no second copy.
-        let mem = knowledge::get_project_memory_facts_excluding(
-            conn,
-            &project,
-            budget.fetch_limit(),
-            knowledge::harvest::EXTRACTOR_CLAUDE_MEMORY,
-        )?;
-        let body = export::agent_memory_md_budgeted(&project, &mem, None, &budget);
+        let body = export::agents_file_body(conn, &project)?;
         let path = std::path::Path::new(&project).join(&filename);
         export::write_managed_block_file(&path, &body)?;
         Ok(path.to_string_lossy().into_owned())
@@ -2821,12 +2827,18 @@ pub struct AskSource {
     pub source: String,
     #[serde(rename = "projectPath")]
     pub project_path: Option<String>,
+    /// The first matching message, so a citation chip can open the thread there.
+    #[serde(rename = "messageId")]
+    pub message_id: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
 struct AskAnswer {
     answer: String,
     sources: Vec<AskSource>,
+    /// The answer plus its sources footer ([`answer_with_sources`]): what the chat saves.
+    #[serde(rename = "answerWithSources")]
+    answer_with_sources: String,
 }
 
 /// Prepared RAG inputs: the resolved engine + packed cited context, ready for the LLM.
@@ -2893,6 +2905,7 @@ pub fn prepare_ask(
             title: h.title.clone(),
             source: h.source.clone(),
             project_path: h.project_path.clone(),
+            message_id: focus.get(&h.thread_id).and_then(|m| m.first().copied()),
         });
     }
     if sources.is_empty() {
@@ -2910,12 +2923,68 @@ pub fn prepare_ask(
 
 /// "Ask your history" (RAG): retrieve the most relevant threads for a question, pack
 /// excerpts, and have the configured LLM answer with [thread N] citations.
+///
+/// Ask is a mode of the Chat view, but this never saves the turn: the frontend saves it on
+/// success with [`save_chat`] (the answer's `answerWithSources`), so a Stop or a later chat
+/// turn is never overwritten by a slow answer landing after it (`persist_chat` replaces the
+/// whole thread).
 #[tauri::command]
 async fn ask_history(app: AppHandle, question: String) -> AppResult<AskAnswer> {
     let q = question.trim().to_string();
     if q.is_empty() {
         return Err(anyhow::anyhow!("ask needs a question").into());
     }
+    ask_answer(&app, &q).await
+}
+
+/// Save a chat whose last reply did not come from `send_chat` (an Ask answer) as an in-app
+/// thread, the way `send_chat` saves one: `messages` is the conversation so far and `reply`
+/// its last assistant turn. It then lists with the saved chats and a follow-up continues it
+/// as a normal chat.
+#[tauri::command]
+async fn save_chat(
+    app: AppHandle,
+    thread_id: String,
+    messages: Vec<agent::ChatMessage>,
+    reply: String,
+) -> AppResult<()> {
+    if thread_id.trim().is_empty() {
+        return Err(anyhow::anyhow!("save_chat needs a thread id").into());
+    }
+    write_blocking(&app, move |conn| {
+        agent::persist_chat(conn, &thread_id, &messages, &reply)
+    })
+    .await
+}
+
+/// The heading of the sources footer an Ask answer is saved with.
+const ASK_SOURCES_HEADING: &str = "Sources:";
+
+/// `answer` with a sources footer, the text an Ask turn is saved as. The `[thread N]`
+/// markers name thread ids, but the titles and the chips came only with the live answer, so
+/// a reopened chat showed dead markers and a follow-up sent the model ids it could not
+/// resolve. The footer is one line per source after a blank line and `Sources:`:
+/// `[thread <id>] <title>` (title redacted, on one line, "untitled" when unknown), which the
+/// frontend parses back into chips.
+fn answer_with_sources(answer: &str, sources: &[AskSource]) -> String {
+    if sources.is_empty() {
+        return answer.to_string();
+    }
+    let mut out = answer.trim_end().to_string();
+    out.push_str("\n\n");
+    out.push_str(ASK_SOURCES_HEADING);
+    for s in sources {
+        let title = s.title.as_deref().map(str::trim).filter(|t| !t.is_empty());
+        let title = context::redact_secrets(title.unwrap_or("untitled"));
+        let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
+        out.push_str(&format!("\n[thread {}] {title}", s.thread_id));
+    }
+    out
+}
+
+async fn ask_answer(app: &AppHandle, q: &str) -> AppResult<AskAnswer> {
+    let app = app.clone();
+    let q = q.to_string();
     // Embed (cached-only: keyword-only when the model isn't usable) and retrieve + pack on
     // the blocking pool; the LLM call runs after the connection is returned.
     let prep_q = q.clone();
@@ -2931,8 +3000,10 @@ async fn ask_history(app: AppHandle, question: String) -> AppResult<AskAnswer> {
     })
     .await?;
     let Some(prep) = prep else {
+        let answer = "I couldn't find anything relevant in your history.".to_string();
         return Ok(AskAnswer {
-            answer: "I couldn't find anything relevant in your history.".into(),
+            answer_with_sources: answer.clone(),
+            answer,
             sources: Vec::new(),
         });
     };
@@ -2946,9 +3017,75 @@ async fn ask_history(app: AppHandle, question: String) -> AppResult<AskAnswer> {
     )
     .await?;
     Ok(AskAnswer {
+        answer_with_sources: answer_with_sources(&answer, &prep.sources),
         answer,
         sources: prep.sources,
     })
+}
+
+#[cfg(test)]
+mod ask_chat_tests {
+    use super::*;
+
+    fn msg(role: &str, content: &str) -> agent::ChatMessage {
+        agent::ChatMessage {
+            role: role.into(),
+            content: content.into(),
+        }
+    }
+
+    fn source(thread_id: i64, title: Option<&str>) -> AskSource {
+        AskSource {
+            thread_id,
+            title: title.map(str::to_string),
+            source: "claude_code".into(),
+            project_path: None,
+            message_id: None,
+        }
+    }
+
+    #[test]
+    fn a_saved_ask_answer_carries_its_sources() {
+        let sources = [
+            source(7, Some("Pin the\nrust toolchain")),
+            source(9, None),
+            source(
+                11,
+                Some("key sk-ant-api03-AbCdEfGhIjKlMnOpQrStUv0123456789"),
+            ),
+        ];
+        let saved = answer_with_sources("Pinned in ci.yml [thread 7].\n", &sources);
+        let (answer, footer) = saved.split_once("\n\nSources:\n").unwrap();
+        assert_eq!(answer, "Pinned in ci.yml [thread 7].");
+        let lines: Vec<&str> = footer.lines().collect();
+        assert_eq!(lines[0], "[thread 7] Pin the rust toolchain");
+        assert_eq!(lines[1], "[thread 9] untitled");
+        assert!(lines[2].starts_with("[thread 11] key "), "{}", lines[2]);
+        assert!(!saved.contains("sk-ant-api03"), "{saved}");
+        // Nothing found: nothing to cite, the text is saved as is.
+        assert_eq!(answer_with_sources("Nothing.", &[]), "Nothing.");
+
+        // Saved through the chat persistence: one in-app thread whose last turn is the
+        // answer with its footer.
+        let mut p = std::env::temp_dir();
+        p.push(format!("callimachus_ask_chat_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        let mut conn = db::open(&p).unwrap();
+        let turns = vec![msg("user", "how did we pin rust?")];
+        agent::persist_chat(&mut conn, "ask-1", &turns, &saved).unwrap();
+        let (title, last): (String, String) = conn
+            .query_row(
+                "SELECT t.title, (SELECT m.text FROM messages m WHERE m.thread_id = t.id \
+                 ORDER BY m.seq DESC LIMIT 1) FROM threads t WHERE t.external_id = 'ask-1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(title, "how did we pin rust?");
+        assert_eq!(last, saved);
+        drop(conn);
+        let _ = std::fs::remove_file(&p);
+    }
 }
 
 /// Code-aware search: threads that mention a file path (substring, case-insensitive).
@@ -3275,7 +3412,7 @@ fn resolve_synth(provider: Option<&str>, model: Option<&str>) -> AppResult<(Stri
         None => {
             let (p, m) = pick_synth_provider().ok_or_else(|| {
                 anyhow::anyhow!(
-                    "the engine is the first saved API key, and none is saved: add one in Settings > Providers or pick an engine"
+                    "the engine is the first saved API key, and none is saved: add one in Settings > AI engine or pick an engine"
                 )
             })?;
             Ok((p.to_string(), m.to_string()))
@@ -3306,7 +3443,7 @@ pub fn resolve_distill_engine(
     let cfg = knowledge::get_config(conn)?;
     if !cfg.enabled {
         anyhow::bail!(
-            "LLM distillation is off: turn on memory in Settings > Knowledge (a CLI subscription, local Ollama or an API key)"
+            "LLM distillation is off: turn on memory in Settings > AI engine (a CLI subscription, local Ollama or an API key)"
         );
     }
     let (provider, model) = resolve_synth(cfg.provider.as_deref(), cfg.model.as_deref())
@@ -3449,6 +3586,235 @@ async fn resume_thread(pool: tauri::State<'_, db::ReadPool>, thread_id: i64) -> 
 #[tauri::command]
 fn cli_launch_supported() -> bool {
     agent::cli_resume::launch_supported()
+}
+
+// ---- The Today view, the Project page's snapshots and agent preview, scoped search ----
+
+/// Most snapshots one list call returns.
+const SNAPSHOT_LIST_MAX: u32 = 500;
+
+/// Saved snapshots, newest first: one project (its canonical key) or all of them.
+#[tauri::command]
+async fn list_snapshots(
+    pool: tauri::State<'_, db::ReadPool>,
+    project: Option<String>,
+    limit: u32,
+) -> AppResult<Vec<snapshot::AppSnapshot>> {
+    read_blocking(&pool, move |conn| {
+        let limit = limit.clamp(1, SNAPSHOT_LIST_MAX) as usize;
+        snapshot::list_for_app(conn, project.as_deref(), None, limit)
+    })
+    .await
+}
+
+/// A snapshot with its body (redacted) for the Project page's drawer.
+#[tauri::command]
+async fn load_snapshot(
+    pool: tauri::State<'_, db::ReadPool>,
+    id: i64,
+) -> AppResult<snapshot::AppSnapshotDetail> {
+    read_blocking(&pool, move |conn| {
+        snapshot::load_for_app(conn, id)?.ok_or_else(|| snapshot_gone(id))
+    })
+    .await
+}
+
+fn snapshot_gone(id: i64) -> anyhow::Error {
+    anyhow::anyhow!("Snapshot #{id} no longer exists. Refresh the list to see the current ones.")
+}
+
+/// Delete a snapshot; false when it was already gone.
+#[tauri::command]
+async fn delete_snapshot(app: AppHandle, id: i64) -> AppResult<bool> {
+    write_blocking(&app, move |conn| snapshot::delete(conn, id)).await
+}
+
+/// Open a snapshot in an agent CLI in a new terminal window, seeded the way `cal resume`
+/// does on Windows (and "Open in CLI" everywhere): the body goes to a context file the
+/// agent's first prompt points at. The SessionStart hook is skipped only when the body
+/// carries the project's memory block; a snapshot of a repo with no facts has none, and the
+/// session then still gets the hook's memory and digest. Redacted first: the body goes to
+/// the agent's provider, and older snapshots were saved before packing redacted.
+#[tauri::command]
+async fn resume_snapshot(
+    pool: tauri::State<'_, db::ReadPool>,
+    id: i64,
+    agent: String,
+) -> AppResult<()> {
+    read_blocking(&pool, move |conn| {
+        let snap = snapshot::load(conn, id)?.ok_or_else(|| snapshot_gone(id))?;
+        let agent = match agent.trim() {
+            "" => "claude",
+            a => a,
+        };
+        let body = context::redact_secrets(&snap.body);
+        agent::cli_resume::launch_with_context_memory(
+            agent,
+            &body,
+            snap.meta.project_path.as_deref(),
+            snapshot::carries_memory(&body),
+        )?;
+        Ok(())
+    })
+    .await
+}
+
+/// What a project's agents are given: the SessionStart hook's injection for a new Claude
+/// Code session there, and the managed AGENTS.md / CLAUDE.md block.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentView {
+    /// The hook's exact output ("" when it would stay silent).
+    hook: String,
+    hook_chars: usize,
+    /// Why the hook would print nothing, when it would not.
+    hook_silent_reason: Option<String>,
+    /// Claude Code's cap on a hook's injected context.
+    hook_cap: usize,
+    /// The block as `cal agents` writes it, markers included.
+    agents_file: String,
+    agents_chars: usize,
+    /// Whether the recent-sessions digest is muted for this project (`cal hook --mute`).
+    muted: bool,
+    /// Whether Claude Code's SessionStart hook is installed (by the app or the plugin):
+    /// without it no session receives `hook`, however full the preview is.
+    hook_installed: bool,
+    /// Whether the repo's AGENTS.md / CLAUDE.md holds this block ("absent", "current" or
+    /// "stale").
+    agents_file_state: cli_core::AgentsFileState,
+}
+
+/// [`AgentView`] for `project` (a canonical key). Built by the functions the hook
+/// (`cli_core::hook_preview`) and `cal agents` (`export::agents_file_body`) run, so the
+/// preview is what the agents get.
+#[tauri::command]
+async fn agent_view(pool: tauri::State<'_, db::ReadPool>, project: String) -> AppResult<AgentView> {
+    read_blocking(&pool, move |conn| {
+        let (hook, hook_silent_reason) = match cli_core::hook_preview(conn, &project)? {
+            cli_core::HookOutcome::Print(text) => (text, None),
+            cli_core::HookOutcome::Silent(reason) => (String::new(), Some(reason)),
+        };
+        let body = export::agents_file_body(conn, &project)?;
+        let agents_file = export::upsert_managed_block("", &body)
+            .trim_end()
+            .to_string();
+        let status = integration::status(&current_exe()?);
+        Ok(AgentView {
+            hook_installed: status.hook_installed || status.plugin_managed,
+            agents_file_state: cli_core::agents_file_state(&project, &body),
+            hook_chars: hook.chars().count(),
+            hook,
+            hook_silent_reason,
+            hook_cap: cli_core::HOOK_OUTPUT_CAP,
+            agents_chars: agents_file.chars().count(),
+            agents_file,
+            muted: export::hook_settings::is_muted(conn, &project)?,
+        })
+    })
+    .await
+}
+
+/// The Today view since `since` (None: since the app last showed it, else the last day).
+/// Reads on the pool, then links fresh commits for the repos in it on a connection of its
+/// own, like `link_thread_commits`: `git log` runs outside any lock the app shares, within
+/// `today::COMMIT_BUDGET` in total.
+#[tauri::command]
+async fn today(
+    pool: tauri::State<'_, db::ReadPool>,
+    since: Option<i64>,
+) -> AppResult<today::Today> {
+    let pool = pool.0.clone();
+    blocking(move || {
+        let now = chrono::Utc::now().timestamp();
+        let mut view = {
+            let conn = pool.get().map_err(|e| anyhow::anyhow!("read pool: {e}"))?;
+            let since = today::resolve_since(&conn, since, now)?;
+            today::build(&conn, since, now)?
+        };
+        if today::has_git_repos(&view) {
+            let started = std::time::Instant::now();
+            // The open waits for the lock (and an upgrade) no longer than the commit budget,
+            // not db::open's 15 s: the watcher or a reindex holds it exactly while sessions
+            // are active.
+            let linked =
+                db::open_with_busy_timeout(&db::default_index_path(), today::COMMIT_BUDGET)
+                    .and_then(|conn| {
+                        let left = today::COMMIT_BUDGET.saturating_sub(started.elapsed());
+                        view.commits_partial = today::link_commits(&conn, &view, left)?;
+                        today::fill_commits(&conn, &mut view)
+                    });
+            if let Err(e) = linked {
+                // The sessions still show; only fresh commit links are missing.
+                if db::is_busy(&e) {
+                    view.commits_partial = true;
+                } else {
+                    app_log!("[today] commit linking failed: {e:#}");
+                }
+            }
+        }
+        Ok(view)
+    })
+    .await
+}
+
+/// Mark now as the last time the Today view loaded (its next window starts here).
+#[tauri::command]
+async fn mark_app_opened(app: AppHandle) -> AppResult<()> {
+    write_blocking(&app, |conn| {
+        today::mark_opened(conn, chrono::Utc::now().timestamp())
+    })
+    .await
+}
+
+/// The project the Project page and the search scope last used.
+#[tauri::command]
+async fn last_project(pool: tauri::State<'_, db::ReadPool>) -> AppResult<Option<String>> {
+    read_blocking(&pool, today::last_project).await
+}
+
+/// Remember the project the app is scoped to (None forgets it).
+#[tauri::command]
+async fn set_last_project(app: AppHandle, project: Option<String>) -> AppResult<()> {
+    write_blocking(&app, move |conn| {
+        today::set_last_project(conn, project.as_deref())
+    })
+    .await
+}
+
+/// Most fact hits one search returns.
+const FACT_SEARCH_MAX: u32 = 50;
+
+/// Decisions and gotchas matching a search box query (every word, case-insensitive), pinned
+/// first then newest, with semantic recall hits ahead of them when the embedding model is
+/// already in memory. Never loads the model: this runs with every search, and a load costs
+/// hundreds of ms and ~400 MB.
+#[tauri::command]
+async fn search_facts(
+    app: AppHandle,
+    query: String,
+    project: Option<String>,
+    limit: u32,
+) -> AppResult<Vec<knowledge::FactHit>> {
+    blocking(move || {
+        let embedder = app.state::<embed::Embedder>();
+        let qv = if embedder.is_loaded() && !query.trim().is_empty() {
+            embed::embed_query_cached_only(&embedder, &query)
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+        let pool = app.state::<db::ReadPool>();
+        let conn = read(&pool).map_err(error::AppError::into_inner)?;
+        knowledge::search_facts(
+            &conn,
+            &query,
+            project.as_deref(),
+            limit.clamp(1, FACT_SEARCH_MAX) as usize,
+            qv.as_deref(),
+        )
+    })
+    .await
 }
 
 // ---- Claude Code integration (one-click /recall skill + MCP server) ----
@@ -4566,6 +4932,16 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            list_snapshots,
+            load_snapshot,
+            delete_snapshot,
+            resume_snapshot,
+            agent_view,
+            today,
+            mark_app_opened,
+            last_project,
+            set_last_project,
+            search_facts,
             db_stats,
             index_stats,
             cleanup_candidates,
@@ -4644,6 +5020,7 @@ pub fn run() {
             recall_gotchas,
             find_prior_work,
             ask_history,
+            save_chat,
             search_by_file,
             list_projects,
             project_memory,

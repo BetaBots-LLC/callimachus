@@ -1,12 +1,10 @@
 import { type ReactNode, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Menu as MenuPrimitive } from "@base-ui/react/menu";
-import { ChevronDown, Pencil, Pin, Plus, Trash2 } from "lucide-react";
-import { api, type MemoryFact, type ProjectMemory } from "../lib/api";
-import { useUi } from "../store/ui";
-import { shortPath } from "../lib/format";
-import { useEmbedStatus, useIndexRewriting } from "../lib/queries";
-import { AGGREGATE_STALE_MS } from "../lib/queryClient";
+import { ChevronDown, EyeOff, Pencil, Pin, Plus } from "lucide-react";
+import { api, type MemoryFact, type ProjectMemory } from "../../lib/api";
+import { shortPath } from "../../lib/format";
+import { useEmbedStatus, useIndexRewriting } from "../../lib/queries";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -18,42 +16,26 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Spinner } from "@/components/ui/spinner";
 import { Progress, ProgressLabel, ProgressValue } from "@/components/ui/progress";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
 import { Item } from "@/components/ui/item";
 import { cn } from "@/lib/utils";
-import { Loading } from "./Loading";
-import { Markdown } from "./Markdown";
-import { MemorySetupCard } from "./MemorySetupCard";
+import { Markdown } from "../Markdown";
+import { MemorySetupCard } from "../MemorySetupCard";
+import { SectionNote, SectionSkeleton } from "./ProjectSection";
+import { useOpenThread } from "./shared";
 
 /**
- * Project Memory: the decisions / gotchas / open TODOs distilled across ALL of a project's
- * threads, with a coverage chip + a background "Build memory" distill, an LLM brief, and a
- * "Write memory file" action that drops a `.callimachus/memory.md` agents can read.
+ * The Project page's Memory section: the decisions / gotchas / open TODOs distilled across
+ * ALL of a project's threads, with a coverage chip + a background "Build memory" distill, an
+ * LLM brief, and a "Write memory file" action that drops a `.callimachus/memory.md` agents
+ * can read.
  *
  * Never gated: TODOs, Remember and harvested Claude Code memory need no engine. While LLM
  * distillation is off the memory card sits above the list and the LLM-only actions (Build
  * memory, brief, conflicts) are hidden or disabled, since they would only fail.
  */
-export function ProjectMemoryView() {
+export function MemorySection({ project }: { project: string }) {
   const qc = useQueryClient();
-  const selectThread = useUi((s) => s.selectThread);
-  const setView = useUi((s) => s.setView);
-  const selectedProject = useUi((s) => s.selectedProject);
-  const openProject = useUi((s) => s.openProject);
-
-  // Refreshed by index:done / distill:done (main.tsx), so revisits reuse the cache.
-  const projects = useQuery({
-    queryKey: ["projects"],
-    queryFn: api.listProjects,
-    staleTime: AGGREGATE_STALE_MS,
-  });
-  const project = selectedProject ?? projects.data?.[0]?.project ?? null;
+  const openThread = useOpenThread();
 
   const knowledge = useQuery({ queryKey: ["knowledge_config"], queryFn: api.knowledgeConfig });
   // Unknown while loading: treat as on, so a distilled user never sees the card flash.
@@ -61,8 +43,7 @@ export function ProjectMemoryView() {
 
   const memory = useQuery({
     queryKey: ["project_memory", project],
-    queryFn: () => api.projectMemory(project as string),
-    enabled: !!project,
+    queryFn: () => api.projectMemory(project),
   });
 
   const distilling = useQuery({
@@ -86,21 +67,27 @@ export function ProjectMemoryView() {
   });
 
   const build = useMutation({
-    mutationFn: () => api.distillProject(project as string),
+    mutationFn: () => api.distillProject(project),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["distill_status"] }),
   });
   const cancel = useMutation({
     mutationFn: api.cancelDistill,
     onSuccess: () => qc.invalidateQueries({ queryKey: ["distill_status"] }),
   });
-  const brief = useMutation({ mutationFn: () => api.projectBrief(project as string) });
+  const brief = useMutation({ mutationFn: () => api.projectBrief(project) });
+  // What agents see renders from the same facts and files, so every write here refreshes it
+  // too: with both sections open, its panes would otherwise show the old facts, and after
+  // Update AGENTS.md a hook that now stays silent would still show its injection.
+  const refreshAgentView = () => qc.invalidateQueries({ queryKey: ["agent_view", project] });
   const writeFile = useMutation({
-    mutationFn: () => api.writeProjectMemoryFile(project as string, true),
+    mutationFn: () => api.writeProjectMemoryFile(project, true),
+    onSuccess: () => refreshAgentView(),
   });
   const agentsFile = useMutation({
-    mutationFn: () => api.writeAgentMemoryFile(project as string, "AGENTS.md"),
+    mutationFn: () => api.writeAgentMemoryFile(project, "AGENTS.md"),
+    onSuccess: () => refreshAgentView(),
   });
-  const conflicts = useMutation({ mutationFn: () => api.detectConflicts(project as string) });
+  const conflicts = useMutation({ mutationFn: () => api.detectConflicts(project) });
   // The project the inline "Remember" form is open for (null = closed). Keyed on the
   // project, so switching projects closes it instead of saving to the wrong one.
   const [remembering, setRemembering] = useState<string | null>(null);
@@ -110,7 +97,8 @@ export function ProjectMemoryView() {
   // resyncs on settle. (Writes go through the app's single writer; a failure here means
   // a real backend error, which we now show instead of silently freezing.)
   const memKey = ["project_memory", project] as const;
-  const refreshMem = () => qc.invalidateQueries({ queryKey: memKey });
+  const refreshMem = () =>
+    Promise.all([qc.invalidateQueries({ queryKey: memKey }), refreshAgentView()]);
   const [curationError, setCurationError] = useState<string | null>(null);
 
   function optimistic<V>(mapFor: (v: V) => (facts: MemoryFact[]) => MemoryFact[]) {
@@ -160,10 +148,7 @@ export function ProjectMemoryView() {
   // query) updates immediately: hiding a decision resolves any conflict it's in.
   const [hiddenIds, setHiddenIds] = useState<Set<number>>(() => new Set());
   const factActions: FactActions = {
-    onOpen: (threadId) => {
-      selectThread(threadId);
-      setView("search");
-    },
+    onOpen: (threadId) => openThread(threadId),
     onPin: (id, pinned) => pin.mutate({ id, pinned }),
     onHide: (id) => {
       setHiddenIds((prev) => new Set(prev).add(id));
@@ -202,28 +187,8 @@ export function ProjectMemoryView() {
         : null;
 
   return (
-    <div className="mx-auto flex h-full w-full max-w-3xl flex-col p-6">
-      <div className="shrink-0 space-y-3 pb-3">
-        <div className="flex items-center gap-2">
-          <Select value={project ?? ""} onValueChange={(v) => v && openProject(v)}>
-            <SelectTrigger size="sm" className="min-w-0 flex-1">
-              <SelectValue placeholder="Pick a project" />
-            </SelectTrigger>
-            <SelectContent>
-              {projects.data?.map((p) => (
-                <SelectItem key={p.project} value={p.project}>
-                  {shortPath(p.project)} · {p.distilledCount}/{p.threadCount}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-          {mem && (
-            <Badge variant="outline" className="shrink-0">
-              {mem.distilledCount}/{mem.threadCount} distilled
-            </Badge>
-          )}
-        </div>
-
+    <div className="space-y-4">
+      <div className="space-y-3">
         {/* One primary action, one secondary, and the rest behind More, so the toolbar
             fits on one row at every width (six buttons wrapped at 1100 and 1440). */}
         <div className="flex flex-wrap items-center gap-2">
@@ -301,6 +266,15 @@ export function ProjectMemoryView() {
               </MenuPrimitive.Group>
             </DropdownMenuContent>
           </DropdownMenu>
+          {mem && (
+            <Badge
+              variant="outline"
+              className="ml-auto shrink-0 tabular-nums"
+              title="Sessions distilled into memory, of this project's sessions"
+            >
+              {mem.distilledCount}/{mem.threadCount} distilled
+            </Badge>
+          )}
         </div>
 
         {isDistilling && (
@@ -316,14 +290,18 @@ export function ProjectMemoryView() {
             Wrote {writeFile.data || agentsFile.data}
           </p>
         )}
-        {curationError && <p className="text-xs text-destructive">{curationError}</p>}
+        {curationError && (
+          <p role="alert" className="text-xs text-destructive">
+            {curationError}
+          </p>
+        )}
       </div>
 
-      <div className="min-h-0 flex-1 overflow-y-auto">
-        {!project ? (
-          <p className="px-1 text-sm text-muted-foreground">No projects indexed yet.</p>
-        ) : memory.isLoading ? (
-          <Loading label="Loading memory…" />
+      <div>
+        {memory.isPending ? (
+          <SectionSkeleton rows={3} />
+        ) : memory.isError ? (
+          <SectionNote tone="error">Couldn't load the memory: {String(memory.error)}</SectionNote>
         ) : mem ? (
           <div className="space-y-5">
             {remembering === project && (
@@ -356,9 +334,9 @@ export function ProjectMemoryView() {
                           <button
                             type="button"
                             onClick={() => factActions.onHide(d.id)}
-                            className="shrink-0 cursor-pointer text-muted-foreground hover:text-destructive"
+                            className="shrink-0 cursor-pointer rounded-sm text-muted-foreground outline-none hover:text-destructive focus-visible:ring-2 focus-visible:ring-ring/50"
                           >
-                            hide
+                            Hide
                           </button>
                         </div>
                       ))}
@@ -374,7 +352,8 @@ export function ProjectMemoryView() {
               distillOn ? (
                 <p className="px-1 text-sm text-muted-foreground">
                   Nothing distilled for this project yet. Click <b>Build memory</b> to distill its{" "}
-                  {mem?.pendingCount ?? 0} thread(s) into decisions, gotchas, and TODOs.
+                  {mem.pendingCount} {mem.pendingCount === 1 ? "session" : "sessions"} into
+                  decisions, gotchas and TODOs.
                 </p>
               ) : (
                 <p className="px-1 text-sm text-muted-foreground">
@@ -406,6 +385,7 @@ function RememberForm({ project, onClose }: { project: string; onClose: () => vo
     mutationFn: () => api.remember(project, kind, text.trim()),
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: ["project_memory", project] });
+      void qc.invalidateQueries({ queryKey: ["agent_view", project] });
       onClose();
     },
   });
@@ -603,8 +583,8 @@ function FactRow({ fact, actions }: { fact: MemoryFact; actions: FactActions }) 
         <IconBtn title="Edit" onClick={() => setEditing(true)}>
           <Pencil className="size-3.5" />
         </IconBtn>
-        <IconBtn title="Delete" onClick={() => actions.onHide(fact.id)}>
-          <Trash2 className="size-3.5" />
+        <IconBtn title="Hide from memory" onClick={() => actions.onHide(fact.id)}>
+          <EyeOff className="size-3.5" />
         </IconBtn>
       </div>
     </div>
@@ -624,12 +604,13 @@ function IconBtn({
     <button
       type="button"
       title={title}
+      aria-label={title}
       // The row (Item) is clickable; stop the action click from opening the thread.
       onClick={(e) => {
         e.stopPropagation();
         onClick();
       }}
-      className="grid size-7 place-items-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+      className="grid size-7 place-items-center rounded-md text-muted-foreground outline-none transition-colors hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/50"
     >
       {children}
     </button>

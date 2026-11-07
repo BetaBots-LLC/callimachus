@@ -1,8 +1,12 @@
 import { memo, useState } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQuery } from "@tanstack/react-query";
+import { Toggle } from "@base-ui/react/toggle";
+import { ToggleGroup } from "@base-ui/react/toggle-group";
 import { api, PROVIDERS } from "../lib/api";
 import {
+  type AskMeta,
   CONTEXT_PREFIX,
+  type ChatMode,
   type ContextMeta,
   contextTitle,
   isContextMessage,
@@ -10,29 +14,23 @@ import {
   type StreamPart,
   type ToolStep,
 } from "../store/chat";
-import { describeKeySaveError } from "../lib/errors";
-import { track } from "../lib/telemetry";
+import { useUi } from "../store/ui";
 import { isSubmitEnter } from "../lib/keyboard";
-import { loadModelCache, saveModelCache, MODELS_TTL } from "../lib/models";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 import { Kbd, KbdGroup } from "@/components/ui/kbd";
 import { Textarea } from "@/components/ui/textarea";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
 import { cn } from "@/lib/utils";
 import {
   ArrowUp,
   Brain,
   Check,
+  KeyRound,
   Loader2,
+  MessagesSquare,
   Paperclip,
   Search,
+  Settings2,
+  Sparkles,
   Square,
   Terminal,
   TriangleAlert,
@@ -58,264 +56,302 @@ import {
   AttachmentMedia,
   AttachmentTitle,
 } from "@/components/ui/attachment";
+import { AskAnswer, CitedMarkdown, splitSavedSources } from "./AskAnswer";
+import { ChatEnginePicker, useChatEngine } from "./ChatEnginePicker";
 import { ChatSidebar } from "./ChatSidebar";
-import { Markdown, StreamingMarkdown } from "./Markdown";
+import { MemorySetupCard } from "./MemorySetupCard";
+import { StreamingMarkdown } from "./Markdown";
+
+const ASK_EXAMPLES = [
+  "How did we handle authentication?",
+  "What did we decide about the database schema?",
+  "Have we hit this kind of error before?",
+];
+
+const MODES: { id: ChatMode; label: string; icon: typeof Sparkles; hint: string }[] = [
+  {
+    id: "chat",
+    label: "Chat",
+    icon: MessagesSquare,
+    hint: "Chat with your provider; it searches your history when that helps",
+  },
+  {
+    id: "ask",
+    label: "Ask",
+    icon: Sparkles,
+    hint: "One cited answer from your past sessions, on your memory engine",
+  },
+];
+
+/** "Chat" | "Ask": how the next message is answered (store/chat.ts ChatMode). Same control
+ *  as Settings > General's theme picker. */
+function ModeToggle({
+  mode,
+  disabled,
+  onChange,
+}: {
+  mode: ChatMode;
+  disabled: boolean;
+  onChange: (m: ChatMode) => void;
+}) {
+  return (
+    <ToggleGroup
+      aria-label="Answer with"
+      value={[mode]}
+      disabled={disabled}
+      onValueChange={(v) => {
+        const next = v[0] as ChatMode | undefined;
+        if (next) onChange(next);
+      }}
+      className="inline-flex shrink-0 rounded-lg bg-muted p-0.5"
+    >
+      {MODES.map((m) => (
+        <Toggle
+          key={m.id}
+          value={m.id}
+          title={m.hint}
+          className={cn(
+            "inline-flex h-7 items-center gap-1.5 rounded-[min(var(--radius-md),12px)] px-2.5 text-[0.8rem] font-medium whitespace-nowrap text-muted-foreground transition-colors outline-none select-none",
+            "hover:text-foreground focus-visible:ring-3 focus-visible:ring-ring/50",
+            "data-pressed:bg-background data-pressed:text-foreground data-pressed:shadow-sm",
+            "data-disabled:pointer-events-none data-disabled:opacity-60",
+            "[&_svg]:size-3.5 [&_svg]:shrink-0",
+          )}
+        >
+          <m.icon aria-hidden="true" />
+          {m.label}
+        </Toggle>
+      ))}
+    </ToggleGroup>
+  );
+}
+
+/** The memory engine's name as the Ask header shows it: the label Settings uses for it. */
+function useMemoryEngineLabel(): {
+  label: string;
+  model: string | null;
+  on: boolean;
+  /** knowledge_config has not answered yet, or failed: whether memory is on is unknown. */
+  status: "pending" | "error" | "success";
+  retry: () => void;
+} {
+  // Same key App and the memory card read, so these are cache hits.
+  const knowledge = useQuery({ queryKey: ["knowledge_config"], queryFn: api.knowledgeConfig });
+  const cliEngines = useQuery({ queryKey: ["cli_engines"], queryFn: api.cliEngines });
+  const provider = knowledge.data?.provider ?? null;
+  const label = !provider
+    ? "First saved API key"
+    : (cliEngines.data?.find((e) => e.id === provider)?.label ??
+      PROVIDERS.find((p) => p.id === provider)?.label ??
+      provider);
+  return {
+    label,
+    model: knowledge.data?.model ?? null,
+    on: !!knowledge.data?.enabled,
+    status: knowledge.status,
+    retry: () => void knowledge.refetch(),
+  };
+}
 
 export function ChatView() {
-  const provider = useChat((s) => s.provider);
-  const model = useChat((s) => s.model);
   const messages = useChat((s) => s.messages);
   const loadingThread = useChat((s) => s.loadingThread);
   const error = useChat((s) => s.error);
   // Streaming state lives in the store, so it survives this view unmounting when the
   // user switches tabs mid-reply (the reply, its tool steps and Stop are still here).
   const isStreaming = useChat((s) => s.isStreaming);
+  const pending = useChat((s) => s.pending);
   const stop = useChat((s) => s.stop);
-
-  const setProvider = useChat((s) => s.setProvider);
-  const setModel = useChat((s) => s.setModel);
+  const mode = useChat((s) => s.mode);
+  const setMode = useChat((s) => s.setMode);
+  const openSettings = useUi((s) => s.openSettings);
 
   const [draft, setDraft] = useState("");
-  const [keyDraft, setKeyDraft] = useState("");
-  const queryClient = useQueryClient();
+  const engine = useChatEngine();
+  const memory = useMemoryEngineLabel();
+  // Ask answers on the memory engine (ask_history), which needs LLM distillation on. Only a
+  // config that answered "off" blocks: while it loads (or failed) the setup card would flash
+  // for someone whose memory is on, and the backend still refuses a send while it is off.
+  const askBlocked = mode === "ask" && memory.status === "success" && !memory.on;
 
-  // Local Ollama and Ollama Cloud take a custom endpoint, persisted per provider and shared with
-  // Settings. react-query is the source of truth (no store mirror): the saved URL feeds the model
-  // list and send directly; edits persist on blur and re-key the model list via invalidation.
-  const isOllamaLike = provider === "ollama" || provider === "ollama_cloud";
-  const savedBaseUrl = useQuery({
-    queryKey: ["providerBaseUrl", provider],
-    queryFn: () => api.providerBaseUrl(provider),
-    enabled: isOllamaLike,
-  });
-  const baseUrl = savedBaseUrl.data ?? "";
-  // `null` = not editing → show the saved value (updates live as the query resolves or the
-  // provider switches). While editing, this local draft overrides it, so an in-flight query
-  // result can never clobber what the user is typing.
-  const [urlEdit, setUrlEdit] = useState<string | null>(null);
-  const saveBaseUrl = useMutation({
-    mutationFn: (url: string) => api.setProviderBaseUrl(provider, url),
-    // Update the cache immediately so the box + model list reflect the new URL without waiting
-    // on the round-trip; the invalidate then reconciles with what the backend actually stored.
-    onMutate: (url: string) => queryClient.setQueryData(["providerBaseUrl", provider], url),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["providerBaseUrl", provider] });
-      track("setting_changed", { key: "provider_base_url" });
-    },
-  });
-
-  const hasKey = useQuery({
-    queryKey: ["hasKey", provider],
-    queryFn: () => api.providerHasKey(provider),
-    // Keyless engines (Ollama, CLI) never need a key, so skip the probe so the keychain stays quiet.
-    enabled: provider !== "ollama" && !provider.endsWith("-cli"),
-  });
-  const saveKey = useMutation({
-    mutationFn: () => api.setApiKey(provider, keyDraft.trim()),
-    onSuccess: () => {
-      setKeyDraft("");
-      queryClient.invalidateQueries({ queryKey: ["hasKey", provider] });
-      track("setting_changed", { key: "api_key" });
-    },
-  });
-
-  // CLI backends (claude-cli / codex-cli) use their own logged-in auth: no API key.
-  const isCli = provider.endsWith("-cli");
-  const needsKey = provider !== "ollama" && !isCli;
-
-  // Offer installed CLI backends alongside the keyed providers (CLI has no default model; the
-  // CLI picks one when model is empty).
-  const cliEngines = useQuery({ queryKey: ["cli_engines"], queryFn: api.cliEngines });
-  const providerOptions = [
-    ...PROVIDERS.map((p) => ({ id: p.id, label: p.label, defaultModel: p.defaultModel })),
-    ...(cliEngines.data ?? [])
-      .filter((e) => e.installed)
-      .map((e) => ({ id: e.id, label: `${e.label} (no key)`, defaultModel: "" })),
-  ];
-
-  // Live model list from the provider API, cached in localStorage so the dropdown
-  // is instant and self-refreshes (TTL / version), so banned models drop off.
-  // Only fetch once we can (key present, or providers that don't need one).
-  const canList =
-    provider === "ollama" || provider === "openrouter" || isCli || hasKey.data === true;
-  const modelsQuery = useQuery({
-    queryKey: ["models", provider, baseUrl],
-    enabled: canList,
-    staleTime: MODELS_TTL,
-    initialData: () => loadModelCache(provider)?.models,
-    initialDataUpdatedAt: () => loadModelCache(provider)?.at,
-    queryFn: async () => {
-      const list = await api.listModels(provider, baseUrl || undefined);
-      saveModelCache(provider, list);
-      // If the selected model is gone (e.g. retired/banned), fall back to a valid one
-      // (prefer the provider's default if the API still offers it).
-      const cur = useChat.getState();
-      if (cur.provider === provider && list.length && !list.includes(cur.model)) {
-        const def = PROVIDERS.find((p) => p.id === provider)?.defaultModel;
-        cur.setModel(def && list.includes(def) ? def : list[0]);
-      }
-      return list;
-    },
-  });
-  const staticModels: string[] = [...(PROVIDERS.find((p) => p.id === provider)?.models ?? [])];
-  const modelOptions: string[] = modelsQuery.data?.length ? modelsQuery.data : staticModels;
-  // Always include the current model so the (strict) dropdown can display it even
-  // before the live list loads or if it isn't in the provider's list.
-  const modelList =
-    model && !modelOptions.includes(model) ? [model, ...modelOptions] : modelOptions;
-
-  function send() {
-    const text = draft.trim();
-    if (!text || useChat.getState().isStreaming) return;
-    setDraft("");
-    void useChat.getState().send(text, { baseUrl: baseUrl || null });
+  /** Send the draft, or `example` (an Ask example question), which leaves the draft alone
+   *  so a half-typed message survives the click. */
+  function send(example?: string) {
+    const q = (example ?? draft).trim();
+    if (!q || useChat.getState().isStreaming || askBlocked) return;
+    if (example === undefined) setDraft("");
+    void useChat.getState().send(q, { baseUrl: engine.baseUrl || null });
   }
+
+  const askEmpty = mode === "ask" && messages.length === 0 && !isStreaming;
+  const askSetupOnly = askEmpty && askBlocked;
 
   return (
     <div className="flex min-h-0 flex-1">
       <ChatSidebar />
-      <div className="flex min-h-0 flex-1 flex-col">
-        <div className="flex items-center gap-2 border-b px-4 py-2.5">
-          <Select
-            value={provider}
-            onValueChange={(v) => {
-              const p = providerOptions.find((x) => x.id === v);
-              if (p) setProvider(p.id, p.defaultModel);
-            }}
-          >
-            <SelectTrigger className="w-40">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              {providerOptions.map((p) => (
-                <SelectItem key={p.id} value={p.id}>
-                  {p.label}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-          <Select value={model} onValueChange={(v) => v && setModel(v)}>
-            <SelectTrigger className="flex-1" aria-label="Model">
-              <SelectValue placeholder={modelsQuery.isFetching ? "loading models…" : "model"} />
-            </SelectTrigger>
-            <SelectContent>
-              {modelList.map((m) => (
-                <SelectItem key={m} value={m}>
-                  {m}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-          {isOllamaLike && (
-            <Input
-              // Controlled: show the saved URL, but a local draft overrides it while editing so an
-              // async query result never clobbers in-progress typing. Persist on blur, which fires
-              // before a provider switch, so it always writes under the correct provider.
-              value={urlEdit ?? baseUrl}
-              onChange={(e) => setUrlEdit(e.currentTarget.value)}
-              onBlur={(e) => {
-                const url = e.currentTarget.value.trim();
-                setUrlEdit(null);
-                if (url !== baseUrl) saveBaseUrl.mutate(url);
-              }}
-              placeholder={
-                provider === "ollama_cloud" ? "https://ollama.com" : "http://localhost:11434"
-              }
-            />
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+        <div className="flex min-w-0 items-center gap-3 border-b px-4 py-2.5">
+          <ModeToggle mode={mode} disabled={isStreaming} onChange={setMode} />
+          {mode === "chat" ? (
+            <ChatEnginePicker engine={engine} className="flex-1" />
+          ) : (
+            <p className="min-w-0 flex-1 truncate text-[13px] text-muted-foreground">
+              {memory.status === "pending" ? (
+                "Answers from your history"
+              ) : memory.status === "error" ? (
+                "Couldn't read the memory engine setting"
+              ) : memory.on ? (
+                <>
+                  Answers from your history with{" "}
+                  <span className="font-medium text-foreground">{memory.label}</span>
+                  {memory.model ? ` · ${memory.model}` : ""}
+                </>
+              ) : (
+                "Ask needs memory turned on"
+              )}
+            </p>
           )}
+          <Button
+            size="icon-sm"
+            variant="ghost"
+            aria-label="AI engine settings"
+            title="AI engine settings: keys, server URLs and the memory engine"
+            onClick={() => openSettings("engine")}
+          >
+            <Settings2 />
+          </Button>
         </div>
 
-        {needsKey && !hasKey.data && (
-          <div className="flex items-center gap-2 border-b px-4 py-2.5">
-            <Input
-              type="password"
-              value={keyDraft}
-              onChange={(e) => setKeyDraft(e.currentTarget.value)}
-              placeholder={`${provider} API key (stored in your OS keychain)`}
-            />
-            <Button
-              size="sm"
-              onClick={() => saveKey.mutate()}
-              disabled={!keyDraft.trim() || saveKey.isPending}
-            >
-              Save key
+        {mode === "chat" && engine.keyMissing && (
+          <div
+            role="status"
+            className="flex items-center gap-2 border-b bg-muted/40 px-4 py-2 text-[13px] text-muted-foreground"
+          >
+            <KeyRound className="size-3.5 shrink-0" aria-hidden="true" />
+            <span className="min-w-0 flex-1">
+              No {engine.providerLabel} API key saved, so Chat can't send yet. Add one in Settings,
+              or pick a provider that needs none.
+            </span>
+            <Button size="xs" variant="outline" onClick={() => openSettings("engine")}>
+              Add an API key
             </Button>
           </div>
         )}
-        {needsKey && !hasKey.data && saveKey.isError && (
-          <p role="alert" className="border-b px-4 py-2 text-xs text-destructive">
-            {describeKeySaveError(saveKey.error)}
-          </p>
-        )}
 
         <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
-          <MessageScrollerProvider autoScroll>
-            <MessageScroller>
-              <MessageScrollerViewport>
-                <MessageScrollerContent
-                  className="mx-auto w-full min-w-0 max-w-3xl px-5 py-6"
-                  role="log"
-                  aria-live="polite"
-                  // Announce only committed messages. The live reply changes every frame,
-                  // so "text" changes (and an un-busy region) would read out each token.
-                  aria-relevant="additions"
-                  aria-busy={isStreaming}
-                >
-                  {messages.length === 0 && !isStreaming && (
-                    <Marker variant="separator" className="my-auto">
-                      <MarkerContent>Ask anything. Replies are saved and searchable.</MarkerContent>
-                    </Marker>
-                  )}
-                  {messages.map((m) => (
-                    <MessageScrollerItem
-                      key={m.id}
-                      messageId={m.id}
-                      scrollAnchor={m.role === "user"}
-                    >
-                      <MessageRow
-                        id={m.id}
-                        role={m.role}
-                        content={m.content}
-                        context={m.context}
-                        // Only context chips use this; keeping it false for other rows
-                        // means a stream starting/ending doesn't re-render every bubble.
-                        removable={!isStreaming && isContextMessage(m)}
+          {askSetupOnly ? (
+            // Nothing to scroll to yet: the card reads from its top, where the scroller would
+            // pin a short window to its end and hide the heading.
+            <div className="flex min-h-0 flex-1 overflow-y-auto">
+              <div className="m-auto w-full max-w-3xl px-5 py-6">
+                <MemorySetupCard whenDismissed="button" checklistLink className="w-full" />
+              </div>
+            </div>
+          ) : (
+            <MessageScrollerProvider autoScroll>
+              <MessageScroller>
+                <MessageScrollerViewport>
+                  <MessageScrollerContent
+                    className="mx-auto w-full min-w-0 max-w-3xl px-5 py-6"
+                    role="log"
+                    aria-live="polite"
+                    // Announce only committed messages. The live reply changes every frame,
+                    // so "text" changes (and an un-busy region) would read out each token.
+                    aria-relevant="additions"
+                    aria-busy={isStreaming}
+                  >
+                    {messages.length === 0 && !isStreaming && mode === "chat" && (
+                      <Marker variant="separator" className="my-auto">
+                        <MarkerContent>
+                          Ask anything. Replies are saved and searchable.
+                        </MarkerContent>
+                      </Marker>
+                    )}
+                    {askEmpty && !askBlocked && <AskIntro onPick={(q) => send(q)} />}
+                    {messages.map((m) => (
+                      <MessageScrollerItem
+                        key={m.id}
+                        messageId={m.id}
+                        scrollAnchor={m.role === "user"}
+                      >
+                        <MessageRow
+                          id={m.id}
+                          role={m.role}
+                          content={m.content}
+                          context={m.context}
+                          ask={m.ask}
+                          // Only context chips use this; keeping it false for other rows
+                          // means a stream starting/ending doesn't re-render every bubble.
+                          removable={!isStreaming && isContextMessage(m)}
+                        />
+                      </MessageScrollerItem>
+                    ))}
+                    {isStreaming && (
+                      // The live reply must never be paint-deferred. The base MessageScrollerItem
+                      // sets content-visibility:auto (+ contain-intrinsic-size), which lets the
+                      // browser skip rendering the growing reply while it sits a hair below the
+                      // fold, and report a stale placeholder size, so the scroller's
+                      // ResizeObserver never sees the growth, autoScroll doesn't follow, and
+                      // streamed text "pops in" in chunks when it finally scrolls into view.
+                      // Force it visible so tokens paint as they arrive and the scroller stays
+                      // pinned to the live edge.
+                      <MessageScrollerItem
+                        messageId="streaming"
+                        className="[content-visibility:visible]"
+                      >
+                        <Message align="start">
+                          <MessageContent>
+                            {pending === "ask" ? (
+                              <TypingDots label="Searching your history" />
+                            ) : (
+                              <StreamingArea />
+                            )}
+                          </MessageContent>
+                        </Message>
+                      </MessageScrollerItem>
+                    )}
+                    {/* Ask runs on the memory engine; while memory is off, its one-click setup
+                        sits right above the composer, as on Projects. In the log rather than the
+                        form, so a short window scrolls it instead of squeezing the log away. */}
+                    {askBlocked && !isStreaming && (
+                      <MemorySetupCard
+                        whenDismissed="button"
+                        checklistLink
+                        className="mt-4 w-full"
                       />
-                    </MessageScrollerItem>
-                  ))}
-                  {isStreaming && (
-                    // The live reply must never be paint-deferred. The base MessageScrollerItem
-                    // sets content-visibility:auto (+ contain-intrinsic-size), which lets the
-                    // browser skip rendering the growing reply while it sits a hair below the
-                    // fold, and report a stale placeholder size, so the scroller's
-                    // ResizeObserver never sees the growth, autoScroll doesn't follow, and
-                    // streamed text "pops in" in chunks when it finally scrolls into view.
-                    // Force it visible so tokens paint as they arrive and the scroller stays
-                    // pinned to the live edge.
-                    <MessageScrollerItem
-                      messageId="streaming"
-                      className="[content-visibility:visible]"
-                    >
-                      <Message align="start">
-                        <MessageContent>
-                          <StreamingArea />
-                        </MessageContent>
-                      </Message>
-                    </MessageScrollerItem>
-                  )}
-                  {error && (
-                    <Marker role="alert" className="text-destructive">
-                      <MarkerIcon>
-                        <TriangleAlert />
-                      </MarkerIcon>
-                      <MarkerContent>{error}</MarkerContent>
-                    </Marker>
-                  )}
-                </MessageScrollerContent>
-              </MessageScrollerViewport>
-              <MessageScrollerButton direction="end" />
-            </MessageScroller>
-          </MessageScrollerProvider>
+                    )}
+                    {mode === "ask" && memory.status === "error" && !isStreaming && (
+                      <Marker role="alert" className="text-destructive">
+                        <MarkerIcon>
+                          <TriangleAlert />
+                        </MarkerIcon>
+                        <MarkerContent>
+                          Couldn't check whether memory is on, which Ask needs.{" "}
+                          <Button
+                            size="xs"
+                            variant="outline"
+                            className="ml-1 align-baseline"
+                            onClick={memory.retry}
+                          >
+                            Try again
+                          </Button>
+                        </MarkerContent>
+                      </Marker>
+                    )}
+                    {error && (
+                      <Marker role="alert" className="text-destructive">
+                        <MarkerIcon>
+                          <TriangleAlert />
+                        </MarkerIcon>
+                        <MarkerContent>{error}</MarkerContent>
+                      </Marker>
+                    )}
+                  </MessageScrollerContent>
+                </MessageScrollerViewport>
+                <MessageScrollerButton direction="end" />
+              </MessageScroller>
+            </MessageScrollerProvider>
+          )}
           {loadingThread && (
             <div className="absolute inset-0 z-10 flex items-center justify-center bg-background/60 backdrop-blur-[1px]">
               <span className="flex items-center gap-2 text-sm text-muted-foreground">
@@ -336,10 +372,15 @@ export function ChatView() {
             <Textarea
               // The composer is the view's only job, so opening Chat lands in it.
               autoFocus
+              aria-label={mode === "ask" ? "Question for your history" : "Message"}
               className="max-h-48 min-h-13 flex-1 resize-none border-0 bg-transparent py-3.5 pl-4 pr-14 shadow-none focus-visible:border-0 focus-visible:ring-0 dark:bg-transparent"
               rows={1}
               value={draft}
-              placeholder="Message…"
+              placeholder={
+                mode === "ask"
+                  ? "Ask your history, e.g. how did we set up release versioning?"
+                  : "Message…"
+              }
               onChange={(e) => setDraft(e.currentTarget.value)}
               onKeyDown={(e) => {
                 if (isSubmitEnter(e)) {
@@ -352,7 +393,7 @@ export function ChatView() {
               <Button
                 type="button"
                 size="icon"
-                aria-label="Stop generating"
+                aria-label={pending === "ask" ? "Stop waiting for the answer" : "Stop generating"}
                 onClick={stop}
                 className="absolute bottom-2 right-2 size-9 rounded-full transition-transform duration-150 hover:scale-105 active:scale-95"
               >
@@ -362,8 +403,8 @@ export function ChatView() {
               <Button
                 type="submit"
                 size="icon"
-                aria-label="Send message"
-                disabled={!draft.trim()}
+                aria-label={mode === "ask" ? "Ask" : "Send message"}
+                disabled={!draft.trim() || askBlocked}
                 className="absolute bottom-2 right-2 size-9 rounded-full transition-transform duration-150 enabled:hover:scale-105 enabled:active:scale-95 disabled:opacity-40"
               >
                 <ArrowUp className="size-4" />
@@ -371,6 +412,7 @@ export function ChatView() {
             )}
           </div>
           <p className="mt-1.5 flex items-center justify-center gap-1 text-[0.7rem] text-muted-foreground">
+            {mode === "ask" && <span>Follow-ups continue as a chat ·</span>}
             <Kbd>Enter</Kbd> to send ·{" "}
             <KbdGroup>
               <Kbd>Shift</Kbd>
@@ -380,6 +422,30 @@ export function ChatView() {
           </p>
         </form>
       </div>
+    </div>
+  );
+}
+
+/** The empty Ask conversation: what Ask does and a few questions to start from. */
+function AskIntro({ onPick }: { onPick: (q: string) => void }) {
+  return (
+    <div className="my-auto space-y-3">
+      <div className="space-y-1">
+        <h2 className="text-base font-semibold tracking-tight">Ask your history</h2>
+        <p className="max-w-[60ch] text-sm text-muted-foreground">
+          Callimachus finds the past sessions that bear on your question and answers from them,
+          citing each thread it used. The answer is saved with your chats.
+        </p>
+      </div>
+      <ul className="flex flex-col items-start gap-1.5" aria-label="Example questions">
+        {ASK_EXAMPLES.map((ex) => (
+          <li key={ex}>
+            <Button size="sm" variant="outline" onClick={() => onPick(ex)}>
+              {ex}
+            </Button>
+          </li>
+        ))}
+      </ul>
     </div>
   );
 }
@@ -398,12 +464,14 @@ const MessageRow = memo(function MessageRow({
   role,
   content,
   context,
+  ask,
   removable,
 }: {
   id: string;
   role: string;
   content: string;
   context?: ContextMeta;
+  ask?: AskMeta;
   removable: boolean;
 }) {
   if (role === "system") {
@@ -432,13 +500,25 @@ const MessageRow = memo(function MessageRow({
       <MessageContent>
         <Bubble variant="ghost">
           <BubbleContent>
-            <Markdown>{content}</Markdown>
+            {/* Chat replies cite [thread N] too (the history tool's prompt asks for it), so
+                every answer gets the chips; an Ask answer also lists its sources. */}
+            <AssistantAnswer content={content} ask={ask} />
           </BubbleContent>
         </Bubble>
       </MessageContent>
     </Message>
   );
 });
+
+/** An assistant turn. An Ask answer carries a sources footer (the text it is saved and
+ *  re-sent as, so a follow-up knows the cited titles); it shows as the source list, with
+ *  the live answer's full sources when this window has them, else the footer's. */
+function AssistantAnswer({ content, ask }: { content: string; ask?: AskMeta }) {
+  const saved = splitSavedSources(content);
+  if (ask) return <AskAnswer answer={saved.body} sources={ask.sources} />;
+  if (saved.sources.length > 0) return <AskAnswer answer={saved.body} sources={saved.sources} />;
+  return <CitedMarkdown text={content} />;
+}
 
 /** An injected thread context, shown as a compact attachment with its size. Attached
  *  context is re-sent with every later message, so the token estimate is the per-turn
@@ -614,16 +694,16 @@ function ThinkingBlock({ text, streaming }: { text: string; streaming?: boolean 
 }
 
 /** ChatGPT/Claude-style loading state shown the instant you hit Enter, until the
- *  first token arrives: a shimmering "Thinking" label with bouncing dots. */
-function TypingDots() {
+ *  first token arrives (or, for Ask, the answer): a shimmering label with bouncing dots. */
+function TypingDots({ label = "Thinking" }: { label?: string }) {
   return (
     // Screen readers get the sr-only sentence; the icon, the short label and the dots are
     // decorative.
     <div className="flex items-center gap-2 text-sm text-muted-foreground">
-      <span className="sr-only">Assistant is thinking</span>
+      <span className="sr-only">{label === "Thinking" ? "Assistant is thinking" : label}</span>
       <Brain className="size-4 animate-pulse" aria-hidden="true" />
       <span className="animate-pulse font-medium" aria-hidden="true">
-        Thinking
+        {label}
       </span>
       <span className="flex items-center gap-1" aria-hidden="true">
         {[0, 160, 320].map((delay) => (
