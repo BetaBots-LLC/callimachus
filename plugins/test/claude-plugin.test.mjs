@@ -62,23 +62,38 @@ test("marketplace.json serves the plugin from the release tag, not main", () => 
   });
 });
 
-test("every hook runs a real cal subcommand behind the missing-cal guard", () => {
+test("every hook is a plain sh script in the plugin that runs a real cal subcommand behind the missing-cal guard", () => {
   const known = calCommands();
   const { hooks } = readJson(plugin, "hooks", "hooks.json");
   const events = Object.keys(hooks).sort();
   assert.deepEqual(events, ["PreCompact", "SessionEnd", "SessionStart"]);
-  // A subcommand and at most one flag (`index --if-stale`, the freshness guard), which
-  // first asks `cal help` whether this `cal` has the command (see the next test).
-  const guard =
-    /^\[ ! -x "\$HOME\/\.local\/bin\/cal" \] \|\| (?:! "\$HOME\/\.local\/bin\/cal" help 2>\/dev\/null \| grep -q '\^ {2}cal ([a-z-]+) ' \|\| )?"\$HOME\/\.local\/bin\/cal" ([a-z-]+)( --[a-z-]+)?$/;
+  // Anthropic's directory allows no variable but ${CLAUDE_PLUGIN_ROOT} in a hook command, so
+  // the command names a script and the script holds the guard: exit quietly without cal, ask
+  // `cal help` first when the command is newer than the app may be, then run one subcommand
+  // with at most one flag (`index --if-stale`, the freshness guard).
+  const command = /^"\$\{CLAUDE_PLUGIN_ROOT\}"\/scripts\/([a-z-]+)\.sh$/;
+  const run = /^exec ~\/\.local\/bin\/cal ([a-z-]+)( --[a-z-]+)?$/;
+  const probe =
+    /^~\/\.local\/bin\/cal help 2>\/dev\/null \| grep -q '\^ {2}cal ([a-z-]+) ' \|\| exit 0$/;
   for (const event of events) {
     for (const group of hooks[event]) {
       for (const hook of group.hooks) {
         assert.equal(hook.type, "command");
-        const m = hook.command.match(guard);
-        assert.ok(m, `${event}: unguarded or unexpected command ${hook.command}`);
-        assert.ok(known.has(m[2]), `${event}: \`cal ${m[2]}\` is not in COMMANDS`);
-        if (m[1]) assert.equal(m[1], m[2], `${event}: the help probe checks another command`);
+        const m = hook.command.match(command);
+        assert.ok(m, `${event}: unexpected command ${hook.command}`);
+        const lines = read(plugin, "scripts", `${m[1]}.sh`).trimEnd().split("\n");
+        assert.equal(lines[0], "#!/bin/sh", `${m[1]}.sh: a plain sh script`);
+        assert.ok(
+          lines.includes("[ -x ~/.local/bin/cal ] || exit 0"),
+          `${m[1]}.sh: no missing-cal guard`,
+        );
+        const last = lines.at(-1).match(run);
+        assert.ok(last, `${m[1]}.sh: does not end by running one cal subcommand: ${lines.at(-1)}`);
+        assert.equal(last[1], m[1], `${m[1]}.sh: the script is named after another command`);
+        assert.ok(known.has(last[1]), `${event}: \`cal ${last[1]}\` is not in COMMANDS`);
+        const probed = lines.map((l) => l.match(probe)).find(Boolean);
+        if (probed)
+          assert.equal(probed[1], last[1], `${m[1]}.sh: the help probe checks another command`);
         assert.ok(Number.isInteger(hook.timeout) && hook.timeout > 0, `${event}: timeout`);
       }
     }
@@ -87,19 +102,23 @@ test("every hook runs a real cal subcommand behind the missing-cal guard", () =>
 
 test("SessionStart also runs the freshness guard, which starts cal index in the background", () => {
   const { hooks } = readJson(plugin, "hooks", "hooks.json");
-  const commands = hooks.SessionStart.flatMap((group) => group.hooks.map((h) => h.command));
-  assert.ok(commands.some((c) => c.endsWith('"$HOME/.local/bin/cal" hook')));
+  const scripts = hooks.SessionStart.flatMap((group) => group.hooks.map((h) => h.command));
+  assert.ok(scripts.some((c) => c.endsWith("/scripts/hook.sh")));
   const guard = hooks.SessionStart.find((group) =>
-    group.hooks.some((h) => h.command.endsWith(" index --if-stale")),
+    group.hooks.some((h) => h.command.endsWith("/scripts/index.sh")),
   );
   assert.ok(guard, "no `cal index --if-stale` SessionStart hook");
   // Only where a session's work starts; clear and compact come after one of these checked.
   assert.equal(guard.matcher, "startup|resume");
   // Released apps before this one have no `cal index`: their `cal` answered "unknown
-  // command" with exit 1, a hook error at every session start. The guard asks `cal help`
+  // command" with exit 1, a hook error at every session start. The script asks `cal help`
   // first and stays silent when the line is missing.
-  const [{ command }] = guard.hooks;
-  assert.match(command, / help 2>\/dev\/null \| grep -q '\^ {2}cal index ' \|\| /);
+  const script = read(plugin, "scripts", "index.sh");
+  assert.match(
+    script,
+    /^~\/\.local\/bin\/cal help 2>\/dev\/null \| grep -q '\^ {2}cal index ' \|\| exit 0$/m,
+  );
+  assert.match(script, /^exec ~\/\.local\/bin\/cal index --if-stale$/m);
   const usage = read(root, "apps", "desktop", "src-tauri", "core", "src", "cli_core.rs");
   assert.match(usage, /^ {2}cal index {2,}\S/m, "USAGE lists `  cal index` as the probe expects");
 });
