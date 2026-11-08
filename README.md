@@ -108,7 +108,7 @@ The `--ignored` tests touch live data on this machine: each source has a `real_<
 
 Beyond the desktop window, the same local index is reachable from your agents, terminal, and editor, all reading one `index.db`.
 
-**Claude Code plugin**: the one-step setup for Claude Code. It bundles the `/recall` skill (as `/callimachus:recall`), the MCP server (through `npx -y callimachus-mcp@<version>`, pinned to the plugin's release) and the SessionStart, PreCompact and SessionEnd memory hooks ([plugins/claude-code](plugins/claude-code)):
+**Claude Code plugin**: the one-step setup for Claude Code. It bundles the `/recall` skill (as `/callimachus:recall`), the MCP server (the `callimachus-mcp` launcher ships inside the plugin and runs with `node`, pinned to the plugin's release) and the SessionStart, PreCompact and SessionEnd memory hooks ([plugins/claude-code](plugins/claude-code)):
 
 ```bash
 claude plugin marketplace add BetaBots-LLC/callimachus

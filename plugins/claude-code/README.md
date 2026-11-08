@@ -3,8 +3,9 @@
 The Callimachus plugin gives Claude Code your past AI coding sessions as memory:
 
 - the `/callimachus:recall` skill, which tells Claude when and how to search your history;
-- the `callimachus` MCP server (`npx -y callimachus-mcp@<version>`, pinned to the plugin's
-  release): search, recall, `check_decision`, project memory and the write-back tools;
+- the `callimachus` MCP server, run with `node` from the launcher in the plugin's `mcp/` folder
+  (a copy of the `callimachus-mcp` npm package, pinned to the plugin's release): search,
+  recall, `check_decision`, project memory and the write-back tools;
 - the memory hooks: SessionStart injects the repo's memory (or a digest of its recent
   sessions) and keeps the index fresh when the desktop app is not running, PreCompact
   snapshots the session and keeps Claude Code's compaction summary, and SessionEnd queues the
@@ -23,8 +24,11 @@ The Callimachus plugin gives Claude Code your past AI coding sessions as memory:
   **Install the cal CLI** in Settings > Agents (with the plugin enabled, the Claude Code
   button installs only `cal`), or run `npx callimachus-mcp --install-cal`. Until `cal`
   exists, the hooks exit quietly and do nothing.
-- Node.js 18 or later for `npx`, which downloads the MCP server release binary and checks it
-  against the release's `SHA256SUMS`.
+- Node.js 18 or later, which runs the MCP launcher inside the plugin (`mcp/bin/callimachus-mcp.mjs`,
+  plain JavaScript with no dependencies; read it to see exactly what runs). It downloads the MCP
+  server binary from the plugin's GitHub release, checks it against that release's
+  `SHA256SUMS` before running it, and caches it, as the npm package does (which carries the
+  checksum file in its tarball instead). Nothing is fetched from the npm registry.
 
 ## Install
 
@@ -74,8 +78,8 @@ sessions) is switched on in the app's Settings > AI engine, so without the app t
 a digest of the repo's recent sessions plus anything you record with `cal remember` or the MCP
 write tools. Search, recall, `check_decision`, snapshots and the hooks work the same.
 
-**Version coupling.** The plugin pins its MCP server to its own release
-(`npx -y callimachus-mcp@<version>`), and each time that server starts it moves a `cal` linked
+**Version coupling.** The plugin pins its MCP server to its own release (the launcher in
+`mcp/` downloads that release's binary), and each time that server starts it moves a `cal` linked
 by `--install-cal` up to the same release, so `cal` and the server open the index with the same
 schema. The exception is another, newer launcher on the machine (an unpinned `npx -y
 callimachus-mcp` in another MCP client): it moves `cal` ahead, nothing moves it back, and its

@@ -9,7 +9,7 @@
 //   apps/desktop/src-tauri/Cargo.lock        the root `callimachus` package entry
 //   server.json                              registry manifest + pinned npm version
 //   plugins/claude-code/.claude-plugin/plugin.json  Claude Code plugin "version"
-//   plugins/claude-code/.mcp.json            pinned `callimachus-mcp@<version>`
+//   plugins/claude-code/mcp/package.json     the vendored MCP launcher's "version"
 //   .claude-plugin/marketplace.json          plugin source `ref` = the `v<version>` tag
 //
 // Run automatically by the `version-packages` script. Safe to run by hand, and
@@ -28,7 +28,7 @@ const cargoPath = join(desktop, "src-tauri", "Cargo.toml");
 const lockPath = join(desktop, "src-tauri", "Cargo.lock");
 const serverPath = join(root, "server.json");
 const pluginPath = join(root, "plugins", "claude-code", ".claude-plugin", "plugin.json");
-const pluginMcpPath = join(root, "plugins", "claude-code", ".mcp.json");
+const pluginLauncherPath = join(root, "plugins", "claude-code", "mcp", "package.json");
 const marketPath = join(root, ".claude-plugin", "marketplace.json");
 
 function fail(message) {
@@ -92,18 +92,21 @@ const pluginBefore = JSON.parse(pluginText).version;
 if (!topLevelVersion.test(pluginText)) fail('no top-level "version" in plugin.json');
 writeFileSync(pluginPath, pluginText.replace(topLevelVersion, `  "version": "${version}"`));
 
-// .mcp.json and marketplace.json: the plugin must match the app release the user installed,
-// not the tip of main. A plugin from main runs `cal` subcommands an older app does not have
-// yet, and an unpinned `npx callimachus-mcp` runs whatever npm calls latest, which can be
-// ahead of the index's schema. So the marketplace fetches the plugin from the release tag and
-// the plugin pins the MCP launcher to the same release. Both swaps are in place, keeping the
-// files' formatting.
-const pluginMcpText = readFileSync(pluginMcpPath, "utf8");
-const npxPin = /"callimachus-mcp@[^"]*"/;
-const mcpBefore = pluginMcpText.match(npxPin)?.[0].slice(17, -1);
-if (mcpBefore === undefined)
-  fail('no "callimachus-mcp@<version>" argument in plugins/claude-code/.mcp.json');
-writeFileSync(pluginMcpPath, pluginMcpText.replace(npxPin, `"callimachus-mcp@${version}"`));
+// The vendored launcher and marketplace.json: the plugin must match the app release the user
+// installed, not the tip of main. A plugin from main runs `cal` subcommands an older app does
+// not have yet, and a launcher from a newer release would download a server ahead of the
+// index's schema. So the marketplace fetches the plugin from the release tag, and the launcher
+// vendored into the plugin (plugins/claude-code/mcp, a copy of packages/callimachus-mcp) reads
+// the release it downloads from its own package.json "version". Both swaps are in place,
+// keeping the files' formatting.
+const launcherText = readFileSync(pluginLauncherPath, "utf8");
+const launcherBefore = JSON.parse(launcherText).version;
+if (!topLevelVersion.test(launcherText))
+  fail('no top-level "version" in plugins/claude-code/mcp/package.json');
+writeFileSync(
+  pluginLauncherPath,
+  launcherText.replace(topLevelVersion, `  "version": "${version}"`),
+);
 
 const marketText = readFileSync(marketPath, "utf8");
 const tagRef = /"ref": "v[^"]*"/;
@@ -117,7 +120,7 @@ console.log(`  Cargo.toml       ${cargoBefore} -> ${version}`);
 console.log(`  Cargo.lock       ${lockBefore} -> ${version}`);
 console.log(`  server.json      ${serverBefore} -> ${version}`);
 console.log(`  plugin.json      ${pluginBefore} -> ${version}`);
-console.log(`  .mcp.json        ${mcpBefore} -> ${version}`);
+console.log(`  mcp/package.json ${launcherBefore} -> ${version}`);
 console.log(`  marketplace.json v${marketBefore} -> v${version}`);
 
 /**
