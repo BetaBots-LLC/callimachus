@@ -3,6 +3,77 @@
 //! background jobs. The desktop app (`callimachus_lib`) re-exports these modules, and the
 //! standalone `cal` and `callimachus-mcp` binaries link this crate alone, so neither needs
 //! GTK or WebKit to build.
+//!
+//! # Identity and the graph tables (migration 0034)
+//!
+//! What the Batch H phase 2 features (repo memory, `cal why`, cost per commit, failure
+//! playbooks) build on. Shapes, as created by `migrations/0034_identity_and_graph.sql`:
+//!
+//! - `facts.uid TEXT`: a random v4 UUID, unique (`idx_facts_uid`, full, not partial) and
+//!   non-null and non-empty for every row after the migration (a backfill; the `facts_uid_ai`
+//!   trigger fills any insert that names none or ''; `facts_uid_bu` aborts an update that
+//!   would clear it). Insert paths pass [`knowledge::new_fact_uid`]. The merge key across
+//!   machines and files. Re-derived heuristic TODOs, re-distilled facts with the same kind and
+//!   text, re-imported Claude Code memory and compaction summaries keep theirs. An importer
+//!   that already has a uid never plain-INSERTs it unchecked: a uid already present (one this
+//!   machine published, coming back from the repo) fails the unique index and aborts the
+//!   import. Repo memory ([`knowledge::repo_memory::import_repo`]) looks each uid up inside
+//!   one IMMEDIATE transaction: an unknown uid is inserted with `extractor = 'repo'`; a uid
+//!   this machine wrote keeps its local copy; an imported one follows the file unless the user
+//!   edited or hid it; a uid another project already imported is skipped.
+//!   [`knowledge::IMPORT_FACT_SQL`] is the plain upsert (`ON CONFLICT(uid) DO UPDATE ...
+//!   WHERE facts.edited = 0 AND facts.hidden = 0`) for an importer that needs no per-project
+//!   check.
+//! - `facts.source_seq INTEGER`: the source message's `seq` in its thread (heuristic TODOs set
+//!   it). After a full re-index replaces a thread's messages, the indexer calls
+//!   [`knowledge::rebind_fact_sources`]`(conn, thread_id)`, which binds a fact to the message
+//!   at that seq only while it still contains the fact's text, else to the nearest message
+//!   that does (updating `source_seq`), else leaves `source_message_id` NULL.
+//! - `projects (key TEXT PRIMARY KEY, remote TEXT, subpath TEXT, portable_id TEXT,
+//!   refreshed_at INTEGER)`, index on `portable_id`. [`knowledge::portable_project_id`]`(conn,
+//!   key) -> Option<String>` computes and caches `host/owner/repo[#subpath]` from `git remote
+//!   get-url origin` (24 h TTL; [`knowledge::refresh_portable_project_id`] skips the cache; a
+//!   failed `git` probe is never cached); None means no remote, so fall back to the local
+//!   key. On github.com, gitlab.com and bitbucket.org the path is lowercased too.
+//!   [`knowledge::local_keys_for_portable`]`(conn, id) -> Vec<String>` maps back to the local
+//!   keys resolved so far (the watcher resolves every checkout it links). `threads.project_key`
+//!   stays the canonical absolute path.
+//! - `file_edits (thread_id, message_id, path, op, ts)`, `op` one of `read | edit | write |
+//!   mention`, indexes `(path, ts)` and `(thread_id)`. One row per tool call and path (see
+//!   [`indexer::file_edits`]); `path` is relative to the checkout the call ran in when inside
+//!   it (`src/a.rs`, `../` resolved), else as written. At most 2000 rows per thread, edits and
+//!   writes kept over reads. `message_id` carries no foreign key (rows are rewritten with the
+//!   thread's messages; a thread delete cascades) and is NULL for a Codex `apply_patch` the
+//!   backfill read from a rollout file. Prose mentions stay in `file_mentions`; sources
+//!   without tool calls add no rows. Threads indexed before 0034 are filled once, in the
+//!   background, by [`indexer::file_edits::backfill_file_edits_once`] (flagged by the
+//!   migration in `app_config` `file_edits.backfill_pending`; the watcher and `cal index` run
+//!   it), never by resetting cursors. A Claude Code subagent transcript keeps its rows under
+//!   its own thread (`is_subagent = 1`): readers that join commits or sessions to files
+//!   expand a session with [`indexer::session_thread_ids`] (and map back with
+//!   [`indexer::parent_session_id`]).
+//! - `issue_clusters (signature TEXT PRIMARY KEY, example, count, threads, first_seen,
+//!   last_seen, last_thread_id, resolved_thread_id, resolved_sha, refreshed_at)`, keyed by
+//!   [`issues::normalize`] of the example line. [`issues::refresh_clusters`]`(conn)` rebuilds
+//!   the top 500 over 180 days (the watcher's minute tick, at most every 5 minutes after new
+//!   messages, and at least daily), upserting the signatures it found and keeping their
+//!   `resolved_*`. `recurring_issues` serves an unscoped 180-day call (`cal issues`, MCP with
+//!   `project: "*"`) from it while the refresh is under 10 minutes old
+//!   ([`issues::CLUSTERS_FRESH_SECS`]), or up to a day old when nothing was indexed since
+//!   ([`issues::CLUSTERS_IDLE_SECS`]); a scoped call mines live. Readers of `issue_clusters`
+//!   filter on `refreshed_at = app_config issues.clusters_refreshed_at`. Rows the latest
+//!   refresh did not see are kept with their `resolved_*` columns: an unresolved one is pruned
+//!   once its `last_seen` falls out of the 180-day window, a resolved one is kept
+//!   indefinitely (`PRUNE_CLUSTERS_SQL`). `resolved_thread_id` / `resolved_sha` hold the fix
+//!   an unscoped read shows; each project's own fix lives in `app_config`
+//!   `issues.cluster_fixes` (JSON, signature then project key) and the stored clusters'
+//!   thread ids in `issues.cluster_threads`, because phase 2 adds no migration. The refresh is split into [`issues::clusters_due`],
+//!   [`issues::mine_for_refresh`] (read-only connection) and [`issues::store_clusters`] (the
+//!   writer). The commit linker and the cluster refresh also run from `cal index`, not only
+//!   from the watcher.
+//! - `thread_commits` stays current without a Today load: after each index batch the watcher
+//!   links the batch's threads in a git checkout ([`jobs::CommitLinker`], at most once a minute
+//!   per checkout, 2 s budget per pass).
 
 // First, so `app_log!` is in scope for every module declared after it.
 #[macro_use]
@@ -43,6 +114,8 @@ pub(crate) mod schema_check;
 pub mod search;
 pub mod snapshot;
 pub mod today;
+// `cal why`: git blame to commits to the sessions behind them, and their decisions.
+pub mod why;
 
 use error::AppResult;
 use search::SearchFilters;

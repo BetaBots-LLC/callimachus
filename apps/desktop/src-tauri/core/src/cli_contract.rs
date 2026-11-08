@@ -1,4 +1,4 @@
-//! The versioned `cal --json` contract. The ten query outputs other tools read (the VS Code
+//! The versioned `cal --json` contract. The thirteen query outputs other tools read (the VS Code
 //! extension, PR auditors, scripts) come as these envelopes, each opening with
 //! `schema_version`, when the caller asks for a version: `--json-version 1`, or
 //! `CAL_JSON_VERSION=1` in the environment beside `--json`. Plain `--json` keeps printing the
@@ -17,7 +17,7 @@ use schemars::generate::SchemaSettings;
 use schemars::JsonSchema;
 use serde::Serialize;
 
-use crate::{issues, knowledge, search};
+use crate::{cost, issues, knowledge, search};
 
 /// The major version every `cal --json` envelope carries in `schema_version`.
 pub const CAL_SCHEMA_VERSION: u32 = 1;
@@ -31,7 +31,7 @@ pub const JSON_VERSION_ENV: &str = "CAL_JSON_VERSION";
 /// Where the schemas are published (`apps/web/public/schemas/cal/`).
 pub const SCHEMA_BASE_URL: &str = "https://callimachus.app/schemas/cal/";
 
-/// A list output (`search`, `recent`, `related`, `decisions`, `gotchas`, `commits`).
+/// A list output (`search`, `recent`, `related`, `decisions`, `gotchas`, `commits`, `issues`).
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct Listing<'a, T> {
     /// Major version of this payload's shape. A reader refuses a version newer than it knows.
@@ -213,9 +213,24 @@ pub fn schemas() -> Vec<CalSchema> {
             "commits",
             "Commits inferred from this repo's threads, newest first.",
         ),
+        schema::<crate::why::WhyOutput>(
+            "why",
+            "The commits that last changed a file or line (git blame), newest first, each with \
+             the sessions inferred to have produced it and their decisions and gotchas.",
+        ),
+        schema::<Listing<issues::Issue>>(
+            "issues",
+            "Recurring errors over the last 180 days, most frequent first, each with the \
+             sessions that hit it and, once a linked commit fixed it, the fix and its playbook.",
+        ),
         schema::<AuditPrOutput>(
             "audit-pr",
             "Provenance, per-file history, recurring errors and memory for a pull request.",
+        ),
+        schema::<Versioned<cost::CostReport>>(
+            "cost",
+            "Estimated spend (list-price equivalents) per model, plus the breakdown --by asks \
+             for: sessions with waste signals, commits, projects or local days.",
         ),
     ]
 }
@@ -368,7 +383,7 @@ mod tests {
     #[test]
     fn every_schema_is_published_under_its_command() {
         let names: Vec<_> = schemas().iter().map(|s| s.command).collect();
-        assert_eq!(names.len(), 10);
+        assert_eq!(names.len(), 13);
         for s in schemas() {
             assert!(
                 crate::cli_core::COMMANDS.contains(&s.command),

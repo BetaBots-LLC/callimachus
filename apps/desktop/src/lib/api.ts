@@ -163,7 +163,8 @@ export interface ThreadDetail {
 
 /** Where a fact came from: "llm" (distilled), "heuristic" (TODO extraction), "user"
  *  (Remember), "agent" (an MCP write), "claude-memory" (a harvested Claude Code auto-memory
- *  file) or "claude-compact" (a PreCompact compaction summary). Older backends omit it. */
+ *  file), "claude-compact" (a PreCompact compaction summary) or "playbook" (the fix of a
+ *  recurring error, recorded when a linked commit fixed it). Older backends omit it. */
 export type FactExtractor =
   | "llm"
   | "heuristic"
@@ -171,6 +172,9 @@ export type FactExtractor =
   | "agent"
   | "claude-memory"
   | "claude-compact"
+  /** Imported from the repo's committed `.callimachus/memory/` files. */
+  | "repo"
+  | "playbook"
   | (string & {});
 
 /** An open TODO extracted from history (knowledge layer). */
@@ -233,6 +237,41 @@ export interface ProjectMemory {
   threadCount: number;
   distilledCount: number;
   pendingCount: number;
+}
+
+/** A project's repo memory (`.callimachus/memory/` in its checkout). */
+export interface RepoMemoryStatus {
+  /** The git checkout; null when the project has none on this machine. */
+  root: string | null;
+  /** Whether `.callimachus/memory/` exists there. */
+  published: boolean;
+  /** Ids of this project's own facts that the files also hold. */
+  sharedIds: number[];
+  /** Visible facts imported from the files. */
+  imported: number;
+}
+
+/** One fact a publish adds, changes or removes (text redacted). */
+export interface RepoFactChange {
+  uid: string;
+  kind: "decision" | "gotcha";
+  text: string;
+}
+
+/** What "Publish to repo" would write (the preview) or wrote. */
+export interface RepoPublishPlan {
+  root: string;
+  dir: string;
+  /** Portable project id written on each line, e.g. "github.com/acme/app". */
+  project: string | null;
+  all: boolean;
+  decisions: number;
+  gotchas: number;
+  added: RepoFactChange[];
+  updated: RepoFactChange[];
+  removed: RepoFactChange[];
+  /** False when the files already hold exactly this. */
+  changed: boolean;
 }
 
 /** A project (by path) with thread + distillation-coverage counts, for the picker. */
@@ -385,6 +424,27 @@ export interface IssueCluster {
   lastSeen: number;
 }
 
+/** The commit that fixed a recurring error: the latest session that hit it, then edited the
+ *  file the error named and committed. */
+export interface IssueFix {
+  sha: string;
+  shortSha: string;
+  subject: string | null;
+  committedAt: number;
+  /** The session that hit the error and made the fix. */
+  threadId: number;
+}
+
+/** A recurring error with its sessions and, once a commit fixed it, the fix and the playbook
+ *  line recorded as a gotcha. Older backends return the bare cluster (no `fix`). */
+export interface Issue extends IssueCluster {
+  /** Sessions that hit it, newest sighting first (at most 10). */
+  threadIds?: number[];
+  /** Null while no fix is known, or when the fix landed in another project. */
+  fix?: IssueFix | null;
+  playbook?: string | null;
+}
+
 export interface ModelSpend {
   model: string;
   cost: number;
@@ -406,6 +466,37 @@ export interface Spend {
   untrackedCalls: number;
   byModel: ModelSpend[];
   topThreads: ThreadCost[];
+}
+/** One local calendar day's estimated spend. */
+export interface DayCost {
+  day: string; // YYYY-MM-DD, local time
+  cost: number;
+  input: number;
+  output: number;
+  cacheWrite: number;
+  cacheRead: number;
+}
+export interface CommitSession {
+  id: number;
+  title: string | null;
+  cost: number; // the session's whole cost, subagents included
+  overlap: number;
+  commits: number; // listed commits this session also produced
+}
+/** What the sessions behind one commit cost. */
+export interface CommitCost {
+  sha: string;
+  shortSha: string;
+  subject: string | null;
+  committedAt: number;
+  project: string | null;
+  cost: number;
+  shared: boolean; // a session behind it produced another commit too
+  sessions: CommitSession[];
+}
+export interface SpendBreakdown {
+  days: DayCost[]; // the last 30 local days, oldest first, zero days included
+  commits: CommitCost[]; // the priciest commits, at most 5
 }
 
 /** What a "Shrink index" pass did (also the `compact:progress` payload, as running totals). */
@@ -502,6 +593,8 @@ export interface LedgerCounts {
   recall: number;
   /** SessionStart injections of the recent-sessions digest (repo with no memory yet). */
   digest: number;
+  /** Error-playbook injections after a failed shell command (`recall-error`). */
+  playbook: number;
 }
 
 /** What Callimachus did for the user's agents, and what it kept (`value_ledger`). */
@@ -646,11 +739,14 @@ export const api = {
   coachOverview: () => invoke<CoachOverview>("coach_overview"),
   // Recurring errors mined across all sessions (last 180 days, most frequent first).
   recurringIssues: (project?: string) =>
-    invoke<IssueCluster[]>("recurring_issues", { project: project ?? null }),
+    invoke<Issue[]>("recurring_issues", { project: project ?? null }),
   // Estimated $ spend by model + priciest threads (needs a reindex to capture token usage).
   // `since` (epoch secs) narrows the window; omitted = all time.
   spend: (project?: string, since?: number) =>
     invoke<Spend>("spend", { project: project ?? null, since: since ?? null }),
+  // Spend per local day (last 30) and the priciest commits the sessions produced.
+  spendBreakdown: (project?: string) =>
+    invoke<SpendBreakdown>("spend_breakdown", { project: project ?? null }),
   // Whether closing the window hides the app to the system tray instead of quitting.
   getCloseToTray: () => invoke<boolean>("get_close_to_tray"),
   setCloseToTray: (on: boolean) => invoke<void>("set_close_to_tray", { on }),
@@ -740,6 +836,13 @@ export const api = {
   // Write/refresh the managed memory block in a project's AGENTS.md / CLAUDE.md.
   writeAgentMemoryFile: (project: string, filename: string) =>
     invoke<string>("write_agent_memory_file", { project, filename }),
+  // Repo memory: `.callimachus/memory/*.jsonl` in the project's checkout.
+  repoMemoryStatus: (project: string) =>
+    invoke<RepoMemoryStatus>("repo_memory_status", { project }),
+  previewRepoMemory: (project: string, all: boolean) =>
+    invoke<RepoPublishPlan>("preview_repo_memory", { project, all }),
+  publishRepoMemory: (project: string, all: boolean) =>
+    invoke<RepoPublishPlan>("publish_repo_memory", { project, all }),
   // Fact curation: pin / edit / hide distilled facts; LLM conflict review.
   setFactPinned: (factId: number, pinned: boolean) =>
     invoke<void>("set_fact_pinned", { factId, pinned }),
@@ -867,6 +970,9 @@ export const api = {
   // Opt-in proactive recall: inject prior work into Claude before each prompt (reads every prompt).
   setProactiveRecall: (enabled: boolean) =>
     invoke<IntegrationStatus>("set_proactive_recall", { enabled }),
+  // Opt-in error playbooks: after each shell command Claude runs, add the fix of an error a
+  // commit fixed before (runs after every shell command).
+  setErrorRecall: (enabled: boolean) => invoke<IntegrationStatus>("set_error_recall", { enabled }),
   // CLI LLM backends (Claude Code / Codex) + whether each is installed — for keyless distillation.
   cliEngines: () => invoke<CliEngine[]>("cli_engines"),
   // MCP registration for the other detected agents (Codex / Cursor / Gemini).
@@ -918,6 +1024,9 @@ export interface IntegrationStatus {
   mcpRegistered: boolean;
   hookInstalled: boolean;
   proactiveRecallInstalled: boolean;
+  /** The opt-in error-playbook hooks (PostToolUse / PostToolUseFailure on Bash). Older
+   *  backends omit it. */
+  errorRecallInstalled?: boolean;
   calInstalled: boolean;
   /** The app runs from a permanent location, so agents can be pointed at it. */
   exeStable: boolean;

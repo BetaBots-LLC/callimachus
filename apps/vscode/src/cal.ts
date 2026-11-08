@@ -13,7 +13,7 @@ import { existsSync, realpathSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { promisify } from "node:util";
-import type { SearchHit, Stats, ThreadSummary } from "./protocol";
+import type { SearchHit, Stats, ThreadSummary, WhyResult } from "./protocol";
 
 const exec = promisify(execFile);
 
@@ -166,10 +166,15 @@ const SYSTEM_CAL_USAGE = /^usage: cal\b/im;
 
 /** Run `cal` with args, returning stdout. Throws CalSetupError when `cal` is
  *  missing or the index hasn't been built yet. */
-export async function runCal(args: string[]): Promise<string> {
+export async function runCal(
+  args: string[],
+  opts: { cwd?: string; timeoutMs?: number } = {},
+): Promise<string> {
   const bin = await resolveCalBin();
   try {
     const { stdout } = await exec(bin, args, {
+      cwd: opts.cwd,
+      timeout: opts.timeoutMs,
       maxBuffer: 64 * 1024 * 1024,
       windowsHide: true,
       // Ask for the versioned `--json` envelopes through the environment, not the
@@ -361,4 +366,57 @@ export function clearRelatedCache(): void {
 /** The packed markdown transcript for a thread. */
 export function catThread(id: number): Promise<string> {
   return runCal(["cat", String(id)]);
+}
+
+/** "Why this line": the commits behind `line` of `file` (git blame), the sessions that
+ *  produced them and their decisions. Run from the file's folder, so `cal` finds the repo
+ *  the way it would in a terminal there. */
+export async function whyLine(file: string, line: number): Promise<WhyResult> {
+  if (!(await supportsWhy(await resolveCalBin()))) throw new Error(NO_WHY_MESSAGE);
+  let raw: string;
+  try {
+    raw = await runCal(["why", `${file}:${line}`, "--json"], {
+      cwd: path.dirname(file),
+      timeoutMs: WHY_TIMEOUT_MS,
+    });
+  } catch (err) {
+    // A `cal` from before `cal why` (the extension updates apart from the app).
+    if (/unknown command 'why'/.test((err as Error).message)) {
+      throw new Error(NO_WHY_MESSAGE);
+    }
+    throw err;
+  }
+  return parseObject<WhyResult>(raw, "why");
+}
+
+const NO_WHY_MESSAGE =
+  "This version of Callimachus has no `cal why`. Update the app, then try again.";
+
+// `cal why` gives git 30 s (WHY_GIT_BUDGET in cli_core.rs); past this something is stuck,
+// and the sidebar would otherwise wait forever.
+const WHY_TIMEOUT_MS = 60_000;
+
+const whySupport = new Map<string, Promise<boolean>>();
+
+/** Whether `bin` has `cal why`. A binary named `cal` answers an unknown command with an
+ *  error, which whyLine reports. The app binary under its own name (a bundle-path
+ *  candidate) enters CLI mode only for a command its version knows, so an app from before
+ *  `cal why` would start a second GUI window instead. Ask its `help` (a command in every
+ *  release) once per binary and look for `cal why` in the usage. */
+function supportsWhy(bin: string): Promise<boolean> {
+  const stem = path.basename(bin, path.extname(bin)).toLowerCase();
+  if (stem === "cal") return Promise.resolve(true);
+  let known = whySupport.get(bin);
+  if (!known) {
+    known = exec(bin, ["help"], { timeout: PROBE_TIMEOUT_MS, windowsHide: true }).then(
+      ({ stdout, stderr }) => /\bcal why\b/.test(`${stdout}\n${stderr}`),
+      () => false,
+    );
+    // Only a yes is kept: the app may be updated (or finish installing) meanwhile.
+    void known.then((ok) => {
+      if (!ok) whySupport.delete(bin);
+    });
+    whySupport.set(bin, known);
+  }
+  return known;
 }

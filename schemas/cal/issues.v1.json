@@ -1,0 +1,123 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://callimachus.app/schemas/cal/issues.v1.json",
+  "title": "cal issues --json",
+  "description": "Recurring errors over the last 180 days, most frequent first, each with the sessions that hit it and, once a linked commit fixed it, the fix and its playbook.",
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "description": "Major version of this payload's shape. A reader refuses a version newer than it knows.",
+      "minimum": 0
+    },
+    "results": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Issue"
+      },
+      "description": "The rows, best match (or newest) first."
+    },
+    "notice": {
+      "type": "string",
+      "description": "Present only when `results` is empty because this machine couldn't run the query (no\nembedding model for `decisions` / `gotchas`), so a reader can tell that from no match."
+    }
+  },
+  "required": [
+    "schema_version",
+    "results"
+  ],
+  "$defs": {
+    "Issue": {
+      "type": "object",
+      "properties": {
+        "example": {
+          "type": "string",
+          "description": "A representative raw error line (the latest raw sighting: candidates are read newest\nfirst and the first line seen for a signature is kept)."
+        },
+        "count": {
+          "type": "integer",
+          "description": "How many messages this error appeared in (≈ times you hit it)."
+        },
+        "threads": {
+          "type": "integer",
+          "description": "Distinct threads it spans."
+        },
+        "firstSeen": {
+          "type": "integer"
+        },
+        "lastSeen": {
+          "type": "integer"
+        },
+        "threadIds": {
+          "type": "array",
+          "items": {
+            "type": "integer"
+          },
+          "description": "The sessions that hit it, newest sighting first (at most 10)."
+        },
+        "fix": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/IssueFix"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The commit that fixed it, null while none is known. Scoped to a project, the newest fix\nmade there (a fix in another project is left out); unscoped, the fix in the project of\nthe latest sighting, else the newest in any project."
+        },
+        "playbook": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The playbook gotcha recorded for that fix in its project (`extractor = 'playbook'`),\nnull when there is none or the user deleted it."
+        }
+      },
+      "required": [
+        "example",
+        "count",
+        "threads",
+        "firstSeen",
+        "lastSeen",
+        "threadIds",
+        "fix",
+        "playbook"
+      ],
+      "description": "A recurring error with its sessions and, once a commit fixed it, the fix and the playbook\nline: what `cal issues --json-version 1`, MCP `recurring_issues` and the app return."
+    },
+    "IssueFix": {
+      "type": "object",
+      "properties": {
+        "sha": {
+          "type": "string"
+        },
+        "shortSha": {
+          "type": "string"
+        },
+        "subject": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The commit's subject line."
+        },
+        "committedAt": {
+          "type": "integer"
+        },
+        "threadId": {
+          "type": "integer",
+          "description": "The session that hit the error and made the fix."
+        }
+      },
+      "required": [
+        "sha",
+        "shortSha",
+        "subject",
+        "committedAt",
+        "threadId"
+      ],
+      "description": "The commit that fixed a recurring error in one project: the latest session there that hit\nit, then edited the file its error named and committed a change to that file."
+    }
+  }
+}

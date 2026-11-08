@@ -10,9 +10,9 @@ import * as vscode from "vscode";
 import { getHtml } from "./webviewHtml";
 import { handleWebviewMessage } from "./webviewMessages";
 import { openThreadPanel } from "./threadPanel";
-import { clearRelatedCache, config, relatedThreads } from "./cal";
+import { clearRelatedCache, config, relatedThreads, showCalSetupPrompt, whyLine } from "./cal";
 import { type EditorContext, EditorContextWatcher } from "./editorContext";
-import type { FromWebview, InitPayload, ToWebview } from "./protocol";
+import type { FromWebview, InitPayload, ToWebview, WhyState } from "./protocol";
 
 export class SidebarProvider implements vscode.WebviewViewProvider, vscode.Disposable {
   public static readonly viewId = "callimachus.sidebar";
@@ -23,6 +23,12 @@ export class SidebarProvider implements vscode.WebviewViewProvider, vscode.Dispo
   // that a newer context has superseded is dropped instead of flashing in.
   private inFlight = false;
   private pending: { ctx: EditorContext | null } | undefined;
+  // The webview has sent `ready` (it listens for pushes). Until then the latest "Why this
+  // line" state waits here: the command focuses the view, which may not exist yet.
+  private webviewReady = false;
+  private whyState: WhyState | null = null;
+  // Each "Why this line" run; a slower earlier run must not overwrite a newer answer.
+  private whySeq = 0;
 
   constructor(private readonly extensionUri: vscode.Uri) {
     this.watcher = new EditorContextWatcher(
@@ -42,6 +48,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider, vscode.Dispo
       enableScripts: true,
       localResourceRoots: [vscode.Uri.joinPath(this.extensionUri, "media")],
     };
+    this.webviewReady = false;
     view.webview.html = getHtml(view.webview, this.extensionUri);
 
     // Re-evaluate related threads whenever the panel is shown again.
@@ -54,8 +61,14 @@ export class SidebarProvider implements vscode.WebviewViewProvider, vscode.Dispo
         const project = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? null;
         const init: InitPayload = { view: "sidebar", projectPath: project };
         view.webview.postMessage({ kind: "init", init } satisfies ToWebview);
+        this.webviewReady = true;
+        if (this.whyState) this.postWhy();
         // Now the webview is listening — kick off the first ambient query.
         this.watcher.refresh();
+        return;
+      }
+      if (msg.kind === "closeWhy") {
+        this.clearWhy();
         return;
       }
       handleWebviewMessage(view.webview, msg, {
@@ -102,6 +115,38 @@ export class SidebarProvider implements vscode.WebviewViewProvider, vscode.Dispo
     } catch {
       // Background feature — stay quiet (e.g. cal missing, index not embedded).
     }
+  }
+
+  /** "Why this line": show the sidebar, then the commits and sessions behind `line` of
+   *  `file` (1-based) as `cal why` reports them. */
+  async why(file: string, line: number): Promise<void> {
+    const seq = ++this.whySeq;
+    this.setWhy({ status: "loading", file, line });
+    await vscode.commands.executeCommand(`${SidebarProvider.viewId}.focus`);
+    try {
+      const result = await whyLine(file, line);
+      if (seq === this.whySeq) this.setWhy({ status: "done", file, line, result });
+    } catch (err) {
+      showCalSetupPrompt(err); // download/setup toast for missing cal / no index
+      if (seq === this.whySeq) {
+        this.setWhy({ status: "error", file, line, message: (err as Error).message });
+      }
+    }
+  }
+
+  /** Close the "Why this line" section. */
+  clearWhy(): void {
+    this.whySeq++;
+    this.setWhy(null);
+  }
+
+  private setWhy(state: WhyState | null): void {
+    this.whyState = state;
+    if (this.webviewReady) this.postWhy();
+  }
+
+  private postWhy(): void {
+    this.view?.webview.postMessage({ kind: "why", state: this.whyState } satisfies ToWebview);
   }
 
   /** Title-bar refresh: reload recent + re-run the current search in the webview. */

@@ -1,0 +1,437 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://callimachus.app/schemas/cal/cost.v1.json",
+  "title": "cal cost --json",
+  "description": "Estimated spend (list-price equivalents) per model, plus the breakdown --by asks for: sessions with waste signals, commits, projects or local days.",
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "description": "Major version of this payload's shape. A reader refuses a version newer than it knows.",
+      "minimum": 0
+    },
+    "by": {
+      "$ref": "#/$defs/CostBy"
+    },
+    "since": {
+      "type": "integer",
+      "description": "Start of the window in epoch seconds (0: all time). With `by: commit` it bounds the\ncommit dates, and each session's whole cost counts."
+    },
+    "basis": {
+      "type": "string",
+      "description": "What the figures are (list-price equivalents, not a bill)."
+    },
+    "totalCost": {
+      "type": "number"
+    },
+    "trackedCalls": {
+      "type": "integer"
+    },
+    "untrackedCalls": {
+      "type": "integer"
+    },
+    "byModel": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ModelCost"
+      }
+    },
+    "threads": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "$ref": "#/$defs/SessionCost"
+      }
+    },
+    "commits": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "$ref": "#/$defs/CommitCost"
+      }
+    },
+    "projects": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "$ref": "#/$defs/ProjectCost"
+      }
+    },
+    "days": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "$ref": "#/$defs/DayCost"
+      }
+    }
+  },
+  "required": [
+    "schema_version",
+    "by",
+    "since",
+    "basis",
+    "totalCost",
+    "trackedCalls",
+    "untrackedCalls",
+    "byModel"
+  ],
+  "$defs": {
+    "CostBy": {
+      "oneOf": [
+        {
+          "type": "string",
+          "const": "model",
+          "description": "Per model only (the default)."
+        },
+        {
+          "type": "string",
+          "const": "thread",
+          "description": "Per session: a Claude Code session's subagents count toward it."
+        },
+        {
+          "type": "string",
+          "const": "commit",
+          "description": "Per commit the sessions produced (from `thread_commits`)."
+        },
+        {
+          "type": "string",
+          "const": "project",
+          "description": "Per project."
+        },
+        {
+          "type": "string",
+          "const": "day",
+          "description": "Per local calendar day."
+        }
+      ],
+      "description": "How `cal cost` breaks spend down."
+    },
+    "ModelCost": {
+      "type": "object",
+      "properties": {
+        "model": {
+          "type": "string"
+        },
+        "family": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The price-table family it matched (`claude-opus`, `gpt-5`...), null when none did."
+        },
+        "priced": {
+          "type": "boolean",
+          "description": "False when the model has no price: its cost is 0 and its calls are untracked."
+        },
+        "unpricedReason": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Why an unpriced model has no price (null for a priced one)."
+        },
+        "cost": {
+          "type": "number"
+        },
+        "calls": {
+          "type": "integer"
+        },
+        "input": {
+          "type": "integer"
+        },
+        "output": {
+          "type": "integer"
+        },
+        "cacheWrite": {
+          "type": "integer"
+        },
+        "cacheRead": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "model",
+        "family",
+        "priced",
+        "unpricedReason",
+        "cost",
+        "calls",
+        "input",
+        "output",
+        "cacheWrite",
+        "cacheRead"
+      ],
+      "description": "Spend on one model."
+    },
+    "SessionCost": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer"
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "type": "string"
+        },
+        "project": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "lastActive": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "cost": {
+          "type": "number",
+          "description": "The session's own cost plus its subagents'."
+        },
+        "subagentCost": {
+          "type": "number"
+        },
+        "subagents": {
+          "type": "integer",
+          "description": "Subagent transcripts folded into this session."
+        },
+        "calls": {
+          "type": "integer",
+          "description": "Priced model calls, subagents included."
+        },
+        "turns": {
+          "type": "integer",
+          "description": "User turns in the session itself."
+        },
+        "signals": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CostSignal"
+          }
+        }
+      },
+      "required": [
+        "id",
+        "title",
+        "source",
+        "project",
+        "lastActive",
+        "cost",
+        "subagentCost",
+        "subagents",
+        "calls",
+        "turns",
+        "signals"
+      ],
+      "description": "One session's spend (`--by thread`)."
+    },
+    "CostSignal": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/SignalKind"
+        },
+        "label": {
+          "type": "string",
+          "description": "Ready to show, e.g. \"Cache reads 64% of cost\"."
+        },
+        "value": {
+          "type": "number",
+          "description": "The share (0 to 1) or count behind the label."
+        }
+      },
+      "required": [
+        "kind",
+        "label",
+        "value"
+      ],
+      "description": "Where a session's spend went, as a short neutral label (never a judgment)."
+    },
+    "SignalKind": {
+      "oneOf": [
+        {
+          "type": "string",
+          "const": "cacheReads",
+          "description": "Re-reading cached context is most of the session's cost."
+        },
+        {
+          "type": "string",
+          "const": "longSession",
+          "description": "More than 50 turns; `value` is the share of cost after turn 50."
+        },
+        {
+          "type": "string",
+          "const": "subagents",
+          "description": "Subagents spent a large share of the session's cost."
+        },
+        {
+          "type": "string",
+          "const": "toolLoop",
+          "description": "The same tool failed several times in a row; `value` is the longest run."
+        }
+      ],
+      "description": "The kind of a [`CostSignal`]."
+    },
+    "CommitCost": {
+      "type": "object",
+      "properties": {
+        "sha": {
+          "type": "string"
+        },
+        "shortSha": {
+          "type": "string"
+        },
+        "subject": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "committedAt": {
+          "type": "integer"
+        },
+        "project": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cost": {
+          "type": "number",
+          "description": "The sum of its sessions' whole costs."
+        },
+        "shared": {
+          "type": "boolean",
+          "description": "True when a session behind it also produced another listed commit, so commit costs\noverlap and do not add up to the total."
+        },
+        "sessions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CommitSession"
+          }
+        }
+      },
+      "required": [
+        "sha",
+        "shortSha",
+        "subject",
+        "committedAt",
+        "project",
+        "cost",
+        "shared",
+        "sessions"
+      ],
+      "description": "What the sessions behind one commit cost (`--by commit`)."
+    },
+    "CommitSession": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer"
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cost": {
+          "type": "number",
+          "description": "The session's whole cost, subagents included."
+        },
+        "overlap": {
+          "type": "integer",
+          "description": "Files the session and the commit share (the link's confidence)."
+        },
+        "commits": {
+          "type": "integer",
+          "description": "How many of the listed commits this session is linked to. Above 1, its cost counts\ntoward each of them in full."
+        }
+      },
+      "required": [
+        "id",
+        "title",
+        "cost",
+        "overlap",
+        "commits"
+      ],
+      "description": "A session behind a commit."
+    },
+    "ProjectCost": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The project key; null for sessions outside any project."
+        },
+        "cost": {
+          "type": "number"
+        },
+        "threads": {
+          "type": "integer",
+          "description": "Sessions with usage; a Claude Code session's subagent transcripts count with it."
+        },
+        "calls": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "project",
+        "cost",
+        "threads",
+        "calls"
+      ],
+      "description": "One project's spend (`--by project`)."
+    },
+    "DayCost": {
+      "type": "object",
+      "properties": {
+        "day": {
+          "type": "string",
+          "description": "`YYYY-MM-DD` in the machine's local time zone."
+        },
+        "cost": {
+          "type": "number"
+        },
+        "input": {
+          "type": "integer"
+        },
+        "output": {
+          "type": "integer"
+        },
+        "cacheWrite": {
+          "type": "integer"
+        },
+        "cacheRead": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "day",
+        "cost",
+        "input",
+        "output",
+        "cacheWrite",
+        "cacheRead"
+      ],
+      "description": "One local calendar day's spend (`--by day`)."
+    }
+  }
+}

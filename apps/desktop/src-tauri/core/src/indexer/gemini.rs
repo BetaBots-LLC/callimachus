@@ -3,14 +3,19 @@
 //! (`sessionId`, `startTime`, `lastUpdated`, `directories`); subsequent lines are
 //! message records typed `user` / `gemini` (= assistant), each carrying a
 //! `content` PartListUnion (a plain string or an array of `{text}` / `{functionCall}`
-//! / `{functionResponse}` parts). We index user/assistant text and tool calls.
+//! / `{functionResponse}` parts). We index user/assistant text and tool calls, plus each
+//! `gemini` record's `model` and `tokens` (the response's usage metadata) for spend.
+//!
+//! The recorder appends a message again, whole and under the same `id`, when it changes:
+//! the tokens of a response arrive after its text (`recordMessageTokens`), and tool calls
+//! are added to the last message (`recordToolCalls`). The latest copy of a record wins.
 //!
 //! Schema verified against google-gemini/gemini-cli `chatRecordingService.ts`.
 
 use super::common::{parse_rfc3339, push_message, truncate_title};
 use super::{
-    file_change_state, set_file_state, source_id, upsert_thread, IndexReport, ParsedMessage,
-    ParsedThread,
+    file_change_state, set_file_state, source_id, upsert_thread, IndexReport, MsgUsage,
+    ParsedMessage, ParsedThread,
 };
 use anyhow::{Context, Result};
 use rusqlite::Connection;
@@ -132,9 +137,72 @@ fn segments_after_chats(rel: &str) -> usize {
     }
 }
 
-/// Folds one parsed JSONL record into the thread under construction, recording the
-/// first user message's text (the title fallback).
-pub(super) type IngestLine = fn(&mut ParsedThread, &Value, &mut Option<String>);
+/// Folds one parsed JSONL record into the thread under construction.
+pub(super) type IngestLine = fn(&mut ParsedThread, &Value, &mut ChatState);
+
+/// What a chat parse carries from one record to the next.
+#[derive(Default)]
+pub(super) struct ChatState {
+    /// The first user message's text (the title fallback).
+    pub first_user_text: Option<String>,
+    /// The last message record, so a re-recorded copy of it replaces the first copy instead
+    /// of repeating it.
+    last_record: Option<RecordStart>,
+}
+
+/// Where a message record's additions to the thread start.
+struct RecordStart {
+    id: String,
+    messages: usize,
+    usage: usize,
+    /// The last usage entry as it stood before the record: a record with no message of its
+    /// own (a tool-call-only turn) adds its tokens into that entry rather than pushing one,
+    /// so truncating `usage` alone would keep the first copy's tokens and every copy would
+    /// add them again (3 copies of a 2,000-token turn stored 6,000).
+    last_usage: Option<MsgUsage>,
+}
+
+impl ChatState {
+    /// Start a message record with this `id` (None: a record without one). A copy of the
+    /// previous record (same id) first drops what that record added, tokens included.
+    pub(super) fn begin_record(&mut self, thread: &mut ParsedThread, id: Option<&str>) {
+        if let (Some(id), Some(last)) = (id, &self.last_record) {
+            if last.id == id {
+                thread.messages.truncate(last.messages);
+                thread.usage.truncate(last.usage);
+                if let (Some(entry), Some(was)) = (thread.usage.last_mut(), &last.last_usage) {
+                    entry.1 = was.clone();
+                }
+                return;
+            }
+        }
+        self.last_record = id.map(|id| RecordStart {
+            id: id.to_string(),
+            messages: thread.messages.len(),
+            usage: thread.usage.len(),
+            last_usage: thread.usage.last().map(|(_, u)| u.clone()),
+        });
+    }
+}
+
+/// A Gemini `GenerateContentResponseUsageMetadata` as usage. The prompt count includes the
+/// cached tokens; thinking is billed as output and tool-use prompts as input.
+pub(super) fn gemini_usage(
+    model: &str,
+    prompt: i64,
+    cached: i64,
+    tool: i64,
+    output: i64,
+    thoughts: i64,
+) -> MsgUsage {
+    MsgUsage {
+        model: model.to_string(),
+        input: (prompt - cached).max(0) + tool.max(0),
+        output: output.max(0) + thoughts.max(0),
+        cache_write: 0,
+        cache_read: cached.max(0),
+    }
+}
 
 /// Parse a chat `.jsonl` file line by line with `ingest`, tolerating malformed lines.
 /// Returns None if it yields no messages.
@@ -148,7 +216,7 @@ pub(super) fn parse_chat_jsonl(
         external_id: external_id.to_string(),
         ..Default::default()
     };
-    let mut first_user_text: Option<String> = None;
+    let mut state = ChatState::default();
     for line in content.lines() {
         if line.trim().is_empty() {
             continue;
@@ -156,13 +224,13 @@ pub(super) fn parse_chat_jsonl(
         let Ok(obj) = serde_json::from_str::<Value>(line) else {
             continue; // tolerate the occasional malformed line
         };
-        ingest(&mut thread, &obj, &mut first_user_text);
+        ingest(&mut thread, &obj, &mut state);
     }
     if thread.messages.is_empty() {
         return Ok(None);
     }
     if thread.title.is_none() {
-        thread.title = first_user_text.as_deref().map(truncate_title);
+        thread.title = state.first_user_text.as_deref().map(truncate_title);
     }
     Ok(Some(thread))
 }
@@ -230,7 +298,7 @@ pub fn parse_file(path: &Path, external_id: &str) -> Result<Option<ParsedThread>
 
 /// Fold one JSONL line into the thread under construction. Handles both the
 /// session-metadata line and the message records.
-fn ingest_line(thread: &mut ParsedThread, obj: &Value, first_user_text: &mut Option<String>) {
+fn ingest_line(thread: &mut ParsedThread, obj: &Value, state: &mut ChatState) {
     // Session metadata (first line): pick up the project dir from `directories`.
     if let Some(dirs) = obj.get("directories").and_then(Value::as_array) {
         if let Some(dir) = dirs
@@ -259,7 +327,35 @@ fn ingest_line(thread: &mut ParsedThread, obj: &Value, first_user_text: &mut Opt
         Some("gemini") => "assistant",
         _ => return, // info / error / warning / tool records — skipped for now
     };
-    ingest_parts(thread, role, obj.get("content"), ts, first_user_text);
+    state.begin_record(thread, obj.get("id").and_then(Value::as_str));
+    let before = thread.messages.len();
+    ingest_parts(
+        thread,
+        role,
+        obj.get("content"),
+        ts,
+        &mut state.first_user_text,
+    );
+    // `tokens` is `{input, output, cached, thoughts, tool, total}`, the response's usage
+    // metadata as `recordMessageTokens` stores it (chatRecordingService.ts, checked
+    // 2026-11-07), on the `gemini` record beside its `model`.
+    if let (Some(model), Some(t)) = (
+        obj.get("model").and_then(Value::as_str),
+        obj.get("tokens").filter(|t| t.is_object()),
+    ) {
+        let n = |k: &str| t.get(k).and_then(Value::as_i64).unwrap_or(0);
+        thread.attach_usage(
+            Some(before),
+            gemini_usage(
+                model,
+                n("input"),
+                n("cached"),
+                n("tool"),
+                n("output"),
+                n("thoughts"),
+            ),
+        );
+    }
 }
 
 #[cfg(test)]
@@ -314,6 +410,61 @@ mod tests {
             .unwrap();
         assert_eq!(tool.tool_name.as_deref(), Some("run_shell_command"));
         assert!(tool.text.contains("cargo build"));
+    }
+
+    /// A turn with no text (tool calls only) puts its tokens on the message before it; when
+    /// the recorder writes that turn three times (recorded, tool calls scheduled, tool calls
+    /// done) its tokens still count once.
+    #[test]
+    fn a_re_recorded_turn_without_text_counts_its_tokens_once() {
+        let path = temp_path("gem_empty_turn.jsonl");
+        let turn = r#"{"id":"m3","type":"gemini","timestamp":"2026-06-01T10:00:06.000Z","content":"","model":"gemini-2.5-pro","tokens":{"input":2000,"output":0,"cached":0,"thoughts":0,"tool":0,"total":2000}}"#;
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"sessionId":"s","startTime":"2026-06-01T10:00:00.000Z","directories":["/p"]}}
+{{"id":"m1","type":"user","timestamp":"2026-06-01T10:00:00.000Z","content":"hello"}}
+{{"id":"m2","type":"gemini","timestamp":"2026-06-01T10:00:05.000Z","content":"hi there","model":"gemini-2.5-pro","tokens":{{"input":1000,"output":0,"cached":0,"thoughts":0,"tool":0,"total":1000}}}}
+{turn}
+{turn}
+{turn}
+"#
+            ),
+        )
+        .unwrap();
+        let t = parse_file(&path, "p/chats/s.jsonl").unwrap().unwrap();
+        assert_eq!(t.messages.len(), 2);
+        let inputs: Vec<(usize, i64)> = t.usage.iter().map(|(i, u)| (*i, u.input)).collect();
+        assert_eq!(inputs, vec![(1, 3000)], "m2's 1000 plus m3's 2000, once");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The recorder appends a message again once its tokens arrive: the copy replaces the
+    /// first one, and its usage (prompt minus cached, thinking as output) lands on it.
+    #[test]
+    fn a_re_recorded_message_carries_its_tokens_once() {
+        let path = temp_path("gem_tokens.jsonl");
+        std::fs::write(
+            &path,
+            r#"{"sessionId":"s","startTime":"2026-06-01T10:00:00.000Z","directories":["/p"]}
+{"id":"m1","type":"user","timestamp":"2026-06-01T10:00:00.000Z","content":"hello"}
+{"id":"m2","type":"gemini","timestamp":"2026-06-01T10:00:05.000Z","content":"hi there","model":"gemini-2.5-pro"}
+{"id":"m2","type":"gemini","timestamp":"2026-06-01T10:00:05.000Z","content":"hi there","model":"gemini-2.5-pro","tokens":{"input":1200,"output":40,"cached":1000,"thoughts":10,"tool":0,"total":1250}}
+{"$set":{"lastUpdated":"2026-06-01T10:00:06.000Z"}}
+"#,
+        )
+        .unwrap();
+        let t = parse_file(&path, "p/chats/s.jsonl").unwrap().unwrap();
+        let texts: Vec<&str> = t.messages.iter().map(|m| m.text.as_str()).collect();
+        assert_eq!(texts, vec!["hello", "hi there"]);
+        assert_eq!(t.usage.len(), 1);
+        let (i, u) = &t.usage[0];
+        assert_eq!(*i, 1);
+        assert_eq!(u.model, "gemini-2.5-pro");
+        assert_eq!(
+            [u.input, u.output, u.cache_write, u.cache_read],
+            [200, 50, 0, 1000]
+        );
     }
 
     #[test]

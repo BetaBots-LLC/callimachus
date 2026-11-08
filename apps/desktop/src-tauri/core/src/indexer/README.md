@@ -30,7 +30,7 @@ pub struct ParsedThread {
     pub updated_at: Option<i64>,
     pub is_subagent: bool,
     pub messages: Vec<ParsedMessage>,
-    pub usage: Vec<(usize, MsgUsage)>, // optional: token usage per assistant turn, keyed by message index (Claude Code fills it)
+    pub usage: Vec<(usize, MsgUsage)>, // optional: token usage per model call, keyed by message index (Claude Code, Codex, Gemini, Qwen, OpenCode and Copilot fill it; `ParsedThread::attach_usage` places a call with no message of its own)
 }
 pub struct ParsedMessage {
     pub role: String,             // user | assistant | tool | system
@@ -82,12 +82,36 @@ but is never embedded or distilled; the tail is kept because that is where build
 errors (what `issues.rs` mines) usually are. Cap the **trimmed** text so the result is
 deterministic and the incremental prefix check stays stable. Claude Code also caps its tool
 calls (assistant rows with a `tool_name`, `"Write: {input json}"`), since a Write carries the
-whole file; the other sources store calls in full. Rows indexed before the cap are not a
+whole file, and so does Codex for its freeform `apply_patch` calls; the other sources store
+calls in full. Rows indexed before the cap are not a
 mismatch either: `upsert_thread` treats a stored `tool` row, or a stored tool call, whose
 capped form is the new text as matching and rewrites it in place, so the first re-parse
 after an upgrade doesn't full-replace the thread. `cleanup::compact_tool_output` rewrites
 such rows in bulk with the same function: `tool` rows for the sources registered with
 `caps_tool_output: true`, tool calls for Claude Code only.
+
+## Tool calls and `file_edits`
+
+Store each tool call as an assistant row with `tool_name` set and the text `"<name>: <input>"`
+(the input as JSON when the source has it). `file_edits::edits_of` reads the paths from that
+text: it knows the file tools by name (read / edit / write verbs, `apply_patch`, shell tools),
+so a new source whose tools use other names adds them there, with a test. Anything else
+with a path argument counts as a mention.
+
+The indexer writes `file_edits` for the messages it inserts. Threads indexed before 0034 get
+theirs once from the stored tool-call rows (`file_edits::backfill_file_edits_once`, behind
+the `file_edits.backfill_pending` flag 0034 sets): a Reindex never re-parses an unchanged
+transcript, and resetting the cursors would rewrite every message id and re-embed the whole
+history. The watcher runs it after its launch catch-up, pausing between batches while a
+writer job runs; `cal index` runs it after its pass.
+
+Token usage has the same problem for the sources that started recording it after their
+sessions were indexed (Codex, Gemini, Qwen, OpenCode). `usage_backfill::backfill_usage_once`
+re-parses those threads' transcripts once, right after the `file_edits` backfill and from the
+same callers, and writes only the usage columns onto the stored rows by `seq` (no replace, no
+id churn, no re-embedding); `usage.backfill_done` in `app_config` marks it done, and a fresh
+index is marked done at once. A source you add that records usage from day one needs none of
+this; one that starts recording it later joins `usage_backfill::SOURCES`.
 
 ## Things every indexer must skip
 
@@ -122,6 +146,14 @@ events only start when the watch does, so at launch (once anything has been inde
 watcher also runs one catch-up pass over every source for what changed while the app was
 closed, holding the reindex flag meanwhile.
 
+After each batch the watcher links the commits of the threads it wrote (`jobs::CommitLinker`:
+each checkout at most once a minute, Today's 2 s budget per pass, a checkout whose `git log`
+runs out of time retried with backoff), and on its minute tick, once the catch-up is done,
+refreshes `issue_clusters` when the index changed since the stored refresh (mined on a
+read-only connection on its own thread, yielding to writer jobs). `cal index` does the same
+for the pass it ran (`headless::graph_upkeep`), so a machine kept fresh only by the plugin's
+`cal index --if-stale` gets commit links and served clusters too.
+
 ## Tolerant parsing
 
 Tool output and message bodies vary wildly. Flatten defensively: pull text parts,
@@ -134,15 +166,15 @@ are embedded; `tool`/`system` are searchable via FTS but skipped by the embedder
 | Kind | Path | Format |
 |------|------|--------|
 | `claude_code` | `$CLAUDE_CONFIG_DIR` or `~/.claude`, then `projects/**/*.jsonl` | JSONL, content blocks |
-| `codex` | `$CODEX_HOME` or `~/.codex`: `sessions/` + `archived_sessions/` rollout JSONL, plus the newest `state_<N>.sqlite` under `sqlite_home` (config.toml), else `$CODEX_SQLITE_HOME`, else the Codex home | mixed |
+| `codex` | `$CODEX_HOME` or `~/.codex`: `sessions/` + `archived_sessions/` rollout JSONL, plus the newest `state_<N>.sqlite` under `sqlite_home` (config.toml), else `$CODEX_SQLITE_HOME`, else the Codex home | mixed; usage from `event_msg` `token_count` (running totals, differenced per call) with the model from `turn_context` |
 | `cursor` | `~/Library/Application Support/Cursor/User/globalStorage/state.vscdb` | SQLite (`cursorDiskKV`) |
 | `cursor` | `~/.cursor/projects/<slug>/agent-transcripts/<id>/<id>.jsonl`, plus `<id>/subagents/*.jsonl`; `<slug>` is the workspace path with non-alphanumerics as `-`, resolved against the disk. Observed on one Mac: 195 nested transcripts (the CLI session's too) and 147 subagents. A flat `agent-transcripts/<id>.jsonl` is also read but was never seen | JSONL `{role, message.content[]}`, `text` / `tool_use` parts, no clock but a user turn's `<timestamp>` |
 | `cursor` | `~/.cursor/chats/<md5 of cwd>/<agent id>/store.db` (+ `meta.json`). Observed: one store, a 4 KB store.db with every table still in its `-wal`, read from a temp copy when a plain read-only open can't see the WAL | SQLite `blobs` + `meta`: the root blob (protobuf) lists the JSON message blobs in order, field 9 the workspace URI |
-| `gemini` | `~/.gemini/tmp/<id>/chats/*.jsonl` | JSONL, `type: user`/`gemini`, `content` PartListUnion |
-| `qwen` | `~/.qwen/tmp/<hash>/chats/*.jsonl` | JSONL, `type: user`/`assistant`, `message.parts` |
+| `gemini` | `~/.gemini/tmp/<id>/chats/*.jsonl` | JSONL, `type: user`/`gemini`, `content` PartListUnion; a message re-recorded under the same `id` replaces the first copy; usage from `tokens` + `model` |
+| `qwen` | `~/.qwen/tmp/<hash>/chats/*.jsonl` | JSONL, `type: user`/`assistant`, `message.parts`; usage from `usageMetadata` + `model` |
 | `goose` | `~/.local/share/goose/sessions/sessions.db` | SQLite (`sessions` + `messages`, `content_json`) |
-| `opencode` | `~/.local/share/opencode/storage/{session,message,part}/*.json` | JSON tree, join msg+part by id |
-| `opencode` | `~/.local/share/opencode/opencode.db` | SQLite V1 (`session` + `message` + `part`, `data` JSON) |
+| `opencode` | `~/.local/share/opencode/storage/{session,message,part}/*.json` | JSON tree, join msg+part by id; usage from the message's `tokens` + `modelID` |
+| `opencode` | `~/.local/share/opencode/opencode.db` | SQLite V1 (`session` + `message` + `part`, `data` JSON); usage from `message.data` `tokens` + `modelID`, text-less turns included |
 | `continue` | `~/.continue/sessions/*.json` | JSON `history[]`, no per-msg ts (use mtime) |
 | `cline` | `<editor>/User/globalStorage/saoudrizwan.claude-dev/tasks/<id>/api_conversation_history.json` | Anthropic Messages array (multi-editor; index-only, no CLI) |
 | `roo` | `<editor>/User/globalStorage/rooveterinaryinc.roo-cline/tasks/<id>/…` | Cline-architecture fork — shares `cline::scan_ext` |

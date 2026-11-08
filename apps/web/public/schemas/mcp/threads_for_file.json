@@ -50,6 +50,138 @@
               }
             }
           }
+        },
+        "commits": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "object",
+            "properties": {
+              "sha": {
+                "type": "string"
+              },
+              "shortSha": {
+                "type": "string"
+              },
+              "subject": {
+                "type": "string"
+              },
+              "committedAt": {
+                "type": "integer"
+              },
+              "threads": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "integer"
+                    },
+                    "title": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "source": {
+                      "type": "string"
+                    },
+                    "lastActive": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "edits": {
+                      "type": "integer"
+                    },
+                    "touch": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "title",
+                    "source",
+                    "lastActive",
+                    "edits",
+                    "touch"
+                  ]
+                }
+              }
+            },
+            "required": [
+              "sha",
+              "shortSha",
+              "subject",
+              "committedAt",
+              "threads"
+            ]
+          }
+        },
+        "facts": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "integer"
+              },
+              "threadId": {
+                "type": "integer"
+              },
+              "kind": {
+                "type": "string"
+              },
+              "text": {
+                "type": "string"
+              },
+              "rationale": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "extractor": {
+                "type": "string"
+              },
+              "originRef": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "id",
+              "threadId",
+              "kind",
+              "text",
+              "rationale",
+              "extractor",
+              "originRef"
+            ]
+          }
+        },
+        "unlinked": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "note": {
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [

@@ -49,10 +49,18 @@ Specifically:
   search, and embeddings are **always local** regardless of which engine you pick.
 - **Agents you connect.** The MCP server, the SessionStart hooks (Claude Code,
   and Codex and Gemini CLI when you turn theirs on), the optional
-  proactive-recall hook, and the managed `AGENTS.md` / `CLAUDE.md` block hand
-  excerpts of your history (search results, threads an agent asks for, project
-  memory), redacted the same way, to that agent, which sends them to its own
-  provider along with the rest of its context. Callimachus makes no network request for this; it happens
+  proactive-recall and error-playbook hooks, and the managed `AGENTS.md` /
+  `CLAUDE.md` block hand excerpts of your history (search results, threads an
+  agent asks for, project memory, the recorded fix of an error), redacted the
+  same way, to that agent, which sends them to its own provider along with the
+  rest of its context. The error-playbook hook (Claude Code PostToolUse and
+  PostToolUseFailure on Bash, off by default) reads each shell command's output
+  on your machine to match it against your recurring errors. Callimachus keeps
+  none of that output and sends it nowhere; it writes only the normalized
+  signatures of the errors it already answered, to a per-session file under
+  `~/.callimachus/recall/` that `cal session-end` deletes when the session ends
+  (and the hook prunes after 7 days), and it prints only a fix that a commit in
+  the same repo made. Callimachus makes no network request for this; it happens
   inside the agent you installed.
 - **The update check.** At launch and periodically while it runs, the desktop app
   fetches the release manifest (`latest.json`) from GitHub Releases to see whether
@@ -147,6 +155,16 @@ browser storage, no cross-site tracking.
   the provider you picked. Imported Claude Code memory is left out of
   `.callimachus/memory.md` and the managed `AGENTS.md` / `CLAUDE.md` block.
   Turning the import off in Settings > Agents removes every imported fact.
+- Repo memory (`.callimachus/memory/*.jsonl` in a checkout) is written only by
+  your own publish action (Publish to repo in the app, after a preview, or the
+  `cal memory publish` command you run, which lists what it wrote); Callimachus
+  never writes, commits or pushes it on its own. Published
+  text is redacted, and Claude Code auto memory is never published. The files
+  leave the machine only when you commit and push them. Imported repo facts come
+  from whoever can push to the repo, so they are never pinned, are marked
+  "From the repo" in the app and `(repo)` in injected memory under a line that
+  names the files, and `cal memory import --review` shows what an import would
+  change without writing it.
 - Agent-recorded and LLM-distilled facts that Callimachus injects into new
   sessions (hooks, `AGENTS.md` / `CLAUDE.md`) are labelled as notes from past
   sessions, not instructions. Review a repo's memory (`cal memory`, or the

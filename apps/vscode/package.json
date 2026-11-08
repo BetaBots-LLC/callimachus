@@ -78,6 +78,11 @@
         "icon": "$(refresh)"
       },
       {
+        "command": "callimachus.whyLine",
+        "title": "Why This Line",
+        "category": "Callimachus"
+      },
+      {
         "command": "callimachus.toggleAmbientRecall",
         "title": "Toggle Ambient Recall",
         "category": "Callimachus"
@@ -102,6 +107,19 @@
       ]
     },
     "menus": {
+      "editor/context": [
+        {
+          "command": "callimachus.whyLine",
+          "when": "resourceScheme == file",
+          "group": "callimachus@1"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "callimachus.whyLine",
+          "when": "editorIsOpen"
+        }
+      ],
       "view/title": [
         {
           "command": "callimachus.refreshRecent",

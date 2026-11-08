@@ -80,6 +80,10 @@ pub enum Kind {
     Recall,
     /// The SessionStart hook injected the recent-sessions digest (no memory yet).
     Digest,
+    /// The error-recall hook (`recall-error`) told the agent how a shell error it just hit
+    /// was fixed before. Its own kind: counted as a recall hit it inflated "prompts where past
+    /// work was surfaced" with shell commands.
+    Playbook,
 }
 
 /// Events per kind (the `week` shape `value_ledger` returns and each `ledger.daily` day).
@@ -93,6 +97,9 @@ pub struct Counts {
     pub recall: u64,
     #[serde(default)]
     pub digest: u64,
+    /// Days rolled up before this kind existed read as 0.
+    #[serde(default)]
+    pub playbook: u64,
 }
 
 impl Counts {
@@ -102,6 +109,7 @@ impl Counts {
             Kind::Mcp => self.mcp += 1,
             Kind::Recall => self.recall += 1,
             Kind::Digest => self.digest += 1,
+            Kind::Playbook => self.playbook += 1,
         }
     }
 
@@ -110,10 +118,11 @@ impl Counts {
         self.mcp += other.mcp;
         self.recall += other.recall;
         self.digest += other.digest;
+        self.playbook += other.playbook;
     }
 
     pub fn total(&self) -> u64 {
-        self.hook + self.mcp + self.recall + self.digest
+        self.hook + self.mcp + self.recall + self.digest + self.playbook
     }
 }
 
@@ -721,15 +730,17 @@ mod tests {
         append_to(&ledger, Kind::Hook, "/a", noon(3));
         append_to(&ledger, Kind::Mcp, "search_threads", noon(3));
         append_to(&ledger, Kind::Digest, "/b", noon(1));
+        append_to(&ledger, Kind::Playbook, "/b", noon(1));
         append_to(&ledger, Kind::Recall, "/a", now);
         append_to(&ledger, Kind::Mcp, "get_thread", now);
 
         let before = summary(&conn, Some(&ledger), now).unwrap();
-        assert_eq!(before.all_time, 5);
-        assert_eq!(before.week.total(), 5);
+        assert_eq!(before.all_time, 6);
+        assert_eq!(before.week.total(), 6);
+        assert_eq!((before.week.recall, before.week.playbook), (1, 1));
 
         let report = rollup_at(&conn, &ledger, now).unwrap();
-        assert_eq!(report.folded, 3);
+        assert_eq!(report.folded, 4);
         // Today's lines stay in the file; the past days are in app_config.
         let left = lines(&ledger);
         assert_eq!(left.len(), 2);
@@ -738,6 +749,7 @@ mod tests {
         assert_eq!(daily[&day_key(noon(3))].hook, 1);
         assert_eq!(daily[&day_key(noon(3))].mcp, 1);
         assert_eq!(daily[&day_key(noon(1))].digest, 1);
+        assert_eq!(daily[&day_key(noon(1))].playbook, 1);
         assert!(!daily.contains_key(&day_key(now)));
         assert!(rolling_files(&dir, "ledger").unwrap().is_empty());
         assert!(!dir.join("ledger.lock").exists());
@@ -749,7 +761,7 @@ mod tests {
 
         // An append after the rollup lands in the fresh file.
         append_to(&ledger, Kind::Hook, "/c", now);
-        assert_eq!(summary(&conn, Some(&ledger), now).unwrap().all_time, 6);
+        assert_eq!(summary(&conn, Some(&ledger), now).unwrap().all_time, 7);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

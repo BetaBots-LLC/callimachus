@@ -34,7 +34,12 @@ fn main() {
     let rest: Vec<String> = argv.iter().skip(1).cloned().collect();
     let is_cal_subcommand = rest
         .first()
-        .map(|a| callimachus_lib::cli_core::COMMANDS.contains(&a.as_str()))
+        .map(|a| {
+            // `help` is not a command but prints the CLI usage; without this, `callimachus help`
+            // (how a script probes for `cal index`) opened a window.
+            callimachus_lib::cli_core::COMMANDS.contains(&a.as_str())
+                || matches!(a.as_str(), "help" | "-h" | "--help")
+        })
         .unwrap_or(false);
     if invoked_as_cal(argv0) || is_cal_subcommand {
         #[cfg(windows)]

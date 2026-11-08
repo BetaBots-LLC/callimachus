@@ -11,12 +11,14 @@ pub mod continue_cli;
 pub mod copilot;
 pub mod copilot_cli;
 pub mod cursor;
+pub mod file_edits;
 pub mod gemini;
 pub mod goose;
 pub mod kilo;
 pub mod opencode;
 pub mod qwen;
 pub mod roo;
+pub mod usage_backfill;
 pub mod watcher;
 
 use anyhow::{Context, Result};
@@ -47,6 +49,42 @@ pub struct MsgUsage {
     pub output: i64,
     pub cache_write: i64,
     pub cache_read: i64,
+}
+
+impl MsgUsage {
+    /// The stored columns' view of this usage, for comparing a re-parse with what a row holds.
+    fn columns(&self) -> (Option<&str>, [i64; 4]) {
+        (
+            Some(self.model.as_str()),
+            [self.input, self.output, self.cache_write, self.cache_read],
+        )
+    }
+}
+
+impl ParsedThread {
+    /// Record one model call's usage on the message at `at` (the call's first message), or,
+    /// when the call produced no message of its own (`None`: a tool-only OpenCode turn, a
+    /// Codex response that was all reasoning, a Qwen record carrying only tokens), on the
+    /// last message so far. A call landing where usage already sits is added to it, so no
+    /// spend is lost to the one-usage-per-row column layout; it keeps the first model.
+    /// Usage before any message is dropped: there is no row to carry it.
+    pub fn attach_usage(&mut self, at: Option<usize>, u: MsgUsage) {
+        let Some(idx) = at
+            .filter(|i| *i < self.messages.len())
+            .or_else(|| self.messages.len().checked_sub(1))
+        else {
+            return;
+        };
+        match self.usage.last_mut() {
+            Some((last, prev)) if *last == idx => {
+                prev.input += u.input;
+                prev.output += u.output;
+                prev.cache_write += u.cache_write;
+                prev.cache_read += u.cache_read;
+            }
+            _ => self.usage.push((idx, u)),
+        }
+    }
 }
 
 /// One message within a thread.
@@ -405,6 +443,71 @@ pub fn backfill_project_keys(conn: &Connection) -> Result<usize> {
     Ok(n)
 }
 
+/// The threads whose per-thread rows (`file_edits` above all) belong to the session
+/// `thread_id`: the thread itself, plus, for a Claude Code session, its subagent transcripts.
+/// Claude Code writes a session's subagents beside it (`<slug>/<session>.jsonl` and
+/// `<slug>/<session>/subagents/agent-*.jsonl`), each indexed as its own thread with
+/// `is_subagent = 1`; in workflow-heavy repos they make most of a session's edits, so a
+/// reader joining commits to sessions to files must include them. Other sources record no
+/// parent for a subagent. A range probe of the `(source_id, external_id)` unique index.
+pub fn session_thread_ids(conn: &Connection, thread_id: i64) -> Result<Vec<i64>> {
+    let mut out = vec![thread_id];
+    let Some((source_id, external_id)) = conn
+        .query_row(
+            "SELECT source_id, external_id FROM threads WHERE id = ?1",
+            [thread_id],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+        )
+        .optional()?
+    else {
+        return Ok(out);
+    };
+    let Some(stem) = external_id
+        .strip_suffix(".jsonl")
+        .filter(|s| !s.contains("/subagents/"))
+    else {
+        return Ok(out);
+    };
+    // `/` + 1 is `0`: every id under `<stem>/subagents/` and nothing after it.
+    let (lo, hi) = (format!("{stem}/subagents/"), format!("{stem}/subagents0"));
+    let mut stmt = conn.prepare_cached(SUBAGENTS_OF_SQL)?;
+    for id in stmt.query_map(params![source_id, lo, hi], |r| r.get::<_, i64>(0))? {
+        out.push(id?);
+    }
+    Ok(out)
+}
+
+/// The subagent transcripts of one session (see [`session_thread_ids`]).
+pub(crate) const SUBAGENTS_OF_SQL: &str = "SELECT id FROM threads
+     WHERE source_id = ?1 AND external_id >= ?2 AND external_id < ?3 AND is_subagent = 1
+     ORDER BY id";
+
+/// The session a subagent transcript belongs to (see [`session_thread_ids`]): its parent's
+/// thread id, or `thread_id` itself for any other thread or when the parent is not indexed.
+pub fn parent_session_id(conn: &Connection, thread_id: i64) -> Result<i64> {
+    let row: Option<(i64, String)> = conn
+        .query_row(
+            "SELECT source_id, external_id FROM threads WHERE id = ?1 AND is_subagent = 1",
+            [thread_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((source_id, external_id)) = row else {
+        return Ok(thread_id);
+    };
+    let Some((stem, _)) = external_id.split_once("/subagents/") else {
+        return Ok(thread_id);
+    };
+    Ok(conn
+        .query_row(
+            "SELECT id FROM threads WHERE source_id = ?1 AND external_id = ?2",
+            params![source_id, format!("{stem}.jsonl")],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(thread_id))
+}
+
 /// Resolve the numeric source id for a source kind (rows are seeded by migration).
 pub fn source_id(conn: &Connection, kind: &str) -> Result<i64> {
     conn.query_row("SELECT id FROM sources WHERE kind = ?1", [kind], |r| {
@@ -424,6 +527,18 @@ pub fn upsert_thread(
     source_id: i64,
     thread: &ParsedThread,
 ) -> Result<usize> {
+    upsert_thread_at(conn, source_id, thread, &[])
+}
+
+/// [`upsert_thread`] for a source that records a working directory per line (Claude Code):
+/// `cwds` holds `(first message index, cwd)` at each change, in order, and a tool call's
+/// relative paths resolve against the cwd it ran in rather than the thread's last one.
+pub fn upsert_thread_at(
+    conn: &mut Connection,
+    source_id: i64,
+    thread: &ParsedThread,
+    cwds: &[(usize, String)],
+) -> Result<usize> {
     if thread.messages.is_empty() {
         return Ok(0);
     }
@@ -442,8 +557,18 @@ pub fn upsert_thread(
     // Count of DISTILLABLE messages (what the LLM actually sees); distill staleness keys off
     // this, not total message_count, so appended tool/system rows don't re-trigger a distill.
     let distillable = distillable_count(&thread.messages);
+    let anchors = edit_anchors(thread, cwds);
     let Some(written) = in_write_tx(conn, |tx| {
-        write_thread(tx, source_id, thread, now, bytes, distillable)
+        write_thread(
+            tx,
+            source_id,
+            thread,
+            now,
+            bytes,
+            distillable,
+            &anchors,
+            cwds,
+        )
     })?
     else {
         return Ok(0);
@@ -479,9 +604,22 @@ pub fn append_messages(
     thread: &ParsedThread,
     start_seq: usize,
 ) -> Result<Option<usize>> {
+    append_messages_at(conn, source_id, thread, start_seq, &[])
+}
+
+/// [`append_messages`] with the tail's per-line working directories (see
+/// [`upsert_thread_at`]; indices into the tail).
+pub fn append_messages_at(
+    conn: &mut Connection,
+    source_id: i64,
+    thread: &ParsedThread,
+    start_seq: usize,
+    cwds: &[(usize, String)],
+) -> Result<Option<usize>> {
     let now = chrono::Utc::now().timestamp();
+    let anchors = edit_anchors(thread, cwds);
     in_write_tx(conn, |tx| {
-        write_append(tx, source_id, thread, start_seq, now)
+        write_append(tx, source_id, thread, start_seq, now, &anchors, cwds)
     })
 }
 
@@ -522,6 +660,7 @@ fn distillable_count(messages: &[ParsedMessage]) -> i64 {
 
 /// The body of [`upsert_thread`], run under the write lock `tx` holds. Returns the rows
 /// inserted, or None (and writes nothing) when the thread was tombstoned.
+#[allow(clippy::too_many_arguments)] // all distinct; [`upsert_thread_at`] is the one caller
 fn write_thread(
     tx: &Connection,
     source_id: i64,
@@ -529,6 +668,8 @@ fn write_thread(
     now: i64,
     bytes: i64,
     distillable: i64,
+    anchors: &file_edits::Anchors,
+    cwds: &[(usize, String)],
 ) -> Result<Option<usize>> {
     // Re-check under the write lock: the watcher indexes on its own connection, so a delete
     // that committed after the early check would otherwise be undone by the INSERT below
@@ -596,19 +737,41 @@ fn write_thread(
     // Stored tool rows that differ from the new parse only by the index-time tool-output
     // cap (see `recapped`), rewritten in place on an append.
     let mut recapped: Vec<i64> = Vec::new();
+    // Stored prefix rows whose token usage differs from the new parse, rewritten in place on
+    // an append. Usage often lands after its message was stored: Codex writes the turn's
+    // `token_count` event after the response items, Gemini re-records a message once its
+    // tokens arrive. And a thread indexed before its source captured usage gets it here on
+    // the next re-parse instead of needing a full replace. The usage columns sit after
+    // `text` in the row, which this scan reads anyway, and no trigger watches them.
+    let mut reusage: Vec<i64> = Vec::new();
+    let prefix_usage: std::collections::HashMap<usize, &MsgUsage> = thread
+        .usage
+        .iter()
+        .filter(|(i, _)| (*i as i64) < existing_count)
+        .map(|(i, u)| (*i, u))
+        .collect();
     let incremental = existing_count > 0 && n >= existing_count && {
-        let mut stmt =
-            tx.prepare("SELECT seq, text FROM messages WHERE thread_id = ?1 ORDER BY seq")?;
+        let mut stmt = tx.prepare(
+            "SELECT seq, text, model, input_tokens, output_tokens, cache_write_tokens,
+                    cache_read_tokens
+             FROM messages WHERE thread_id = ?1 ORDER BY seq",
+        )?;
         let mut matched = 0i64;
         let mut ok = true;
         let rows = stmt.query_map([thread_id], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            let tokens = |i| r.get::<_, Option<i64>>(i).map(|v| v.unwrap_or(0));
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                [tokens(3)?, tokens(4)?, tokens(5)?, tokens(6)?],
+            ))
         })?;
         for row in rows {
-            let (seq, text) = row?;
-            let Some(new) = usize::try_from(seq)
+            let (seq, text, model, tokens) = row?;
+            let Some((i, new)) = usize::try_from(seq)
                 .ok()
-                .and_then(|i| thread.messages.get(i))
+                .and_then(|i| thread.messages.get(i).map(|m| (i, m)))
             else {
                 ok = false;
                 break;
@@ -619,6 +782,11 @@ fn write_thread(
                     break;
                 }
                 recapped.push(seq);
+            }
+            let parsed = prefix_usage.get(&i).map(|u| u.columns());
+            let stored = model.as_deref().map(|m| (Some(m), tokens));
+            if parsed != stored {
+                reusage.push(seq);
             }
             matched += 1;
         }
@@ -634,6 +802,23 @@ fn write_thread(
             tx.prepare("UPDATE messages SET text = ?3 WHERE thread_id = ?1 AND seq = ?2")?;
         for seq in &recapped {
             upd.execute(params![thread_id, seq, thread.messages[*seq as usize].text])?;
+        }
+        let mut upd = tx.prepare(
+            "UPDATE messages SET model = ?3, input_tokens = ?4, output_tokens = ?5,
+                    cache_write_tokens = ?6, cache_read_tokens = ?7
+             WHERE thread_id = ?1 AND seq = ?2",
+        )?;
+        for seq in &reusage {
+            let u = prefix_usage.get(&(*seq as usize));
+            upd.execute(params![
+                thread_id,
+                seq,
+                u.map(|u| u.model.as_str()),
+                u.map(|u| u.input),
+                u.map(|u| u.output),
+                u.map(|u| u.cache_write),
+                u.map(|u| u.cache_read),
+            ])?;
         }
     } else {
         // Full replace: clear existing messages (FTS triggers keep the index in sync).
@@ -663,6 +848,12 @@ fn write_thread(
         now,
     )?;
     derive_file_mentions(tx, thread_id, &inserted, incremental)?;
+    derive_file_edits(tx, thread_id, anchors, cwds, 0, &inserted, incremental)?;
+    if !incremental && existing_count > 0 {
+        // The replace deleted every message the thread's kept facts pointed at (0011's ON
+        // DELETE SET NULL); point them at the rows that took their place.
+        crate::knowledge::rebind_fact_sources(tx, thread_id)?;
+    }
     // A full replace of an existing thread (prefix mismatch / shrink) means the content
     // changed even if the count didn't (e.g. an in-place edit).
     invalidate_distilled(
@@ -681,6 +872,8 @@ fn write_append(
     thread: &ParsedThread,
     start_seq: usize,
     now: i64,
+    anchors: &file_edits::Anchors,
+    cwds: &[(usize, String)],
 ) -> Result<Option<usize>> {
     if crate::cleanup::is_tombstoned(tx, source_id, &thread.external_id)? {
         return Ok(None);
@@ -739,12 +932,20 @@ fn write_append(
     let inserted = insert_messages(tx, thread_id, start_seq, &thread.messages, &usage)?;
     derive_todos(tx, thread_id, &inserted, true, thread.is_subagent, now)?;
     derive_file_mentions(tx, thread_id, &inserted, true)?;
+    derive_file_edits(tx, thread_id, anchors, cwds, start_seq, &inserted, true)?;
     invalidate_distilled(tx, thread_id, distillable, false)?;
     Ok(Some(inserted.len()))
 }
 
-/// One message row just inserted: (message id, role, text, message timestamp).
-type Inserted<'a> = (i64, &'a str, &'a str, Option<i64>);
+/// One message row just inserted.
+struct Inserted<'a> {
+    id: i64,
+    seq: i64,
+    role: &'a str,
+    text: &'a str,
+    tool_name: Option<&'a str>,
+    ts: Option<i64>,
+}
 
 /// Insert `messages` as seqs `first_seq..`, with `usage` keyed by index into `messages`.
 fn insert_messages<'a>(
@@ -776,12 +977,14 @@ fn insert_messages<'a>(
             u.map(|u| u.cache_write),
             u.map(|u| u.cache_read),
         ])?;
-        inserted.push((
-            tx.last_insert_rowid(),
-            m.role.as_str(),
-            m.text.as_str(),
-            m.ts,
-        ));
+        inserted.push(Inserted {
+            id: tx.last_insert_rowid(),
+            seq: (first_seq + i) as i64,
+            role: m.role.as_str(),
+            text: m.text.as_str(),
+            tool_name: m.tool_name.as_deref(),
+            ts: m.ts,
+        });
     }
     Ok(inserted)
 }
@@ -808,24 +1011,25 @@ fn derive_todos(
     // re-derive only the open, untouched ones.
     // Full replace re-derives open heuristic todos from scratch; an append keeps the
     // existing ones (the `seen` seed below dedups) and scans only the new tail.
-    if !appended {
-        tx.execute(
-            "DELETE FROM facts WHERE thread_id = ?1 AND extractor = 'heuristic'
-                AND status = 'open' AND hidden = 0 AND pinned = 0",
-            [thread_id],
-        )?;
-    }
+    // A re-derived TODO keeps the uid it had, so a full re-index does not mint new facts.
+    let uids = if appended {
+        std::collections::HashMap::new()
+    } else {
+        crate::knowledge::take_open_heuristic_todos(tx, thread_id)?
+    };
+    let edited = if appended {
+        std::collections::HashSet::new()
+    } else {
+        crate::knowledge::edited_todo_seqs(tx, thread_id)?
+    };
     // An append whose tail has no user/assistant text has nothing to scan: skip the seeds.
     if !inserted
         .iter()
-        .any(|(_, role, _, _)| *role == "user" || *role == "assistant")
+        .any(|m| m.role == "user" || m.role == "assistant")
     {
         return Ok(());
     }
-    let mut fstmt = tx.prepare(
-        "INSERT INTO facts (thread_id, kind, text, source_message_id, status, extractor, created_at)
-         VALUES (?1, 'todo', ?2, ?3, 'open', 'heuristic', ?4)",
-    )?;
+    let mut fstmt = tx.prepare(crate::knowledge::INSERT_HEURISTIC_TODO_SQL)?;
     let mut seen = std::collections::HashSet::new();
     // Seed with kept curated todos so we don't re-add an open copy of a closed one.
     {
@@ -850,22 +1054,34 @@ fn derive_todos(
     } else {
         0
     };
-    'outer: for (mid, role, text, ts) in inserted {
-        if *role != "user" && *role != "assistant" {
+    'outer: for m in inserted {
+        if m.role != "user" && m.role != "assistant" {
             continue;
         }
-        for todo in crate::knowledge::extract_todos(text) {
+        for todo in crate::knowledge::extract_todos(m.text) {
             if count >= MAX_TODOS_PER_THREAD {
                 break 'outer;
             }
-            if seen.insert(todo.to_ascii_lowercase()) {
+            let lower = todo.to_ascii_lowercase();
+            if edited.contains(&m.seq) && !uids.contains_key(&lower) {
+                // The user reworded the TODO this message raised (see `edited_todo_seqs`).
+                seen.insert(lower);
+                continue;
+            }
+            if seen.insert(lower.clone()) {
+                let uid = uids
+                    .get(&lower)
+                    .cloned()
+                    .unwrap_or_else(crate::knowledge::new_fact_uid);
                 // Stamped with the source message's time, not index time, so a
                 // re-index of old history doesn't make old TODOs look new.
                 fstmt.execute(params![
                     thread_id,
                     todo,
-                    mid,
-                    crate::knowledge::todo_created_at(*ts, now)
+                    m.id,
+                    crate::knowledge::todo_created_at(m.ts, now),
+                    m.seq,
+                    uid
                 ])?;
                 count += 1;
             }
@@ -905,11 +1121,11 @@ fn derive_file_mentions(
             seen.insert(p.to_ascii_lowercase());
         }
     }
-    'paths: for (_mid, role, text, _ts) in inserted {
-        if *role != "user" && *role != "assistant" {
+    'paths: for m in inserted {
+        if m.role != "user" && m.role != "assistant" {
             continue;
         }
-        for path in extract_paths(text) {
+        for path in extract_paths(m.text) {
             if seen.len() >= MAX_PATHS_PER_THREAD {
                 break 'paths;
             }
@@ -918,6 +1134,73 @@ fn derive_file_mentions(
             }
         }
     }
+    Ok(())
+}
+
+/// The `file_edits` anchors for `thread`'s tool calls: the thread's cwd and every cwd a call
+/// ran in (`cwds`, or one the call names). Resolved before the write transaction opens, since
+/// each probes the disk for its checkout (a cwd on a sleeping volume must not stall a writer
+/// holding the lock); a thread without tool calls probes nothing.
+fn edit_anchors(thread: &ParsedThread, cwds: &[(usize, String)]) -> file_edits::Anchors {
+    let mut call_cwds: Vec<String> = Vec::new();
+    let mut any = false;
+    for (i, m) in thread.messages.iter().enumerate() {
+        let Some(name) = m.tool_name.as_deref() else {
+            continue;
+        };
+        any = true;
+        let named = file_edits::call_cwd(name, &m.text);
+        for c in named.as_deref().into_iter().chain(cwd_at(cwds, i)) {
+            if !call_cwds.iter().any(|k| k == c) {
+                call_cwds.push(c.to_string());
+            }
+        }
+    }
+    if !any {
+        return file_edits::Anchors::default();
+    }
+    file_edits::Anchors::resolve(
+        thread.project_path.as_deref(),
+        call_cwds.iter().map(String::as_str),
+    )
+}
+
+/// The cwd message `i` ran in: the last change at or before it, else the first one recorded.
+fn cwd_at(cwds: &[(usize, String)], i: usize) -> Option<&str> {
+    let after = cwds.partition_point(|(k, _)| *k <= i);
+    cwds.get(after.saturating_sub(1)).map(|(_, c)| c.as_str())
+}
+
+/// The `file_edits` rows for the tool calls just inserted (see [`file_edits`]): a full
+/// replace re-derives the thread's rows, an append adds the tail's. Paths are anchored on
+/// the checkout each call ran in (`anchors`, resolved by [`edit_anchors`]); `base` is the
+/// seq of `cwds`' index 0.
+fn derive_file_edits(
+    tx: &Connection,
+    thread_id: i64,
+    anchors: &file_edits::Anchors,
+    cwds: &[(usize, String)],
+    base: usize,
+    inserted: &[Inserted],
+    appended: bool,
+) -> Result<()> {
+    // No tool call in an append's tail: nothing to add.
+    if appended && !inserted.iter().any(|m| m.tool_name.is_some()) {
+        return Ok(());
+    }
+    let rows: Vec<file_edits::ToolRow> = inserted
+        .iter()
+        .map(|m| file_edits::ToolRow {
+            id: Some(m.id),
+            tool_name: m.tool_name,
+            text: m.text,
+            ts: m.ts,
+            cwd: m
+                .tool_name
+                .and_then(|_| cwd_at(cwds, (m.seq as usize).saturating_sub(base))),
+        })
+        .collect();
+    file_edits::derive(tx, thread_id, anchors, &rows, appended)?;
     Ok(())
 }
 
@@ -1137,6 +1420,244 @@ mod tests {
             .unwrap()
             .flatten()
             .collect()
+    }
+
+    #[test]
+    fn file_edits_follow_the_messages_and_todos_keep_their_uid() {
+        let p = std::env::temp_dir().join(format!("calli_fedits_{}.db", std::process::id()));
+        for ext in ["db", "db-wal", "db-shm"] {
+            let _ = std::fs::remove_file(p.with_extension(ext));
+        }
+        let mut conn = crate::db::open(&p).unwrap();
+        let sid = source_id(&conn, "claude_code").unwrap();
+        let call = |name: &str, input: &str, ts: i64| ParsedMessage {
+            role: "assistant".into(),
+            text: format!("{name}: {input}"),
+            tool_name: Some(name.into()),
+            ts: Some(ts),
+        };
+        let mut t = thread_with(&["TODO: wire the exporter"]);
+        t.project_path = Some("/no/such/checkout/app".into());
+        t.messages.push(call(
+            "Read",
+            r#"{"file_path":"/no/such/checkout/app/src/a.rs"}"#,
+            10,
+        ));
+        t.messages.push(call(
+            "Edit",
+            r#"{"file_path":"/no/such/checkout/app/src/a.rs"}"#,
+            11,
+        ));
+        t.messages
+            .push(call("Bash", r#"{"command":"cat docs/x.md"}"#, 12));
+        upsert_thread(&mut conn, sid, &t).unwrap();
+        let tid: i64 = conn
+            .query_row("SELECT id FROM threads WHERE external_id = 't1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let rows = |conn: &rusqlite::Connection| -> Vec<(String, String, i64)> {
+            conn.prepare("SELECT path, op, ts FROM file_edits WHERE thread_id = ?1 ORDER BY rowid")
+                .unwrap()
+                .query_map([tid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        let want = |v: &[(&str, &str, i64)]| -> Vec<(String, String, i64)> {
+            v.iter()
+                .map(|(a, b, c)| (a.to_string(), b.to_string(), *c))
+                .collect()
+        };
+        assert_eq!(
+            rows(&conn),
+            want(&[
+                ("src/a.rs", "read", 10),
+                ("src/a.rs", "edit", 11),
+                ("docs/x.md", "read", 12)
+            ])
+        );
+        let todo_uid: String = conn
+            .query_row("SELECT uid FROM facts WHERE kind = 'todo'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+
+        // An append adds only the tail's rows.
+        t.messages.push(call(
+            "Write",
+            r#"{"file_path":"src/b.rs","content":"x"}"#,
+            13,
+        ));
+        upsert_thread(&mut conn, sid, &t).unwrap();
+        assert_eq!(rows(&conn).len(), 4);
+        assert_eq!(
+            rows(&conn)[3],
+            ("src/b.rs".to_string(), "write".to_string(), 13)
+        );
+
+        // A full replace re-derives them (no duplicates) and the open TODO keeps its uid.
+        t.messages[0].text = "TODO: wire the exporter (edited)".into();
+        t.messages.insert(
+            1,
+            thread_with(&["TODO: wire the exporter"]).messages.remove(0),
+        );
+        upsert_thread(&mut conn, sid, &t).unwrap();
+        assert_eq!(rows(&conn).len(), 4);
+        let uids: Vec<String> = conn
+            .prepare("SELECT uid FROM facts WHERE kind = 'todo' ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(uids.len(), 2, "{uids:?}");
+        assert!(uids.contains(&todo_uid), "the same TODO keeps its identity");
+        let seqs: Vec<i64> = conn
+            .prepare("SELECT source_seq FROM facts WHERE kind = 'todo' ORDER BY source_seq")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(seqs, vec![0, 1]);
+
+        // Deleting the thread cascades.
+        conn.execute("DELETE FROM threads WHERE id = ?1", [tid])
+            .unwrap();
+        assert!(rows(&conn).is_empty());
+
+        // The lookups phase 2 runs: by path (cal why) and by thread.
+        let plan = |sql: &str| -> String {
+            conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap()
+                .query_map([], |r| r.get::<_, String>(3))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+                .join(" | ")
+        };
+        let p = plan("SELECT thread_id, op, ts FROM file_edits WHERE path = 'a' AND ts >= 0");
+        assert!(p.contains("USING INDEX idx_file_edits_path_ts"), "{p}");
+        let p = plan("SELECT path, op FROM file_edits WHERE thread_id = 1");
+        assert!(p.contains("USING INDEX idx_file_edits_thread"), "{p}");
+        let p = plan("SELECT id FROM threads WHERE last_indexed_at >= 5");
+        assert!(p.contains("idx_threads_last_indexed"), "{p}");
+    }
+
+    /// Usage that arrives after its message was stored (or a source that only now captures
+    /// it) is written onto the stored prefix in place: the append stays an append, no row
+    /// is replaced, and an unchanged re-parse writes nothing.
+    #[test]
+    fn late_usage_fills_the_stored_prefix_in_place() {
+        let p = std::env::temp_dir().join(format!("calli_lateusage_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        let mut conn = crate::db::open(&p).unwrap();
+        let sid = source_id(&conn, "codex").unwrap();
+        upsert_thread(&mut conn, sid, &thread_with(&["alpha", "beta"])).unwrap();
+        let tid: i64 = conn
+            .query_row("SELECT id FROM threads WHERE external_id = 't1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let before = message_rowids(&conn, tid);
+        let mut grown = thread_with(&["alpha", "beta", "gamma"]);
+        let usage = |input| super::MsgUsage {
+            model: "gpt-5".into(),
+            input,
+            output: 2,
+            cache_write: 0,
+            cache_read: 3,
+        };
+        grown.usage = vec![(1, usage(10)), (2, usage(20))];
+        assert_eq!(upsert_thread(&mut conn, sid, &grown).unwrap(), 1);
+        assert_eq!(&message_rowids(&conn, tid)[..2], &before[..]);
+        let stored: Vec<(Option<String>, Option<i64>)> = conn
+            .prepare("SELECT model, input_tokens FROM messages WHERE thread_id = ?1 ORDER BY seq")
+            .unwrap()
+            .query_map([tid], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            stored,
+            vec![
+                (None, None),
+                (Some("gpt-5".into()), Some(10)),
+                (Some("gpt-5".into()), Some(20))
+            ]
+        );
+        assert_eq!(upsert_thread(&mut conn, sid, &grown).unwrap(), 0);
+        let changes = conn.total_changes();
+        upsert_thread(&mut conn, sid, &grown).unwrap();
+        // The threads row upsert is the only write of an unchanged re-parse.
+        assert!(
+            conn.total_changes() - changes <= 1,
+            "{}",
+            conn.total_changes() - changes
+        );
+    }
+
+    #[test]
+    fn usage_without_a_message_lands_on_the_last_one_and_adds_up() {
+        let mut t = thread_with(&["a", "b"]);
+        let u = |n| super::MsgUsage {
+            model: "m".into(),
+            input: n,
+            ..Default::default()
+        };
+        t.attach_usage(Some(0), u(1));
+        t.attach_usage(None, u(2));
+        t.attach_usage(Some(5), u(3));
+        let got: Vec<(usize, i64)> = t.usage.iter().map(|(i, u)| (*i, u.input)).collect();
+        assert_eq!(got, vec![(0, 1), (1, 5)]);
+        let mut empty = ParsedThread::default();
+        empty.attach_usage(None, u(1));
+        assert!(empty.usage.is_empty(), "no row to carry it");
+    }
+
+    #[test]
+    fn subagent_transcripts_roll_up_to_their_session() {
+        let p = std::env::temp_dir().join(format!("calli_subs_{}.db", std::process::id()));
+        for ext in ["db", "db-wal", "db-shm"] {
+            let _ = std::fs::remove_file(p.with_extension(ext));
+        }
+        let mut conn = crate::db::open(&p).unwrap();
+        let sid = source_id(&conn, "claude_code").unwrap();
+        let mut add = |ext: &str, sub: bool| -> i64 {
+            let mut t = thread_with(&["hi"]);
+            t.external_id = ext.into();
+            t.is_subagent = sub;
+            upsert_thread(&mut conn, sid, &t).unwrap();
+            conn.query_row(
+                "SELECT id FROM threads WHERE external_id = ?1",
+                [ext],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let parent = add("-r-app/s1.jsonl", false);
+        let a = add("-r-app/s1/subagents/agent-a.jsonl", true);
+        let b = add("-r-app/s1/subagents/agent-b.jsonl", true);
+        let other = add("-r-app/s10/subagents/agent-c.jsonl", true);
+        add("-r-app/s10.jsonl", false);
+        assert_eq!(
+            super::session_thread_ids(&conn, parent).unwrap(),
+            vec![parent, a, b]
+        );
+        assert_eq!(super::session_thread_ids(&conn, a).unwrap(), vec![a]);
+        assert_eq!(super::parent_session_id(&conn, b).unwrap(), parent);
+        assert_eq!(super::parent_session_id(&conn, parent).unwrap(), parent);
+        assert_ne!(super::parent_session_id(&conn, other).unwrap(), parent);
+        let plan: String = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {}", super::SUBAGENTS_OF_SQL))
+            .unwrap()
+            .query_map(rusqlite::params![1, "a", "b"], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join(" | ");
+        assert!(plan.contains("external_id>?"), "{plan}");
     }
 
     #[test]

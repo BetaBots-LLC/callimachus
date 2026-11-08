@@ -1,0 +1,193 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://callimachus.app/schemas/cal/why.v1.json",
+  "title": "cal why --json",
+  "description": "The commits that last changed a file or line (git blame), newest first, each with the sessions inferred to have produced it and their decisions and gotchas.",
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "description": "Major version of this payload's shape. A reader refuses a version newer than it knows.",
+      "minimum": 0
+    },
+    "file": {
+      "type": "string",
+      "description": "The file, relative to the repo root, with `/` separators."
+    },
+    "line": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "description": "The 1-based line asked about; null for the whole file.",
+      "minimum": 0
+    },
+    "repo": {
+      "type": "string",
+      "description": "The repo root (git's toplevel) the file was blamed in."
+    },
+    "commits": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/WhyCommit"
+      },
+      "description": "The commits that last changed the line, or the file's lines, newest first."
+    },
+    "unlinked": {
+      "type": "boolean",
+      "description": "True when no commit here links to a session yet: run `cal commits` in the repo."
+    },
+    "uncommitted": {
+      "type": "boolean",
+      "description": "True when the line (or some of the file) has changes no commit owns yet."
+    }
+  },
+  "required": [
+    "schema_version",
+    "file",
+    "line",
+    "repo",
+    "commits",
+    "unlinked",
+    "uncommitted"
+  ],
+  "$defs": {
+    "WhyCommit": {
+      "type": "object",
+      "properties": {
+        "sha": {
+          "type": "string"
+        },
+        "shortSha": {
+          "type": "string"
+        },
+        "subject": {
+          "type": "string"
+        },
+        "committedAt": {
+          "type": "integer",
+          "description": "Committer time, epoch seconds."
+        },
+        "lines": {
+          "type": "integer",
+          "description": "Lines of the file this commit last changed (1 for a single line).",
+          "minimum": 0
+        },
+        "threads": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/WhyThread"
+          },
+          "description": "The sessions inferred to have produced the commit, best first: the ones that edited\nthis file, then read it, then mentioned it."
+        }
+      },
+      "required": [
+        "sha",
+        "shortSha",
+        "subject",
+        "committedAt",
+        "lines",
+        "threads"
+      ]
+    },
+    "WhyThread": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer"
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "type": "string"
+        },
+        "lastActive": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "When the thread last changed, epoch seconds."
+        },
+        "edits": {
+          "type": "integer",
+          "description": "Edit and write tool calls on this file inside the thread."
+        },
+        "touch": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The strongest thing the thread did to this file: `write`, `edit`, `read` or\n`mention`; null when only the commit's other files linked it."
+        },
+        "overlap": {
+          "type": "integer",
+          "description": "Files the thread and the commit share (the link's confidence, not normalized)."
+        },
+        "facts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/WhyFact"
+          },
+          "description": "The thread's decisions and gotchas, pinned first."
+        }
+      },
+      "required": [
+        "id",
+        "title",
+        "source",
+        "lastActive",
+        "edits",
+        "touch",
+        "overlap",
+        "facts"
+      ]
+    },
+    "WhyFact": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer"
+        },
+        "threadId": {
+          "type": "integer"
+        },
+        "kind": {
+          "type": "string",
+          "description": "`decision` or `gotcha`."
+        },
+        "text": {
+          "type": "string"
+        },
+        "rationale": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "extractor": {
+          "type": "string",
+          "description": "Who wrote it: llm, heuristic, user, agent, or an importer such as claude-memory."
+        },
+        "originRef": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "threadId",
+        "kind",
+        "text",
+        "rationale",
+        "extractor",
+        "originRef"
+      ]
+    }
+  }
+}

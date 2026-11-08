@@ -10,6 +10,7 @@ import type {
   RpcMethod,
   ThreadSummary,
   ToWebview,
+  WhyState,
 } from "../protocol";
 
 interface VsCodeApi {
@@ -27,6 +28,10 @@ const pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: Err
 let initHandler: ((init: InitPayload) => void) | null = null;
 let refreshHandler: (() => void) | null = null;
 let relatedHandler: ((label: string, results: ThreadSummary[]) => void) | null = null;
+let whyHandler: ((state: WhyState | null) => void) | null = null;
+// The host pushes the "Why this line" state right after init, before the sidebar has
+// mounted and registered its handler, so the latest state is kept for it.
+let lastWhy: WhyState | null = null;
 
 window.addEventListener("message", (ev: MessageEvent<ToWebview>) => {
   const msg = ev.data;
@@ -39,6 +44,10 @@ window.addEventListener("message", (ev: MessageEvent<ToWebview>) => {
       break;
     case "related":
       relatedHandler?.(msg.label, msg.results);
+      break;
+    case "why":
+      lastWhy = msg.state;
+      whyHandler?.(msg.state);
       break;
     case "rpc-result": {
       const p = pending.get(msg.id);
@@ -73,6 +82,11 @@ export const onRefresh = (fn: () => void): void => void (refreshHandler = fn);
 export const onRelated = (fn: (label: string, results: ThreadSummary[]) => void): void => {
   relatedHandler = fn;
 };
+export const onWhy = (fn: (state: WhyState | null) => void): void => {
+  whyHandler = fn;
+  if (lastWhy) fn(lastWhy);
+};
+export const closeWhy = (): void => vscode().postMessage({ kind: "closeWhy" });
 export const ready = (): void => vscode().postMessage({ kind: "ready" });
 
 export const getState = <T>(): T | undefined => vscode().getState<T>();
