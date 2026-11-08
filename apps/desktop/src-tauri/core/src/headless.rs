@@ -220,12 +220,14 @@ fn index_is_empty(host: &CliHost) -> bool {
 }
 
 /// Before the first import into an empty index: every TODO will come from indexing
-/// itself, so the one-time backfill for older indexes has nothing to do. Without this the
+/// itself (and every session's token usage), so the one-time TODO and usage backfills for
+/// older indexes have nothing to do. Without this the
 /// watcher (the app's or `cal watch`'s) later ran that full backfill over the whole new
 /// corpus; the app's onboarding avoids it by starting its watcher before the first import.
 fn mark_fresh_index(host: &CliHost) {
     if let Ok(conn) = host.db.0.lock() {
         let _ = knowledge::mark_todos_backfilled(&conn);
+        let _ = indexer::usage_backfill::mark_usage_backfilled(&conn);
     }
 }
 
@@ -242,6 +244,36 @@ fn index_once(host: &Arc<CliHost>) -> anyhow::Result<indexer::IndexReport> {
     let job = jobs::claim_index_all(host.flags())
         .ok_or_else(|| anyhow::anyhow!("a reindex is already running in this process"))?;
     jobs::run_index_all(&dyn_host, job)
+}
+
+/// After `cal index`'s pass, what the watcher does after a batch and after its launch
+/// catch-up: link the commits of the threads the pass wrote and refresh the issue clusters
+/// when due ([`jobs::graph_upkeep_after_pass`], under the watcher's bounds), then the
+/// one-time `file_edits` backfill for sessions indexed before 0034 and the one-time token
+/// usage backfill for Codex, Gemini, Qwen and OpenCode sessions indexed before usage (each a
+/// no-op once its app_config flag says done). A machine that keeps the index fresh only through the
+/// plugin's `--if-stale` guard runs no watcher. Never fails the command: the pass already
+/// landed.
+fn graph_upkeep(host: &CliHost, pass_started: i64) {
+    if let Ok(conn) = host.db.0.lock() {
+        jobs::graph_upkeep_after_pass(&conn, pass_started);
+    }
+    match indexer::file_edits::backfill_file_edits_once(&host.db, &|| false) {
+        Ok(Some(r)) => note(&format!(
+            "filled file edits for {} older sessions ({} rows)",
+            r.filled, r.rows
+        )),
+        Ok(None) => {}
+        Err(e) => note(&format!("file edits backfill: {e:#}")),
+    }
+    match indexer::usage_backfill::backfill_usage_once(&host.db, &|| false) {
+        Ok(Some(r)) if r.filled > 0 => note(&format!(
+            "filled token usage for {} older sessions ({} messages)",
+            r.filled, r.rows
+        )),
+        Ok(_) => {}
+        Err(e) => note(&format!("usage backfill: {e:#}")),
+    }
 }
 
 /// `cal index --if-stale`, the plugin's SessionStart guard.
@@ -286,7 +318,19 @@ pub fn cmd_index(args: &[String]) -> anyhow::Result<()> {
     if index_is_empty(&host) {
         mark_fresh_index(&host);
     }
+    let pass_started = chrono::Utc::now().timestamp();
     let r = index_once(&host)?;
+    // The checkouts this pass wrote sessions in: import their committed repo memory, as the
+    // app's watcher does after each batch.
+    if let Some(db) = host.writer() {
+        if let Ok(conn) = jobs::lock_anyhow(db) {
+            crate::knowledge::repo_memory::import_since(
+                &conn,
+                pass_started,
+                chrono::Utc::now().timestamp(),
+            );
+        }
+    }
     println!(
         "indexed {} threads ({} unchanged, {} errors) in {:.1} s",
         r.threads_indexed,
@@ -294,6 +338,7 @@ pub fn cmd_index(args: &[String]) -> anyhow::Result<()> {
         r.errors,
         started.elapsed().as_secs_f64()
     );
+    graph_upkeep(&host, pass_started);
     if r.errors > 0 {
         anyhow::bail!(
             "{} error{} while indexing; the [index] lines above name each file or source",

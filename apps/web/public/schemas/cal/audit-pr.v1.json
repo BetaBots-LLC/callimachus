@@ -299,7 +299,7 @@
         },
         "extractor": {
           "type": "string",
-          "description": "Who wrote it: `llm`, `heuristic`, `user`, `agent`, or a harvest origin such as\n`claude-memory`. The SessionStart hook and the managed AGENTS.md / CLAUDE.md block\ndrop `claude-memory` facts, which Claude Code already loads from its own auto memory,\nand so does `.callimachus/memory.md`, a repo file people commit; MCP results and the\nProjects tab keep them."
+          "description": "Who wrote it: `llm`, `heuristic`, `user`, `agent`, or a harvest origin such as\n`claude-memory`. The SessionStart hook and the managed AGENTS.md / CLAUDE.md block\ndrop `claude-memory` facts, which Claude Code already loads from its own auto memory,\nand so does `.callimachus/memory.md`, a repo file people commit; MCP results and the\nProjects tab keep them. `repo`: imported from the repo's committed\n`.callimachus/memory/` files (`originRef` names the file), shown everywhere."
         },
         "originRef": {
           "type": [

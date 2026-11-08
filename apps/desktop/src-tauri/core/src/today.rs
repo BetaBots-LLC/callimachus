@@ -278,7 +278,7 @@ fn issue_since(since: i64, now: i64) -> i64 {
 }
 
 /// `path` when it is a git checkout (a `.git` dir, or the file a linked worktree has).
-fn git_checkout(path: &str) -> Option<&str> {
+pub(crate) fn git_checkout(path: &str) -> Option<&str> {
     (!path.is_empty() && std::path::Path::new(path).join(".git").exists()).then_some(path)
 }
 
@@ -324,30 +324,57 @@ pub(crate) fn link_commits_with(
     conn: &Connection,
     today: &Today,
     budget: Duration,
-    mut git_log: impl FnMut(&str, i64, Instant) -> Result<Option<String>>,
+    git_log: impl FnMut(&str, i64, Instant) -> Result<Option<String>>,
 ) -> Result<bool> {
+    let all: Vec<(&str, Vec<i64>)> = today.groups.iter().flat_map(checkouts).collect();
+    Ok(link_checkouts_with(conn, &all, budget, git_log)?.1 != LinkStop::Done)
+}
+
+/// Why a [`link_checkouts_with`] pass stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LinkStop {
+    /// Every checkout was linked.
+    Done,
+    /// The budget ran out before the next checkout started; it was not tried.
+    OutOfTime,
+    /// The next checkout was tried and wrote nothing: `git log` was still running at the
+    /// deadline (and was killed), or the index stayed locked past the budget.
+    Failed,
+}
+
+/// Link each checkout's threads through `gitlink::link_threads`, in order, within `budget`
+/// in total. Shared by Today and the watcher's per-batch linking. Returns how many checkouts
+/// were linked (the first ones, in order) and why the pass stopped, so a caller that queues
+/// work can tell a checkout that was tried and failed from one never reached. Leaves `conn`'s
+/// busy timeout at whatever the budget had left: a caller with a long-lived connection
+/// restores its own.
+pub(crate) fn link_checkouts_with(
+    conn: &Connection,
+    checkouts: &[(&str, Vec<i64>)],
+    budget: Duration,
+    mut git_log: impl FnMut(&str, i64, Instant) -> Result<Option<String>>,
+) -> Result<(usize, LinkStop)> {
     let deadline = Instant::now() + budget;
-    for group in &today.groups {
-        for (repo, ids) in checkouts(group) {
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                return Ok(true);
-            }
-            // The link's write waits for the lock no longer than the budget left: while the
-            // watcher or a reindex holds it, the default 15 s wait per checkout hung the view
-            // exactly when sessions were active.
-            conn.busy_timeout(left)?;
-            match gitlink::link_threads_with(conn, repo, &ids, deadline, &mut git_log) {
-                Ok(Some(_)) => {}
-                Ok(None) => return Ok(true),
-                Err(e) if db::is_busy(&e) => return Ok(true),
-                // A checkout git can't read (moved, corrupt, git missing) just shows no
-                // commits.
-                Err(_) => {}
-            }
+    let mut linked = 0;
+    for (repo, ids) in checkouts {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Ok((linked, LinkStop::OutOfTime));
+        }
+        // The link's write waits for the lock no longer than the budget left: while the
+        // watcher or a reindex holds it, the default 15 s wait per checkout hung the view
+        // exactly when sessions were active.
+        conn.busy_timeout(left)?;
+        match gitlink::link_threads_with(conn, repo, ids, deadline, &mut git_log) {
+            Ok(Some(_)) => linked += 1,
+            Ok(None) => return Ok((linked, LinkStop::Failed)),
+            Err(e) if db::is_busy(&e) => return Ok((linked, LinkStop::Failed)),
+            // A checkout git can't read (moved, corrupt, git missing) just shows no
+            // commits.
+            Err(_) => linked += 1,
         }
     }
-    Ok(false)
+    Ok((linked, LinkStop::Done))
 }
 
 /// Fill each thread's commits from the stored links, those committed since the window

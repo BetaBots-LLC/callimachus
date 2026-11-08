@@ -13,6 +13,13 @@ and PR checks; this file is what an agent needs on top of that.
     `distill --auto`) and `locks` (`<index>.gui.lock` / `<index>.watch.lock` / `<index>.distill.lock`). It cannot name
     telemetry.
     Its build.rs stamps the app crate's version as `CALLIMACHUS_VERSION` (core stays 0.0.0).
+    The graph tables from 0034 (`facts.uid` / `source_seq`, `projects`, `file_edits`,
+    `issue_clusters`) and their functions are documented at the top of `core/src/lib.rs`. The
+    watcher keeps them current (`jobs::CommitLinker` after each batch, the off-writer
+    `issue_clusters_kick` when the index changed since the stored refresh, and after its launch
+    catch-up the one-time `file_edits` backfill that 0034 flags in `app_config`); `cal index`
+    runs the same upkeep after its pass (`headless::graph_upkeep`), since a plugin-only machine
+    has no watcher.
   - The app crate (`src/`, `callimachus_lib`): window, tray, Tauri commands in `lib.rs` (thin
     over `core::jobs`; `TauriHost` emits through Tauri's `Emitter`) and `telemetry.rs`. It
     re-exports core's modules, so `crate::db` etc. resolve. One binary: `callimachus`
@@ -69,11 +76,13 @@ which holds the user's whole history and their Settings (`app_config`).
   therefore points `CALLIMACHUS_DB` at `index.dev.db` next to it (`scripts/desktop-dev.mjs`);
   only a raw `tauri dev` or an explicit `CALLIMACHUS_DB` opens the real index. Other writers:
   the MCP server, the `cal` write commands (`star`, `tag`, `distill`, `done`, `remember`,
-  `snapshot`, `commits`, `audit-pr`, and the headless jobs `index`, `watch`, `embed`,
-  `distill --auto`), and the PreCompact and SessionEnd hooks, which open with
-  `db::open_sidecar_current` and never migrate (they skip until the app or a `cal` command has
-  upgraded the index). `cal hook`, `memory`, `stats`, `search` and the other queries open
-  read-only.
+  `snapshot`, `commits`, `audit-pr`, `memory import` without `--review`, and the headless jobs
+  `index`, `watch`, `embed`, `distill --auto`), and the PreCompact and SessionEnd hooks, which
+  open with `db::open_sidecar_current` and never migrate (they skip until the app or a `cal`
+  command has upgraded the index). `cal hook`, `memory`, `memory import --review`, `stats`,
+  `search` and the other queries open read-only; `cal memory publish` reads the index
+  read-only but writes `.callimachus/memory/` into the checkout it runs in, so never run it in
+  this repo to test it.
 - A dev app launch also runs `integration::refresh_installed`, which can rewrite the installed
   skill and re-point dangling hooks, MCP entries and the `cal` link at the dev binary.
 - Smoke-test built binaries on an APFS clone with a throwaway HOME (never `cargo` or `pnpm`
@@ -90,8 +99,8 @@ env -u CLAUDE_CONFIG_DIR -u CODEX_HOME HOME="$S/home" CALLIMACHUS_DB="$S/index.d
 ## Migrations
 
 - Add `src-tauri/migrations/00NN_<name>.sql` (the directory stays there, not under `core/`)
-  with the next number (0034) and register it in `core/src/db/migrations.rs`. Never edit a
-  committed migration (0001-0033): `rusqlite_migration` tracks only `user_version`, so an
+  with the next number (0035) and register it in `core/src/db/migrations.rs`. Never edit a
+  committed migration (0001-0034): `rusqlite_migration` tracks only `user_version`, so an
   edited file never re-runs on an index that already applied it.
 - An upgrade runs in whichever process opens the index first and holds the write lock, so time
   it on a large index (`db::migrate` pre-reads big files sequentially first, unless every pending
@@ -136,7 +145,7 @@ hook output cap), `COMPACT` (after compaction, snapshot carry), `AGENTS_FILE` (t
 AGENTS.md / CLAUDE.md block) and `MCP` (`project_memory`). Change sizes there, not at call sites.
 MCP transcript tools take a `budget` (`TRANSCRIPT_BUDGET_*` in `mcp_server.rs`, default 24k).
 Hook events, matchers and timeouts are the `HookSpec` consts in `integration.rs` (the plugin's
-own SessionStart guard is `PLUGIN_ONLY_HOOKS` in its tests). Hook commands (`hook`,
+own SessionStart guard is `PLUGIN_ONLY_HOOKS` in its tests). Hook commands (`hook`, `recall-error`,
 `snapshot-hook`, `session-end`, `recall-now`, `index --if-stale`) exit 0 silently on any error,
 never create an index and never migrate one themselves (`index --if-stale` starts a detached
 `cal index` only on a non-empty index; that pass upgrades the schema only when it runs from

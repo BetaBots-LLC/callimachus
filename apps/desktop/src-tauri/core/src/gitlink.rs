@@ -181,7 +181,7 @@ pub fn correlate(threads: &[ThreadWindow], commits: &[Commit]) -> Vec<Link> {
 
 /// `git` with no console window on Windows (a GUI app spawning a console program would
 /// otherwise flash one for every link pass).
-fn git_command() -> std::process::Command {
+pub(crate) fn git_command() -> std::process::Command {
     #[allow(unused_mut)]
     let mut cmd = std::process::Command::new("git");
     #[cfg(windows)]
@@ -195,7 +195,7 @@ fn git_command() -> std::process::Command {
 
 /// Drop Windows' verbatim `\\?\` prefix (what `std::fs::canonicalize` returns there), which
 /// git and most tools don't accept as a working directory. Unchanged elsewhere.
-fn plain_path(p: &str) -> String {
+pub(crate) fn plain_path(p: &str) -> String {
     if let Some(rest) = p.strip_prefix(r"\\?\UNC\") {
         return format!(r"\\{rest}");
     }
@@ -350,9 +350,37 @@ pub(crate) fn run_git_log_until(
     since: i64,
     deadline: Instant,
 ) -> Result<Option<String>> {
+    let out = run_until(git_log_command(repo, since), deadline)?;
+    match out {
+        Some((true, stdout)) => Ok(Some(stdout)),
+        Some((false, _)) => bail!("git log failed in {repo}"),
+        None => Ok(None),
+    }
+}
+
+/// `git -C dir <args>` that gives up at `deadline`: its trimmed stdout, None when git had not
+/// finished by then (the process is killed), an error when it exited non-zero. For the
+/// watcher's probes, which run on the thread that indexes: a git hung on a sleeping network
+/// mount or a slow fsmonitor hook must not stall indexing.
+pub(crate) fn run_git_until(dir: &str, args: &[&str], deadline: Instant) -> Result<Option<String>> {
+    let mut cmd = git_command();
+    cmd.arg("-C").arg(plain_path(dir)).args(args);
+    match run_until(cmd, deadline)? {
+        Some((true, stdout)) => Ok(Some(stdout.trim().to_string())),
+        Some((false, _)) => bail!("git {} failed in {dir}", args.join(" ")),
+        None => Ok(None),
+    }
+}
+
+/// Run `cmd` to completion or `deadline`, whichever comes first: Some((success, stdout)), or
+/// None when it was still running at the deadline (it is killed and reaped).
+fn run_until(mut cmd: std::process::Command, deadline: Instant) -> Result<Option<(bool, String)>> {
     use std::io::Read;
     use std::process::Stdio;
-    let mut child = git_log_command(repo, since)
+    if Instant::now() >= deadline {
+        return Ok(None);
+    }
+    let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -373,15 +401,15 @@ pub(crate) fn run_git_log_until(
                 // Reap git before giving up, or it and the reader thread keep running.
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(anyhow::anyhow!("waiting for git in {repo}: {e}"));
+                return Err(anyhow::anyhow!("waiting for git: {e}"));
             }
         };
         if let Some(status) = polled {
             let out = reader.join().unwrap_or_default();
-            if !status.success() {
-                bail!("git log failed in {repo}");
-            }
-            return Ok(Some(String::from_utf8_lossy(&out).into_owned()));
+            return Ok(Some((
+                status.success(),
+                String::from_utf8_lossy(&out).into_owned(),
+            )));
         }
         if Instant::now() >= deadline {
             let _ = child.kill();

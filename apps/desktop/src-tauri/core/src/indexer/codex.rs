@@ -5,8 +5,8 @@
 
 use super::common::{parse_rfc3339, push_message, truncate_title};
 use super::{
-    file_change_state, set_file_state, source_id, upsert_thread, IndexReport, ParsedMessage,
-    ParsedThread,
+    file_change_state, set_file_state, source_id, upsert_thread, IndexReport, MsgUsage,
+    ParsedMessage, ParsedThread,
 };
 use anyhow::Result;
 use rusqlite::Connection;
@@ -270,7 +270,7 @@ fn index_rollout(conn: &mut Connection, sid: i64, meta: &ThreadMeta) -> Result<O
         return Ok(None);
     }
 
-    let messages = parse_rollout(path)?;
+    let Rollout { messages, usage } = parse_rollout(path)?;
     // `codex exec` runs the app's own distill / Ask calls (codex-cli engine) and always
     // writes a rollout; those are not the user's history.
     let cwd = (!meta.cwd.is_empty()).then_some(meta.cwd.as_str());
@@ -303,7 +303,7 @@ fn index_rollout(conn: &mut Connection, sid: i64, meta: &ThreadMeta) -> Result<O
         created_at: meta.created_at,
         updated_at: meta.updated_at,
         is_subagent: false,
-        usage: Vec::new(),
+        usage,
         messages,
     };
     let n = upsert_thread(conn, sid, &thread)?;
@@ -377,10 +377,19 @@ fn meta_from_rollout(path: &Path) -> Option<ThreadMeta> {
     })
 }
 
-/// Parse a rollout JSONL file into ordered messages.
-fn parse_rollout(path: &Path) -> Result<Vec<ParsedMessage>> {
+/// A rollout's messages and the token usage of each model call, keyed like
+/// [`ParsedThread::usage`].
+#[derive(Default)]
+struct Rollout {
+    messages: Vec<ParsedMessage>,
+    usage: Vec<(usize, MsgUsage)>,
+}
+
+/// Parse a rollout JSONL file into ordered messages and their usage.
+fn parse_rollout(path: &Path) -> Result<Rollout> {
     let content = fs::read_to_string(path)?;
-    let mut out = Vec::new();
+    let mut thread = ParsedThread::default();
+    let mut tokens = TokenCounter::default();
     for line in content.lines() {
         if line.trim().is_empty() {
             continue;
@@ -388,19 +397,122 @@ fn parse_rollout(path: &Path) -> Result<Vec<ParsedMessage>> {
         let Ok(obj) = serde_json::from_str::<Value>(line) else {
             continue;
         };
-        if obj.get("type").and_then(Value::as_str) != Some("response_item") {
-            continue;
-        }
-        let ts = obj
-            .get("timestamp")
-            .and_then(Value::as_str)
-            .and_then(parse_rfc3339);
         let Some(payload) = obj.get("payload") else {
             continue;
         };
-        ingest_payload(&mut out, payload, ts);
+        match obj.get("type").and_then(Value::as_str) {
+            Some("response_item") => {
+                let ts = obj
+                    .get("timestamp")
+                    .and_then(Value::as_str)
+                    .and_then(parse_rfc3339);
+                ingest_payload(&mut thread.messages, payload, ts);
+            }
+            // Each turn names its model; usage events that follow are that model's.
+            Some("turn_context") => {
+                if let Some(m) = payload.get("model").and_then(Value::as_str) {
+                    tokens.model = Some(m.to_string());
+                }
+            }
+            Some("event_msg")
+                if payload.get("type").and_then(Value::as_str) == Some("token_count") =>
+            {
+                tokens.ingest(&mut thread, payload);
+            }
+            _ => {}
+        }
     }
-    Ok(out)
+    Ok(Rollout {
+        messages: thread.messages,
+        usage: thread.usage,
+    })
+}
+
+/// A rollout's messages and usage as a thread, for the usage backfill
+/// (`indexer::usage_backfill`), which writes only the usage onto the stored rows.
+pub(super) fn parse_rollout_thread(path: &Path) -> Result<ParsedThread> {
+    let Rollout { messages, usage } = parse_rollout(path)?;
+    Ok(ParsedThread {
+        messages,
+        usage,
+        ..Default::default()
+    })
+}
+
+/// Turns Codex's `token_count` events into per-call usage. Each event carries
+/// `info.total_token_usage`, the session's running total, so a call's usage is the
+/// difference from the previous event; Codex repeats an event with an unchanged total (a
+/// rate-limit update), which adds nothing. A count that restarted (the total equals the
+/// event's own `last_token_usage`, or went down) takes `last_token_usage` instead. Shape checked against
+/// `TokenUsage` / `TokenCountEvent` in codex-rs/protocol/src/protocol.rs on 2026-11-07:
+/// `input_tokens` includes the cached (and cache-write) tokens, `output_tokens` includes
+/// reasoning.
+#[derive(Default)]
+struct TokenCounter {
+    model: Option<String>,
+    total: Option<[i64; 4]>,
+    /// The first message of the call the next event reports: messages pushed since the
+    /// previous event belong to it.
+    call_start: usize,
+}
+
+impl TokenCounter {
+    fn ingest(&mut self, thread: &mut ParsedThread, payload: &Value) {
+        let Some(info) = payload.get("info").filter(|i| i.is_object()) else {
+            return;
+        };
+        let Some(total) = info.get("total_token_usage").map(token_counts) else {
+            return;
+        };
+        let last = info.get("last_token_usage").map(token_counts);
+        let delta = match self.total {
+            None => total,
+            // A repeat (a rate-limit update) adds nothing.
+            Some(prev) if total == prev => [0; 4],
+            // The count restarted at this call: its total is just this call. Differencing
+            // would lose whatever the previous total held (1000 + 3000 input read as 2000).
+            Some(_) if last == Some(total) => total,
+            Some(prev) if total.iter().zip(prev).all(|(now, was)| *now >= was) => {
+                [0, 1, 2, 3].map(|i| total[i] - prev[i])
+            }
+            // The count restarted earlier and went down: the event's own call is all we know.
+            Some(_) => last.unwrap_or([0; 4]),
+        };
+        self.total = Some(total);
+        let start = std::mem::replace(&mut self.call_start, thread.messages.len());
+        if delta == [0; 4] {
+            return;
+        }
+        let [input, cached, cache_write, output] = delta;
+        // On the call's first assistant row (its text or first tool call), as Claude Code's
+        // usage sits; the user prompt or tool output that fed the call came before it.
+        let at = thread.messages[start..]
+            .iter()
+            .position(|m| m.role == "assistant")
+            .map(|i| start + i);
+        thread.attach_usage(
+            at,
+            MsgUsage {
+                // A rollout from before turns named their model: counted, but unpriced.
+                model: self.model.clone().unwrap_or_else(|| "codex".to_string()),
+                input: (input - cached - cache_write).max(0),
+                output,
+                cache_write,
+                cache_read: cached,
+            },
+        );
+    }
+}
+
+/// `[input, cached input, cache-write input, output]` of one Codex `TokenUsage` object.
+fn token_counts(u: &Value) -> [i64; 4] {
+    let n = |k: &str| u.get(k).and_then(Value::as_i64).unwrap_or(0).max(0);
+    [
+        n("input_tokens"),
+        n("cached_input_tokens"),
+        n("cache_write_input_tokens"),
+        n("output_tokens"),
+    ]
 }
 
 fn ingest_payload(out: &mut Vec<ParsedMessage>, payload: &Value, ts: Option<i64>) {
@@ -426,7 +538,14 @@ fn ingest_payload(out: &mut Vec<ParsedMessage>, payload: &Value, ts: Option<i64>
                 .to_string();
             push_message(out, "assistant", &format!("{name}: {args}"), Some(name), ts);
         }
-        Some("function_call_output") => {
+        // Freeform tools, `apply_patch` above all: the input is the raw patch text. Capped
+        // (a patch can carry whole files) by `cap_call_text`, which keeps every `*** ` file
+        // line `file_edits` reads.
+        Some("custom_tool_call") => {
+            let (name, text) = custom_call_text(payload);
+            push_message(out, "assistant", &cap_call_text(&text), Some(name), ts);
+        }
+        Some("function_call_output") | Some("custom_tool_call_output") => {
             let output = payload.get("output").map(value_to_text).unwrap_or_default();
             // Same index-time cap as Claude tool results (see `claude::cap_tool_text`).
             let output = super::claude::cap_tool_text(output.trim());
@@ -434,6 +553,112 @@ fn ingest_payload(out: &mut Vec<ParsedMessage>, payload: &Value, ts: Option<i64>
         }
         _ => {} // reasoning, etc. — skipped
     }
+}
+
+/// A `custom_tool_call` payload's tool name and its `Name: input` text, uncapped.
+fn custom_call_text(payload: &Value) -> (String, String) {
+    let name = payload
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("tool")
+        .to_string();
+    let input = payload.get("input").map(value_to_text).unwrap_or_default();
+    let text = format!("{name}: {input}").trim().to_string();
+    (name, text)
+}
+
+/// A freeform call's text capped at [`super::claude::TOOL_TEXT_CAP_CHARS`]. A patch over the
+/// cap keeps every `*** ` line (each file it adds, updates, deletes or moves) and elides hunk
+/// lines once the budget is spent: `cap_tool_text`'s head plus tail drops the file headers in
+/// the middle of a large multi-file patch, and those are what `file_edits` records.
+/// Deterministic, so a re-parse stores the same text.
+fn cap_call_text(text: &str) -> String {
+    let cap = super::claude::TOOL_TEXT_CAP_CHARS;
+    if text.len() <= cap || !text.contains("*** Begin Patch") {
+        return super::claude::cap_tool_text(text);
+    }
+    let is_header = |l: &str| l.trim_start().starts_with("*** ");
+    let headers: usize = text
+        .lines()
+        .filter(|l| is_header(l))
+        .map(|l| l.len() + 1)
+        .sum();
+    let mut budget = cap.saturating_sub(headers);
+    let mut out = String::with_capacity(cap.max(headers) + 256);
+    let mut elided = 0usize;
+    let flush = |out: &mut String, elided: &mut usize| {
+        if *elided > 0 {
+            out.push_str(&format!("[… {elided} patch lines elided …]\n"));
+            *elided = 0;
+        }
+    };
+    for line in text.lines() {
+        if is_header(line) {
+            flush(&mut out, &mut elided);
+            out.push_str(line);
+            out.push('\n');
+        } else if line.len() < budget {
+            budget -= line.len() + 1;
+            flush(&mut out, &mut elided);
+            out.push_str(line);
+            out.push('\n');
+        } else {
+            budget = 0;
+            elided += 1;
+        }
+    }
+    flush(&mut out, &mut elided);
+    out.truncate(out.trim_end().len());
+    out
+}
+
+/// The freeform tool calls (`custom_tool_call`, `apply_patch` above all) in a rollout file,
+/// as (timestamp, tool name, `Name: input`), uncapped. An index from before 0034 never stored
+/// them; the `file_edits` backfill reads them from here instead of re-parsing the thread.
+pub(crate) fn custom_tool_calls(path: &Path) -> Result<Vec<(Option<i64>, String, String)>> {
+    let file = fs::File::open(path)?;
+    let mut out = Vec::new();
+    for line in BufReader::new(file).lines().map_while(std::io::Result::ok) {
+        // Most lines are messages and outputs: skip them before paying for a JSON parse.
+        if !line.contains("\"custom_tool_call\"") {
+            continue;
+        }
+        let Ok(obj) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if obj.get("type").and_then(Value::as_str) != Some("response_item") {
+            continue;
+        }
+        let Some(payload) = obj
+            .get("payload")
+            .filter(|p| p.get("type").and_then(Value::as_str) == Some("custom_tool_call"))
+        else {
+            continue;
+        };
+        let ts = obj
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(parse_rfc3339);
+        let (name, text) = custom_call_text(payload);
+        out.push((ts, name, text));
+    }
+    Ok(out)
+}
+
+/// The session id (the thread's `external_id`) a rollout file belongs to: the UUID that ends
+/// its name (`rollout-<time>-<uuid>.jsonl`), else its `session_meta` header.
+pub(crate) fn rollout_session_id(path: &Path) -> Option<String> {
+    let stem = path.file_stem()?.to_str()?;
+    let tail = stem.get(stem.len().checked_sub(36)?..)?;
+    let is_uuid = tail.len() == 36
+        && tail.char_indices().all(|(i, c)| match i {
+            8 | 13 | 18 | 23 => c == '-',
+            _ => c.is_ascii_hexdigit(),
+        });
+    if is_uuid {
+        return Some(tail.to_ascii_lowercase());
+    }
+    meta_from_rollout(path).map(|m| m.id)
 }
 
 /// Join the text of a message's content blocks (input_text / output_text / text).
@@ -481,17 +706,167 @@ mod tests {
 {"timestamp":"2026-04-25T22:09:39.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"fix the warranty audit"}]}}
 {"timestamp":"2026-04-25T22:09:40.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"On it"}]}}
 {"timestamp":"2026-04-25T22:09:41.000Z","type":"response_item","payload":{"type":"function_call","name":"shell","arguments":"{\"cmd\":\"ls\"}"}}
+{"timestamp":"2026-04-25T22:09:42.000Z","type":"response_item","payload":{"type":"custom_tool_call","status":"completed","call_id":"c1","name":"apply_patch","input":"*** Begin Patch\n*** Update File: src/audit.rs\n@@\n-a\n+b\n*** End Patch\n"}}
+{"timestamp":"2026-04-25T22:09:43.000Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"c1","output":"Success. Updated the following files:\nM src/audit.rs"}}
 "#;
         std::fs::File::create(&path)
             .unwrap()
             .write_all(sample.as_bytes())
             .unwrap();
 
-        let msgs = parse_rollout(&path).unwrap();
-        assert_eq!(msgs.len(), 3); // user, assistant, function_call (session_meta ignored)
+        let msgs = parse_rollout(&path).unwrap().messages;
+        // user, assistant, function_call, custom_tool_call, its output (session_meta ignored)
+        assert_eq!(msgs.len(), 5);
         assert_eq!(msgs[0].role, "user");
         assert!(msgs[0].text.contains("warranty"));
         assert_eq!(msgs[2].tool_name.as_deref(), Some("shell"));
+        assert_eq!(msgs[3].tool_name.as_deref(), Some("apply_patch"));
+        assert_eq!(
+            super::super::file_edits::edits_of("apply_patch", &msgs[3].text),
+            vec![(
+                "src/audit.rs".to_string(),
+                super::super::file_edits::Op::Edit
+            )]
+        );
+        assert_eq!(msgs[4].role, "tool");
+    }
+
+    #[test]
+    fn a_big_patch_keeps_every_file_line() {
+        let mut patch = String::from("apply_patch: *** Begin Patch\n");
+        for i in 0..40 {
+            patch.push_str(&format!("*** Update File: src/m{i}.rs\n@@\n"));
+            for j in 0..100 {
+                patch.push_str(&format!("+line {j} of a long hunk in file {i}\n"));
+            }
+        }
+        patch.push_str("*** End Patch");
+        let capped = cap_call_text(&patch);
+        assert!(capped.len() < super::super::claude::TOOL_TEXT_CAP_CHARS + 1_500);
+        let edits = super::super::file_edits::edits_of("apply_patch", &capped);
+        assert_eq!(edits.len(), 40, "every file survives the cap");
+        assert!(capped.contains("patch lines elided"));
+        assert_eq!(cap_call_text(&patch), capped, "deterministic");
+        // Not a patch, or under the cap: the usual cap.
+        assert_eq!(cap_call_text("apply_patch: x"), "apply_patch: x");
+    }
+
+    #[test]
+    fn rollout_ids_come_from_the_file_name() {
+        assert_eq!(
+            rollout_session_id(Path::new(
+                "/x/rollout-2026-04-25T15-09-15-019dc6b0-998d-7a31-a39d-1229e6b38072.jsonl"
+            ))
+            .as_deref(),
+            Some("019dc6b0-998d-7a31-a39d-1229e6b38072")
+        );
+        assert_eq!(
+            rollout_session_id(Path::new("/no/such/rollout-x.jsonl")),
+            None
+        );
+    }
+
+    /// `token_count` totals are cumulative: each call's usage is the difference, a repeated
+    /// event adds nothing, and the usage sits on the call's first assistant row with the
+    /// turn's model. Cached input comes out of fresh input.
+    #[test]
+    fn token_counts_become_per_call_usage() {
+        let path = std::env::temp_dir().join(format!(
+            "callimachus_codex_tok_{}.jsonl",
+            std::process::id()
+        ));
+        let tc = |input: i64, cached: i64, output: i64| {
+            format!(
+                r#"{{"timestamp":"2026-04-25T22:09:45.000Z","type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":{input},"cached_input_tokens":{cached},"output_tokens":{output},"reasoning_output_tokens":0,"total_tokens":{}}},"last_token_usage":{{"input_tokens":1,"cached_input_tokens":0,"output_tokens":1,"reasoning_output_tokens":0,"total_tokens":2}},"model_context_window":272000}},"rate_limits":null}}}}"#,
+                input + output
+            )
+        };
+        let lines = [
+            r#"{"timestamp":"2026-04-25T22:09:38.623Z","type":"session_meta","payload":{"id":"t1","cwd":"/proj"}}"#.to_string(),
+            r#"{"timestamp":"2026-04-25T22:09:38.700Z","type":"turn_context","payload":{"cwd":"/proj","model":"gpt-5.3-codex"}}"#.to_string(),
+            r#"{"timestamp":"2026-04-25T22:09:39.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"fix it"}]}}"#.to_string(),
+            r#"{"timestamp":"2026-04-25T22:09:39.500Z","type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":null}}"#.to_string(),
+            r#"{"timestamp":"2026-04-25T22:09:41.000Z","type":"response_item","payload":{"type":"function_call","name":"shell","arguments":"{}"}}"#.to_string(),
+            tc(1000, 200, 50),
+            tc(1000, 200, 50),
+            r#"{"timestamp":"2026-04-25T22:09:42.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"c","output":"ok"}}"#.to_string(),
+            r#"{"timestamp":"2026-04-25T22:09:43.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}}"#.to_string(),
+            tc(2500, 1100, 80),
+        ];
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        let r = parse_rollout(&path).unwrap();
+        assert_eq!(r.messages.len(), 4);
+        let got: Vec<(usize, &str, [i64; 4])> = r
+            .usage
+            .iter()
+            .map(|(i, u)| {
+                (
+                    *i,
+                    u.model.as_str(),
+                    [u.input, u.output, u.cache_write, u.cache_read],
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (1, "gpt-5.3-codex", [800, 50, 0, 200]),
+                (3, "gpt-5.3-codex", [600, 30, 0, 900]),
+            ]
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A restarted running total: one that lands above the previous total with the event's
+    /// own call as the whole of it, and one that drops below. Each call counts in full.
+    #[test]
+    fn a_restarted_token_count_keeps_each_calls_tokens() {
+        let path = std::env::temp_dir().join(format!(
+            "callimachus_codex_reset_{}.jsonl",
+            std::process::id()
+        ));
+        let tc = |total: [i64; 2], last: [i64; 2]| {
+            format!(
+                r#"{{"timestamp":"2026-04-25T22:09:45.000Z","type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":{},"cached_input_tokens":0,"output_tokens":{}}},"last_token_usage":{{"input_tokens":{},"cached_input_tokens":0,"output_tokens":{}}}}}}}}}"#,
+                total[0], total[1], last[0], last[1]
+            )
+        };
+        let say = |text: &str| {
+            format!(
+                r#"{{"timestamp":"2026-04-25T22:09:43.000Z","type":"response_item","payload":{{"type":"message","role":"assistant","content":[{{"type":"output_text","text":"{text}"}}]}}}}"#
+            )
+        };
+        let lines = [
+            r#"{"timestamp":"2026-04-25T22:09:38.700Z","type":"turn_context","payload":{"cwd":"/proj","model":"gpt-5.3-codex"}}"#.to_string(),
+            say("one"),
+            tc([1000, 100], [1000, 100]),
+            // Restarted at this call, landing above the old total: 3000 in, not 2000.
+            say("two"),
+            tc([3000, 200], [3000, 200]),
+            // Restarted again, now below the old total: the event's own call.
+            say("three"),
+            tc([500, 40], [500, 40]),
+            // Growth after a restart differences as usual.
+            say("four"),
+            tc([800, 60], [300, 20]),
+        ];
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        let r = parse_rollout(&path).unwrap();
+        let got: Vec<(usize, [i64; 2])> = r
+            .usage
+            .iter()
+            .map(|(i, u)| (*i, [u.input, u.output]))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (0, [1000, 100]),
+                (1, [3000, 200]),
+                (2, [500, 40]),
+                (3, [300, 20]),
+            ]
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     /// Pass 2: a rollout file on disk with NO state DB still gets indexed (covers

@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { type KeyboardEvent, useRef, useState } from "react";
-import { api, SOURCE_LABELS, type SourceKind, type ValueLedger } from "../lib/api";
+import { api, type DayCost, SOURCE_LABELS, type SourceKind, type ValueLedger } from "../lib/api";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Spinner } from "@/components/ui/spinner";
@@ -11,6 +11,7 @@ import { errorText, notify } from "../lib/toast";
 import { useUi } from "../store/ui";
 import { cn } from "@/lib/utils";
 import { Loading } from "./Loading";
+import { CommitSpendList } from "./project/SpendSection";
 
 export function StatsView() {
   const { data, isLoading, isError, error } = useQuery({
@@ -364,7 +365,7 @@ function ValueCard() {
   if (!data) return null;
 
   const { week, allTime } = data;
-  const weekTotal = week.hook + week.digest + week.recall + week.mcp;
+  const weekTotal = week.hook + week.digest + week.recall + week.playbook + week.mcp;
   return (
     <Card>
       <CardHeader>
@@ -376,7 +377,7 @@ function ValueCard() {
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-5">
-        <dl className="grid grid-cols-2 gap-px overflow-hidden rounded-lg border bg-border sm:grid-cols-4">
+        <dl className="grid grid-cols-2 gap-px overflow-hidden rounded-lg border bg-border sm:grid-cols-5">
           <Stat
             label="Memory injected"
             value={week.hook.toLocaleString()}
@@ -391,6 +392,11 @@ function ValueCard() {
             label="Recall hits"
             value={week.recall.toLocaleString()}
             title="Prompts where related past work was surfaced before the agent redid it"
+          />
+          <Stat
+            label="Error playbooks"
+            value={week.playbook.toLocaleString()}
+            title="Failed shell commands where the agent was told how the same error was fixed before"
           />
           <Stat
             label="MCP tool calls"
@@ -501,12 +507,17 @@ function RetentionGuard({ preserved }: { preserved: ValueLedger["preserved"] }) 
   );
 }
 
-/** Estimated AI spend by model + the priciest threads, from captured token usage. */
+/** Estimated AI spend by model + the priciest threads, from captured token usage, with the
+ *  last 30 days and the priciest commits once the breakdown loads. */
 function SpendCard() {
-  const openSettings = useUi((s) => s.openSettings);
   const { data } = useQuery({
     queryKey: ["spend"],
     queryFn: () => api.spend(),
+    staleTime: AGGREGATE_STALE_MS,
+  });
+  const breakdown = useQuery({
+    queryKey: ["spend_breakdown"],
+    queryFn: () => api.spendBreakdown(),
     staleTime: AGGREGATE_STALE_MS,
   });
   if (!data) return null;
@@ -519,16 +530,10 @@ function SpendCard() {
         </CardHeader>
         <CardContent>
           <p className="text-sm text-muted-foreground">
-            No token usage captured yet. Use{" "}
-            <Button
-              variant="link"
-              className="h-auto p-0 align-baseline text-sm"
-              onClick={() => openSettings("index")}
-            >
-              Reindex everything
-            </Button>{" "}
-            in Settings to read it from your source files. Then this shows your estimated AI spend
-            by model and your priciest threads.
+            No token usage recorded yet. Claude Code, Codex, Gemini CLI, Qwen Code, OpenCode and
+            Copilot record it; other agents do not. Sessions indexed before this update get theirs
+            once, in the background, soon after the app starts. Then this shows your estimated AI
+            spend by model and your priciest threads.
           </p>
         </CardContent>
       </Card>
@@ -556,6 +561,7 @@ function SpendCard() {
               </div>
             ))}
         </div>
+        {breakdown.data?.days.some((d) => d.cost > 0) && <SpendByDay days={breakdown.data.days} />}
         {data.topThreads.length > 0 && (
           <div>
             <div className="mb-1 text-xs uppercase tracking-wide text-muted-foreground">
@@ -575,8 +581,17 @@ function SpendCard() {
             </div>
           </div>
         )}
+        {breakdown.data && breakdown.data.commits.length > 0 && (
+          <div>
+            <div className="mb-1 text-xs uppercase tracking-wide text-muted-foreground">
+              Priciest commits
+            </div>
+            <CommitSpendList commits={breakdown.data.commits} />
+          </div>
+        )}
         <p className="text-[0.7rem] text-muted-foreground">
-          Estimate from list prices, not a billing record.
+          List-price equivalent of the recorded usage, not a billing record; a subscription bills
+          differently.
           {data.untrackedCalls > 0
             ? ` ${data.untrackedCalls.toLocaleString()} calls on unpriced models not counted.`
             : ""}
@@ -584,6 +599,57 @@ function SpendCard() {
       </CardContent>
     </Card>
   );
+}
+
+/** The last 30 local days as thin columns on a shared baseline, one tooltip per day. One
+ *  series, so no legend: the heading names it, and the peak day is stated in text. */
+function SpendByDay({ days }: { days: DayCost[] }) {
+  const max = Math.max(...days.map((d) => d.cost));
+  const total = days.reduce((n, d) => n + d.cost, 0);
+  const peak = days.reduce((a, b) => (b.cost > a.cost ? b : a), days[0]);
+  const label = (d: DayCost) => `${dayLabel(d.day)}: ${formatUsd(d.cost)}`;
+  return (
+    <div>
+      <div className="mb-1.5 flex items-baseline justify-between gap-2">
+        <span className="text-xs uppercase tracking-wide text-muted-foreground">Last 30 days</span>
+        <span className="text-xs tabular-nums text-muted-foreground">
+          {formatUsd(total)} · peak {formatUsd(peak.cost)} on {dayLabel(peak.day)}
+        </span>
+      </div>
+      <TooltipProvider delay={100}>
+        <ol className="flex h-16 items-end gap-0.5" aria-label="Estimated spend per day">
+          {days.map((d) => (
+            <Tooltip key={d.day}>
+              <TooltipTrigger
+                render={
+                  <li className="flex h-full min-w-0 flex-1 items-end">
+                    <span className="sr-only">{label(d)}</span>
+                    <span
+                      aria-hidden
+                      className={cn(
+                        "w-full rounded-t-[3px]",
+                        d.cost > 0 ? "bg-primary hover:bg-primary/80" : "bg-muted",
+                      )}
+                      style={{
+                        height: d.cost > 0 ? `${Math.max(4, (d.cost / max) * 100)}%` : "2px",
+                      }}
+                    />
+                  </li>
+                }
+              />
+              <TooltipContent aria-hidden>{label(d)}</TooltipContent>
+            </Tooltip>
+          ))}
+        </ol>
+      </TooltipProvider>
+    </div>
+  );
+}
+
+/** "Nov 7" for a local `YYYY-MM-DD`. */
+function dayLabel(day: string): string {
+  const [y, m, d] = day.split("-").map(Number);
+  return new Date(y, m - 1, d).toLocaleDateString(undefined, { month: "short", day: "numeric" });
 }
 
 /** A label/value cell. `title` (the value by default) keeps a truncated value readable;

@@ -90,6 +90,12 @@ pub static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
         M::up(include_str!("../../../migrations/0032_fact_origin_ref.sql")),
         // 0033: Copilot CLI as a source (one row in `sources`).
         M::up(include_str!("../../../migrations/0033_copilot_cli.sql")),
+        // 0034: fact identity (facts.uid, facts.source_seq) and the graph tables: projects
+        // (portable ids), file_edits (per tool call), issue_clusters; plus a
+        // threads(last_indexed_at) index for the watcher's commit linking.
+        M::up(include_str!(
+            "../../../migrations/0034_identity_and_graph.sql"
+        )),
     ])
 });
 
@@ -97,9 +103,11 @@ pub static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
 /// column adds and indexes over small tables. When every pending migration is listed here,
 /// `db::migrate` skips its sequential pre-read of the whole file, which costs about 1.2 s
 /// warm (several seconds cold) on a 5.1 GB index, far more than these migrations themselves
-/// (0032 is one ALTER ADD COLUMN and a partial index over `facts`; 0033 one row in `sources`).
-/// Add a migration here only when it touches no large table.
-pub const SCAN_FREE_MIGRATIONS: &[usize] = &[32, 33];
+/// (0032 is one ALTER ADD COLUMN and a partial index over `facts`; 0033 one row in `sources`;
+/// 0034 backfills `facts` (2k rows), creates empty tables and indexes `threads`: opening a
+/// copy of that index at 0032 ran 0033 and 0034 in 0.4 s cold). Add a migration here only when
+/// it touches no large table.
+pub const SCAN_FREE_MIGRATIONS: &[usize] = &[32, 33, 34];
 
 /// Whether every migration after `applied` (the index's `user_version`) up to `latest` is in
 /// [`SCAN_FREE_MIGRATIONS`].
@@ -116,6 +124,7 @@ mod tests {
     fn scan_free_pending_skips_the_preread() {
         assert!(pending_are_scan_free(31, 32), "0032 alone is cheap");
         assert!(pending_are_scan_free(31, 33), "so is 0033");
+        assert!(pending_are_scan_free(31, 34), "and 0034");
         assert!(
             !pending_are_scan_free(30, 32),
             "0031 builds indexes on messages"

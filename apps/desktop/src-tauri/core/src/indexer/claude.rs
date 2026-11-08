@@ -17,7 +17,8 @@
 
 use super::common::{join_text_parts, parse_rfc3339, push_message, truncate_title};
 use super::{
-    append_messages, file_stamp, source_id, upsert_thread, IndexReport, MsgUsage, ParsedThread,
+    append_messages_at, file_stamp, source_id, upsert_thread_at, IndexReport, MsgUsage,
+    ParsedThread,
 };
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -500,7 +501,7 @@ fn index_file(conn: &mut Connection, sid: i64, root: &Path, path: &Path) -> Resu
         return Ok(None);
     }
     let n = if let Some(t) = thread {
-        upsert_thread(conn, sid, &t)?
+        upsert_thread_at(conn, sid, &t, &parsed.cwds)?
     } else {
         0
     };
@@ -683,9 +684,11 @@ fn try_append(
         thread.git_branch.clone(),
     );
     // `thread` holds the stored metadata and no messages, so what ingest pushes (and the
-    // usage indices it records) is exactly the tail.
+    // usage indices it records) is exactly the tail. Until the tail names a cwd, its calls
+    // ran where the stored thread last was.
     let mut first_user_text = None;
-    let consumed = ingest_jsonl(&mut thread, &tail, &mut first_user_text);
+    let mut cwds: Vec<(usize, String)> = before.1.iter().map(|c| (0, c.clone())).collect();
+    let consumed = ingest_jsonl(&mut thread, &tail, &mut first_user_text, &mut cwds);
     finish_title(&mut thread, first_user_text);
     let new_offset = offset + consumed as u64;
     let tag = cursor_tag(
@@ -700,7 +703,7 @@ fn try_append(
         || thread.project_path != before.1
         || thread.git_branch != before.2;
     let result = if changed {
-        match append_messages(conn, sid, &thread, stored_count)? {
+        match append_messages_at(conn, sid, &thread, stored_count, &cwds)? {
             Some(n) => Append::Applied(n),
             // Another writer moved the thread since the check above.
             None => return Ok(Append::Fallback),
@@ -764,6 +767,10 @@ struct FullParse {
     thread: Option<ParsedThread>,
     offset: usize,
     fingerprint: String,
+    /// `(first message index, cwd)` at each change of the lines' `cwd` (see
+    /// `indexer::upsert_thread_at`): a session that `cd`s or enters a worktree runs its later
+    /// calls somewhere else than its first ones.
+    cwds: Vec<(usize, String)>,
 }
 
 /// Parse a `.jsonl` thread file. `external_id` keys the thread; `project_fallback`
@@ -785,13 +792,15 @@ fn parse_full(path: &Path, external_id: &str, project_fallback: Option<&str>) ->
         ..Default::default()
     };
     let mut first_user_text: Option<String> = None;
-    let offset = ingest_jsonl(&mut thread, &content, &mut first_user_text);
+    let mut cwds = Vec::new();
+    let offset = ingest_jsonl(&mut thread, &content, &mut first_user_text, &mut cwds);
     let fingerprint = fingerprint_bytes(&content, offset);
     if thread.messages.is_empty() {
         return Ok(FullParse {
             thread: None,
             offset,
             fingerprint,
+            cwds,
         });
     }
     finish_title(&mut thread, first_user_text);
@@ -799,6 +808,7 @@ fn parse_full(path: &Path, external_id: &str, project_fallback: Option<&str>) ->
         thread: Some(thread),
         offset,
         fingerprint,
+        cwds,
     })
 }
 
@@ -810,6 +820,7 @@ fn ingest_jsonl(
     thread: &mut ParsedThread,
     bytes: &[u8],
     first_user_text: &mut Option<String>,
+    cwds: &mut Vec<(usize, String)>,
 ) -> usize {
     let mut pos = 0;
     let mut consumed = 0;
@@ -817,7 +828,7 @@ fn ingest_jsonl(
         match bytes[pos..].iter().position(|&b| b == b'\n') {
             Some(len) => {
                 if let Some(obj) = parse_line(&bytes[pos..pos + len]) {
-                    ingest_line(thread, &obj, first_user_text);
+                    ingest_line(thread, &obj, first_user_text, cwds);
                 }
                 pos += len + 1;
                 consumed = pos;
@@ -829,7 +840,7 @@ fn ingest_jsonl(
                     .and_then(|s| serde_json::from_str::<Value>(s.trim()).ok())
                     .filter(Value::is_object)
                 {
-                    ingest_line(thread, &obj, first_user_text);
+                    ingest_line(thread, &obj, first_user_text, cwds);
                     consumed = bytes.len();
                 }
                 break;
@@ -856,12 +867,21 @@ fn finish_title(thread: &mut ParsedThread, first_user_text: Option<String>) {
     }
 }
 
-/// Fold a single JSONL line into the thread under construction.
-fn ingest_line(thread: &mut ParsedThread, obj: &Value, first_user_text: &mut Option<String>) {
+/// Fold a single JSONL line into the thread under construction, recording in `cwds` where
+/// the line's messages ran when its `cwd` differs from the last one recorded.
+fn ingest_line(
+    thread: &mut ParsedThread,
+    obj: &Value,
+    first_user_text: &mut Option<String>,
+    cwds: &mut Vec<(usize, String)>,
+) {
     // A real cwd in the file overrides the slug-derived fallback.
     if let Some(cwd) = obj.get("cwd").and_then(Value::as_str) {
         if !cwd.is_empty() {
             thread.project_path = Some(cwd.to_string());
+            if cwds.last().is_none_or(|(_, c)| c != cwd) {
+                cwds.push((thread.messages.len(), cwd.to_string()));
+            }
         }
     }
     if let Some(branch) = obj.get("gitBranch").and_then(Value::as_str) {
@@ -972,7 +992,7 @@ fn extract_messages(
 
 #[cfg(test)]
 mod tests {
-    use super::super::ParsedMessage;
+    use super::super::{append_messages, upsert_thread, ParsedMessage};
     use super::*;
     use std::io::Write;
 
@@ -1240,6 +1260,62 @@ mod tests {
             .unwrap()
             .unwrap()
             .offset
+    }
+
+    #[test]
+    fn tool_calls_resolve_against_the_cwd_of_their_line() {
+        let repo = temp_path("cwd_repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join("apps/web")).unwrap();
+        let repo = std::fs::canonicalize(&repo).unwrap();
+        let web = repo.join("apps/web");
+        let bash = |cwd: &Path, cmd: &str| {
+            serde_json::json!({
+                "type": "assistant",
+                "cwd": cwd.to_string_lossy(),
+                "timestamp": "2026-06-01T10:00:01.000Z",
+                "message": {"role": "assistant", "content": [
+                    {"type": "tool_use", "name": "Bash", "input": {"command": cmd}}
+                ]},
+            })
+            .to_string()
+        };
+        let mut f = fixture(&[
+            bash(&repo, "cat src/a.rs"),
+            bash(&web, "cat src/b.rs"),
+            bash(&repo, "cat src/c.rs"),
+        ]);
+        index_file(&mut f.conn, f.sid, &f.root, &f.path).unwrap();
+        // The append path: the tail's first line still runs in the stored thread's last cwd
+        // until it names another.
+        append(
+            &f.path,
+            &format!(
+                "{}\n{}\n",
+                bash(&web, "cat src/d.rs"),
+                bash(&web, "cat e.rs")
+            ),
+        );
+        index_file(&mut f.conn, f.sid, &f.root, &f.path).unwrap();
+        let paths: Vec<String> = f
+            .conn
+            .prepare("SELECT path FROM file_edits ORDER BY rowid")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            paths,
+            vec![
+                "src/a.rs",
+                "apps/web/src/b.rs",
+                "src/c.rs",
+                "apps/web/src/d.rs",
+                "apps/web/e.rs"
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&repo);
     }
 
     #[test]

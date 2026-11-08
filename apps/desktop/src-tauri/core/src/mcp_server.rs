@@ -227,6 +227,9 @@ struct FilePathArgs {
     path: String,
     /// Max threads (default 15, max 50).
     limit: Option<u32>,
+    /// 1-based line; path must then be a file in this repo. Adds the commits behind the line
+    /// (git blame), their sessions, and those sessions' decisions and gotchas.
+    line: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -380,8 +383,9 @@ struct CompactFact<'a> {
     text: std::borrow::Cow<'a, str>,
     #[serde(skip_serializing_if = "is_false")]
     pinned: bool,
-    /// Who wrote it (`llm`, `heuristic`, `user`, `agent`, `claude-memory`), so an agent can
-    /// weigh a harvested note differently from a distilled decision.
+    /// Who wrote it (`llm`, `heuristic`, `user`, `agent`, `claude-memory`, or `repo` for a
+    /// fact imported from the repo's committed `.callimachus/memory/` files), so an agent can
+    /// weigh a harvested or team note differently from a distilled decision.
     extractor: &'a str,
     /// Always present (null when absent), matching the Tauri `MemoryFact` shape the frontend
     /// reads, so one fact JSON contract covers both surfaces.
@@ -568,10 +572,10 @@ mod out {
 
     #[derive(JsonSchema)]
     pub struct Issues {
-        issues: Vec<issues::IssueCluster>,
+        issues: Vec<issues::Issue>,
     }
 
-    /// recent_threads, threads_for_file.
+    /// recent_threads.
     #[derive(JsonSchema)]
     pub struct Threads {
         threads: Vec<search::ThreadSummary>,
@@ -829,7 +833,7 @@ impl Callimachus {
     }
 
     #[tool(
-        description = "Errors the user keeps hitting across sessions, grouped by normalized signature with counts and first/last seen. Current repo by default; project=\"*\" for all. Check before retrying an approach.",
+        description = "Errors the user keeps hitting across sessions: signature, counts, the sessions, and the fix (commit, thread, playbook) once a commit fixed one. Current repo by default; project=\"*\" for all. Check before retrying.",
         output_schema = output_schema::<out::Issues>(),
         annotations(read_only_hint = true, open_world_hint = false)
     )]
@@ -851,8 +855,14 @@ impl Callimachus {
             _ => cwd_project_key(),
         };
         let conn = self.lock()?;
-        let clusters = crate::issues::recurring_issues(&conn, project.as_deref(), since, limit)
-            .map_err(internal)?;
+        let clusters = crate::issues::recurring_issues_with_fixes(
+            &conn,
+            project.as_deref(),
+            crate::search::ProjectMatch::Substring,
+            since,
+            limit,
+        )
+        .map_err(internal)?;
         list_result("issues", &clusters)
     }
 
@@ -1119,8 +1129,8 @@ impl Callimachus {
     }
 
     #[tool(
-        description = "Past threads that mentioned a file path (substring match, e.g. \"embed/mod.rs\"), newest first. Use to find which sessions touched a file before editing it.",
-        output_schema = output_schema::<out::Threads>(),
+        description = "Past threads that mentioned a file path (substring match, e.g. \"embed/mod.rs\"), newest first. With line: also the commits behind that line (git blame), their sessions and decisions.",
+        output_schema = output_schema::<FileWhy>(),
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn threads_for_file(
@@ -1131,10 +1141,45 @@ impl Callimachus {
             return Ok(notice);
         }
         let limit = clamp_limit(args.limit, FILE_THREADS_DEFAULT, FILE_THREADS_MAX);
+        let Some(line) = args.line else {
+            let conn = self.lock()?;
+            let hits = crate::search::threads_with_file(&conn, &args.path, limit as i64)
+                .map_err(internal)?;
+            return list_result("threads", &hits);
+        };
+        if line == 0 {
+            return Err(ErrorData::invalid_params("line counts from 1", None));
+        }
+        // git runs before the index lock is taken: a blame can take a few seconds.
+        let deadline = std::time::Instant::now() + WHY_GIT_BUDGET;
+        let base = std::env::current_dir().unwrap_or_default();
+        let blamed = crate::why::resolve(&args.path, &base, deadline).and_then(|target| {
+            let porcelain = crate::why::blame(&target, Some(line), deadline)?;
+            Ok((target, crate::why::parse_blame(&porcelain)))
+        });
+        // An absolute or cwd-relative path names the file; the index stores paths as the
+        // agents wrote them, mostly repo-relative.
+        let needle = blamed
+            .as_ref()
+            .map_or(args.path.as_str(), |(t, _)| t.rel.as_str());
         let conn = self.lock()?;
-        let hits =
-            crate::search::threads_with_file(&conn, &args.path, limit as i64).map_err(internal)?;
-        list_result("threads", &hits)
+        let threads =
+            crate::search::threads_with_file(&conn, needle, limit as i64).map_err(internal)?;
+        let answer = match blamed {
+            Ok((target, commits)) => {
+                let why =
+                    crate::why::explain(&conn, &target, Some(line), &commits).map_err(internal)?;
+                FileWhy::new(threads, why)
+            }
+            Err(e) => FileWhy {
+                threads,
+                commits: None,
+                facts: None,
+                unlinked: None,
+                note: Some(format!("No blame for line {line}: {e}")),
+            },
+        };
+        json_result(&answer)
     }
 
     #[tool(
@@ -2077,6 +2122,102 @@ fn char_suffix(s: &str, max: usize) -> &str {
     &s[start..]
 }
 
+/// threads_for_file's git budget with `line`: an agent waits on the answer, so a blame
+/// that takes longer (a huge file, a cold pack) gives up and the threads still come back.
+const WHY_GIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+/// Commits threads_for_file returns with `line` (a line has one; this bounds a merge).
+const FILE_WHY_COMMITS: usize = 3;
+/// Facts threads_for_file returns with `line`, across the commits' sessions.
+const FILE_WHY_FACTS: usize = 12;
+
+/// threads_for_file's answer: the threads, plus with `line` the commits behind it, their
+/// sessions, and those sessions' facts in one top-level list (each names its thread), so a
+/// session linked to two commits doesn't repeat them. Leaner than `cal why --json`: no
+/// per-commit line count or per-thread overlap, which an agent reading one line never needs.
+#[derive(Debug, Serialize, JsonSchema)]
+struct FileWhy {
+    threads: Vec<search::ThreadSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    commits: Option<Vec<FileCommit>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    facts: Option<Vec<crate::why::WhyFact>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unlinked: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct FileCommit {
+    sha: String,
+    short_sha: String,
+    subject: String,
+    committed_at: i64,
+    threads: Vec<FileCommitThread>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct FileCommitThread {
+    id: i64,
+    title: Option<String>,
+    source: String,
+    last_active: Option<i64>,
+    edits: i64,
+    touch: Option<String>,
+}
+
+impl FileWhy {
+    fn new(threads: Vec<search::ThreadSummary>, why: crate::why::WhyOutput) -> Self {
+        let mut facts: Vec<crate::why::WhyFact> = Vec::new();
+        let mut commits = Vec::new();
+        for c in why.commits.into_iter().take(FILE_WHY_COMMITS) {
+            let mut rows = Vec::with_capacity(c.threads.len());
+            for t in c.threads {
+                for f in t.facts {
+                    if facts.len() < FILE_WHY_FACTS && !facts.iter().any(|g| g.id == f.id) {
+                        facts.push(f);
+                    }
+                }
+                rows.push(FileCommitThread {
+                    id: t.id,
+                    title: t.title,
+                    source: t.source,
+                    last_active: t.last_active,
+                    edits: t.edits,
+                    touch: t.touch,
+                });
+            }
+            commits.push(FileCommit {
+                sha: c.sha,
+                short_sha: c.short_sha,
+                subject: c.subject,
+                committed_at: c.committed_at,
+                threads: rows,
+            });
+        }
+        let note = if commits.is_empty() && why.uncommitted {
+            Some("The line has uncommitted changes, so no commit owns it yet.".to_string())
+        } else if why.unlinked {
+            Some(
+                "No session is linked to this commit yet; the user can run `cal commits` in \
+                 the repo to link its history."
+                    .to_string(),
+            )
+        } else {
+            None
+        };
+        Self {
+            threads,
+            commits: Some(commits),
+            facts: Some(facts),
+            unlinked: Some(why.unlinked),
+            note,
+        }
+    }
+}
+
 /// The project key for the server's cwd (`knowledge::cwd_project_key`, the resolver `cal`
 /// and its hooks use), the one the tools scope to by default. None only when the cwd can't
 /// be read.
@@ -2600,6 +2741,64 @@ mod tests {
         let res = write_error(anyhow::Error::from(busy).context("saving")).expect("soft result");
         assert_eq!(text_of(&res), INDEX_BUSY_NOTICE);
         assert!(write_error(anyhow::anyhow!("no such table: facts")).is_err());
+    }
+
+    /// A blamed commit listing `thread` twice, each copy carrying the fact `fact_id`, so a
+    /// test can see the fact list deduplicated.
+    fn why_commit(thread: i64, fact_id: i64) -> crate::why::WhyCommit {
+        let fact = crate::why::WhyFact {
+            id: fact_id,
+            thread_id: thread,
+            kind: "decision".into(),
+            text: "rotate on a 401".into(),
+            rationale: Some("tokens expire early".into()),
+            extractor: "llm".into(),
+            origin_ref: None,
+        };
+        let t = crate::why::WhyThread {
+            id: thread,
+            title: Some("auth".into()),
+            source: "claude_code".into(),
+            last_active: Some(1),
+            edits: 2,
+            touch: Some("edit".into()),
+            overlap: 1,
+            facts: vec![fact],
+        };
+        crate::why::WhyCommit {
+            sha: "ab".repeat(20),
+            short_sha: "abababab".into(),
+            subject: "fix".into(),
+            committed_at: 1,
+            lines: 1,
+            threads: vec![t.clone(), t],
+        }
+    }
+
+    #[test]
+    fn file_why_lists_each_fact_once_and_explains_an_empty_answer() {
+        let why = |commits, unlinked, uncommitted| crate::why::WhyOutput {
+            schema_version: 1,
+            file: "a.rs".into(),
+            line: Some(1),
+            repo: "/r".into(),
+            commits,
+            unlinked,
+            uncommitted,
+        };
+        let out = FileWhy::new(Vec::new(), why(vec![why_commit(1, 9)], false, false));
+        assert_eq!(out.facts.as_ref().unwrap().len(), 1, "deduplicated by id");
+        assert_eq!(out.commits.as_ref().unwrap()[0].threads.len(), 2);
+        assert!(out.note.is_none());
+        let text = serde_json::to_string(&out).unwrap();
+        assert!(
+            !text.contains("overlap") && !text.contains("\"lines\""),
+            "{text}"
+        );
+        let unlinked = FileWhy::new(Vec::new(), why(Vec::new(), true, false));
+        assert!(unlinked.note.unwrap().contains("cal commits"));
+        let local = FileWhy::new(Vec::new(), why(Vec::new(), true, true));
+        assert!(local.note.unwrap().contains("uncommitted"));
     }
 
     /// A fresh scratch dir under the temp dir (not under $HOME, so the home stop stays out of
@@ -4111,6 +4310,26 @@ mod tests {
             "threads_for_file",
             srv.threads_for_file(args(json!({ "path": "auth" }))).await,
         );
+        // With a line but no such file: the threads plus a note, never an error.
+        let res = check(
+            &srv,
+            "threads_for_file",
+            srv.threads_for_file(args(json!({ "path": "no/such/file.rs", "line": 3 })))
+                .await,
+        );
+        assert!(structured_of(&res).contains("No blame for line 3"));
+        // With a line blamed to a linked commit: commits, sessions and their facts.
+        let why = crate::why::WhyOutput {
+            schema_version: 1,
+            file: "src/auth.rs".into(),
+            line: Some(3),
+            repo: "/proj/app".into(),
+            commits: vec![why_commit(id, 7)],
+            unlinked: false,
+            uncommitted: false,
+        };
+        let res = json_result(&FileWhy::new(Vec::new(), why)).unwrap();
+        assert_matches_schema(&srv, "threads_for_file", &res);
         check(
             &srv,
             "complete_todo",

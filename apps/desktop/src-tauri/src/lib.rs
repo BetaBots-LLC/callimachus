@@ -512,15 +512,24 @@ async fn coach_overview(pool: tauri::State<'_, db::ReadPool>) -> AppResult<searc
     .await
 }
 
-/// Recurring errors mined across all sessions in the last 180 days (most frequent first).
+/// Recurring errors mined across all sessions in the last 180 days (most frequent first),
+/// each with the commit that fixed it once one is known (in this project, when scoped).
 #[tauri::command]
 async fn recurring_issues(
     pool: tauri::State<'_, db::ReadPool>,
     project: Option<String>,
-) -> AppResult<Vec<issues::IssueCluster>> {
+) -> AppResult<Vec<issues::Issue>> {
     read_blocking(&pool, move |conn| {
         let since = chrono::Utc::now().timestamp() - 180 * 86_400;
-        issues::recurring_issues_cached(conn, project.as_deref(), since, 30)
+        let clusters = issues::recurring_issues_cached(conn, project.as_deref(), since, 30)?;
+        // Read live, after the cache: a fix lands without changing the thread set the
+        // cache key follows (a refresh resolves it minutes after the commit is linked).
+        Ok(issues::with_fixes(
+            conn,
+            clusters,
+            project.as_deref(),
+            search::ProjectMatch::Exact,
+        ))
     })
     .await
 }
@@ -535,6 +544,19 @@ async fn spend(
 ) -> AppResult<cost::Spend> {
     read_blocking(&pool, move |conn| {
         cost::spend_cached(conn, since.unwrap_or(0).max(0), project.as_deref(), 8)
+    })
+    .await
+}
+
+/// The spend charts: the last 30 local days and the priciest commits the sessions produced,
+/// across everything or for one project key.
+#[tauri::command]
+async fn spend_breakdown(
+    pool: tauri::State<'_, db::ReadPool>,
+    project: Option<String>,
+) -> AppResult<cost::SpendBreakdown> {
+    read_blocking(&pool, move |conn| {
+        cost::breakdown_cached(conn, project.as_deref())
     })
     .await
 }
@@ -1635,6 +1657,48 @@ async fn write_agent_memory_file(
     .await
 }
 
+/// The project's repo memory: its checkout, whether `.callimachus/memory/` exists, which of
+/// its facts the files share and how many it imported, for the Memory section's badges.
+#[tauri::command]
+async fn repo_memory_status(
+    pool: tauri::State<'_, db::ReadPool>,
+    project: String,
+) -> AppResult<knowledge::repo_memory::RepoMemoryStatus> {
+    read_blocking(&pool, move |conn| {
+        knowledge::repo_memory::status(conn, &project)
+    })
+    .await
+}
+
+/// What "Publish to repo" would write: counts per kind and the facts added, updated and
+/// removed. Writes nothing.
+#[tauri::command]
+async fn preview_repo_memory(
+    pool: tauri::State<'_, db::ReadPool>,
+    project: String,
+    all: bool,
+) -> AppResult<knowledge::repo_memory::PublishPlan> {
+    read_blocking(&pool, move |conn| {
+        knowledge::repo_memory::plan_publish(conn, std::path::Path::new(&project), all)
+    })
+    .await
+}
+
+/// Publish the project's memory into its checkout's `.callimachus/memory/` (the user's
+/// explicit action; nothing publishes on its own, and nothing is committed). Recomputes the
+/// plan rather than trusting a preview the files may have moved past.
+#[tauri::command]
+async fn publish_repo_memory(
+    pool: tauri::State<'_, db::ReadPool>,
+    project: String,
+    all: bool,
+) -> AppResult<knowledge::repo_memory::PublishPlan> {
+    read_blocking(&pool, move |conn| {
+        knowledge::repo_memory::publish(conn, std::path::Path::new(&project), all)
+    })
+    .await
+}
+
 /// Whether a project distill is in progress (for the Build-memory button state).
 #[tauri::command]
 fn distilling_status(flags: tauri::State<'_, JobFlags>) -> bool {
@@ -2600,6 +2664,15 @@ async fn uninstall_recall_integration() -> AppResult<()> {
 #[tauri::command]
 async fn set_proactive_recall(enabled: bool) -> AppResult<integration::IntegrationStatus> {
     blocking(move || integration::set_proactive_recall(&current_exe()?, enabled)).await
+}
+
+/// Toggle the opt-in error-playbook hook (Claude Code PostToolUse and PostToolUseFailure on
+/// Bash: tells Claude the fix when a command fails with an error a commit fixed before). It
+/// runs after every shell command, so it stays off until the user asks. Returns refreshed
+/// status.
+#[tauri::command]
+async fn set_error_recall(enabled: bool) -> AppResult<integration::IntegrationStatus> {
+    blocking(move || integration::set_error_recall(&current_exe()?, enabled)).await
 }
 
 /// MCP-registration status for the other detected agents (Codex / Cursor / Gemini).
@@ -3738,6 +3811,7 @@ pub fn run() {
             install_recall_integration,
             uninstall_recall_integration,
             set_proactive_recall,
+            set_error_recall,
             cli_engines,
             memory_setup,
             enable_memory,
@@ -3773,6 +3847,7 @@ pub fn run() {
             link_thread_commits,
             recurring_issues,
             spend,
+            spend_breakdown,
             distill_thread,
             recall_decisions,
             recall_gotchas,
@@ -3788,6 +3863,9 @@ pub fn run() {
             cancel_distill,
             distill_project,
             write_agent_memory_file,
+            repo_memory_status,
+            preview_repo_memory,
+            publish_repo_memory,
             set_fact_pinned,
             hide_fact,
             set_todo_done,

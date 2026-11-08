@@ -3,7 +3,7 @@
 //   http://localhost:1420/mock.html?view=settings&section=engine&theme=light
 // Params: theme, consent, memory (alias: knowledge), engines, agents, agenthooks, plugin, claude, keys,
 // update, jobs, semantic, searchMs, onboarding, ledger, chats, projectdata, lastproject, muted,
-// sections, today, scope, cliwatch (see SCENARIO below). mock-entry.ts also reads view, section,
+// sections, today, scope, cliwatch, repomemory (see SCENARIO below). mock-entry.ts also reads view, section,
 // chatmode=ask and ask=<question> (sends it on load). Dev-only.
 import type {
   AgentHooksStatus,
@@ -23,7 +23,7 @@ import type {
   HookAgentId,
   HookSettings,
   IntegrationStatus,
-  IssueCluster,
+  Issue,
   JobsStatus,
   KnowledgeConfig,
   MemoryEngine,
@@ -32,11 +32,15 @@ import type {
   OnboardingSteps,
   ProjectInfo,
   ProjectMemory,
+  RepoFactChange,
+  RepoMemoryStatus,
+  RepoPublishPlan,
   SearchFilters,
   SearchHit,
   Snapshot,
   SourceKind,
   Spend,
+  SpendBreakdown,
   Stats,
   ThreadDetail,
   ThreadKnowledge,
@@ -136,6 +140,9 @@ const SCENARIO = {
   // The remembered last project (`last_project`), which Search scopes to by default:
   // payments-api (default), or none.
   scope: pick("scope", ["repo", "all"] as const, "repo"),
+  // Repo memory (`.callimachus/memory/`): published with a teammate's fact imported (default),
+  // a checkout that has none yet, or a project with no checkout on this machine.
+  repomemory: pick("repomemory", ["published", "unpublished", "nocheckout"] as const, "published"),
 };
 
 // sections=all|none: open (or close) every Project page section before the app reads the
@@ -405,8 +412,8 @@ function valueLedger(): ValueLedger {
   const empty = SCENARIO.ledger === "empty";
   return {
     week: empty
-      ? { hook: 0, mcp: 0, recall: 0, digest: 0 }
-      : { hook: 23, mcp: 141, recall: 6, digest: 9 },
+      ? { hook: 0, mcp: 0, recall: 0, digest: 0, playbook: 0 }
+      : { hook: 23, mcp: 141, recall: 6, digest: 9, playbook: 4 },
     allTime: empty ? 0 : 1874,
     preserved: {
       threads: empty ? 0 : 312,
@@ -512,6 +519,7 @@ function recallStatus(installed: boolean): IntegrationStatus {
     mcpRegistered: installed && !managed,
     hookInstalled: installed && !managed,
     proactiveRecallInstalled: false,
+    errorRecallInstalled: false,
     calInstalled: installed,
     exeStable: true,
     exeProblem: null,
@@ -1064,6 +1072,49 @@ const projectInfos = (): ProjectInfo[] =>
     lastActivity: NOW - i * 2 * DAY,
   }));
 
+function repoMemoryStatus(project: string): RepoMemoryStatus {
+  if (SCENARIO.repomemory === "nocheckout") {
+    return { root: null, published: false, sharedIds: [], imported: 0 };
+  }
+  const published = SCENARIO.repomemory === "published";
+  return { root: project, published, sharedIds: published ? [1] : [], imported: published ? 1 : 0 };
+}
+
+let repoPublishedAll = false;
+function repoPublishPlan(project: string, all: boolean): RepoPublishPlan {
+  const published = SCENARIO.repomemory === "published";
+  const change = (uid: string, kind: RepoFactChange["kind"], text: string): RepoFactChange => ({
+    uid,
+    kind,
+    text,
+  });
+  const distilled = [
+    change("4b1f", "decision", "Retries use exponential backoff capped at 5 minutes."),
+    change("9c2e", "gotcha", "Fake timers must be advanced after `scheduler.flush()`."),
+  ];
+  const added = [
+    ...(published
+      ? []
+      : [change("1a07", "decision", "Use idempotency keys on every POST that moves money.")]),
+    ...(all && !repoPublishedAll ? distilled : []),
+  ];
+  const removed = !all && repoPublishedAll ? distilled : [];
+  // The files hold the pinned decision (shared from here) and, once published, a teammate's
+  // gotcha; `all` adds one distilled decision and one gotcha.
+  return {
+    root: project,
+    dir: `${project}/.callimachus/memory`,
+    project: "github.com/acme/payments-api",
+    all,
+    decisions: 1 + (all ? 1 : 0),
+    gotchas: (published ? 1 : 0) + (all ? 1 : 0),
+    added,
+    updated: [],
+    removed,
+    changed: added.length + removed.length > 0,
+  };
+}
+
 function projectMemory(project: string): ProjectMemory {
   const fact = (
     id: number,
@@ -1082,7 +1133,9 @@ function projectMemory(project: string): ProjectMemory {
     originRef:
       extractor === "claude-memory"
         ? `claude-memory:-Users-dev-code-payments-api/${id === 5 ? "project_ledger.md" : "feedback_tests.md"}`
-        : null,
+        : extractor === "repo"
+          ? "repo:.callimachus/memory/gotchas.jsonl"
+          : null,
   });
   // With distillation off only the engine-free facts exist: Remember, TODO heuristics and
   // harvested Claude Code memory.
@@ -1110,6 +1163,13 @@ function projectMemory(project: string): ProjectMemory {
           "Run the webhook tests with --test-threads=1; they share a port.",
           4,
           "claude-memory",
+        ),
+      SCENARIO.repomemory === "published" &&
+        fact(
+          7,
+          "Staging webhooks come from a second Stripe account; use its signing secret.",
+          6,
+          "repo",
         ),
     ].filter(keep),
     openTodos: [fact(4, "Backfill idempotency keys for legacy refunds.", 5, "heuristic")],
@@ -1152,13 +1212,23 @@ type Handler = (args: Args) => unknown;
 
 // Project page --------------------------------------------------------------
 
-const RECURRING: IssueCluster[] = [
+const RECURRING: Issue[] = [
   {
     example: "error[E0502]: cannot borrow `self` as mutable",
     count: 41,
     threads: 17,
     firstSeen: NOW - 300 * DAY,
     lastSeen: NOW - 2 * DAY,
+    threadIds: [1, 2, 3],
+    fix: {
+      sha: "9f3c2a1b7e6d5c4b3a2f1e0d9c8b7a6f5e4d3c2b",
+      shortSha: "9f3c2a1",
+      subject: "fix(cart): clone the line items before the borrow",
+      committedAt: NOW - 2 * DAY + 3600,
+      threadId: 1,
+    },
+    playbook:
+      "error[e0502]: cannot borrow '…' as mutable: seen 41 times; fixed in 9f3c2a1 (fix(cart): clone the line items before the borrow), see thread 1",
   },
   {
     example: "TypeError: Cannot read properties of undefined (reading 'map')",
@@ -1216,6 +1286,60 @@ function spendFor(project: string | null, since: number): Spend {
           cost: [18.4, 12.9, 9.75][i] * (project ? 0.6 : 1),
         })),
   };
+}
+
+/** Thirty local days of spend (a quiet weekend dip, one heavy day) and the priciest commits,
+ *  for the Stats card and a Project page. */
+function spendBreakdownFor(project: string | null): SpendBreakdown {
+  const empty = !!project && SCENARIO.projectdata === "empty";
+  const scale = (project ? 0.42 : 1) * (empty ? 0 : 1);
+  const today = new Date();
+  const days = Array.from({ length: 30 }, (_, i) => {
+    const d = new Date(today.getFullYear(), today.getMonth(), today.getDate() - (29 - i));
+    const weekend = d.getDay() === 0 || d.getDay() === 6;
+    const base = weekend ? 1.2 : 2.6 + ((i * 7) % 5) * 0.9;
+    const cost = (i === 22 ? 14.8 : base) * scale;
+    const pad = (n: number) => String(n).padStart(2, "0");
+    return {
+      day: `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`,
+      cost,
+      input: Math.round(cost * 90_000),
+      output: Math.round(cost * 9_000),
+      cacheWrite: Math.round(cost * 40_000),
+      cacheRead: Math.round(cost * 1_100_000),
+    };
+  });
+  const pool = project ? threads.filter((t) => t.projectPath === project) : threads;
+  const commits = empty
+    ? []
+    : [
+        ["9f3c2e1a7b", "Retry webhooks with a re-signed header", 2, 18.4, 2],
+        ["4d81b0c2ee", "Move signature checks into middleware", 5, 12.9, 1],
+        ["c07a5d9f31", "Add idempotency keys to refunds", 9, 9.75, 1],
+      ].map(([sha, subject, daysAgo, cost, commitsOfSession], i) => {
+        const t = pool[i % Math.max(pool.length, 1)];
+        return {
+          sha: String(sha),
+          shortSha: String(sha).slice(0, 7),
+          subject: String(subject),
+          committedAt: NOW - Number(daysAgo) * DAY,
+          project: t?.projectPath ?? null,
+          cost: Number(cost) * (project ? 0.6 : 1),
+          shared: Number(commitsOfSession) > 1,
+          sessions: t
+            ? [
+                {
+                  id: t.id,
+                  title: t.title,
+                  cost: Number(cost) * (project ? 0.6 : 1),
+                  overlap: 3,
+                  commits: Number(commitsOfSession),
+                },
+              ]
+            : [],
+        };
+      });
+  return { days, commits };
 }
 
 /** Linked commits for the payments-api sessions (the first and fifth thread). */
@@ -1520,6 +1644,7 @@ const handlers: Record<string, Handler> = {
   },
   recurring_issues: (a) => (a.project && SCENARIO.projectdata === "empty" ? [] : RECURRING),
   spend: (a) => spendFor(a.project ? String(a.project) : null, a.since ? Number(a.since) : 0),
+  spend_breakdown: (a) => spendBreakdownFor(a.project ? String(a.project) : null),
   get_close_to_tray: () => closeToTray,
 
   set_close_to_tray: (a) => {
@@ -1744,6 +1869,14 @@ const handlers: Record<string, Handler> = {
   cancel_distill: ok,
   write_project_memory_file: (a) => `${String(a.project)}/MEMORY.md`,
   write_agent_memory_file: (a) => `${String(a.project)}/${String(a.filename)}`,
+  repo_memory_status: (a) => repoMemoryStatus(String(a.project)),
+  preview_repo_memory: (a) => sleep(200).then(() => repoPublishPlan(String(a.project), !!a.all)),
+  publish_repo_memory: (a) =>
+    sleep(300).then(() => {
+      const plan = repoPublishPlan(String(a.project), !!a.all);
+      repoPublishedAll = !!a.all;
+      return plan;
+    }),
   set_fact_pinned: ok,
   hide_fact: ok,
   set_todo_done: ok,
@@ -1927,6 +2060,10 @@ const handlers: Record<string, Handler> = {
   },
   set_proactive_recall: (a) => {
     recall = { ...recall, proactiveRecallInstalled: Boolean(a.enabled) };
+    return { ...recall };
+  },
+  set_error_recall: (a) => {
+    recall = { ...recall, errorRecallInstalled: Boolean(a.enabled) };
     return { ...recall };
   },
   agent_integrations_status: () => agents.map((x) => ({ ...x })),

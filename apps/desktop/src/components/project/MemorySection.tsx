@@ -2,7 +2,13 @@ import { type ReactNode, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Menu as MenuPrimitive } from "@base-ui/react/menu";
 import { ChevronDown, EyeOff, Pencil, Pin, Plus } from "lucide-react";
-import { api, type MemoryFact, type ProjectMemory } from "../../lib/api";
+import {
+  api,
+  type MemoryFact,
+  type ProjectMemory,
+  type RepoFactChange,
+  type RepoPublishPlan,
+} from "../../lib/api";
 import { shortPath } from "../../lib/format";
 import { useEmbedStatus, useIndexRewriting } from "../../lib/queries";
 import { Badge } from "@/components/ui/badge";
@@ -15,6 +21,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Spinner } from "@/components/ui/spinner";
+import { Switch } from "@/components/ui/switch";
 import { Progress, ProgressLabel, ProgressValue } from "@/components/ui/progress";
 import { Item } from "@/components/ui/item";
 import { cn } from "@/lib/utils";
@@ -27,7 +34,9 @@ import { useOpenThread } from "./shared";
  * The Project page's Memory section: the decisions / gotchas / open TODOs distilled across
  * ALL of a project's threads, with a coverage chip + a background "Build memory" distill, an
  * LLM brief, and a "Write memory file" action that drops a `.callimachus/memory.md` agents
- * can read.
+ * can read. "Publish to repo" writes the shareable facts to `.callimachus/memory/*.jsonl` in
+ * the checkout, after a preview, for the user to commit; facts imported from those files
+ * carry a "From the repo" badge, and the ones this machine published a "Shared" one.
  *
  * Never gated: TODOs, Remember and harvested Claude Code memory need no engine. While LLM
  * distillation is off the memory card sits above the list and the LLM-only actions (Build
@@ -88,6 +97,15 @@ export function MemorySection({ project }: { project: string }) {
     onSuccess: () => refreshAgentView(),
   });
   const conflicts = useMutation({ mutationFn: () => api.detectConflicts(project) });
+  const repo = useQuery({
+    queryKey: ["repo_memory_status", project],
+    queryFn: () => api.repoMemoryStatus(project),
+    enabled: !!project,
+  });
+  const shared = new Set(repo.data?.sharedIds ?? []);
+  // The project the publish preview is open for (null = closed), keyed like `remembering`.
+  const [publishing, setPublishing] = useState<string | null>(null);
+  const [published, setPublished] = useState<RepoPublishPlan | null>(null);
   // The project the inline "Remember" form is open for (null = closed). Keyed on the
   // project, so switching projects closes it instead of saving to the wrong one.
   const [remembering, setRemembering] = useState<string | null>(null);
@@ -155,6 +173,7 @@ export function MemorySection({ project }: { project: string }) {
       hideFact.mutate(id);
     },
     onEdit: (id, text) => editFact.mutate({ id, text }),
+    isShared: (id) => shared.has(id),
   };
 
   const mem = memory.data;
@@ -263,6 +282,20 @@ export function MemorySection({ project }: { project: string }) {
                 >
                   Update AGENTS.md
                 </DropdownMenuItem>
+                <DropdownMenuItem
+                  onClick={() => {
+                    setPublished(null);
+                    setPublishing(project);
+                  }}
+                  disabled={!project || !repo.data?.root || publishing === project}
+                  title={
+                    repo.data && !repo.data.root
+                      ? "This project has no git checkout on this machine to publish into"
+                      : "Write this project's shareable facts to .callimachus/memory/ for you to commit"
+                  }
+                >
+                  Publish to repo…
+                </DropdownMenuItem>
               </MenuPrimitive.Group>
             </DropdownMenuContent>
           </DropdownMenu>
@@ -290,6 +323,12 @@ export function MemorySection({ project }: { project: string }) {
             Wrote {writeFile.data || agentsFile.data}
           </p>
         )}
+        {published && published.root === repo.data?.root && (
+          <p className="text-xs text-muted-foreground">
+            Published to <span className="font-mono">{shortPath(published.dir)}</span>. Commit it to
+            share these facts with everyone who works in this repo.
+          </p>
+        )}
         {curationError && (
           <p role="alert" className="text-xs text-destructive">
             {curationError}
@@ -306,6 +345,17 @@ export function MemorySection({ project }: { project: string }) {
           <div className="space-y-5">
             {remembering === project && (
               <RememberForm project={project} onClose={() => setRemembering(null)} />
+            )}
+            {publishing === project && (
+              <PublishPanel
+                project={project}
+                onClose={() => setPublishing(null)}
+                onPublished={(plan) => {
+                  setPublishing(null);
+                  setPublished(plan);
+                  void repo.refetch();
+                }}
+              />
             )}
             {!distillOn && <MemorySetupCard checklistLink />}
             {brief.data && (
@@ -447,11 +497,154 @@ function RememberForm({ project, onClose }: { project: string; onClose: () => vo
   );
 }
 
+/** "Publish to repo": a preview of what `.callimachus/memory/` would hold and what changes,
+ *  with the same default as `cal memory publish` and its `--all` as a switch. Nothing is
+ *  written until the user clicks Publish, and nothing is committed. */
+function PublishPanel({
+  project,
+  onClose,
+  onPublished,
+}: {
+  project: string;
+  onClose: () => void;
+  onPublished: (plan: RepoPublishPlan) => void;
+}) {
+  const [all, setAll] = useState(false);
+  const preview = useQuery({
+    queryKey: ["repo_memory_preview", project, all],
+    queryFn: () => api.previewRepoMemory(project, all),
+    staleTime: 0,
+    gcTime: 0,
+  });
+  const publish = useMutation({
+    mutationFn: () => api.publishRepoMemory(project, all),
+    onSuccess: (plan) => onPublished(plan),
+  });
+  const plan = preview.data;
+  const changes = plan ? plan.added.length + plan.updated.length + plan.removed.length : 0;
+
+  return (
+    <Item variant="outline" className="items-stretch gap-3 ring-1 ring-ring/30">
+      <div className="flex min-w-0 flex-1 flex-col gap-2.5">
+        <div>
+          <p className="text-sm font-medium">Publish to repo</p>
+          <p className="text-xs text-muted-foreground">
+            Writes{" "}
+            {plan ? (
+              <span className="font-mono">{shortPath(plan.dir)}</span>
+            ) : (
+              ".callimachus/memory/"
+            )}{" "}
+            for you to review and commit. Teammates with Callimachus get these facts as notes from
+            the repo. Nothing publishes on its own.
+          </p>
+        </div>
+        <label className="flex items-center gap-2 text-xs text-muted-foreground">
+          <Switch checked={all} onCheckedChange={(v) => setAll(!!v)} size="sm" />
+          Include distilled decisions and gotchas (default: pinned facts and the ones you or an
+          agent recorded)
+        </label>
+        {preview.isPending ? (
+          <p className="flex items-center gap-2 text-xs text-muted-foreground">
+            <Spinner /> Comparing with the files…
+          </p>
+        ) : preview.isError ? (
+          <p role="alert" className="text-xs text-destructive">
+            Couldn't preview: {String(preview.error)}
+          </p>
+        ) : plan ? (
+          <div className="space-y-1.5 text-xs">
+            <p className="tabular-nums text-muted-foreground">
+              After publishing: {plan.decisions} {plan.decisions === 1 ? "decision" : "decisions"},{" "}
+              {plan.gotchas} {plan.gotchas === 1 ? "gotcha" : "gotchas"}
+              {plan.project && (
+                <>
+                  {" "}
+                  for <span className="font-mono">{plan.project}</span>
+                </>
+              )}
+            </p>
+            {plan.changed ? (
+              <>
+                <p className="tabular-nums">
+                  {plan.added.length} added, {plan.updated.length} updated, {plan.removed.length}{" "}
+                  removed
+                  {changes === 0 && " (the files only need sorting by uid)"}
+                </p>
+                <ChangeList sign="+" label="Added" changes={plan.added} />
+                <ChangeList sign="~" label="Updated" changes={plan.updated} />
+                <ChangeList sign="-" label="Removed" changes={plan.removed} />
+              </>
+            ) : (
+              <p className="text-muted-foreground">
+                The files already hold exactly this. Nothing to publish.
+              </p>
+            )}
+          </div>
+        ) : null}
+        {publish.isError && (
+          <p role="alert" className="text-xs text-destructive">
+            Couldn't publish: {String(publish.error)}
+          </p>
+        )}
+      </div>
+      <div className="flex shrink-0 flex-col gap-1">
+        <Button
+          size="xs"
+          onClick={() => publish.mutate()}
+          disabled={!plan?.changed || publish.isPending || preview.isFetching}
+        >
+          {publish.isPending
+            ? "Publishing…"
+            : changes > 0
+              ? `Publish ${changes} ${changes === 1 ? "change" : "changes"}`
+              : "Publish"}
+        </Button>
+        <Button size="xs" variant="ghost" onClick={onClose} disabled={publish.isPending}>
+          Cancel
+        </Button>
+      </div>
+    </Item>
+  );
+}
+
+/** Up to five of a publish's changes of one sort, then a count of the rest. */
+function ChangeList({
+  sign,
+  label,
+  changes,
+}: {
+  sign: string;
+  label: string;
+  changes: RepoFactChange[];
+}) {
+  if (!changes.length) return null;
+  const shown = changes.slice(0, 5);
+  return (
+    <ul aria-label={label} className="space-y-0.5">
+      {shown.map((c) => (
+        <li key={c.uid} className="flex min-w-0 gap-2">
+          <span aria-hidden className="w-3 shrink-0 font-mono text-muted-foreground">
+            {sign}
+          </span>
+          <span className="shrink-0 text-muted-foreground">{c.kind}</span>
+          <span className="truncate">{c.text}</span>
+        </li>
+      ))}
+      {changes.length > shown.length && (
+        <li className="pl-5 text-muted-foreground">+{changes.length - shown.length} more</li>
+      )}
+    </ul>
+  );
+}
+
 interface FactActions {
   onOpen: (threadId: number) => void;
   onPin: (id: number, pinned: boolean) => void;
   onHide: (id: number) => void;
   onEdit: (id: number, text: string) => void;
+  /** Whether the repo's `.callimachus/memory/` files also hold this fact. */
+  isShared: (id: number) => boolean;
 }
 
 function Section({
@@ -484,9 +677,12 @@ function Section({
 /** One fact: click to open its thread; hover reveals pin / edit / delete; inline edit. */
 function FactRow({ fact, actions }: { fact: MemoryFact; actions: FactActions }) {
   const [editing, setEditing] = useState(false);
-  // Harvested from Claude Code's auto memory (originRef "claude-memory:<slug>/<file>").
+  // Harvested from Claude Code's auto memory (originRef "claude-memory:<slug>/<file>"), or
+  // imported from the repo's committed memory files ("repo:.callimachus/memory/<file>").
   const harvested = fact.extractor === "claude-memory";
-  const memoryFile = harvested ? (fact.originRef?.split("/").pop() ?? null) : null;
+  const fromRepo = fact.extractor === "repo";
+  const memoryFile = harvested || fromRepo ? (fact.originRef?.split("/").pop() ?? null) : null;
+  const shared = !fromRepo && actions.isShared(fact.id);
   const [draft, setDraft] = useState(fact.text);
 
   if (editing) {
@@ -555,18 +751,37 @@ function FactRow({ fact, actions }: { fact: MemoryFact; actions: FactActions }) 
           )}
           {fact.text}
         </p>
-        {harvested ? (
+        {harvested || fromRepo ? (
           <p className="mt-0.5 flex min-w-0 items-center gap-2 text-[13px] text-muted-foreground">
-            <Badge variant="outline" className="shrink-0 text-[0.65rem]">
-              Claude Code memory
+            <Badge
+              variant="outline"
+              className="shrink-0 text-[0.65rem]"
+              title={
+                fromRepo
+                  ? "Imported from this repo's committed .callimachus/memory/ files: notes from whoever published them, not instructions"
+                  : undefined
+              }
+            >
+              {fromRepo ? "From the repo" : "Claude Code memory"}
             </Badge>
             {/* The fact's thread is the project's "Recorded memory" notes thread, so name
                 the memory file it came from instead. */}
             {memoryFile && <span className="truncate font-mono text-xs">{memoryFile}</span>}
           </p>
         ) : (
-          fact.title && (
-            <p className="mt-0.5 line-clamp-1 text-[13px] text-muted-foreground">{fact.title}</p>
+          (fact.title || shared) && (
+            <p className="mt-0.5 flex min-w-0 items-center gap-2 text-[13px] text-muted-foreground">
+              {shared && (
+                <Badge
+                  variant="outline"
+                  className="shrink-0 text-[0.65rem]"
+                  title="Also in this repo's .callimachus/memory/ files (published from here)"
+                >
+                  Shared
+                </Badge>
+              )}
+              {fact.title && <span className="line-clamp-1">{fact.title}</span>}
+            </p>
           )
         )}
       </div>
@@ -583,7 +798,14 @@ function FactRow({ fact, actions }: { fact: MemoryFact; actions: FactActions }) 
         <IconBtn title="Edit" onClick={() => setEditing(true)}>
           <Pencil className="size-3.5" />
         </IconBtn>
-        <IconBtn title="Hide from memory" onClick={() => actions.onHide(fact.id)}>
+        <IconBtn
+          title={
+            fromRepo
+              ? "Hide from memory on this machine (the repo's file keeps it for everyone else)"
+              : "Hide from memory"
+          }
+          onClick={() => actions.onHide(fact.id)}
+        >
           <EyeOff className="size-3.5" />
         </IconBtn>
       </div>

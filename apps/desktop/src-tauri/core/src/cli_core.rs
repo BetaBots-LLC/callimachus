@@ -11,9 +11,10 @@ use crate::cli_contract::{
     AuditCommitThread, AuditFile, AuditFileThread, AuditKnowledge, AuditNotes, AuditPrOutput,
     AuditSha, CatOutput, Listing, Versioned, CAL_SCHEMA_VERSION, JSON_VERSION_ENV,
 };
+use crate::knowledge::repo_memory;
 use crate::{
     agent, context, cost, db, embed, export, gitlink, issues, knowledge, ledger, search, secrets,
-    snapshot,
+    snapshot, why,
 };
 use rusqlite::Connection;
 use std::borrow::Cow;
@@ -52,9 +53,11 @@ pub const COMMANDS: &[&str] = &[
     "snapshot-hook",
     "check",
     "commits",
+    "why",
     "issues",
     "cost",
     "recall-now",
+    "recall-error",
     "session-end",
     "audit-pr",
     "index",
@@ -100,6 +103,13 @@ USAGE:
   cal memory [<project>] [-n LIMIT] [--json]
                                 a project's distilled memory (decisions / gotchas /
                                 open TODOs); defaults to the current repo
+  cal memory publish [--all] [<path>]
+                                write the repo's pinned and recorded decisions and
+                                gotchas (--all: distilled ones too) to its
+                                .callimachus/memory/ for you to commit
+  cal memory import [--review] [<path>]
+                                import the repo's .callimachus/memory/ now (--review:
+                                list what would change, write nothing)
   cal done <todo-id>            mark an open TODO done (id from `cal todos`)
   cal remember <decision|gotcha> <text…> [--because WHY]
                                 record a fact in the current repo's project memory
@@ -110,16 +120,24 @@ USAGE:
   cal commits [<repo>] [-n LIMIT] [--json]
                                 infer + show which commits your threads produced
                                 (run inside a git repo, or pass its path)
+  cal why <file>[:<line>] [--json]
+                                why a line (or file) is the way it is: git blame's
+                                commits, the sessions that produced them, and their
+                                decisions and gotchas (run inside the repo)
   cal audit-pr [<repo>] --changed-files a,b --shas s1,s2 [-n CAP]
                                 one JSON bundle for an external PR auditor: per-commit
                                 provenance (the session behind each sha), per-file prior
                                 threads + reasoning, repo recurring errors + project memory
   cal issues [<project>] [-n LIMIT] [--json]
                                 recurring errors you keep hitting across sessions
-                                (last 180 days, most frequent first)
-  cal cost [<project>] [-n LIMIT] [--json]
-                                estimated $ spend by model + priciest threads
-                                (needs a Reindex to capture token usage)
+                                (last 180 days, most frequent first), each with the
+                                commit that fixed it once one is linked
+  cal cost [<project>] [--by thread|commit|project|day] [--since DAYS] [-n LIMIT] [--json]
+                                estimated $ spend by model + priciest threads, or broken
+                                down per session (with waste signals), per commit the
+                                sessions produced, per project or per local day
+                                (list-price equivalents; usage of sessions indexed before
+                                an update fills in on its own, once, in the background)
   cal hook [<project>] [-n PER_KIND] [--budget CHARS]
                                 print the current repo's memory for injection (a Claude
                                 Code SessionStart hook command; size-capped, ~6k chars),
@@ -164,6 +182,9 @@ OPTIONS:
   -n, --limit N         max results (default 20; todos 50, files 40; hook: per kind)
       --budget CHARS    max chars `hook` prints (default 6000)
       --for AGENT       hook protocol: claude (default), codex or gemini
+      --by KIND         `cost` breakdown: thread, commit, project or day
+      --since DAYS      `cost` window: the last DAYS days, today included
+                        (default all time; 30 for --by day)
   -V, --vault DIR       Obsidian vault dir for `export` (else CALLIMACHUS_VAULT)
   -o, --out FILE        write `export` output to FILE instead of a vault/stdout
   -S, --synthesize      prepend an LLM summary / decisions / gotchas / TODOs
@@ -221,9 +242,15 @@ fn usage() -> String {
 }
 
 /// Hook targets Claude Code runs inside the agent loop (SessionStart, PreCompact,
-/// UserPromptSubmit, SessionEnd). They must never fail visibly: Claude Code shows a non-zero
+/// UserPromptSubmit, PostToolUse, SessionEnd). They must never fail visibly: Claude Code shows a non-zero
 /// exit plus stderr as a hook error on every session start or prompt.
-const HOOK_COMMANDS: &[&str] = &["hook", "snapshot-hook", "recall-now", "session-end"];
+const HOOK_COMMANDS: &[&str] = &[
+    "hook",
+    "snapshot-hook",
+    "recall-now",
+    "recall-error",
+    "session-end",
+];
 
 /// Run the CLI and map the result to a process exit code (printing errors). Used
 /// by both the `cal` binary and the app's cal-mode dispatch.
@@ -273,6 +300,7 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
         println!("{}", usage());
         return Ok(());
     };
+    reject_cost_flags(cmd, rest)?;
     match cmd.as_str() {
         "search" => cmd_search(rest),
         "related" => cmd_related(rest),
@@ -302,9 +330,11 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
         "snapshot-hook" => cmd_snapshot_hook(rest),
         "check" => cmd_check(rest),
         "commits" => cmd_commits(rest),
+        "why" => cmd_why(rest),
         "issues" => cmd_issues(rest),
         "cost" => cmd_cost(rest),
         "recall-now" => cmd_recall_now(rest),
+        "recall-error" => cmd_recall_error(rest),
         "session-end" => cmd_session_end(rest),
         "audit-pr" => cmd_audit_pr(rest),
         "index" => crate::headless::cmd_index(rest),
@@ -343,6 +373,10 @@ struct Opts {
     because: Option<String>,
     /// `hook`: max chars to print.
     budget: Option<usize>,
+    /// `cost --by`: the breakdown (thread, commit, project, day).
+    by: Option<cost::CostBy>,
+    /// `cost --since`: the window in days, today included.
+    since_days: Option<u32>,
     /// `--for`: which agent's hook protocol a hook command speaks (see [`HookAgent`]).
     for_agent: Option<String>,
     /// `--raw`: print stored text as is instead of redacting secrets (see [`Opts::shown`]).
@@ -384,8 +418,8 @@ impl Opts {
         Ok(serde_json::to_string_pretty(&v)?)
     }
 
-    /// A list output (`search`, `recent`, `related`, `decisions`, `gotchas`, `commits`): the
-    /// bare array, or with a JSON version the [`Listing`] envelope.
+    /// A list output (`search`, `recent`, `related`, `decisions`, `gotchas`, `commits`,
+    /// `issues`): the bare array, or with a JSON version the [`Listing`] envelope.
     fn json_list<T: serde::Serialize>(&self, rows: &[T]) -> anyhow::Result<String> {
         if self.json_version.is_some() {
             self.json(&Listing::new(rows))
@@ -417,6 +451,24 @@ impl Opts {
             obj.shift_remove("schema_version");
         }
         self.json(&v)
+    }
+}
+
+/// Flags only `cal cost` reads.
+const COST_ONLY_FLAGS: &[&str] = &["--by", "--since"];
+
+/// Refuse `--by` and `--since` outside `cal cost`. The parser is shared, so every command
+/// would accept them and quietly ignore them, and these two change what an answer means:
+/// `cal issues --since 7` printed its 180-day list as if it had honored the window. The other
+/// shared flags (`--label`, `--budget`, `--for`) only tune output, and their OPTIONS lines
+/// name the command they are for.
+fn reject_cost_flags(cmd: &str, rest: &[String]) -> anyhow::Result<()> {
+    if cmd == "cost" {
+        return Ok(());
+    }
+    match rest.iter().find(|a| COST_ONLY_FLAGS.contains(&a.as_str())) {
+        Some(flag) => anyhow::bail!("{flag} only applies to `cal cost`, not `cal {cmd}`"),
+        None => Ok(()),
     }
 }
 
@@ -456,6 +508,24 @@ fn parse_with(args: &[String], env_json_version: Option<&str>) -> anyhow::Result
                 )
             }
             "--for" => o.for_agent = Some(next(&mut it, "--for")?),
+            "--by" => {
+                let v = next(&mut it, "--by")?;
+                o.by = Some(cost::CostBy::parse(&v).ok_or_else(|| {
+                    anyhow::anyhow!("--by takes thread, commit, project or day, got '{v}'")
+                })?);
+            }
+            "--since" => {
+                let v = next(&mut it, "--since")?;
+                o.since_days = Some(
+                    v.trim_end_matches('d')
+                        .parse()
+                        .ok()
+                        .filter(|d| *d > 0)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("--since takes a number of days (e.g. 30), got '{v}'")
+                        })?,
+                );
+            }
             "--starred" => o.starred = true,
             "--off" => o.off = true,
             "--json" => o.json = true,
@@ -862,7 +932,7 @@ fn cwd_project_root() -> String {
 /// else `dir`. Unlike the project key this keeps a worktree as itself, which is what git
 /// commands and files written into the checkout need. Never climbs above $HOME, so a
 /// `~/.git` dotfiles repo doesn't capture every directory under home.
-fn git_root_of(dir: &std::path::Path) -> std::path::PathBuf {
+pub(crate) fn git_root_of(dir: &std::path::Path) -> std::path::PathBuf {
     let home = dirs::home_dir().map(|h| std::fs::canonicalize(&h).unwrap_or(h));
     let start = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
     let mut cur = start.as_path();
@@ -888,6 +958,11 @@ fn cwd_git_root() -> String {
 }
 
 fn cmd_memory(args: &[String]) -> anyhow::Result<()> {
+    match args.first().map(String::as_str) {
+        Some("publish") => return cmd_memory_publish(&args[1..]),
+        Some("import") => return cmd_memory_import(&args[1..]),
+        _ => {}
+    }
     let o = parse(args)?;
     let project = project_arg(&o);
     let conn = open_db()?;
@@ -906,7 +981,12 @@ fn cmd_memory(args: &[String]) -> anyhow::Result<()> {
         }
         println!("\n{title}:");
         for f in facts {
-            println!("  - {}", o.shown(f.text.trim()));
+            let mark = if f.extractor == repo_memory::EXTRACTOR_REPO {
+                "  (repo)"
+            } else {
+                ""
+            };
+            println!("  - {}{mark}", o.shown(f.text.trim()));
         }
     };
     section("Decisions", &mem.decisions);
@@ -914,6 +994,144 @@ fn cmd_memory(args: &[String]) -> anyhow::Result<()> {
     section("Open TODOs", &mem.open_todos);
     if mem.decisions.is_empty() && mem.gotchas.is_empty() && mem.open_todos.is_empty() {
         eprintln!("\n(no distilled knowledge yet — distill this project's threads in the app)");
+    }
+    Ok(())
+}
+
+/// Pull a bare flag `cal memory publish|import` takes out of `args` (the shared parser
+/// refuses flags it does not know). Returns whether it was there.
+fn take_flag(args: &[String], flag: &str) -> (bool, Vec<String>) {
+    let rest: Vec<String> = args.iter().filter(|a| *a != flag).cloned().collect();
+    (rest.len() != args.len(), rest)
+}
+
+/// The checkout `cal memory publish|import` acts on: the path given, else the cwd's.
+fn memory_checkout(o: &Opts) -> anyhow::Result<std::path::PathBuf> {
+    let start = if o.positional.is_empty() {
+        std::env::current_dir()?
+    } else {
+        std::path::PathBuf::from(o.positional.join(" "))
+    };
+    repo_memory::checkout_root(&start).ok_or_else(|| {
+        anyhow::anyhow!(
+            "{} is not inside a git checkout; repo memory lives in a repository's \
+             .callimachus/memory/",
+            start.display()
+        )
+    })
+}
+
+fn print_changes(sign: &str, changes: &[repo_memory::FactChange]) {
+    for c in changes {
+        println!("  {sign} {}: {}", c.kind, export::fact_line(&c.text, 120));
+    }
+}
+
+/// `cal memory publish [--all] [path]`: write the repo's decisions and gotchas into its
+/// `.callimachus/memory/` (pinned facts plus recorded ones; `--all` adds distilled ones), and
+/// say what changed. Silent, exit 0, when the files already say it all. Nothing commits.
+fn cmd_memory_publish(args: &[String]) -> anyhow::Result<()> {
+    let (all, rest) = take_flag(args, "--all");
+    let o = parse(&rest)?;
+    if o.json {
+        anyhow::bail!("`cal memory publish` prints a summary, not JSON; drop --json");
+    }
+    let root = memory_checkout(&o)?;
+    // Read-only: publishing writes files, not the index.
+    let conn = open_db()?;
+    let plan = repo_memory::publish(&conn, &root, all)?;
+    if !plan.changed {
+        return Ok(());
+    }
+    println!(
+        "Published to {}: {} added, {} updated, {} removed ({} decisions, {} gotchas)",
+        plan.dir,
+        plan.added.len(),
+        plan.updated.len(),
+        plan.removed.len(),
+        plan.decisions,
+        plan.gotchas
+    );
+    print_changes("+", &plan.added);
+    print_changes("~", &plan.updated);
+    print_changes("-", &plan.removed);
+    println!(
+        "Commit {} to share it with everyone who works in this repo.",
+        repo_memory::MEMORY_DIR
+    );
+    Ok(())
+}
+
+/// `cal memory import [--review] [path]`: bring the index in line with the checkout's
+/// `.callimachus/memory/` files now (the app and `cal index` do it as sessions there are
+/// indexed). `--review` lists what would change from a read-only connection.
+fn cmd_memory_import(args: &[String]) -> anyhow::Result<()> {
+    let (review, rest) = take_flag(args, "--review");
+    let o = parse(&rest)?;
+    if o.json {
+        anyhow::bail!("`cal memory import` prints a summary, not JSON; drop --json");
+    }
+    let root = memory_checkout(&o)?;
+    let dir = root.join(repo_memory::MEMORY_DIR);
+    // A missing directory is an import too when this checkout imported before: its facts
+    // are then hidden, as they would be after a `git rm`. Only a checkout that never had
+    // repo memory gets the "no repo memory" answer.
+    let no_memory = |conn: &rusqlite::Connection| -> anyhow::Result<()> {
+        if !dir.is_dir() && !repo_memory::is_known_checkout(conn, &root) {
+            anyhow::bail!(
+                "no repo memory at {} (`cal memory publish` creates it)",
+                dir.display()
+            );
+        }
+        Ok(())
+    };
+    let r = if review {
+        // A review only reads: opening the index writable would run pending migrations
+        // (after which an older installed app can no longer open it) and take the write lock
+        // the watcher needs, all for a transaction it rolls back.
+        let conn = open_db()?;
+        if db::schema_pending(&conn)? > 0 {
+            anyhow::bail!(
+                "the index is older than this cal and a review never upgrades it: open the app \
+                 once (or run `cal index`), then review again"
+            );
+        }
+        no_memory(&conn)?;
+        repo_memory::plan_import(&conn, &root)?
+    } else {
+        let conn = open_db_write()?;
+        no_memory(&conn)?;
+        repo_memory::import_repo(&conn, &root, chrono::Utc::now().timestamp(), false)?
+    };
+    if !r.changed() {
+        println!(
+            "Nothing to import from {}: the index already matches it",
+            dir.display()
+        );
+    } else {
+        println!(
+            "{} {}: {} added, {} updated, {} hidden (removed from the files), {} restored",
+            if review {
+                "Would import from"
+            } else {
+                "Imported from"
+            },
+            dir.display(),
+            r.added.len(),
+            r.updated.len(),
+            r.hidden.len(),
+            r.restored.len()
+        );
+        print_changes("+", &r.added);
+        print_changes("~", &r.updated);
+        print_changes("-", &r.hidden);
+        print_changes("^", &r.restored);
+    }
+    if r.skipped > 0 {
+        eprintln!(
+            "skipped {} line(s): not a readable fact, or a uid another project already imported",
+            r.skipped
+        );
     }
     Ok(())
 }
@@ -2034,6 +2252,115 @@ fn cmd_commits(args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// How long `cal why` waits for git: blame of a long file with deep history takes seconds.
+const WHY_GIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn cmd_why(args: &[String]) -> anyhow::Result<()> {
+    let o = parse(args)?;
+    let (file, line) = why::parse_target(&o.positional)?;
+    let deadline = std::time::Instant::now() + WHY_GIT_BUDGET;
+    let cwd = std::env::current_dir()?;
+    // git first: a missing file or a non-repo fails before the index is opened.
+    let target = why::resolve(&file, &cwd, deadline)?;
+    let porcelain = why::blame(&target, line, deadline)?;
+    let conn = open_db()?;
+    let out = why::explain(&conn, &target, line, &why::parse_blame(&porcelain))?;
+    if o.json {
+        println!("{}", o.json_typed(&out)?);
+        return Ok(());
+    }
+    print!("{}", why_text(&out, &o));
+    if let Some(note) = why_note(&out) {
+        eprintln!("{note}");
+    }
+    Ok(())
+}
+
+/// The line `cal why` adds on stderr when it has no session to show. `unlinked` is also true
+/// when blame named no commit at all (an empty tracked file), and "run `cal commits`" would
+/// then send the user to link commits that do not exist.
+fn why_note(out: &why::WhyOutput) -> Option<String> {
+    if out.commits.is_empty() {
+        return Some(if out.uncommitted {
+            "No commit owns this yet: the change is not committed.".to_string()
+        } else {
+            "git blame named no commit for this file, so no session can be linked to it."
+                .to_string()
+        });
+    }
+    out.unlinked.then(|| {
+        format!(
+            "No session is linked to {} yet. Run `cal commits` in {} to link the repo's \
+             history, then ask again.",
+            if out.commits.len() == 1 {
+                "this commit"
+            } else {
+                "these commits"
+            },
+            out.repo
+        )
+    })
+}
+
+/// `cal why`'s readable block: each commit, then the sessions behind it with what they did
+/// to the file and their decisions and gotchas.
+fn why_text(out: &why::WhyOutput, o: &Opts) -> String {
+    let mut s = String::new();
+    let at = match out.line {
+        Some(n) => format!("{}:{n}", out.file),
+        None => out.file.clone(),
+    };
+    let _ = writeln!(s, "{at}  ({})", out.repo);
+    for c in &out.commits {
+        let owns = match out.line {
+            None => format!(
+                "  [{} line{}]",
+                c.lines,
+                if c.lines == 1 { "" } else { "s" }
+            ),
+            Some(_) => String::new(),
+        };
+        let _ = writeln!(
+            s,
+            "\n{}  {}  {}{owns}",
+            c.short_sha,
+            fmt_time(Some(c.committed_at)),
+            o.shown(&c.subject)
+        );
+        if c.threads.is_empty() {
+            let _ = writeln!(s, "  (no linked session)");
+        }
+        for t in &c.threads {
+            let did = match (t.touch.as_deref(), t.edits) {
+                (Some("write" | "edit"), n) => {
+                    format!("edited the file {n} time{}", if n == 1 { "" } else { "s" })
+                }
+                (Some("read"), _) => "read the file".to_string(),
+                (Some(_), _) => "mentioned the file".to_string(),
+                (None, _) => format!("shares {} file(s) with the commit", t.overlap),
+            };
+            let _ = writeln!(
+                s,
+                "  [{}] {:<11} {}  ({} · {did})",
+                t.id,
+                t.source,
+                o.shown(t.title.as_deref().unwrap_or("(untitled)")),
+                fmt_time(t.last_active)
+            );
+            for f in &t.facts {
+                let why = f
+                    .rationale
+                    .as_deref()
+                    .filter(|r| !r.trim().is_empty())
+                    .map(|r| format!(" (because {})", o.shown(r)))
+                    .unwrap_or_default();
+                let _ = writeln!(s, "      {}: {}{why}", f.kind, o.shown(&f.text));
+            }
+        }
+    }
+    s
+}
+
 fn cmd_files(args: &[String]) -> anyhow::Result<()> {
     let o = parse(args)?;
     let path = o.positional.join(" ");
@@ -2606,7 +2933,7 @@ fn is_uuid(s: &str) -> bool {
 /// ended at the front of the auto-distill queue (`knowledge::enqueue_distill_priority`), so
 /// its memory lands minutes after it ends instead of after the 30-minute idle wait. The app
 /// distills it (the watcher kicks a round once the transcript is indexed); this only writes
-/// one `app_config` row. SessionEnd has no `transcript_path` and a 1.5 s budget shared by
+/// one `app_config` row, and deletes the session's `recall-error` state file. SessionEnd has no `transcript_path` and a 1.5 s budget shared by
 /// every SessionEnd hook, so it waits at most 1 s for the lock, skips the write when memory
 /// is off, and exits 0 silently on anything else.
 ///
@@ -2618,6 +2945,12 @@ fn cmd_session_end(args: &[String]) -> anyhow::Result<()> {
     let Some(v) = read_hook_payload() else {
         return Ok(());
     };
+    // The session is over, so its `recall-error` dedupe state has no further use. Before the
+    // index checks: the file lives outside the index and goes even when there is none.
+    if let (Some(dir), Some(session)) = (recall_dir(), v.get("session_id").and_then(|x| x.as_str()))
+    {
+        forget_error_recall(&dir, session);
+    }
     if v.get("session_id").and_then(|x| x.as_str()).is_none() || !db::default_index_path().exists()
     {
         return Ok(());
@@ -2798,18 +3131,24 @@ struct RecallState {
     injections: u32,
 }
 
-/// Per-session cache file for `recall-now`, so it doesn't repeat itself.
-fn recall_seen_path(session: &str) -> Option<std::path::PathBuf> {
-    let home = dirs::home_dir()?;
-    let safe: String = session
+/// Where the per-session hook state files live (`~/.callimachus/recall`).
+fn recall_dir() -> Option<std::path::PathBuf> {
+    Some(dirs::home_dir()?.join(".callimachus/recall"))
+}
+
+/// A session id reduced to characters safe in a file name; empty when none are left.
+fn safe_session_name(session: &str) -> String {
+    session
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-        .collect();
+        .collect()
+}
+
+/// Per-session cache file for `recall-now`, so it doesn't repeat itself.
+fn recall_seen_path(session: &str) -> Option<std::path::PathBuf> {
+    let safe = safe_session_name(session);
     let name = if safe.is_empty() { "session" } else { &safe };
-    Some(
-        home.join(".callimachus/recall")
-            .join(format!("{name}.json")),
-    )
+    Some(recall_dir()?.join(format!("{name}.json")))
 }
 
 fn load_recall_state(session: &str) -> RecallState {
@@ -2840,7 +3179,242 @@ fn save_recall_state(session: &str, state: &RecallState) {
     }
 }
 
-/// `cal issues [project] [-n N] [--json]` — recurring errors across sessions (last 180 days).
+/// Most playbook lines one `recall-error` run injects.
+const ERROR_RECALL_MAX_LINES: usize = 2;
+/// Chars of each output field `recall-error` scans, from its head and its tail: errors lead a
+/// command's output or close it, as the miner reads them (`issues::recurring_issues`).
+const ERROR_RECALL_HEAD_CHARS: usize = 6_000;
+const ERROR_RECALL_TAIL_CHARS: usize = 2_000;
+
+/// `cal recall-error`: the opt-in Claude Code PostToolUse / PostToolUseFailure hook on Bash.
+/// When the command's output carries an error line whose signature (`issues::normalize`) is a
+/// recurring cluster a linked commit fixed in this repo, it adds that cluster's playbook line
+/// to Claude's context, once per signature per session. It runs after every shell command, so
+/// the cheap gate comes first: output without an error line exits before the index is
+/// opened. SILENT and best-effort: no match, a missing index or table, or any error exits 0
+/// with no output. The hook ships for Claude Code first; Codex (PostToolUse) and Gemini CLI
+/// (AfterTool) also pass the tool's output to hooks, so a `--for` variant can follow.
+fn cmd_recall_error(_args: &[String]) -> anyhow::Result<()> {
+    let Some(v) = read_hook_payload() else {
+        return Ok(());
+    };
+    let Some(dir) = recall_dir() else {
+        return Ok(());
+    };
+    let now = std::time::SystemTime::now();
+    let Some(hit) = recall_error(&v, &db::default_index_path(), &dir, now)? else {
+        return Ok(());
+    };
+    println!("{}", hit.output);
+    ledger::append(ledger::Kind::Playbook, &hit.project);
+    Ok(())
+}
+
+/// What one `recall-error` run injects: the hook's stdout line, and the project it was for.
+struct ErrorRecall {
+    output: String,
+    project: String,
+}
+
+/// [`cmd_recall_error`] after the payload is read, with the index and the state directory
+/// passed in (tests use temp ones). None means stay silent.
+fn recall_error(
+    v: &serde_json::Value,
+    index: &std::path::Path,
+    state_dir: &std::path::Path,
+    now: std::time::SystemTime,
+) -> anyhow::Result<Option<ErrorRecall>> {
+    let errors = issues::extract_errors(&hook_tool_output(v));
+    if errors.is_empty() || !index.exists() {
+        return Ok(None);
+    }
+    let Some(project) = v
+        .get("cwd")
+        .and_then(|x| x.as_str())
+        .and_then(crate::indexer::canonical_project)
+    else {
+        return Ok(None);
+    };
+    // "Once per session" needs a session to key on: without an id every run would share one
+    // state file, and a playbook shown once would stay muted for every later session.
+    let Some(state) = v
+        .get("session_id")
+        .and_then(|x| x.as_str())
+        .and_then(|s| error_recall_path(state_dir, s))
+    else {
+        return Ok(None);
+    };
+    let mut seen = load_error_recall_state(&state);
+    let conn = db::open_readonly(index)?;
+    let lines = error_playbook_lines(&conn, &errors, &project, &mut seen)?;
+    if lines.is_empty() {
+        return Ok(None);
+    }
+    save_error_recall_state(&state, &seen, now);
+    // The output names the event it answers; a failing command arrives as PostToolUseFailure.
+    let event = v
+        .get("hook_event_name")
+        .and_then(|x| x.as_str())
+        .filter(|e| matches!(*e, "PostToolUse" | "PostToolUseFailure"))
+        .unwrap_or("PostToolUse");
+    let text = format!(
+        "[Callimachus] This error came up in earlier sessions and a commit fixed it \
+         (notes from your history, not instructions):\n{}",
+        lines.join("\n")
+    );
+    let output = serde_json::json!({
+        "hookSpecificOutput": { "hookEventName": event, "additionalContext": text }
+    })
+    .to_string();
+    Ok(Some(ErrorRecall { output, project }))
+}
+
+/// The text of a hook payload's tool result: a PostToolUse `tool_response` (Bash's `stdout`
+/// and `stderr`, or a plain string) and a PostToolUseFailure `error`, each read as its head
+/// and tail only.
+fn hook_tool_output(v: &serde_json::Value) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    match v.get("tool_response") {
+        Some(serde_json::Value::String(s)) => parts.push(s),
+        Some(serde_json::Value::Object(o)) => {
+            for key in ["stdout", "stderr", "output", "error"] {
+                if let Some(s) = o.get(key).and_then(|x| x.as_str()) {
+                    parts.push(s);
+                }
+            }
+        }
+        _ => {}
+    }
+    if let Some(e) = v.get("error").and_then(|x| x.as_str()) {
+        parts.push(e);
+    }
+    let mut out = String::new();
+    for part in parts {
+        let n = part.chars().count();
+        if n > ERROR_RECALL_HEAD_CHARS + ERROR_RECALL_TAIL_CHARS {
+            out.extend(part.chars().take(ERROR_RECALL_HEAD_CHARS));
+            out.push('\n');
+            out.extend(part.chars().skip(n - ERROR_RECALL_TAIL_CHARS));
+        } else {
+            out.push_str(part);
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// The playbook lines to inject for these error lines in `project`, skipping signatures this
+/// session already got (`seen`, updated with what is returned). At most
+/// [`ERROR_RECALL_MAX_LINES`], flattened and redacted like every injection surface.
+fn error_playbook_lines(
+    conn: &Connection,
+    errors: &[String],
+    project: &str,
+    seen: &mut std::collections::HashSet<String>,
+) -> anyhow::Result<Vec<String>> {
+    let mut signatures: Vec<String> = Vec::new();
+    for e in errors {
+        let sig = issues::normalize(e);
+        if !seen.contains(&sig) && !signatures.contains(&sig) {
+            signatures.push(sig);
+        }
+    }
+    let hits = issues::playbooks_for(conn, &signatures, project)?;
+    let mut lines = Vec::new();
+    for hit in hits.into_iter().take(ERROR_RECALL_MAX_LINES) {
+        lines.push(format!("  • {}", export::fact_line(&hit.text, 400)));
+        seen.insert(hit.signature);
+    }
+    Ok(lines)
+}
+
+/// Suffix of `recall-error`'s per-session state files, beside `recall-now`'s `<session>.json`.
+const ERROR_RECALL_SUFFIX: &str = ".errors.json";
+/// Age after which a `recall-error` state file is pruned: a session that never sent
+/// SessionEnd (a crash, a killed terminal, the SessionEnd hook not installed) would otherwise
+/// leave its file forever, and a week covers any session someone still resumes.
+const ERROR_RECALL_STATE_TTL: std::time::Duration = std::time::Duration::from_secs(7 * 86_400);
+
+/// Per-session `recall-error` state in `dir`: the signatures already injected. None for a
+/// session id with no file-safe characters.
+fn error_recall_path(dir: &std::path::Path, session: &str) -> Option<std::path::PathBuf> {
+    let safe = safe_session_name(session);
+    (!safe.is_empty()).then(|| dir.join(format!("{safe}{ERROR_RECALL_SUFFIX}")))
+}
+
+fn load_error_recall_state(path: &std::path::Path) -> std::collections::HashSet<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+/// Save the session's injected signatures, merged with what the file holds now, and prune
+/// other sessions' state older than [`ERROR_RECALL_STATE_TTL`]. Claude Code runs PostToolUse
+/// hooks of parallel tool calls concurrently and this is load-then-save without a lock, so
+/// two runs racing on the same new error can both inject it once (one duplicate line); the
+/// merge keeps either run from dropping the other's signatures, and the write goes to a
+/// temp file renamed over the old one, so a reader never sees a torn or corrupt file.
+fn save_error_recall_state(
+    path: &std::path::Path,
+    seen: &std::collections::HashSet<String>,
+    now: std::time::SystemTime,
+) {
+    let Some(dir) = path.parent() else {
+        return;
+    };
+    let _ = std::fs::create_dir_all(dir);
+    prune_error_recall_state(dir, now);
+    let mut all = load_error_recall_state(path);
+    all.extend(seen.iter().cloned());
+    let Ok(json) = serde_json::to_string(&all) else {
+        return;
+    };
+    // `<session>.errors.json.tmp<pid>`: still carries the suffix, so the prune finds a
+    // leftover from a run killed between the write and the rename.
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(format!(".tmp{}", std::process::id()));
+    let tmp = std::path::PathBuf::from(tmp);
+    if std::fs::write(&tmp, json).is_ok() && std::fs::rename(&tmp, path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// Remove `recall-error` state files (and temp files a killed run left) last written more
+/// than [`ERROR_RECALL_STATE_TTL`] before `now`.
+fn prune_error_recall_state(dir: &std::path::Path, now: std::time::SystemTime) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        if !e
+            .file_name()
+            .to_string_lossy()
+            .contains(ERROR_RECALL_SUFFIX)
+        {
+            continue;
+        }
+        let old = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|m| now.duration_since(m).ok())
+            .is_some_and(|age| age > ERROR_RECALL_STATE_TTL);
+        if old {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+}
+
+/// Drop a finished session's `recall-error` state (`cal session-end`).
+fn forget_error_recall(dir: &std::path::Path, session: &str) {
+    if let Some(p) = error_recall_path(dir, session) {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+/// `cal issues [project] [-n N] [--json]`: recurring errors across sessions (last 180 days),
+/// each with the commit that fixed it once one is known.
 fn cmd_issues(args: &[String]) -> anyhow::Result<()> {
     let o = parse(args)?;
     let project = if o.positional.is_empty() {
@@ -2850,14 +3424,21 @@ fn cmd_issues(args: &[String]) -> anyhow::Result<()> {
     };
     let conn = open_db()?;
     let since = chrono::Utc::now().timestamp() - 180 * 86_400;
-    let found = issues::recurring_issues(
+    let found = issues::recurring_issues_with_fixes(
         &conn,
         project.as_deref(),
+        search::ProjectMatch::Substring,
         since,
         o.limit.unwrap_or(20) as usize,
     )?;
     if o.json {
-        println!("{}", o.json(&found)?);
+        // The unversioned output keeps the bare clusters it printed before fixes existed.
+        if o.json_version.is_some() {
+            println!("{}", o.json_list(&found)?);
+        } else {
+            let bare: Vec<&issues::IssueCluster> = found.iter().map(|i| &i.cluster).collect();
+            println!("{}", o.json(&bare)?);
+        }
         return Ok(());
     }
     if found.is_empty() {
@@ -2865,7 +3446,8 @@ fn cmd_issues(args: &[String]) -> anyhow::Result<()> {
         return Ok(());
     }
     println!("Recurring errors (last 180 days, most frequent first):");
-    for i in &found {
+    for issue in &found {
+        let i = &issue.cluster;
         let threads = if i.threads == 1 {
             "1 thread".to_string()
         } else {
@@ -2878,11 +3460,27 @@ fn cmd_issues(args: &[String]) -> anyhow::Result<()> {
             fmt_time(Some(i.last_seen))
         );
         println!("    {}", o.shown(i.example.trim()));
+        if let Some(fix) = &issue.fix {
+            let subject = fix
+                .subject
+                .as_deref()
+                .map(|s| format!(" ({})", o.shown(s.trim())))
+                .unwrap_or_default();
+            println!(
+                "    fixed in {}{subject}, {}, thread {}  (cal cat {})",
+                fix.short_sha,
+                fmt_time(Some(fix.committed_at)),
+                fix.thread_id,
+                fix.thread_id
+            );
+        }
     }
     Ok(())
 }
 
-/// `cal cost [project] [-n N] [--json]` — estimated $ spend by model + the priciest threads.
+/// `cal cost [project] [--by KIND] [--since DAYS] [-n N] [--json]`: estimated $ spend by
+/// model and the priciest threads, or one breakdown. Plain `--json` without `--by` prints
+/// the unversioned object it always printed; `--json-version 1` prints [`cost::CostReport`].
 fn cmd_cost(args: &[String]) -> anyhow::Result<()> {
     let o = parse(args)?;
     let project = if o.positional.is_empty() {
@@ -2891,47 +3489,230 @@ fn cmd_cost(args: &[String]) -> anyhow::Result<()> {
         Some(o.positional.join(" "))
     };
     let conn = open_db()?;
-    // All-time by default (cost is a lifetime figure); `since = 0`.
-    let s = cost::spend(&conn, 0, project.as_deref(), o.limit.unwrap_or(8) as usize)?;
-    if o.json {
+    let by = o.by.unwrap_or_default();
+    // All time by default (cost is a lifetime figure); a day listing defaults to 30 days.
+    let since = match (o.since_days, by) {
+        (Some(days), _) => cost::local_day_start(days),
+        (None, cost::CostBy::Day) => cost::local_day_start(30),
+        (None, _) => 0,
+    };
+    let limit = o.limit.unwrap_or(if o.by.is_some() { 20 } else { 8 }) as usize;
+    if o.json && o.json_version.is_none() && o.by.is_none() && o.since_days.is_none() {
+        let s = cost::spend(&conn, 0, project.as_deref(), limit)?;
         println!("{}", o.json(&s)?);
         return Ok(());
     }
-    if s.tracked_calls == 0 && s.untracked_calls == 0 {
-        eprintln!(
-            "(no token usage captured yet — run Reindex in the app, then retry. The source files\n carry it; data indexed before this feature doesn't.)"
-        );
+    if !o.json && by == cost::CostBy::Model {
+        return print_cost_by_model(&o, &conn, since, project.as_deref(), limit);
+    }
+    let r = cost::cost_report(
+        &conn,
+        &cost::CostQuery {
+            by,
+            since,
+            project: project.as_deref(),
+            mode: search::ProjectMatch::Substring,
+            limit,
+        },
+    )?;
+    if o.json {
+        println!("{}", o.json_object(&r)?);
+        return Ok(());
+    }
+    if r.tracked_calls == 0 && r.untracked_calls == 0 {
+        no_usage_note(since);
         return Ok(());
     }
     println!(
-        "Estimated spend: ${:.2}  ({} tracked LLM calls)",
-        s.total_cost, s.tracked_calls
+        "Estimated spend{}: ${:.2}  ({} priced model calls)",
+        window_label(since),
+        r.total_cost,
+        r.tracked_calls
     );
-    if s.untracked_calls > 0 {
-        println!(
-            "  (+{} calls on models with no price on file — not counted)",
-            s.untracked_calls
-        );
-    }
-    println!("\nBy model:");
-    for m in &s.by_model {
-        if m.priced {
-            println!("  ${:>9.2}   {}  ({} calls)", m.cost, m.model, m.calls);
-        } else {
-            println!("  {:>10}   {}  ({} calls, no price)", "—", m.model, m.calls);
+    match by {
+        cost::CostBy::Model => {}
+        cost::CostBy::Thread => print_cost_by_session(&o, &r),
+        cost::CostBy::Commit => print_cost_by_commit(&o, &r),
+        cost::CostBy::Project => {
+            println!("\nBy project:");
+            for p in r.projects.iter().flatten() {
+                println!(
+                    "  ${:>9.2}   {}  ({} sessions, {} calls)",
+                    p.cost,
+                    o.shown(p.project.as_deref().unwrap_or("(no project)")),
+                    p.threads,
+                    p.calls
+                );
+            }
+        }
+        cost::CostBy::Day => {
+            println!("\nBy day (local time):");
+            let days = r.days.as_deref().unwrap_or_default();
+            let top = days.iter().map(|d| d.cost).fold(0.0, f64::max);
+            for d in days {
+                let bar = if top > 0.0 {
+                    "#".repeat(((d.cost / top) * 30.0).round() as usize)
+                } else {
+                    String::new()
+                };
+                println!("  {}  ${:>9.2}  {bar}", d.day, d.cost);
+            }
         }
     }
-    println!("\nMost expensive threads:");
-    for t in &s.top_threads {
+    print_unpriced(
+        r.untracked_calls,
+        r.by_model
+            .iter()
+            .filter(|m| !m.priced)
+            .map(|m| (m.model.as_str(), m.calls)),
+    );
+    Ok(())
+}
+
+/// " since <local date>" for a window, nothing for all time.
+fn window_label(since: i64) -> String {
+    use chrono::TimeZone;
+    match chrono::Local.timestamp_opt(since, 0).earliest() {
+        Some(t) if since > 0 => format!(" since {}", t.format("%Y-%m-%d")),
+        _ => String::new(),
+    }
+}
+
+fn no_usage_note(since: i64) {
+    eprintln!(
+        "(no token usage recorded{}. Claude Code, Codex, Gemini CLI, Qwen Code, OpenCode and \
+         Copilot sessions carry it; for ones indexed before the update the app (or `cal index`) \
+         fills it in once, in the background, so retry after that has run. Other agents record \
+         none.)",
+        if since > 0 { " in this window" } else { "" }
+    );
+}
+
+/// The unpriced models, each with why it has no price, then what the figures are.
+fn print_unpriced<'a>(calls: i64, models: impl Iterator<Item = (&'a str, i64)>) {
+    let lines: Vec<String> = models
+        .map(|(model, n)| {
+            let why = match cost::pricing(model) {
+                cost::Pricing::Unpriced { why, .. } => why,
+                _ => "no list price on file",
+            };
+            format!("{model} ({n} calls): {why}")
+        })
+        .collect();
+    if !lines.is_empty() {
         println!(
-            "  ${:>9.2}   #{}  {}",
-            t.cost,
-            t.thread_id,
-            o.shown(t.title.as_deref().unwrap_or(""))
+            "\nNot counted, {calls} calls on unpriced models:\n  {}",
+            lines.join("\n  ")
         );
     }
-    println!("\n(estimate from list prices; not a billing record)");
+    println!("\n({})", cost::COST_BASIS);
+}
+
+/// The default listing: per model, then the priciest threads (as `cal cost` always printed).
+fn print_cost_by_model(
+    o: &Opts,
+    conn: &Connection,
+    since: i64,
+    project: Option<&str>,
+    limit: usize,
+) -> anyhow::Result<()> {
+    let s = cost::spend(conn, since, project, limit)?;
+    if s.tracked_calls == 0 && s.untracked_calls == 0 {
+        no_usage_note(since);
+        return Ok(());
+    }
+    println!(
+        "Estimated spend{}: ${:.2}  ({} priced model calls)",
+        window_label(since),
+        s.total_cost,
+        s.tracked_calls
+    );
+    println!("\nBy model:");
+    for m in s.by_model.iter().filter(|m| m.priced) {
+        println!("  ${:>9.2}   {}  ({} calls)", m.cost, m.model, m.calls);
+    }
+    if !s.top_threads.is_empty() {
+        println!("\nMost expensive threads (more with --by thread):");
+        for t in &s.top_threads {
+            println!(
+                "  ${:>9.2}   #{}  {}",
+                t.cost,
+                t.thread_id,
+                o.shown(t.title.as_deref().unwrap_or(""))
+            );
+        }
+    }
+    print_unpriced(
+        s.untracked_calls,
+        s.by_model
+            .iter()
+            .filter(|m| !m.priced)
+            .map(|m| (m.model.as_str(), m.calls)),
+    );
     Ok(())
+}
+
+fn print_cost_by_session(o: &Opts, r: &cost::CostReport) {
+    println!("\nPriciest sessions:");
+    for t in r.threads.iter().flatten() {
+        let subagents = if t.subagents > 0 {
+            format!("  (+{} subagents)", t.subagents)
+        } else {
+            String::new()
+        };
+        println!(
+            "  ${:>9.2}   #{}  {}  [{}, {}]{subagents}",
+            t.cost,
+            t.id,
+            o.shown(t.title.as_deref().unwrap_or("")),
+            t.source,
+            fmt_time(t.last_active)
+        );
+        if !t.signals.is_empty() {
+            let labels: Vec<&str> = t.signals.iter().map(|s| s.label.as_str()).collect();
+            println!("               {}", labels.join(" · "));
+        }
+    }
+}
+
+fn print_cost_by_commit(o: &Opts, r: &cost::CostReport) {
+    let commits = r.commits.as_deref().unwrap_or_default();
+    if commits.is_empty() {
+        println!(
+            "\nNo commits linked to these sessions yet. Run `cal commits` inside a repo to \
+             link its history, then retry."
+        );
+        return;
+    }
+    println!("\nBy commit (what the sessions behind it cost):");
+    for c in commits {
+        println!(
+            "  ${:>9.2}   {}  {}  ({})",
+            c.cost,
+            c.short_sha,
+            o.shown(c.subject.as_deref().unwrap_or("")),
+            fmt_time(Some(c.committed_at))
+        );
+        for s in &c.sessions {
+            let also = if s.commits > 1 {
+                format!(", also counted toward {} other commits", s.commits - 1)
+            } else {
+                String::new()
+            };
+            println!(
+                "               #{}  {}  ${:.2}{also}",
+                s.id,
+                o.shown(s.title.as_deref().unwrap_or("")),
+                s.cost
+            );
+        }
+    }
+    if commits.iter().any(|c| c.shared) {
+        println!(
+            "\n(A session that produced several commits counts toward each in full, so the \
+             commit costs overlap.)"
+        );
+    }
 }
 
 fn fmt_time(epoch: Option<i64>) -> String {
@@ -3244,6 +4025,40 @@ mod tests {
         }];
         check("commits", &json(&Listing::new(&commits)));
 
+        // `why` on a commit linked to the seeded thread, whose decision comes along.
+        conn.execute(
+            "INSERT INTO facts (thread_id, kind, text, rationale, extractor, created_at)
+             VALUES (?1, 'decision', 'rotate on a 401', 'tokens expire early', 'llm', 1)",
+            [id],
+        )
+        .unwrap();
+        let sha = "ab".repeat(20);
+        conn.execute(
+            "INSERT INTO thread_commits
+                (thread_id, sha, short_sha, subject, committed_at, overlap, created_at)
+             VALUES (?1, ?2, 'abababab', 'fix', 1200, 1, 1)",
+            rusqlite::params![id, sha],
+        )
+        .unwrap();
+        let target = why::Target {
+            repo: "/proj/app".into(),
+            rel: "src/auth.rs".into(),
+        };
+        let blamed = [why::BlameCommit {
+            sha,
+            committed_at: 1_200,
+            subject: "fix: rotate tokens".into(),
+            lines: 1,
+        }];
+        let out = why::explain(&conn, &target, Some(3), &blamed).unwrap();
+        assert!(!out.commits[0].threads[0].facts.is_empty());
+        check("why", &json(&out));
+        let unlinked = why::explain(&conn, &target, None, &[]).unwrap();
+        check("why", &json(&unlinked));
+        let text = why_text(&out, &Opts::default());
+        assert!(text.contains("src/auth.rs:3"), "{text}");
+        assert!(text.contains("decision: "), "{text}");
+
         let knowledge = Some(AuditKnowledge {
             summary: None,
             decisions: vec!["rotate refresh tokens".into()],
@@ -3288,6 +4103,7 @@ mod tests {
                 first_seen: 1_000,
                 last_seen: 1_300,
                 last_thread_id: id,
+                thread_ids: vec![id],
             }],
             project_memory: Some(mem),
             notes: AuditNotes {
@@ -3298,7 +4114,42 @@ mod tests {
         };
         let audit = json(&audit);
         assert!(!audit.contains("lastThreadId"), "{audit}");
+        assert!(!audit.contains("threadIds"), "{audit}");
         check("audit-pr", &audit);
+
+        let cluster = issues::IssueCluster {
+            example: "error[E0382]: borrow of moved value".into(),
+            count: 3,
+            threads: 2,
+            first_seen: 1_000,
+            last_seen: 1_300,
+            last_thread_id: id,
+            thread_ids: vec![id],
+        };
+        let found = [
+            issues::Issue {
+                cluster: cluster.clone(),
+                thread_ids: vec![id],
+                fix: Some(issues::IssueFix {
+                    sha: "abc123".into(),
+                    short_sha: "abc123".into(),
+                    subject: Some("fix: move the clone".into()),
+                    committed_at: 1_400,
+                    thread_id: id,
+                }),
+                playbook: Some("error[e0382]: borrow of moved value: seen 3 times".into()),
+            },
+            issues::Issue {
+                cluster,
+                thread_ids: vec![],
+                fix: None,
+                playbook: None,
+            },
+        ];
+        let listing = json(&Listing::new(&found));
+        assert!(listing.contains("\"shortSha\": \"abc123\""), "{listing}");
+        assert!(!listing.contains("lastThreadId"), "{listing}");
+        check("issues", &listing);
     }
 
     /// Lets the schema test above print any envelope the way `--json` does.
@@ -3311,6 +4162,256 @@ mod tests {
                 super::Opts::default().json(self).unwrap()
             }
         }
+    }
+
+    /// `recall-error` reads the command output from either Claude Code event: PostToolUse's
+    /// Bash `tool_response` (stdout and stderr, or a plain string) and PostToolUseFailure's
+    /// `error`, long output as its head and tail.
+    #[test]
+    fn error_recall_reads_both_tool_events() {
+        let ok = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "tool_response": {"stdout": "compiling", "stderr": "error: linker `cc` failed",
+                              "interrupted": false, "isImage": false}
+        });
+        assert_eq!(
+            issues::extract_errors(&hook_tool_output(&ok)),
+            ["error: linker `cc` failed"]
+        );
+        let failed = serde_json::json!({
+            "hook_event_name": "PostToolUseFailure",
+            "error": "Exit code 101\nerror[E0425]: cannot find value `x` in this scope"
+        });
+        assert_eq!(issues::extract_errors(&hook_tool_output(&failed)).len(), 1);
+        let plain = serde_json::json!({"tool_response": "fatal: not a git repository"});
+        assert_eq!(issues::extract_errors(&hook_tool_output(&plain)).len(), 1);
+        let long = format!(
+            "{}\nerror: could not compile `app`",
+            "compiling a crate\n".repeat(2_000)
+        );
+        let out = hook_tool_output(&serde_json::json!({"tool_response": {"stdout": long}}));
+        assert!(out.chars().count() < 9_000);
+        assert!(out.contains("could not compile"));
+        assert!(hook_tool_output(&serde_json::json!({})).trim().is_empty());
+    }
+
+    /// A temp index where `error[E0425]` was hit twice in `project` and a session that then
+    /// edited `src/cart.rs` produced commit abcdef0 (which changed it), with the clusters refreshed so the error
+    /// has a fix and a playbook. Returns the writer and the fixing thread's id.
+    fn index_with_a_fixed_error(p: &std::path::Path, project: &str) -> (Connection, i64) {
+        for ext in ["db", "db-wal", "db-shm"] {
+            let _ = std::fs::remove_file(p.with_extension(ext));
+        }
+        let conn = db::open(p).unwrap();
+        let now = chrono::Utc::now().timestamp();
+        conn.execute(
+            "INSERT INTO threads (source_id, external_id, title, project_path, project_key)
+             VALUES (1, 'fix', 'fix', ?1, ?1)",
+            [project],
+        )
+        .unwrap();
+        let tid = conn.last_insert_rowid();
+        let err = "error[E0425]: cannot find value `total` in this scope";
+        for seq in 0..2 {
+            conn.execute(
+                "INSERT INTO messages (thread_id, seq, role, text, ts)
+                 VALUES (?1, ?2, 'tool', ?3, ?4)",
+                rusqlite::params![tid, seq, format!("{err}\n --> src/cart.rs:4:9"), now - 900],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO file_edits (thread_id, path, op, ts) VALUES (?1, 'src/cart.rs', 'edit', ?2)",
+            rusqlite::params![tid, now - 800],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO thread_commits
+                (thread_id, sha, short_sha, subject, committed_at, overlap, created_at)
+             VALUES (?1, 'abcdef0123456', 'abcdef0', 'fix: declare total', ?2, 1, ?2)",
+            rusqlite::params![tid, now - 700],
+        )
+        .unwrap();
+        // A fix must change the file the error named; no checkout holds this made-up commit.
+        issues::seed_commit_files("abcdef0123456", &["src/cart.rs"]);
+        issues::refresh_clusters(&conn).unwrap();
+        (conn, tid)
+    }
+
+    /// The hook end to end, as separate hook processes see it: the payload in, the index and
+    /// the per-session state file on disk. The first run prints the envelope naming the event
+    /// it answers and writes the state; a second run in the same session is silent, another
+    /// session hears it again, a payload without a session id stays silent, `session-end`
+    /// removes the file, and a file older than the TTL is pruned on the next save.
+    #[test]
+    fn error_recall_hook_runs_end_to_end() {
+        let home = temp_dir("recall_error_home");
+        let state = home.join(".callimachus/recall");
+        let repo = temp_dir("recall_error_repo");
+        let project = crate::indexer::canonical_project(&repo.to_string_lossy()).unwrap();
+        let index = home.join("index.db");
+        let (_conn, tid) = index_with_a_fixed_error(&index, &project);
+        let now = std::time::SystemTime::now();
+        let payload = |session: Option<&str>| {
+            let mut v = serde_json::json!({
+                "hook_event_name": "PostToolUseFailure",
+                "tool_name": "Bash",
+                "cwd": repo.to_string_lossy(),
+                "error": "Exit code 101\nerror[E0425]: cannot find value `subtotal` in this scope",
+            });
+            if let Some(s) = session {
+                v["session_id"] = serde_json::json!(s);
+            }
+            v
+        };
+
+        let hit = recall_error(&payload(Some("s-1")), &index, &state, now)
+            .unwrap()
+            .expect("a fixed error is recalled");
+        assert_eq!(hit.project, project);
+        let out: serde_json::Value = serde_json::from_str(&hit.output).unwrap();
+        assert_eq!(
+            out["hookSpecificOutput"]["hookEventName"],
+            "PostToolUseFailure"
+        );
+        let ctx = out["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap();
+        assert!(
+            ctx.contains("fixed in abcdef0 (fix: declare total)"),
+            "{ctx}"
+        );
+        assert!(ctx.contains(&format!("see thread {tid}")), "{ctx}");
+        let file = state.join("s-1.errors.json");
+        assert!(file.is_file());
+
+        assert!(recall_error(&payload(Some("s-1")), &index, &state, now)
+            .unwrap()
+            .is_none());
+        assert!(recall_error(&payload(Some("s-2")), &index, &state, now)
+            .unwrap()
+            .is_some());
+        assert!(recall_error(&payload(None), &index, &state, now)
+            .unwrap()
+            .is_none());
+        // Output with no error line, and a missing index, are silent before any lookup.
+        let quiet = serde_json::json!({"session_id": "s-3", "cwd": repo.to_string_lossy(),
+                                       "tool_response": {"stdout": "ok"}});
+        assert!(recall_error(&quiet, &index, &state, now).unwrap().is_none());
+        assert!(
+            recall_error(&payload(Some("s-3")), &home.join("none.db"), &state, now)
+                .unwrap()
+                .is_none()
+        );
+
+        forget_error_recall(&state, "s-1");
+        assert!(!file.exists());
+        assert!(state.join("s-2.errors.json").is_file());
+        // A week later the next save prunes s-2's file and keeps its own.
+        let later = now + ERROR_RECALL_STATE_TTL + std::time::Duration::from_secs(60);
+        assert!(recall_error(&payload(Some("s-4")), &index, &state, later)
+            .unwrap()
+            .is_some());
+        assert!(!state.join("s-2.errors.json").exists());
+        assert!(state.join("s-4.errors.json").is_file());
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// `cal why` names the right gap: an uncommitted change, a file blame found no commit
+    /// in, or commits no session is linked to yet.
+    #[test]
+    fn why_note_tells_no_commit_from_no_link() {
+        let out = |commits: usize, unlinked: bool, uncommitted: bool| why::WhyOutput {
+            schema_version: 1,
+            file: "src/a.rs".into(),
+            line: None,
+            repo: "/r/app".into(),
+            commits: (0..commits)
+                .map(|i| why::WhyCommit {
+                    sha: format!("{i:040}"),
+                    short_sha: format!("{i:07}"),
+                    subject: "s".into(),
+                    committed_at: 0,
+                    lines: 1,
+                    threads: Vec::new(),
+                })
+                .collect(),
+            unlinked,
+            uncommitted,
+        };
+        let note = |o| why_note(&o).unwrap_or_default();
+        assert!(note(out(0, true, true)).contains("not committed"));
+        assert!(note(out(0, true, false)).starts_with("git blame named no commit"));
+        assert!(note(out(1, true, false)).contains("this commit yet. Run `cal commits`"));
+        assert!(note(out(2, true, false)).contains("these commits"));
+        assert!(why_note(&out(1, false, false)).is_none());
+    }
+
+    /// The hook injects a resolved cluster's playbook once per session, says nothing for an
+    /// error with no fix or in another repo, and stays silent (no line, or an error the
+    /// silent runner swallows) on an index without `issue_clusters` or with another shape.
+    #[test]
+    fn error_recall_injects_a_fix_once_per_session() {
+        let p = std::env::temp_dir().join(format!("calli_recall_error_{}.db", std::process::id()));
+        let (conn, tid) = index_with_a_fixed_error(&p, "/r/app");
+
+        // The same error with other specifics (another variable, another path) matches.
+        let output = "error[E0425]: cannot find value `subtotal` in this scope\n --> src/x.rs:1:1";
+        let errors = issues::extract_errors(output);
+        let mut seen = std::collections::HashSet::new();
+        let lines = error_playbook_lines(&conn, &errors, "/r/app", &mut seen).unwrap();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].contains("fixed in abcdef0 (fix: declare total)"),
+            "{}",
+            lines[0]
+        );
+        assert!(
+            lines[0].contains(&format!("see thread {tid}")),
+            "{}",
+            lines[0]
+        );
+        // Once per session.
+        assert!(error_playbook_lines(&conn, &errors, "/r/app", &mut seen)
+            .unwrap()
+            .is_empty());
+        // A new session hears it again; another repo, or an error never fixed, does not.
+        let mut fresh = std::collections::HashSet::new();
+        assert!(error_playbook_lines(&conn, &errors, "/r/other", &mut fresh)
+            .unwrap()
+            .is_empty());
+        let unknown = issues::extract_errors("error: disk quota exceeded");
+        assert!(error_playbook_lines(&conn, &unknown, "/r/app", &mut fresh)
+            .unwrap()
+            .is_empty());
+        assert!(fresh.is_empty());
+
+        // Schema mismatch: no table is silence; a table of another shape is an error, which
+        // `run_hook_silently` turns into a silent exit 0.
+        conn.execute_batch("ALTER TABLE issue_clusters RENAME TO issue_clusters_old")
+            .unwrap();
+        assert!(error_playbook_lines(&conn, &errors, "/r/app", &mut fresh)
+            .unwrap()
+            .is_empty());
+        conn.execute_batch("CREATE TABLE issue_clusters (signature TEXT PRIMARY KEY)")
+            .unwrap();
+        assert!(error_playbook_lines(&conn, &errors, "/r/app", &mut fresh).is_err());
+        assert!(HOOK_COMMANDS.contains(&"recall-error"));
+        assert!(is_silent_hook(&argv(&["recall-error"])));
+    }
+
+    /// `--by` and `--since` belong to `cal cost`; any other command refuses them instead of
+    /// answering for a window it never applied.
+    #[test]
+    fn cost_flags_are_refused_elsewhere() {
+        let err = run(&argv(&["issues", "--since", "7"]))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "--since only applies to `cal cost`, not `cal issues`");
+        assert!(run(&argv(&["stats", "--by", "day"])).is_err());
+        assert!(reject_cost_flags("cost", &argv(&["--by", "day", "--since", "7"])).is_ok());
+        assert!(reject_cost_flags("search", &argv(&["since", "-n", "3"])).is_ok());
     }
 
     #[test]
@@ -4209,7 +5310,7 @@ mod tests {
     /// undocumented. Internal hook targets are intentionally not user-facing.
     #[test]
     fn usage_documents_every_command() {
-        const INTERNAL: &[&str] = &["snapshot-hook", "recall-now", "session-end"];
+        const INTERNAL: &[&str] = &["snapshot-hook", "recall-now", "recall-error", "session-end"];
         for &c in COMMANDS {
             if INTERNAL.contains(&c) {
                 continue;

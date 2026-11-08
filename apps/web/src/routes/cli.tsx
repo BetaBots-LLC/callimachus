@@ -10,7 +10,7 @@ export const Route = createFileRoute("/cli")({
     meta: seo({
       title: "cal: the Callimachus CLI",
       description:
-        "Search your AI coding history from the terminal. cal search, recent, cat, ask, files, commits, memory, remember, check, snapshot, resume, stats, and export. Pipe-friendly, and it reads the same local index as the desktop app.",
+        "Search your AI coding history from the terminal. cal search, recent, cat, ask, files, commits, why, memory, remember, check, snapshot, resume, stats, and export. Pipe-friendly, and it reads the same local index as the desktop app.",
       path: "/cli",
     }),
     links: [{ rel: "canonical", href: `${SITE_URL}/cli` }],
@@ -80,14 +80,20 @@ function CliPage() {
               "cal files embed/mod.rs",
               "# the thread→commit timeline: which commits each conversation produced",
               "cal commits",
-              "# recurring errors you keep hitting across every tool (last 180 days)",
+              "# why a line is the way it is: the commit behind it, its sessions and their decisions",
+              "cal why src/auth.rs:42",
+              "# recurring errors you keep hitting across every tool, and the commit that fixed each",
               "cal issues",
               "# estimated $ spend by model + your priciest threads",
               "cal cost",
+              "# what the sessions behind each recent commit cost (also --by thread, project or day)",
+              "cal cost --by commit --since 30",
               "# one JSON bundle for an external PR auditor (provenance + file history + errors)",
               "cal audit-pr . --changed-files src/auth.rs --shas $(git rev-parse HEAD)",
               "# a project's durable memory (decisions / gotchas / open TODOs)",
               "cal memory",
+              "# share it with your team: write .callimachus/memory/ in the repo, for you to commit",
+              "cal memory publish",
               "# record a decision, with the reasoning behind it",
               'cal remember decision "use sqlite-vec for the KNN index" --because "fewest deps, ships in-process"',
               "# surface settled decisions before re-litigating one",
@@ -120,7 +126,7 @@ function CliPage() {
           For a contract you can build on, pass <code className="font-mono">--json-version 1</code>{" "}
           (or set <code className="font-mono">CAL_JSON_VERSION=1</code> beside{" "}
           <code className="font-mono">--json</code>). Then search, recent, related, cat, stats,
-          memory, decisions, gotchas, commits, and audit-pr open with{" "}
+          memory, decisions, gotchas, commits, why, cost, issues, and audit-pr open with{" "}
           <code className="font-mono">schema_version</code>, a list comes under{" "}
           <code className="font-mono">results</code>, and each shape has a published JSON Schema at{" "}
           <code className="font-mono">/schemas/cal/&lt;command&gt;.v1.json</code>, such as{" "}
@@ -149,7 +155,10 @@ function CliPage() {
           <code className="font-mono">git log</code>'s changed files inside the thread's time
           window, where the shared-file count is the confidence. Run it inside a git repo or pass a
           path; it prints the thread→commit timeline, one row per commit with its linked-thread
-          count.
+          count. <code className="font-mono">cal why src/auth.rs:42</code> goes the other way:{" "}
+          <code className="font-mono">git blame</code> names the commit behind the line, and you get
+          the sessions that produced it, the ones that edited the file first, with their decisions
+          and gotchas. Leave off the line for the commits behind the whole file.
         </p>
         <p className="mt-4 max-w-[60ch] leading-relaxed text-muted-foreground">
           Curate as you go with <code className="font-mono">cal star</code>,{" "}
@@ -172,7 +181,12 @@ function CliPage() {
           new fact into that memory (add <code className="font-mono">--because "&lt;why&gt;"</code>{" "}
           to a decision to keep its rationale), and <code className="font-mono">cal done</code>{" "}
           closes a leftover TODO. These only ever touch Callimachus's own index and memory, never
-          your files.
+          your files. The one exception is yours to run:{" "}
+          <code className="font-mono">cal memory publish</code> writes the repo's pinned and
+          recorded facts into <code className="font-mono">.callimachus/memory/</code> for you to
+          review and commit, and everyone with Callimachus who works in the repo imports them as
+          notes from the repo (<code className="font-mono">cal memory import --review</code> shows
+          what an import would change).
         </p>
         <p className="mt-4 max-w-[60ch] leading-relaxed text-muted-foreground">
           A contradiction guard keeps agents honest:{" "}

@@ -50,6 +50,58 @@ export interface Stats {
   topProjects: ProjectStat[];
 }
 
+/** A decision or gotcha from a session behind a commit (`cal why --json`). */
+export interface WhyFact {
+  id: number;
+  threadId: number;
+  kind: string;
+  text: string;
+  rationale: string | null;
+  extractor: string;
+  originRef: string | null;
+}
+
+/** A session inferred to have produced a blamed commit, with what it did to the file. */
+export interface WhyThread {
+  id: number;
+  title: string | null;
+  source: string;
+  lastActive: number | null;
+  /** Edit and write tool calls on the file inside the session. */
+  edits: number;
+  /** The strongest thing the session did to the file: write, edit, read or mention. */
+  touch: string | null;
+  overlap: number;
+  facts: WhyFact[];
+}
+
+export interface WhyCommit {
+  sha: string;
+  shortSha: string;
+  subject: string;
+  committedAt: number;
+  lines: number;
+  threads: WhyThread[];
+}
+
+/** `cal why <file>:<line> --json` (schema: callimachus.app/schemas/cal/why.v1.json). */
+export interface WhyResult {
+  file: string;
+  line: number | null;
+  repo: string;
+  commits: WhyCommit[];
+  /** No commit here links to a session yet (`cal commits` links the repo's history). */
+  unlinked: boolean;
+  /** The line has changes no commit owns yet. */
+  uncommitted: boolean;
+}
+
+/** The sidebar's "Why this line" section: asking, the answer, or why there is none. */
+export type WhyState =
+  | { status: "loading"; file: string; line: number }
+  | { status: "done"; file: string; line: number; result: WhyResult }
+  | { status: "error"; file: string; line: number; message: string };
+
 /** RPC methods (webview -> host, awaiting a reply). */
 export interface RpcMap {
   search: { params: { query: string; project?: string | null }; result: SearchHit[] };
@@ -82,7 +134,9 @@ export interface InitPayload {
 export type FromWebview =
   | { kind: "ready" }
   | { kind: "rpc"; id: number; method: RpcMethod; params: unknown }
-  | { kind: "action"; action: ActionName; id: number; title?: string | null };
+  | { kind: "action"; action: ActionName; id: number; title?: string | null }
+  // The user closed the "Why this line" section.
+  | { kind: "closeWhy" };
 
 /** host -> webview envelope. */
 export type ToWebview =
@@ -92,7 +146,10 @@ export type ToWebview =
   | { kind: "refresh" }
   // Ambient recall: the host computes related threads from the editor context and
   // pushes them; `label` is a short hint of what matched (a symbol, "selection"…).
-  | { kind: "related"; label: string; results: ThreadSummary[] };
+  | { kind: "related"; label: string; results: ThreadSummary[] }
+  // "Why this line": the host runs `cal why` for the editor line and pushes each state;
+  // null clears the section.
+  | { kind: "why"; state: WhyState | null };
 
 /** Human labels for the source kinds (kept in sync with the desktop app). */
 export const SOURCE_LABELS: Record<string, string> = {

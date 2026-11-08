@@ -1306,6 +1306,411 @@ pub fn harvest_landed(host: &Host, report: knowledge::harvest::HarvestReport) {
     }
 }
 
+// ---- the watcher's graph upkeep: commit links per batch, issue clusters per minute -------
+
+/// The threads an index batch just wrote, the most recently active sessions first: the rows
+/// with `last_indexed_at` at or after the batch start, off 0034's index, sorted by
+/// `updated_at` (a sort over the batch's rows only; the COALESCE keeps SQLite from walking
+/// idx_threads_updated over every thread instead). Ordering by `last_indexed_at` kept the
+/// threads written last in the pass, so after a launch catch-up the sources scanned after
+/// Claude Code took every slot. Subagent transcripts are skipped, as `gitlink` does; the `+`
+/// keeps SQLite off idx_threads_subagent, an equality it otherwise prefers to the range.
+pub(crate) const BATCH_THREADS_SQL: &str =
+    "SELECT id, COALESCE(project_path, ''), COALESCE(project_key, project_path, '')
+     FROM threads WHERE last_indexed_at >= ?1 AND +is_subagent = 0
+     ORDER BY COALESCE(updated_at, 0) DESC, id DESC LIMIT ?2";
+
+/// Threads one batch queues for linking. A batch during an active session writes one or
+/// two; a launch catch-up can write hundreds, and only the newest are worth a `git log` now
+/// (the rest link on a Today load or a project's whole-repo scan).
+const BATCH_LINK_MAX_THREADS: i64 = 50;
+/// Least time between two links of the same checkout: an active session's transcript lands
+/// in a batch every few seconds, and `git log` over its window each time would be waste.
+pub const COMMIT_LINK_EVERY: Duration = Duration::from_secs(60);
+/// Tries before the linker drops a checkout whose `git log` keeps outrunning the budget or
+/// meeting a busy index (a resumed months-old session in a big repo asks for months of log).
+/// With the doubling backoff that is about half an hour; its sessions still link on a Today
+/// load or a project's whole-repo scan.
+const LINK_MAX_ATTEMPTS: u32 = 5;
+/// Deadline for the two `git` calls that resolve a checkout's portable id. They run on the
+/// watcher's thread, and a git hung on a sleeping network mount or a slow fsmonitor hook
+/// must not hold indexing; a probe that runs out is retried on a later pass.
+const PORTABLE_PROBE_DEADLINE: Duration = Duration::from_secs(3);
+
+/// One checkout's queued work.
+#[derive(Default)]
+struct Queued {
+    /// The project keys of its sessions, each resolved to a portable id once it links.
+    keys: std::collections::BTreeSet<String>,
+    threads: std::collections::BTreeSet<i64>,
+    /// Passes in a row where this checkout was tried and wrote nothing.
+    failures: u32,
+    /// Not before this, after a failure.
+    retry_at: Option<std::time::Instant>,
+}
+
+/// Keeps `thread_commits` current as sessions land, without the GUI: the watcher (and `cal
+/// index`) queues the threads each index batch wrote, and links the checkouts that are due
+/// (each at most once per [`COMMIT_LINK_EVERY`]) under Today's 2 s budget in total
+/// ([`crate::today::COMMIT_BUDGET`]). A checkout that was tried and wrote nothing (git ran
+/// past the deadline, or the index stayed locked) stays queued and is retried with a
+/// doubling backoff, after the checkouts that have not failed, and dropped after
+/// [`LINK_MAX_ATTEMPTS`].
+#[derive(Default)]
+pub struct CommitLinker {
+    /// Checkout dir (canonical) -> its queued work.
+    pending: std::collections::BTreeMap<String, Queued>,
+    last_run: std::collections::HashMap<String, std::time::Instant>,
+    /// Project keys of linked checkouts still to resolve to a portable id.
+    portable: std::collections::BTreeSet<String>,
+}
+
+/// The checkout a session's commits land in: the nearest directory at or above its own cwd
+/// that has a `.git` (a linked worktree's own root, whose branch the main checkout's log
+/// does not walk), else the project key's checkout (the git root `canonical_project` found
+/// when the cwd existed). A monorepo session started in `repo/apps/web` used to be skipped,
+/// since only the cwd itself was checked. The walk stops below the home directory, as
+/// `canonical_project` does, so a dotfiles `~/.git` never claims every session under home.
+/// Canonicalized, so `/tmp/x`, `/private/tmp/x` and `x/` share one queue entry and one
+/// once-a-minute slot.
+fn checkout_for(path: &str, key: &str) -> Option<String> {
+    let home = dirs::home_dir();
+    let start = if path.is_empty() { key } else { path };
+    let start = std::path::Path::new(start);
+    let found = start
+        .ancestors()
+        .take_while(|dir| home.as_deref() != Some(*dir) || *dir == start)
+        .find(|dir| !dir.as_os_str().is_empty() && dir.join(".git").exists())
+        .map(|dir| dir.to_string_lossy().into_owned())
+        .or_else(|| crate::today::git_checkout(key).map(str::to_string))?;
+    Some(
+        std::fs::canonicalize(&found)
+            .map(|c| crate::gitlink::plain_path(&c.to_string_lossy()))
+            .unwrap_or(found),
+    )
+}
+
+/// The portable-id probe with a deadline: `git rev-parse --show-prefix` (where the key sits
+/// below the toplevel) and `git remote get-url origin`, each killed at `deadline`. None when
+/// `dir` is not a checkout here or a call ran out of time; a checkout with no `origin` is a
+/// probe with no remote.
+fn probe_remote_until(
+    dir: &str,
+    deadline: std::time::Instant,
+) -> Option<knowledge::identity::RemoteProbe> {
+    if !std::path::Path::new(&crate::gitlink::plain_path(dir)).is_dir() {
+        return None;
+    }
+    let prefix =
+        crate::gitlink::run_git_until(dir, &["rev-parse", "--show-prefix"], deadline).ok()??;
+    let remote =
+        match crate::gitlink::run_git_until(dir, &["remote", "get-url", "origin"], deadline) {
+            Ok(Some(url)) => Some(url).filter(|u| !u.is_empty()),
+            Ok(None) => return None,
+            Err(_) => None, // no `origin`
+        };
+    Some(knowledge::identity::RemoteProbe {
+        remote,
+        subpath: prefix.trim_matches('/').to_string(),
+    })
+}
+
+impl CommitLinker {
+    /// Queue the threads written since `since` (unix secs, taken before the batch ran) whose
+    /// session ran in a git checkout. Returns how many were queued.
+    pub fn queue_since(
+        &mut self,
+        conn: &rusqlite::Connection,
+        since: i64,
+    ) -> anyhow::Result<usize> {
+        let mut stmt = conn.prepare_cached(BATCH_THREADS_SQL)?;
+        let rows = stmt
+            .query_map(rusqlite::params![since, BATCH_LINK_MAX_THREADS], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut queued = 0;
+        for (id, path, key) in rows {
+            let Some(repo) = checkout_for(&path, &key) else {
+                continue;
+            };
+            let entry = self.pending.entry(repo).or_default();
+            if !key.is_empty() {
+                entry.keys.insert(key);
+            }
+            queued += usize::from(entry.threads.insert(id));
+        }
+        Ok(queued)
+    }
+
+    /// Whether any queued checkout is due now, or a linked one still needs its portable id.
+    pub fn has_due(&self, now: std::time::Instant) -> bool {
+        !self.portable.is_empty() || self.pending.keys().any(|repo| self.is_due(repo, now))
+    }
+
+    fn is_due(&self, repo: &str, now: std::time::Instant) -> bool {
+        if let Some(at) = self.pending.get(repo).and_then(|q| q.retry_at) {
+            return now >= at;
+        }
+        self.last_run
+            .get(repo)
+            .is_none_or(|at| now.saturating_duration_since(*at) >= COMMIT_LINK_EVERY)
+    }
+
+    /// Link the due checkouts on `conn` (the watcher's writer) within `budget`, then cache
+    /// linked checkouts' portable project ids while time is left. A checkout skipped for
+    /// time stays queued for the next pass; one that was tried and wrote nothing backs off.
+    /// Returns how many checkouts were linked.
+    pub fn link_due(
+        &mut self,
+        conn: &rusqlite::Connection,
+        budget: Duration,
+    ) -> anyhow::Result<usize> {
+        self.link_due_with(
+            conn,
+            budget,
+            crate::gitlink::run_git_log_until,
+            probe_remote_until,
+        )
+    }
+
+    /// [`link_due`](Self::link_due) with the `git log` runner and the remote probe injected
+    /// (tests pass fakes).
+    pub(crate) fn link_due_with(
+        &mut self,
+        conn: &rusqlite::Connection,
+        budget: Duration,
+        git_log: impl FnMut(&str, i64, std::time::Instant) -> anyhow::Result<Option<String>>,
+        mut probe: impl FnMut(&str, std::time::Instant) -> Option<knowledge::identity::RemoteProbe>,
+    ) -> anyhow::Result<usize> {
+        use crate::today::LinkStop;
+        let started = std::time::Instant::now();
+        // link_checkouts_with shortens the busy wait to the budget left. This connection is
+        // the watcher's writer for the rest of the process, whose wait may be the sidecar's
+        // 60 s rather than db::BUSY_TIMEOUT, so the value it had is what comes back.
+        let busy_before: i64 =
+            conn.pragma_query_value(None, "busy_timeout", |r| r.get::<_, i64>(0))?;
+        let restore =
+            || conn.busy_timeout(Duration::from_millis(busy_before.max(0).unsigned_abs()));
+
+        let mut due: Vec<String> = self
+            .pending
+            .keys()
+            .filter(|repo| self.is_due(repo, started))
+            .cloned()
+            .collect();
+        // Checkouts that have not failed go first: a checkout whose log always runs out of
+        // time would otherwise spend the whole budget on every pass ahead of the rest.
+        due.sort_by_key(|repo| self.pending[repo].failures);
+        let mut linked = 0;
+        if !due.is_empty() {
+            let batch: Vec<(&str, Vec<i64>)> = due
+                .iter()
+                .map(|repo| {
+                    let ids = self.pending[repo].threads.iter().copied().collect();
+                    (repo.as_str(), ids)
+                })
+                .collect();
+            let result = crate::today::link_checkouts_with(conn, &batch, budget, git_log);
+            restore()?;
+            let (n, stop) = result?;
+            linked = n;
+            let now = std::time::Instant::now();
+            for repo in &due[..n] {
+                self.last_run.insert(repo.clone(), now);
+                if let Some(q) = self.pending.remove(repo) {
+                    self.portable.extend(q.keys);
+                }
+            }
+            if stop == LinkStop::Failed {
+                let repo = &due[n];
+                let q = self
+                    .pending
+                    .get_mut(repo)
+                    .expect("a due checkout is queued");
+                q.failures += 1;
+                if q.failures >= LINK_MAX_ATTEMPTS {
+                    app_log!(
+                        "[gitlink] {repo}: no link after {} tries (git log too slow or the index \
+                         busy); its sessions link on a Today load or a project scan",
+                        q.failures
+                    );
+                    self.pending.remove(repo);
+                    self.last_run.insert(repo.clone(), now);
+                } else {
+                    q.retry_at = Some(now + COMMIT_LINK_EVERY * (1u32 << (q.failures - 1)));
+                }
+            }
+        }
+
+        // Portable ids while the budget lasts. Cheap once cached (one row read); a probe
+        // runs git at most once a day per key, under its own deadline, and only one probe
+        // runs per pass so the pass stays near its budget. The cache write waits for the lock
+        // no longer than the budget left.
+        let mut probed = false;
+        while !probed && started.elapsed() < budget {
+            let Some(key) = self.portable.pop_first() else {
+                break;
+            };
+            conn.busy_timeout(budget.saturating_sub(started.elapsed()))?;
+            let now = chrono::Utc::now().timestamp();
+            let _ = knowledge::identity::portable_project_id_with(conn, &key, now, false, |k| {
+                probed = true;
+                probe(k, std::time::Instant::now() + PORTABLE_PROBE_DEADLINE)
+            });
+            restore()?;
+        }
+        Ok(linked)
+    }
+}
+
+/// After an index batch: queue what it wrote and link the due checkouts. Never fails the
+/// batch; a busy index or a slow git leaves the work queued for the next batch or tick.
+pub fn link_commits_after_batch(
+    linker: &mut CommitLinker,
+    conn: &rusqlite::Connection,
+    since: i64,
+) {
+    if let Err(e) = linker.queue_since(conn, since) {
+        app_log!("[gitlink] queue: {e:#}");
+        return;
+    }
+    link_commits_tick(linker, conn);
+}
+
+/// Link whatever is queued and due (the watcher's minute tick flushes checkouts that were
+/// linked too recently when their batch landed, and retries those that backed off).
+pub fn link_commits_tick(linker: &mut CommitLinker, conn: &rusqlite::Connection) {
+    if !linker.has_due(std::time::Instant::now()) {
+        return;
+    }
+    let clock = jobclock::JobClock::start();
+    match linker.link_due(conn, crate::today::COMMIT_BUDGET) {
+        // Logged only when slow: a pass usually links one or two checkouts at about 35 ms
+        // each warm (4 checkouts took 0.14 s warm and 0.81 s cold on a 21k-thread index), so
+        // a line here means git or the write lock was slow.
+        Ok(n) if clock.wall() >= Duration::from_millis(500) => {
+            app_log!(
+                "[gitlink] linked {n} checkout(s) in {}",
+                clock.thread_summary()
+            )
+        }
+        Ok(_) => {}
+        Err(e) if db::is_busy(&e) => {}
+        Err(e) => app_log!("[gitlink] link: {e:#}"),
+    }
+}
+
+/// Least time between two `issue_clusters` refreshes while sessions keep writing: about 0.7 s
+/// of mining each, and readers trust a refresh for [`crate::issues::CLUSTERS_FRESH_SECS`].
+pub const CLUSTER_REFRESH_EVERY: Duration = Duration::from_secs(5 * 60);
+/// A refresh at least this slow gets a log line: a warm one takes about 0.7 s and a cold
+/// one 3.7 s on a 21k-thread index, and a line per refresh was up to 288 a day.
+const CLUSTER_REFRESH_SLOW: Duration = Duration::from_secs(2);
+
+/// Whether an `issue_clusters` refresh is due on `conn` now (see [`crate::issues::clusters_due`]).
+pub fn clusters_due(conn: &rusqlite::Connection) -> bool {
+    crate::issues::clusters_due(
+        conn,
+        chrono::Utc::now().timestamp(),
+        CLUSTER_REFRESH_EVERY.as_secs() as i64,
+    )
+}
+
+/// One refresh in flight per process.
+static CLUSTERS_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// The watcher's minute tick: when a refresh is due ([`clusters_due`] on the watcher's
+/// connection, a few point reads) and no job holding the writer is running, refresh
+/// `issue_clusters` on a thread of its own: the mining (3.7 s cold) on a read-only
+/// connection, so neither the watcher thread nor its writer waits on it, then the short
+/// write through the host's writer. `last_try` spaces the attempts by
+/// [`CLUSTER_REFRESH_EVERY`], so a refresh that keeps failing is not retried every minute.
+pub fn issue_clusters_kick(
+    host: &Host,
+    conn: &rusqlite::Connection,
+    last_try: &mut Option<std::time::Instant>,
+) {
+    if last_try.is_some_and(|at| at.elapsed() < CLUSTER_REFRESH_EVERY)
+        || writer_job_running(host.flags())
+        || CLUSTERS_RUNNING.load(Ordering::SeqCst)
+        || !clusters_due(conn)
+    {
+        return;
+    }
+    *last_try = Some(std::time::Instant::now());
+    if CLUSTERS_RUNNING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let host = Arc::clone(host);
+    std::thread::spawn(move || {
+        struct Release;
+        impl Drop for Release {
+            fn drop(&mut self) {
+                CLUSTERS_RUNNING.store(false, Ordering::SeqCst);
+            }
+        }
+        let _release = Release;
+        let clock = jobclock::JobClock::start();
+        let result = db::open_readonly(&db::default_index_path())
+            .and_then(|reader| refresh_clusters_off_writer(&reader, writer(&*host), host.flags()));
+        log_cluster_refresh(result, &clock);
+    });
+}
+
+/// Mine on `reader`, then store through `writer` unless a job that holds the writer started
+/// meanwhile (a reindex, a catch-up, a semantic build, a rewrite): then it yields, writing
+/// nothing, and a later tick tries again. Some(clusters stored), or None when it yielded.
+pub(crate) fn refresh_clusters_off_writer(
+    reader: &rusqlite::Connection,
+    writer: &db::Db,
+    flags: &JobFlags,
+) -> anyhow::Result<Option<usize>> {
+    let now = chrono::Utc::now().timestamp();
+    let clusters = crate::issues::mine_for_refresh(reader, now)?;
+    if writer_job_running(flags) {
+        return Ok(None);
+    }
+    let conn = lock_anyhow(writer)?;
+    Ok(Some(crate::issues::store_clusters(&conn, &clusters, now)?))
+}
+
+/// The log line for a refresh: only a slow or failed one (a busy index stays quiet).
+pub(crate) fn log_cluster_refresh(
+    result: anyhow::Result<Option<usize>>,
+    clock: &jobclock::JobClock,
+) {
+    match result {
+        Ok(Some(n)) if clock.wall() >= CLUSTER_REFRESH_SLOW => {
+            app_log!(
+                "[issues] {n} clusters refreshed in {}",
+                clock.thread_summary()
+            );
+        }
+        Ok(_) => {}
+        Err(e) if db::is_busy(&e) => {}
+        Err(e) => app_log!("[issues] refresh: {e:#}"),
+    }
+}
+
+/// `cal index`'s graph upkeep for the pass it just ran (`since`: unix secs before the
+/// pass), under the watcher's bounds: commit links for the newest threads the pass wrote
+/// (Today's 2 s budget), then the issue clusters when a refresh is due. Without it a machine
+/// that keeps the index fresh only through the plugin's `cal index --if-stale` never got
+/// either, and its `cal issues` always mined live.
+pub fn graph_upkeep_after_pass(conn: &rusqlite::Connection, since: i64) {
+    let mut linker = CommitLinker::default();
+    link_commits_after_batch(&mut linker, conn, since);
+    if clusters_due(conn) {
+        let clock = jobclock::JobClock::start();
+        log_cluster_refresh(crate::issues::refresh_clusters(conn).map(Some), &clock);
+    }
+}
+
 /// One-time TODO backfill for indexes from before TODOs were always on (guarded by
 /// `knowledge.todos_backfilled`, so later launches return at once). The watcher calls this
 /// once its launch catch-up is done, so the two never compete for the writer; the backfill
@@ -1324,6 +1729,30 @@ pub fn todo_backfill_kick(host: &Host) {
             }
             Ok(false) => {}
             Err(e) => app_log!("[knowledge] todo backfill: {e}"),
+        }
+    });
+}
+
+/// One-time `file_edits` backfill for threads indexed before 0034 (guarded by 0034's
+/// `file_edits.backfill_pending` flag, so later launches return at once): a Reindex never
+/// re-parses an unchanged transcript, so without it every older session had no rows. Then,
+/// on the same thread so the two never compete for the writer, the one-time token usage
+/// backfill for Codex, Gemini CLI, Qwen Code and OpenCode sessions indexed before those
+/// sources recorded usage (`indexer::usage_backfill`, done once `usage.backfill_done` is
+/// set). The watcher calls this after its launch catch-up, as it does the TODO backfill;
+/// both pause between batches while a reindex, catch-up, semantic build or rewrite runs.
+pub fn file_edits_backfill_kick(host: &Host) {
+    let host = Arc::clone(host);
+    std::thread::spawn(move || {
+        let db = writer(&*host);
+        let pause = || writer_job_running(host.flags());
+        if let Err(e) = indexer::file_edits::backfill_file_edits_once(db, &pause) {
+            app_log!("[index] file edits backfill: {e:#}");
+        }
+        // The spend views' caches expire on their own TTL (`search::cache`), so the filled
+        // usage shows up on the next read after that without a signal.
+        if let Err(e) = indexer::usage_backfill::backfill_usage_once(db, &pause) {
+            app_log!("[index] usage backfill: {e:#}");
         }
     });
 }
@@ -1647,6 +2076,410 @@ mod tests {
             let why = super::cal_writer_running(&index).expect(name);
             assert!(why.starts_with(says), "{name}: {why}");
         }
+    }
+
+    /// A thread in `cwd` with one Edit call, written through the indexer.
+    fn linked_thread(
+        conn: &mut rusqlite::Connection,
+        ext: &str,
+        cwd: &str,
+        updated_at: i64,
+    ) -> i64 {
+        use crate::indexer::{source_id, upsert_thread, ParsedMessage, ParsedThread};
+        let sid = source_id(conn, "claude_code").unwrap();
+        let t = ParsedThread {
+            external_id: ext.into(),
+            project_path: Some(cwd.into()),
+            updated_at: Some(updated_at),
+            messages: vec![
+                ParsedMessage {
+                    role: "user".into(),
+                    text: "fix the parser".into(),
+                    tool_name: None,
+                    ts: Some(1_000),
+                },
+                ParsedMessage {
+                    role: "assistant".into(),
+                    text: format!(r#"Edit: {{"file_path":"{cwd}/src/parse.rs"}}"#),
+                    tool_name: Some("Edit".into()),
+                    ts: Some(1_100),
+                },
+            ],
+            ..Default::default()
+        };
+        upsert_thread(conn, sid, &t).unwrap();
+        conn.query_row(
+            "SELECT id FROM threads WHERE external_id = ?1",
+            [ext],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// A temp dir holding a `.git`, and its canonical spelling (what the linker keys on).
+    fn temp_checkout(tag: &str) -> (std::path::PathBuf, String) {
+        let repo = std::env::temp_dir().join(format!("calli_jobs_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&repo);
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let canon = std::fs::canonicalize(&repo)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        (repo, canon)
+    }
+
+    fn no_probe(_: &str, _: std::time::Instant) -> Option<crate::knowledge::identity::RemoteProbe> {
+        None
+    }
+
+    /// The watcher's per-batch linking: the batch's threads in a git checkout are linked
+    /// once, a checkout linked within the last minute waits for its turn, and the query that
+    /// finds the batch's threads stays on 0034's index.
+    #[test]
+    fn a_batch_links_its_threads_commits_once_per_interval() {
+        let (repo, canon) = temp_checkout("link");
+        let repo_s = repo.to_string_lossy().into_owned();
+        let mut conn = crate::db::open(&temp_db("link")).unwrap();
+        // A writer whose wait is not the default (the watcher's sidecar connection).
+        conn.busy_timeout(super::Duration::from_millis(61_000))
+            .unwrap();
+        let since = chrono::Utc::now().timestamp();
+        linked_thread(&mut conn, "s1", &repo_s, 1_000);
+        // Outside a checkout: never queued.
+        linked_thread(&mut conn, "s2", "/no/such/checkout", 1_000);
+
+        let mut linker = super::CommitLinker::default();
+        assert_eq!(linker.queue_since(&conn, since).unwrap(), 1);
+        let mut runs = 0;
+        let log = "\u{1e}COMMIT\u{1f}abcdef0123456789abcdef0123456789abcdef01\u{1f}1200\u{1f}fix parser\nsrc/parse.rs\n";
+        let n = linker
+            .link_due_with(
+                &conn,
+                super::Duration::from_secs(2),
+                |dir, _, _| {
+                    runs += 1;
+                    assert_eq!(dir, canon);
+                    Ok(Some(log.to_string()))
+                },
+                |_, _| {
+                    Some(crate::knowledge::identity::RemoteProbe {
+                        remote: Some("git@github.com:me/app.git".into()),
+                        subpath: String::new(),
+                    })
+                },
+            )
+            .unwrap();
+        assert_eq!((n, runs), (1, 1));
+        let linked: i64 = conn
+            .query_row("SELECT COUNT(*) FROM thread_commits", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(linked, 1);
+        // The busy wait the budget shortened is the writer's own again, not the default.
+        let busy: i64 = conn
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(busy, 61_000);
+        // The checkout's key was resolved (and cached) after it linked.
+        assert!(linker.portable.is_empty());
+        let cached: Option<String> = conn
+            .query_row("SELECT portable_id FROM projects", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(cached.as_deref(), Some("github.com/me/app"));
+
+        // The next batch a few seconds later queues it again but waits out the interval.
+        assert_eq!(linker.queue_since(&conn, since).unwrap(), 1);
+        assert!(!linker.has_due(std::time::Instant::now()));
+        let n = linker
+            .link_due_with(
+                &conn,
+                super::Duration::from_secs(2),
+                |_, _, _| panic!("not due yet"),
+                no_probe,
+            )
+            .unwrap();
+        assert_eq!(n, 0);
+
+        let p: String = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {}", super::BATCH_THREADS_SQL))
+            .unwrap()
+            .query_map(rusqlite::params![0, 50], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join(" | ");
+        // The range probe, then a sort of the batch's rows only (never a walk of
+        // idx_threads_updated over every thread).
+        assert!(
+            p.contains("SEARCH threads USING INDEX idx_threads_last_indexed"),
+            "{p}"
+        );
+        assert!(!p.contains("idx_threads_updated"), "{p}");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// A checkout whose `git log` runs past the deadline is not recorded as linked: it backs
+    /// off (doubling), lets the other checkouts go first, and is dropped after the last try.
+    #[test]
+    fn a_checkout_that_times_out_backs_off_and_yields_its_turn() {
+        let (slow, slow_canon) = temp_checkout("slow");
+        let (fast, fast_canon) = temp_checkout("fast");
+        let mut conn = crate::db::open(&temp_db("slowlink")).unwrap();
+        let since = chrono::Utc::now().timestamp();
+        linked_thread(&mut conn, "slow", &slow.to_string_lossy(), 1_000);
+        let mut linker = super::CommitLinker::default();
+        linker.queue_since(&conn, since).unwrap();
+        let budget = super::Duration::from_secs(2);
+
+        let n = linker
+            .link_due_with(&conn, budget, |_, _, _| Ok(None), no_probe)
+            .unwrap();
+        assert_eq!(n, 0);
+        let q = &linker.pending[&slow_canon];
+        assert_eq!(q.failures, 1);
+        assert!(!linker.has_due(std::time::Instant::now()), "backing off");
+        assert!(linker.has_due(std::time::Instant::now() + super::COMMIT_LINK_EVERY));
+
+        // Due again together with a fresh checkout: the fresh one is tried first.
+        linked_thread(&mut conn, "fast", &fast.to_string_lossy(), 2_000);
+        linker.queue_since(&conn, since).unwrap();
+        linker.pending.get_mut(&slow_canon).unwrap().retry_at = None;
+        let mut order = Vec::new();
+        let n = linker
+            .link_due_with(
+                &conn,
+                budget,
+                |dir, _, _| {
+                    order.push(dir.to_string());
+                    Ok((dir == fast_canon).then(String::new))
+                },
+                no_probe,
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(order, [fast_canon.clone(), slow_canon.clone()]);
+        assert_eq!(linker.pending[&slow_canon].failures, 2);
+        let wait = linker.pending[&slow_canon].retry_at.unwrap() - std::time::Instant::now();
+        assert!(wait > super::COMMIT_LINK_EVERY, "doubled: {wait:?}");
+
+        // The last try drops it, and it is not tried again before the interval.
+        for _ in 2..super::LINK_MAX_ATTEMPTS {
+            linker.pending.get_mut(&slow_canon).unwrap().retry_at = None;
+            linker
+                .link_due_with(&conn, budget, |_, _, _| Ok(None), no_probe)
+                .unwrap();
+        }
+        assert!(linker.pending.is_empty());
+        let _ = std::fs::remove_dir_all(&slow);
+        let _ = std::fs::remove_dir_all(&fast);
+    }
+
+    /// A session started in a monorepo subdirectory (no `.git` of its own) queues under the
+    /// checkout above it, and two spellings of one checkout share one entry.
+    #[test]
+    fn subdirectory_sessions_queue_under_their_checkout() {
+        let (repo, canon) = temp_checkout("mono");
+        let web = repo.join("apps/web");
+        std::fs::create_dir_all(&web).unwrap();
+        let mut conn = crate::db::open(&temp_db("mono")).unwrap();
+        let since = chrono::Utc::now().timestamp();
+        linked_thread(&mut conn, "web", &web.to_string_lossy(), 1_000);
+        linked_thread(
+            &mut conn,
+            "root",
+            &format!("{}/", repo.to_string_lossy()),
+            1_000,
+        );
+        let mut linker = super::CommitLinker::default();
+        assert_eq!(linker.queue_since(&conn, since).unwrap(), 2);
+        assert_eq!(linker.pending.keys().collect::<Vec<_>>(), [&canon]);
+        assert_eq!(linker.pending[&canon].threads.len(), 2);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// The batch's newest sessions win the 50 slots, not the threads written last in the
+    /// pass.
+    #[test]
+    fn a_batch_queues_its_most_recent_sessions() {
+        let mut conn = crate::db::open(&temp_db("recent")).unwrap();
+        let since = chrono::Utc::now().timestamp();
+        let newest = linked_thread(&mut conn, "newest", "/r/a", 9_000);
+        let older = linked_thread(&mut conn, "older", "/r/b", 1_000);
+        // Written last in the pass, but the older session.
+        conn.execute(
+            "UPDATE threads SET last_indexed_at = last_indexed_at + 5 WHERE id = ?1",
+            [older],
+        )
+        .unwrap();
+        let ids: Vec<i64> = conn
+            .prepare(super::BATCH_THREADS_SQL)
+            .unwrap()
+            .query_map(rusqlite::params![since, 50], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(ids, [newest, older]);
+    }
+
+    /// The watcher's bounded probe agrees with what `knowledge::identity` reads from git: the
+    /// origin URL and where the directory sits below the toplevel; a deadline already past
+    /// gives no answer (git is killed), never a cached "no remote".
+    #[test]
+    fn the_bounded_remote_probe_reads_origin_and_subpath() {
+        let dir = std::env::temp_dir().join(format!("calli_jobs_probe_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("pkg/web")).unwrap();
+        let git = |args: &[&str]| {
+            crate::gitlink::git_command()
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        if !git(&["init", "-q"]) {
+            return; // no git on this machine
+        }
+        let sub = dir.join("pkg/web").to_string_lossy().into_owned();
+        let soon = || std::time::Instant::now() + super::PORTABLE_PROBE_DEADLINE;
+        let p = super::probe_remote_until(&sub, soon()).expect("a checkout");
+        assert_eq!((p.remote, p.subpath.as_str()), (None, "pkg/web"));
+        assert!(git(&[
+            "remote",
+            "add",
+            "origin",
+            "git@github.com:me/mono.git"
+        ]));
+        let p = super::probe_remote_until(&sub, soon()).expect("a checkout");
+        assert_eq!(p.remote.as_deref(), Some("git@github.com:me/mono.git"));
+        let past = std::time::Instant::now() - super::Duration::from_millis(1);
+        assert_eq!(super::probe_remote_until(&sub, past), None);
+        assert_eq!(
+            super::probe_remote_until("/no/such/dir/anywhere", soon()),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The off-writer refresh stores what it mined, and yields (writing nothing) when a job
+    /// that holds the writer started while it mined.
+    #[test]
+    fn the_cluster_refresh_yields_to_writer_jobs() {
+        let path = temp_db("clusters");
+        let conn = crate::db::open(&path).unwrap();
+        conn.execute(
+            "INSERT INTO threads (source_id, external_id, title, project_path, last_indexed_at)
+             VALUES (1, 't', 't', '/r/app', 1)",
+            [],
+        )
+        .unwrap();
+        let tid = conn.last_insert_rowid();
+        let now = chrono::Utc::now().timestamp();
+        for seq in 0..2 {
+            conn.execute(
+                "INSERT INTO messages (thread_id, seq, role, text, ts)
+                 VALUES (?1, ?2, 'tool', 'error: linker failed', ?3)",
+                rusqlite::params![tid, seq, now - 60],
+            )
+            .unwrap();
+        }
+        assert!(super::clusters_due(&conn), "never refreshed");
+        let writer = crate::db::Db(std::sync::Mutex::new(conn));
+        let reader = crate::db::open_readonly(&path).unwrap();
+        let flags = super::JobFlags::default();
+        let busy = JobGuard::try_acquire(&flags.index.0).unwrap();
+        assert_eq!(
+            super::refresh_clusters_off_writer(&reader, &writer, &flags).unwrap(),
+            None
+        );
+        drop(busy);
+        assert_eq!(
+            super::refresh_clusters_off_writer(&reader, &writer, &flags).unwrap(),
+            Some(1)
+        );
+        let conn = writer.0.lock().unwrap();
+        assert!(
+            !super::clusters_due(&conn),
+            "just refreshed, nothing indexed since"
+        );
+    }
+
+    /// Measures the 0034 upgrade, an issue-cluster refresh and a batch link on a real index.
+    /// It works on a copy of the file `CALLIMACHUS_DB` names (a clone on APFS, so instant),
+    /// never on that file: the upgrade and the rows it writes would otherwise leave the dev
+    /// or real index past what the installed app can open, for anyone running every ignored
+    /// test with `CALLIMACHUS_DB` exported.
+    /// `CALLIMACHUS_DB=/path/to/index.db <test binary> graph_upkeep_on_a_real_index
+    /// --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn graph_upkeep_on_a_real_index() {
+        let src = std::path::PathBuf::from(
+            std::env::var("CALLIMACHUS_DB").expect("CALLIMACHUS_DB names an index to copy"),
+        );
+        let dir = std::env::temp_dir().join(format!("calli_graph_upkeep_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let copy = dir.join("index.db");
+        std::fs::copy(&src, &copy).unwrap();
+        let wal = src.with_extension("db-wal");
+        if wal.exists() {
+            std::fs::copy(&wal, dir.join("index.db-wal")).unwrap();
+        }
+        let path = copy.to_string_lossy().into_owned();
+        eprintln!("working on a copy of {} at {path}", src.display());
+        let raw = rusqlite::Connection::open(&path).unwrap();
+        let before: i64 = raw
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        drop(raw);
+        let t = std::time::Instant::now();
+        let conn = crate::db::open(std::path::Path::new(&path)).unwrap();
+        eprintln!("open + migrate from {before}: {:?}", t.elapsed());
+        let (facts, uids, seqs): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), COUNT(DISTINCT uid), COUNT(source_seq) FROM facts",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        eprintln!("facts {facts}, distinct uids {uids}, with source_seq {seqs}");
+        assert_eq!(facts, uids);
+
+        let t = std::time::Instant::now();
+        let n = crate::issues::refresh_clusters(&conn).unwrap();
+        eprintln!("refresh_clusters: {n} clusters in {:?}", t.elapsed());
+
+        let newest: i64 = conn
+            .query_row("SELECT MAX(last_indexed_at) FROM threads", [], |r| r.get(0))
+            .unwrap();
+        let mut linker = super::CommitLinker::default();
+        let t = std::time::Instant::now();
+        let queued = linker.queue_since(&conn, newest - 6 * 3600).unwrap();
+        eprintln!("queued {queued} threads in {:?}", t.elapsed());
+        let t = std::time::Instant::now();
+        let linked = linker.link_due(&conn, crate::today::COMMIT_BUDGET).unwrap();
+        eprintln!("linked {linked} checkouts in {:?}", t.elapsed());
+
+        // The one-time file_edits backfill over every thread indexed before 0034, as the
+        // watcher and `cal index` run it (into this copy).
+        let db = crate::db::Db(std::sync::Mutex::new(conn));
+        let t = std::time::Instant::now();
+        let r = crate::indexer::file_edits::backfill_file_edits(&db, &|| false).unwrap();
+        eprintln!("file_edits backfill: {r:?} in {:?}", t.elapsed());
+        let conn = db.0.into_inner().unwrap();
+        let mut by_op = conn
+            .prepare("SELECT op, COUNT(*) FROM file_edits GROUP BY op ORDER BY 2 DESC")
+            .unwrap();
+        for row in by_op
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+            .unwrap()
+        {
+            eprintln!("  {:?}", row.unwrap());
+        }
+        drop(by_op);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn temp_db(tag: &str) -> std::path::PathBuf {

@@ -444,6 +444,11 @@ fn run_loop(host: Host, launch_catch_up: bool) -> anyhow::Result<()> {
     let mut rollup = Rollup::default();
     // Unix time the earliest session auto-distill skipped as live goes idle.
     let mut distill_idle_at: Option<i64> = None;
+    // Commit links for the threads each batch writes, and when the issue clusters were last
+    // tried (whether one is due is read from the index: a refresh another process stored
+    // counts, so a restart does not mine again).
+    let mut linker = jobs::CommitLinker::default();
+    let mut clusters_try: Option<Instant> = None;
 
     // Not on a first run: until something is indexed, indexing waits for the user to start
     // it from onboarding. Roots are already watched, so a write during the pass is queued.
@@ -455,16 +460,24 @@ fn run_loop(host: Host, launch_catch_up: bool) -> anyhow::Result<()> {
         // Nothing indexed yet: every TODO will come from indexing itself, so the one-time
         // backfill for older indexes has nothing to do.
         let _ = crate::knowledge::mark_todos_backfilled(&conn);
+        // Nor the usage backfill: every session gets its usage as it is indexed.
+        let _ = super::usage_backfill::mark_usage_backfilled(&conn);
     } else if !launch_catch_up {
         // The caller's full pass stood in for the catch-up: what follows one.
         embed_timer.poke(Instant::now());
         jobs::harvest_claude_memory_tick(&host, &conn);
         jobs::todo_backfill_kick(&host);
+        jobs::file_edits_backfill_kick(&host);
     }
 
     loop {
         if catch_up_at.is_some_and(|at| at <= Instant::now()) {
+            let started = chrono::Utc::now().timestamp();
             catch_up_at = if catch_up(&host, &mut conn, &mut last_run) {
+                // The newest sessions it wrote get their commits linked now, and their
+                // checkouts' committed repo memory imported.
+                jobs::link_commits_after_batch(&mut linker, &conn, started);
+                repo_memory_after_batch(&conn, started);
                 // Sessions written while the app was closed (and anything a sidecar
                 // indexed) may need vectors: top up once things settle.
                 embed_timer.poke(Instant::now());
@@ -473,6 +486,9 @@ fn run_loop(host: Host, launch_catch_up: bool) -> anyhow::Result<()> {
                 // And the one-time TODO backfill (a no-op after its first full pass), only
                 // now so it never competes with the catch-up for the writer.
                 jobs::todo_backfill_kick(&host);
+                // And `file_edits` for the sessions indexed before 0034, then token usage for
+                // the Codex, Gemini, Qwen and OpenCode ones indexed before usage (once each).
+                jobs::file_edits_backfill_kick(&host);
                 None
             } else {
                 Some(Instant::now() + CATCH_UP_RETRY)
@@ -536,6 +552,8 @@ fn run_loop(host: Host, launch_catch_up: bool) -> anyhow::Result<()> {
             std::thread::sleep(Duration::from_secs(1));
             continue;
         }
+        let batch_started = chrono::Utc::now().timestamp();
+        let mut batch_wrote = false;
         for kind in due {
             if let Some(work) = pending.remove(kind) {
                 let paths = work.paths.len();
@@ -553,9 +571,16 @@ fn run_loop(host: Host, launch_catch_up: bool) -> anyhow::Result<()> {
                 if threads > 0 {
                     embed_timer.poke(Instant::now());
                     priority_distill_kick(&host, &conn);
+                    batch_wrote = true;
                 }
                 last_run.insert(kind, Instant::now());
             }
+        }
+        if batch_wrote {
+            // `thread_commits` stays current without a Today load: the threads this pass
+            // wrote, through `gitlink::link_threads`, at most 2 s (`today::COMMIT_BUDGET`).
+            jobs::link_commits_after_batch(&mut linker, &conn, batch_started);
+            repo_memory_after_batch(&conn, batch_started);
         }
 
         // The once-a-minute tick: new roots, the batch log line, idle memory, the ledger
@@ -581,6 +606,14 @@ fn run_loop(host: Host, launch_catch_up: bool) -> anyhow::Result<()> {
             // A session that ended while its transcript was already indexed has nothing to
             // index again, so the batch check above never sees its queue entry.
             priority_distill_kick(&host, &conn);
+            // Checkouts linked too recently when their batch landed, then the clusters the
+            // recurring-issue readers serve from.
+            jobs::link_commits_tick(&mut linker, &conn);
+            // Not before the launch catch-up is done: the cold mine (3.7 s) would compete
+            // with it for the disk, and the refresh it wrote would be stale at once.
+            if catch_up_at.is_none() && has_agent_threads(&conn) {
+                jobs::issue_clusters_kick(&host, &conn, &mut clusters_try);
+            }
             // Claude Code writes auto memory in the middle of a session, a few files at most.
             // Not before the first index: imported facts live in "Recorded memory" threads,
             // which would make the next launch's has_threads skip onboarding's start.
@@ -674,6 +707,13 @@ fn priority_distill_kick(host: &Host, conn: &Connection) {
     if crate::knowledge::distill_priority_ready(conn, now).unwrap_or(false) {
         jobs::auto_distill_kick(host);
     }
+}
+
+/// Import the `.callimachus/memory/` files of the checkouts a batch just wrote sessions in
+/// (`knowledge::repo_memory`): a pulled teammate's facts land as the next session there is
+/// indexed. A checkout without the directory costs a stat; an unchanged one two more.
+fn repo_memory_after_batch(conn: &Connection, since: i64) {
+    crate::knowledge::repo_memory::import_since(conn, since, chrono::Utc::now().timestamp());
 }
 
 /// Re-scan every source once, on the watcher's own connection, to pick up what changed

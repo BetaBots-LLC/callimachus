@@ -12,7 +12,10 @@
               "count",
               "threads",
               "firstSeen",
-              "lastSeen"
+              "lastSeen",
+              "threadIds",
+              "fix",
+              "playbook"
             ],
             "type": "object",
             "properties": {
@@ -30,6 +33,51 @@
               },
               "lastSeen": {
                 "type": "integer"
+              },
+              "threadIds": {
+                "items": {
+                  "type": "integer"
+                },
+                "type": "array"
+              },
+              "fix": {
+                "required": [
+                  "sha",
+                  "shortSha",
+                  "subject",
+                  "committedAt",
+                  "threadId"
+                ],
+                "type": [
+                  "object",
+                  "null"
+                ],
+                "properties": {
+                  "sha": {
+                    "type": "string"
+                  },
+                  "shortSha": {
+                    "type": "string"
+                  },
+                  "subject": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "committedAt": {
+                    "type": "integer"
+                  },
+                  "threadId": {
+                    "type": "integer"
+                  }
+                }
+              },
+              "playbook": {
+                "type": [
+                  "string",
+                  "null"
+                ]
               }
             }
           }

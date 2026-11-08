@@ -5,10 +5,12 @@
 //! `message` Gemini-`Content` object (`{ role, parts: [{text}|{functionCall}|…] }`).
 //!
 //! Schema verified against QwenLM/qwen-code `chatRecordingService.ts`. Recording
-//! can be disabled in Qwen, so an absent dir is not an error.
+//! can be disabled in Qwen, so an absent dir is not an error. An `assistant` record also
+//! carries `model` and `usageMetadata` (Gemini's `GenerateContentResponseUsageMetadata`,
+//! written by `recordAssistantTurn`, checked 2026-11-07), read for spend.
 
 use super::common::parse_rfc3339;
-use super::gemini::{ingest_parts, parse_chat_jsonl, scan_chats};
+use super::gemini::{gemini_usage, ingest_parts, parse_chat_jsonl, scan_chats, ChatState};
 use super::{IndexReport, ParsedThread};
 use anyhow::Result;
 use rusqlite::Connection;
@@ -37,7 +39,7 @@ pub fn parse_file(path: &Path, external_id: &str) -> Result<Option<ParsedThread>
     parse_chat_jsonl(path, external_id, ingest_line)
 }
 
-fn ingest_line(thread: &mut ParsedThread, obj: &Value, first_user_text: &mut Option<String>) {
+fn ingest_line(thread: &mut ParsedThread, obj: &Value, state: &mut ChatState) {
     if let Some(cwd) = obj.get("cwd").and_then(Value::as_str) {
         if !cwd.is_empty() {
             thread.project_path = Some(cwd.to_string());
@@ -65,7 +67,26 @@ fn ingest_line(thread: &mut ParsedThread, obj: &Value, first_user_text: &mut Opt
     };
     // Content lives in the nested Gemini `message` object: { role, parts: [...] }.
     let parts = obj.get("message").and_then(|m| m.get("parts"));
-    ingest_parts(thread, role, parts, ts, first_user_text);
+    let before = thread.messages.len();
+    ingest_parts(thread, role, parts, ts, &mut state.first_user_text);
+    // A turn that carried only tokens (no `message`) lands on the last message.
+    if let (Some(model), Some(u)) = (
+        obj.get("model").and_then(Value::as_str),
+        obj.get("usageMetadata").filter(|u| u.is_object()),
+    ) {
+        let n = |k: &str| u.get(k).and_then(Value::as_i64).unwrap_or(0);
+        thread.attach_usage(
+            Some(before),
+            gemini_usage(
+                model,
+                n("promptTokenCount"),
+                n("cachedContentTokenCount"),
+                n("toolUsePromptTokenCount"),
+                n("candidatesTokenCount"),
+                n("thoughtsTokenCount"),
+            ),
+        );
+    }
 }
 
 #[cfg(test)]
@@ -116,6 +137,34 @@ mod tests {
             .find(|m| m.tool_name.is_some())
             .unwrap();
         assert_eq!(tool.tool_name.as_deref(), Some("run_shell"));
+    }
+
+    /// An assistant record's `usageMetadata` is its usage; one with tokens but no message
+    /// lands on the last message.
+    #[test]
+    fn assistant_records_carry_usage() {
+        let path = temp_path("qwen_usage.jsonl");
+        std::fs::write(
+            &path,
+            r#"{"uuid":"u1","type":"user","timestamp":"2026-06-01T10:00:00.000Z","message":{"role":"user","parts":[{"text":"go"}]}}
+{"uuid":"u2","type":"assistant","timestamp":"2026-06-01T10:00:05.000Z","model":"qwen3-coder-plus","usageMetadata":{"promptTokenCount":500,"candidatesTokenCount":20,"cachedContentTokenCount":300,"totalTokenCount":520},"message":{"role":"model","parts":[{"text":"ok"}]}}
+{"uuid":"u3","type":"assistant","timestamp":"2026-06-01T10:00:06.000Z","model":"qwen3-coder-plus","usageMetadata":{"promptTokenCount":100,"candidatesTokenCount":5,"thoughtsTokenCount":5,"totalTokenCount":110}}
+"#,
+        )
+        .unwrap();
+        let t = parse_file(&path, "h/chats/s.jsonl").unwrap().unwrap();
+        assert_eq!(t.messages.len(), 2);
+        let got: Vec<(usize, [i64; 4])> = t
+            .usage
+            .iter()
+            .map(|(i, u)| (*i, [u.input, u.output, u.cache_write, u.cache_read]))
+            .collect();
+        assert_eq!(
+            got,
+            vec![(1, [300, 30, 0, 300])],
+            "the token-only turn adds to the last"
+        );
+        assert_eq!(t.usage[0].1.model, "qwen3-coder-plus");
     }
 
     #[test]

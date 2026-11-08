@@ -34,6 +34,7 @@ The sidebar can also work *without* you searching. With **Ambient Recall** on, i
 | **Callimachus: Recent Threads** | Browse the most recently updated threads. |
 | **Callimachus: Insert Thread into Editor** | Insert a thread's transcript at the cursor (seed a chat / notes). |
 | **Callimachus: Copy Thread Context** | Copy a thread's packed transcript to the clipboard. |
+| **Callimachus: Why This Line** | Show, in the sidebar, the commit that last changed the line under the cursor (`git blame`), the sessions that produced it, and their decisions and gotchas. Also in the editor's right-click menu. Uses `cal why`, so it needs a Callimachus that has it. |
 | **Callimachus: Toggle Ambient Recall** | Turn the sidebar's ambient-recall section on or off. |
 
 There's also a **status-bar** button (`$(history) Callimachus`) that opens search.

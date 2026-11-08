@@ -274,6 +274,10 @@ pub struct IntegrationStatus {
     /// The opt-in UserPromptSubmit "proactive recall" hook is installed (injects prior work
     /// before each prompt). Separate from `hook_installed` because it reads every prompt.
     pub proactive_recall_installed: bool,
+    /// The opt-in error-playbook hooks are installed (PostToolUse / PostToolUseFailure on
+    /// Bash: inject the fix of a recurring error a commit fixed before). Separate because
+    /// they run after every shell command.
+    pub error_recall_installed: bool,
     /// The `cal` CLI entry point exists and is ours (`~/.local/bin/cal`, or `cal.exe` on
     /// Windows). Powers the `cal` CLI and the VS Code extension.
     pub cal_installed: bool,
@@ -342,6 +346,9 @@ fn build_status(
     let proactive_recall_installed = settings
         .as_ref()
         .is_some_and(|v| event_has_our_hook(v, PROACTIVE_RECALL_HOOK.event, &exe));
+    let error_recall_installed = settings
+        .as_ref()
+        .is_some_and(|v| event_has_our_hook(v, ERROR_RECALL_HOOK.event, &exe));
 
     let path_hint = path_hint(&cal, &exe, wait_for_path);
     let cal_problem = if cal.installed {
@@ -357,6 +364,7 @@ fn build_status(
         mcp_registered,
         hook_installed,
         proactive_recall_installed,
+        error_recall_installed,
         cal_installed: cal.installed,
         exe_stable: exe_problem.is_none(),
         exe_problem,
@@ -520,8 +528,8 @@ fn handover_candidates(files: &ClaudeFiles, exe: &Path) -> Result<HandedOver> {
 }
 
 /// Remove what the plugin now provides, where the app put it: our base hooks (SessionStart,
-/// PreCompact, SessionEnd, and retired ones; the opt-in proactive-recall hook stays, since
-/// the plugin does not ship it), the `/recall` skill when nobody edited it, and the MCP entry
+/// PreCompact, SessionEnd, and retired ones; the opt-in proactive-recall and error-playbook
+/// hooks stay, since the plugin does not ship them), the `/recall` skill when nobody edited it, and the MCP entry
 /// the app registered (`<app> --mcp`; an entry the user wrote by hand stays theirs). The
 /// record goes to `marker` first, so a removal cut short still restores. Returns whether
 /// anything changed.
@@ -633,12 +641,10 @@ pub fn plugin_handover_tick(current_exe: &Path) -> Result<bool> {
     sync_plugin_handover(&exe, takes_over)
 }
 
-/// Strip our hooks from every event except the opt-in UserPromptSubmit one.
+/// Strip our hooks from every event except the opt-in ones (UserPromptSubmit, and
+/// PostToolUse / PostToolUseFailure).
 fn strip_base_hooks(obj: &mut Map<String, Value>, exe: &Path) {
-    for event in ALL_HOOK_EVENTS
-        .into_iter()
-        .filter(|e| *e != PROACTIVE_RECALL_HOOK.event)
-    {
+    for event in ALL_HOOK_EVENTS.into_iter().filter(|e| !is_opt_in_event(e)) {
         strip_our_hooks(obj, event, exe);
     }
 }
@@ -700,6 +706,37 @@ pub fn set_proactive_recall(app_exe: &Path, enabled: bool) -> Result<Integration
         })?;
     }
     Ok(status(app_exe))
+}
+
+/// Toggle the opt-in error-playbook hooks (PostToolUse and PostToolUseFailure on Bash ->
+/// `recall-error`) on their own, independent of the base integration. They run after every
+/// shell command Claude runs, so they stay off until the user asks. Both events, because a
+/// command that exits non-zero arrives as PostToolUseFailure, and one that prints an error
+/// but exits 0 (`cargo test 2>&1 | tail`) as PostToolUse. Disabling strips only those.
+/// Idempotent.
+pub fn set_error_recall(app_exe: &Path, enabled: bool) -> Result<IntegrationStatus> {
+    set_error_recall_in(&settings_path()?, app_exe, enabled)?;
+    Ok(status(app_exe))
+}
+
+fn set_error_recall_in(path: &Path, app_exe: &Path, enabled: bool) -> Result<bool> {
+    if enabled {
+        let exe = stable_app_exe(app_exe)?;
+        update_json_file(path, true, |obj| {
+            for spec in ERROR_RECALL_HOOKS {
+                upsert_hook(obj, spec, &hook_command(&exe, spec.subcommand), &exe)?;
+            }
+            Ok(())
+        })
+    } else {
+        let (exe, _) = resolve_exe(app_exe);
+        update_json_file(path, false, |obj| {
+            for spec in ERROR_RECALL_HOOKS {
+                strip_our_hooks(obj, spec.event, &exe);
+            }
+            Ok(())
+        })
+    }
 }
 
 /// Remove the skill file, the Claude Code MCP registration, every Callimachus hook (including
@@ -770,6 +807,8 @@ struct RemovedIntegration {
     claude_hooks: Vec<String>,
     /// The opt-in UserPromptSubmit hook.
     proactive_recall: bool,
+    /// The opt-in PostToolUse / PostToolUseFailure error-playbook hooks.
+    error_recall: bool,
     /// `mcpServers.callimachus` in Claude Code's config.
     claude_mcp: bool,
     /// Ids (see [`agent_targets`]) of the other agents whose config held our MCP entry.
@@ -806,6 +845,7 @@ impl RemovedIntegration {
             }
         }
         self.proactive_recall |= earlier.proactive_recall;
+        self.error_recall |= earlier.error_recall;
         self.claude_mcp |= earlier.claude_mcp;
         self.cal |= earlier.cal;
         self.skill |= earlier.skill;
@@ -879,6 +919,7 @@ fn detect_installed(exe: &Path) -> RemovedIntegration {
             .map(|spec| spec.event.to_string())
             .collect(),
         proactive_recall: has_hook(PROACTIVE_RECALL_HOOK.event),
+        error_recall: has_hook(ERROR_RECALL_HOOK.event),
         claude_mcp: claude_config_path().is_ok_and(|c| has_mcp_json(&c)),
         agents,
         agent_hooks,
@@ -983,6 +1024,9 @@ pub fn restore_from_marker(current_exe: &Path) -> Result<bool> {
         .collect();
     if removed.proactive_recall {
         hooks.push(&PROACTIVE_RECALL_HOOK);
+    }
+    if removed.error_recall {
+        hooks.extend(ERROR_RECALL_HOOKS);
     }
     if !hooks.is_empty() {
         attempt(
@@ -1208,6 +1252,7 @@ const SHIPPED_SKILL_HASHES: &[u64] = &[
     0xd572be1865981676, // version: 1.1.0 (first with the rendered CLI note)
     0x29e126dbe1770847, // version: 1.2.0 (Batch D: prompts, fallbacks, digest note)
     0x57df09b3095b9add, // version: 1.2.1 (Batch G: recall results under `facts` when structured)
+    0xd32ed8411a5ed529, // version: 1.2.2 (Batch H: facts marked (repo), threads_for_file with a line, `cal why`)
 ];
 
 /// Stable across builds and platforms, unlike `DefaultHasher`. Only identifies known texts.
@@ -1336,6 +1381,40 @@ const PROACTIVE_RECALL_HOOK: HookSpec = HookSpec {
     powershell: false,
 };
 
+/// Opt-in: after a Bash command whose output carries an error a linked commit fixed before
+/// (a resolved `issue_clusters` row), injects that fix's playbook line. Toggled by
+/// `set_error_recall`. It runs after every shell command, so the timeout is short: output
+/// without an error line exits before the index is opened.
+const ERROR_RECALL_HOOK: HookSpec = HookSpec {
+    event: "PostToolUse",
+    subcommand: "recall-error",
+    matcher: Some("Bash"),
+    timeout_secs: 5,
+    millis: false,
+    name: None,
+    powershell: false,
+};
+
+/// [`ERROR_RECALL_HOOK`] for a command that failed: Claude Code reports a non-zero exit as
+/// PostToolUseFailure (its `error` field holds the output), not PostToolUse.
+const ERROR_RECALL_FAILURE_HOOK: HookSpec = HookSpec {
+    event: "PostToolUseFailure",
+    subcommand: "recall-error",
+    matcher: Some("Bash"),
+    timeout_secs: 5,
+    millis: false,
+    name: None,
+    powershell: false,
+};
+
+const ERROR_RECALL_HOOKS: [&HookSpec; 2] = [&ERROR_RECALL_HOOK, &ERROR_RECALL_FAILURE_HOOK];
+
+/// Events that hold only the opt-in hooks: kept through a plugin hand-over, re-shaped by
+/// Install only when the user already opted in.
+fn is_opt_in_event(event: &str) -> bool {
+    event == PROACTIVE_RECALL_HOOK.event || ERROR_RECALL_HOOKS.iter().any(|s| s.event == event)
+}
+
 /// Codex's SessionStart hook (`~/.codex/hooks.json`). Codex's matcher is a regex over the
 /// same sources as Claude Code's (`startup|resume|clear|compact|fork`), and its `timeout` is
 /// in seconds.
@@ -1414,11 +1493,13 @@ const BASE_HOOKS: [&HookSpec; 3] = [&SESSION_START_HOOK, &PRE_COMPACT_HOOK, &SES
 const LEGACY_HOOK_EVENTS: [&str; 1] = ["SubagentStop"];
 
 /// Every event that can hold a Callimachus hook, current or legacy (what uninstall sweeps).
-const ALL_HOOK_EVENTS: [&str; 5] = [
+const ALL_HOOK_EVENTS: [&str; 7] = [
     "SessionStart",
     "PreCompact",
     "SessionEnd",
     "UserPromptSubmit",
+    "PostToolUse",
+    "PostToolUseFailure",
     "SubagentStop",
 ];
 
@@ -1472,10 +1553,11 @@ fn sh_double_quote(s: &str) -> String {
 
 /// The subcommands our hooks run, with the `--for` forms the Codex and Gemini CLI hooks use.
 /// No entry is a suffix of another after a space, so a command matches exactly one.
-const HOOK_SUBCOMMANDS: [&str; 9] = [
+const HOOK_SUBCOMMANDS: [&str; 10] = [
     "hook",
     "snapshot-hook",
     "recall-now",
+    "recall-error",
     "session-end",
     "hook --for codex",
     "snapshot-hook --for codex",
@@ -1632,13 +1714,23 @@ fn strip_our_hooks(obj: &mut Map<String, Value>, event: &str, exe: &Path) -> boo
     true
 }
 
-/// The base hooks in their current shape, plus the proactive-recall hook re-shaped if the user
-/// already opted in. Retired hooks are stripped.
+/// The base hooks in their current shape, plus the opt-in hooks (proactive recall, the
+/// error playbooks) re-shaped if the user already opted in. Retired hooks are stripped.
 fn apply_base_hooks(obj: &mut Map<String, Value>, exe: &Path) -> Result<()> {
     apply_hooks(obj, &BASE_HOOKS, exe)?;
     if our_hook_command(obj, PROACTIVE_RECALL_HOOK.event, exe).is_some() {
         let command = hook_command(exe, PROACTIVE_RECALL_HOOK.subcommand);
         upsert_hook(obj, &PROACTIVE_RECALL_HOOK, &command, exe)?;
+    }
+    // Either event opted in means both: an older hand-edit or a half-applied toggle
+    // must not leave failing commands (or exit-0 ones) without the playbook.
+    if ERROR_RECALL_HOOKS
+        .iter()
+        .any(|spec| our_hook_command(obj, spec.event, exe).is_some())
+    {
+        for spec in ERROR_RECALL_HOOKS {
+            upsert_hook(obj, spec, &hook_command(exe, spec.subcommand), exe)?;
+        }
     }
     Ok(())
 }
@@ -1733,6 +1825,8 @@ fn refresh_hooks_in(obj: &mut Map<String, Value>, exe: &Path) -> Result<()> {
             &PRE_COMPACT_HOOK,
             &SESSION_END_HOOK,
             &PROACTIVE_RECALL_HOOK,
+            &ERROR_RECALL_HOOK,
+            &ERROR_RECALL_FAILURE_HOOK,
         ],
         exe,
     );
@@ -3976,6 +4070,72 @@ mod tests {
         assert_eq!(entry["name"], manifest["name"]);
         assert_eq!(entry["source"]["path"], "plugins/claude-code");
         assert_eq!(entry["source"]["ref"], format!("v{version}"));
+    }
+
+    /// The error-playbook hooks are opt-in like proactive recall: Install leaves them out,
+    /// a reinstall re-shapes them once opted in (both events, even when only one was there),
+    /// a plugin hand-over keeps them, uninstall removes them, and the user's own PostToolUse
+    /// hooks are never touched.
+    #[test]
+    fn error_recall_hooks_are_opt_in_and_survive_reinstall_and_hand_over() {
+        let exe = Path::new("/Applications/Callimachus.app/Contents/MacOS/callimachus");
+        let mut root = json!({"hooks": {"PostToolUse": [
+            {"matcher": "Bash", "hooks": [{"type": "command", "command": "lint-it"}]}
+        ]}});
+        apply_base_hooks(root.as_object_mut().unwrap(), exe).unwrap();
+        assert_eq!(
+            ours_in(&root, "PostToolUse"),
+            0,
+            "off until the user opts in"
+        );
+        assert_eq!(ours_in(&root, "PostToolUseFailure"), 0);
+
+        upsert_hook(
+            root.as_object_mut().unwrap(),
+            &ERROR_RECALL_HOOK,
+            &hook_command(exe, "recall-error"),
+            exe,
+        )
+        .unwrap();
+        for _ in 0..2 {
+            apply_base_hooks(root.as_object_mut().unwrap(), exe).unwrap();
+        }
+        for event in ["PostToolUse", "PostToolUseFailure"] {
+            assert_eq!(ours_in(&root, event), 1, "{event}");
+            let group = our_group(&root, event);
+            assert_eq!(group["matcher"], "Bash", "{event}");
+            assert_eq!(group["hooks"][0]["timeout"], 5, "{event}");
+            assert_eq!(
+                group["hooks"][0]["command"],
+                hook_command(exe, "recall-error").as_str()
+            );
+        }
+        assert!(is_our_hook(&hook_command(exe, "recall-error"), exe));
+        assert!(event_has_our_hook(&root, ERROR_RECALL_HOOK.event, exe));
+
+        strip_base_hooks(root.as_object_mut().unwrap(), exe);
+        assert_eq!(ours_in(&root, "PostToolUse"), 1, "the plugin ships none");
+        assert_eq!(ours_in(&root, "PostToolUseFailure"), 1);
+
+        for event in ALL_HOOK_EVENTS {
+            strip_our_hooks(root.as_object_mut().unwrap(), event, exe);
+        }
+        assert_eq!(ours_in(&root, "PostToolUse"), 0);
+        assert!(root["hooks"].get("PostToolUseFailure").is_none());
+        assert_eq!(
+            root["hooks"]["PostToolUse"][0]["hooks"][0]["command"],
+            "lint-it"
+        );
+
+        // The uninstaller's record carries it, from older markers too.
+        let mut removed: RemovedIntegration =
+            serde_json::from_str(r#"{"proactiveRecall": true}"#).unwrap();
+        assert!(!removed.error_recall);
+        removed.merge(RemovedIntegration {
+            error_recall: true,
+            ..Default::default()
+        });
+        assert!(removed.error_recall && removed.proactive_recall);
     }
 
     #[test]

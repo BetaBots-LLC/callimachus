@@ -118,6 +118,7 @@ pub const SETTING_KEYS: &[&str] = &[
     "close_to_tray",
     "auto_distill",
     "proactive_recall",
+    "error_recall",
     "knowledge_engine",
     "theme",
     "api_key",

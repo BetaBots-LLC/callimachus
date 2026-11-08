@@ -57,6 +57,7 @@ function useRecallStatus() {
  *  app as the `callimachus` MCP server, no terminal or cargo. */
 function ClaudeCodeRows() {
   const recallId = useId();
+  const errorRecallId = useId();
   const queryClient = useQueryClient();
   const status = useRecallStatus();
   const refresh = () => queryClient.invalidateQueries({ queryKey: ["recall_integration"] });
@@ -88,6 +89,14 @@ function ClaudeCodeRows() {
       track("setting_changed", { key: "proactive_recall" });
     },
     onError: (e) => notify.error("Couldn't change proactive recall", { description: errorText(e) }),
+  });
+  const setErrorRecall = useMutation({
+    mutationFn: api.setErrorRecall,
+    onSuccess: () => {
+      refresh();
+      track("setting_changed", { key: "error_recall" });
+    },
+    onError: (e) => notify.error("Couldn't change error playbooks", { description: errorText(e) }),
   });
 
   const s = status.data;
@@ -227,6 +236,27 @@ function ClaudeCodeRows() {
           {setRecall.isError && (
             <InlineError>
               Couldn't change proactive recall: {errorText(setRecall.error)}
+            </InlineError>
+          )}
+        </SettingRow>
+      )}
+      {connected && (
+        <SettingRow
+          htmlFor={errorRecallId}
+          title="Error playbooks"
+          description="When a shell command Claude runs fails with an error a past commit in this repo fixed, tell Claude that fix, once per session. Runs after every shell command: output without an error costs a few milliseconds, an error one indexed lookup."
+          control={
+            <Switch
+              id={errorRecallId}
+              checked={!!s?.errorRecallInstalled}
+              disabled={setErrorRecall.isPending}
+              onCheckedChange={(v) => setErrorRecall.mutate(v)}
+            />
+          }
+        >
+          {setErrorRecall.isError && (
+            <InlineError>
+              Couldn't change error playbooks: {errorText(setErrorRecall.error)}
             </InlineError>
           )}
         </SettingRow>

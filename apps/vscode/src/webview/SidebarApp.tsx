@@ -4,14 +4,31 @@
 // host RPC bridge.
 
 import { type ReactNode, useCallback, useEffect, useState } from "react";
-import { CornerDownLeft, Copy, Search } from "lucide-react";
+import { CornerDownLeft, Copy, Search, X } from "lucide-react";
 import { Button } from "@desktop/components/ui/button";
 import { Input } from "@desktop/components/ui/input";
 import { Badge } from "@desktop/components/ui/badge";
-import { formatTime, renderSnippet, shortPath } from "@desktop/lib/format";
-import type { InitPayload, SearchHit, Stats, ThreadSummary } from "../protocol";
+import { baseName, formatTime, renderSnippet, shortPath } from "@desktop/lib/format";
+import type {
+  InitPayload,
+  SearchHit,
+  Stats,
+  ThreadSummary,
+  WhyCommit,
+  WhyState,
+  WhyThread,
+} from "../protocol";
 import { sourceLabel } from "../protocol";
-import { action, getState, onRefresh, onRelated, request, setState } from "./bridge";
+import {
+  action,
+  closeWhy,
+  getState,
+  onRefresh,
+  onRelated,
+  onWhy,
+  request,
+  setState,
+} from "./bridge";
 
 type Scope = "all" | "project";
 interface Persisted {
@@ -84,6 +101,109 @@ function Row({
   );
 }
 
+/** What a session did to the file, for its row's meta line. */
+function touchLabel(t: WhyThread): string {
+  switch (t.touch) {
+    case "write":
+    case "edit":
+      return t.edits === 1 ? "edited the file once" : `edited the file ${t.edits} times`;
+    case "read":
+      return "read the file";
+    case "mention":
+      return "mentioned the file";
+    default:
+      return `shares ${t.overlap} ${t.overlap === 1 ? "file" : "files"} with the commit`;
+  }
+}
+
+function WhyCommitBlock({ commit }: { commit: WhyCommit }) {
+  return (
+    <div className="pb-1">
+      <p className="px-2 pt-1.5 text-xs" title={commit.sha}>
+        <span className="font-mono text-muted-foreground">{commit.shortSha.slice(0, 8)}</span>{" "}
+        <span className="font-medium">{commit.subject}</span>
+        <span className="text-muted-foreground"> · {formatTime(commit.committedAt)}</span>
+      </p>
+      {commit.threads.length === 0 ? (
+        <p className="px-2 py-1 text-xs text-muted-foreground">No linked session.</p>
+      ) : (
+        commit.threads.map((t) => (
+          <div key={`${commit.sha}-${t.id}`}>
+            <Row
+              id={t.id}
+              source={t.source}
+              title={t.title}
+              meta={[touchLabel(t), formatTime(t.lastActive)].filter(Boolean).join(" · ")}
+            />
+            {t.facts.length > 0 ? (
+              <ul className="mb-1 space-y-1 pl-4 pr-2 text-xs">
+                {t.facts.map((f) => (
+                  <li key={f.id} className="flex gap-1.5">
+                    <Badge
+                      variant="outline"
+                      className="h-4 shrink-0 px-1.5 py-0 text-[10px] font-normal"
+                    >
+                      {f.kind}
+                    </Badge>
+                    <span>
+                      {f.text}
+                      {f.rationale ? (
+                        <span className="text-muted-foreground"> Because: {f.rationale}</span>
+                      ) : null}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            ) : null}
+          </div>
+        ))
+      )}
+    </div>
+  );
+}
+
+/** "Why this line": the commits git blame names for the line and the sessions behind them. */
+function WhySection({ state, onClose }: { state: WhyState; onClose: () => void }) {
+  const where = `${baseName(state.file)}:${state.line}`;
+  return (
+    <section className="mx-1 mb-2 rounded-md border border-border pb-1">
+      <div className="flex items-center justify-between pr-1">
+        <SectionLabel>
+          Why · <span className="font-mono normal-case">{where}</span>
+        </SectionLabel>
+        <Button size="icon-xs" variant="ghost" title="Close" aria-label="Close" onClick={onClose}>
+          <X />
+        </Button>
+      </div>
+      {state.status === "loading" ? (
+        <p className="px-2 py-1 text-xs text-muted-foreground">Reading git blame…</p>
+      ) : state.status === "error" ? (
+        <p className="mx-1 rounded-md bg-destructive/10 px-2 py-1.5 text-xs text-destructive">
+          {state.message}
+        </p>
+      ) : state.result.commits.length === 0 ? (
+        <p className="px-2 py-1 text-xs text-muted-foreground">
+          {state.result.uncommitted
+            ? "This line has changes that aren't committed yet, so no commit explains it."
+            : "git blame named no commit for this line."}
+        </p>
+      ) : (
+        <>
+          {state.result.commits.map((c) => (
+            <WhyCommitBlock key={c.sha} commit={c} />
+          ))}
+          {state.result.unlinked ? (
+            <p className="px-2 py-1 text-xs text-muted-foreground">
+              No session is linked to this commit yet. Run <code>cal commits</code> in the repo to
+              link its history, then ask again.
+            </p>
+          ) : null}
+        </>
+      )}
+    </section>
+  );
+}
+
 export function SidebarApp({ init }: { init: InitPayload }) {
   const persisted = getState<Persisted>();
   const [query, setQuery] = useState(persisted?.query ?? init.query ?? "");
@@ -95,6 +215,7 @@ export function SidebarApp({ init }: { init: InitPayload }) {
   const [error, setError] = useState<string | null>(null);
   const [related, setRelated] = useState<ThreadSummary[]>([]);
   const [relatedLabel, setRelatedLabel] = useState("");
+  const [why, setWhy] = useState<WhyState | null>(null);
 
   const project = init.projectPath ?? null;
 
@@ -158,6 +279,11 @@ export function SidebarApp({ init }: { init: InitPayload }) {
     });
   }, []);
 
+  // "Why this line": the host pushes each state of the editor command.
+  useEffect(() => {
+    onWhy(setWhy);
+  }, []);
+
   const showingResults = query.trim().length > 0;
   const summaryMeta = (t: ThreadSummary) =>
     [`${t.messageCount} msgs`, formatTime(t.updatedAt), shortPath(t.projectPath)]
@@ -203,6 +329,16 @@ export function SidebarApp({ init }: { init: InitPayload }) {
           <p className="mx-1 my-2 rounded-md bg-destructive/10 px-2 py-1.5 text-xs text-destructive">
             {error}
           </p>
+        ) : null}
+
+        {why ? (
+          <WhySection
+            state={why}
+            onClose={() => {
+              setWhy(null);
+              closeWhy();
+            }}
+          />
         ) : null}
 
         {showingResults ? (

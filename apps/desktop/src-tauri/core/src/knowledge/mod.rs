@@ -7,8 +7,14 @@
 
 pub mod app_config;
 pub mod harvest;
+pub mod identity;
 pub mod priority;
+pub mod repo_memory;
 
+pub use identity::{
+    local_keys_for_portable, new_fact_uid, portable_project_id, rebind_fact_sources,
+    refresh_portable_project_id, IMPORT_FACT_SQL,
+};
 pub use priority::{distill_priority_ready, enqueue_distill_priority};
 
 use crate::agent::Distilled;
@@ -193,12 +199,8 @@ pub fn purge_subagent_todos(conn: &Connection) -> Result<usize> {
 /// inside the caller's transaction. Shared by the indexer and the backfill.
 fn rebuild_thread_todos(tx: &Connection, thread_id: i64, now: i64) -> Result<()> {
     // Keep CURATED todos (done / dismissed / pinned) so closing a TODO survives re-index;
-    // only the open, untouched ones are re-derived.
-    tx.execute(
-        "DELETE FROM facts WHERE thread_id = ?1 AND extractor = 'heuristic'
-            AND status = 'open' AND hidden = 0 AND pinned = 0",
-        [thread_id],
-    )?;
+    // only the open, untouched ones are re-derived, under the uid each had before.
+    let uids = take_open_heuristic_todos(tx, thread_id)?;
     // Subagent transcripts are the parent session's delegated work (most of the corpus in
     // workflow-heavy repos); their checklists and code comments are not the user's TODOs.
     let is_subagent: bool = tx
@@ -213,16 +215,16 @@ fn rebuild_thread_todos(tx: &Connection, thread_id: i64, now: i64) -> Result<()>
         return Ok(());
     }
     let mut sel = tx.prepare(
-        "SELECT id, text, ts FROM messages WHERE thread_id = ?1 AND role IN ('user', 'assistant')
+        "SELECT id, text, ts, seq FROM messages
+         WHERE thread_id = ?1 AND role IN ('user', 'assistant')
          ORDER BY seq, id",
     )?;
-    let rows: Vec<(i64, String, Option<i64>)> = sel
-        .query_map([thread_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+    let rows: Vec<(i64, String, Option<i64>, i64)> = sel
+        .query_map([thread_id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })?
         .collect::<rusqlite::Result<_>>()?;
-    let mut ins = tx.prepare(
-        "INSERT INTO facts (thread_id, kind, text, source_message_id, status, extractor, created_at)
-         VALUES (?1, 'todo', ?2, ?3, 'open', 'heuristic', ?4)",
-    )?;
+    let mut ins = tx.prepare(INSERT_HEURISTIC_TODO_SQL)?;
     let mut seen = std::collections::HashSet::new();
     // Seed with kept curated todos so we don't insert an open duplicate of a closed one.
     {
@@ -235,8 +237,9 @@ fn rebuild_thread_todos(tx: &Connection, thread_id: i64, now: i64) -> Result<()>
             seen.insert(t.to_ascii_lowercase());
         }
     }
+    let edited = edited_todo_seqs(tx, thread_id)?;
     let mut per = 0usize;
-    'outer: for (mid, text, ts) in rows {
+    'outer: for (mid, text, ts, seq) in rows {
         if per >= MAX_TODOS_PER_THREAD {
             break;
         }
@@ -244,14 +247,70 @@ fn rebuild_thread_todos(tx: &Connection, thread_id: i64, now: i64) -> Result<()>
             if per >= MAX_TODOS_PER_THREAD {
                 break 'outer;
             }
-            if seen.insert(todo.to_ascii_lowercase()) {
+            let lower = todo.to_ascii_lowercase();
+            if edited.contains(&seq) && !uids.contains_key(&lower) {
+                // The user reworded the TODO this message raised (see `edited_todo_seqs`).
+                seen.insert(lower);
+                continue;
+            }
+            if seen.insert(lower.clone()) {
                 let created = todo_created_at(ts, now);
-                ins.execute(rusqlite::params![thread_id, todo, mid, created])?;
+                let uid = uids.get(&lower).cloned().unwrap_or_else(new_fact_uid);
+                ins.execute(rusqlite::params![thread_id, todo, mid, created, seq, uid])?;
                 per += 1;
             }
         }
     }
     Ok(())
+}
+
+/// The insert for one heuristic TODO: (thread, text, source message, created_at, source seq,
+/// uid). Shared by the indexer and the backfill.
+pub(crate) const INSERT_HEURISTIC_TODO_SQL: &str = "INSERT INTO facts
+        (thread_id, kind, text, source_message_id, status, extractor, created_at, source_seq, uid)
+     VALUES (?1, 'todo', ?2, ?3, 'open', 'heuristic', ?4, ?5, ?6)";
+
+/// Delete this thread's open, uncurated heuristic TODOs (the ones a re-derive replaces) and
+/// return their uids by lowercased text, so the same TODO found again keeps its identity
+/// instead of turning into a new fact on every full re-index. A TODO the user reworded
+/// (`edit_fact`) is curated: it stays, under its uid, like a done or pinned one.
+pub(crate) fn take_open_heuristic_todos(
+    tx: &Connection,
+    thread_id: i64,
+) -> Result<std::collections::HashMap<String, String>> {
+    const OPEN_UNCURATED: &str = "thread_id = ?1 AND extractor = 'heuristic'
+            AND status = 'open' AND hidden = 0 AND pinned = 0 AND edited = 0";
+    let mut sel = tx.prepare(&format!(
+        "SELECT text, uid FROM facts WHERE {OPEN_UNCURATED} AND uid IS NOT NULL"
+    ))?;
+    let uids = sel
+        .query_map([thread_id], |r| {
+            Ok((r.get::<_, String>(0)?.to_ascii_lowercase(), r.get(1)?))
+        })?
+        .collect::<rusqlite::Result<std::collections::HashMap<_, _>>>()?;
+    tx.execute(
+        &format!("DELETE FROM facts WHERE {OPEN_UNCURATED}"),
+        [thread_id],
+    )?;
+    Ok(uids)
+}
+
+/// The messages (by `source_seq`) whose heuristic TODO the user reworded. Its original text
+/// is gone (`edit_fact` overwrites it), so a re-derive cannot match it by text: it skips the
+/// TODOs it finds again in those messages that no open fact it just took claims, or the
+/// original would come back as a second, open copy beside the edited one.
+pub(crate) fn edited_todo_seqs(
+    tx: &Connection,
+    thread_id: i64,
+) -> Result<std::collections::HashSet<i64>> {
+    let mut stmt = tx.prepare_cached(
+        "SELECT source_seq FROM facts WHERE thread_id = ?1 AND extractor = 'heuristic'
+            AND edited = 1 AND source_seq IS NOT NULL",
+    )?;
+    let seqs = stmt
+        .query_map([thread_id], |r| r.get::<_, i64>(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(seqs)
 }
 
 /// Backfill heuristic todos across the whole corpus from already-indexed message text
@@ -347,7 +406,8 @@ pub struct TodoFact {
     #[serde(rename = "createdAt")]
     pub created_at: i64,
     /// Who wrote it: 'heuristic', 'llm', 'user', 'agent', or an importer
-    /// ([`harvest::EXTRACTOR_CLAUDE_MEMORY`], [`harvest::EXTRACTOR_CLAUDE_COMPACT`]).
+    /// ([`harvest::EXTRACTOR_CLAUDE_MEMORY`], [`harvest::EXTRACTOR_CLAUDE_COMPACT`],
+    /// [`EXTRACTOR_PLAYBOOK`]).
     pub extractor: String,
     /// Stable key of an imported fact (`facts.origin_ref`), else None.
     #[serde(rename = "originRef")]
@@ -567,6 +627,31 @@ pub fn store_distilled(
     now: i64,
 ) -> Result<()> {
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    // The same fact distilled again keeps its uid: a copy already published to repo memory
+    // (or another machine) must still match it, not come back as a duplicate. Keyed by kind
+    // and trimmed, lowercased text.
+    let mut uids: std::collections::HashMap<(String, String), String> = {
+        let mut sel = tx.prepare(
+            "SELECT kind, text, uid FROM facts WHERE thread_id = ?1 AND extractor = 'llm'
+                AND pinned = 0 AND edited = 0 AND hidden = 0 AND uid IS NOT NULL",
+        )?;
+        let rows = sel
+            .query_map([thread_id], |r| {
+                Ok((
+                    (
+                        r.get::<_, String>(0)?,
+                        distilled_key(&r.get::<_, String>(1)?),
+                    ),
+                    r.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        rows
+    };
+    let mut uid_for = |kind: &str, text: &str| {
+        uids.remove(&(kind.to_string(), distilled_key(text)))
+            .unwrap_or_else(new_fact_uid)
+    };
     // Replace only the UN-curated LLM facts; pinned / edited / hidden ones are the user's
     // now and survive re-distillation.
     tx.execute(
@@ -576,23 +661,44 @@ pub fn store_distilled(
     )?;
     {
         let mut ins = tx.prepare(
-            "INSERT INTO facts (thread_id, kind, text, status, extractor, seq, created_at)
-             VALUES (?1, ?2, ?3, 'open', 'llm', ?4, ?5)",
+            "INSERT INTO facts (thread_id, kind, text, status, extractor, seq, created_at, uid)
+             VALUES (?1, ?2, ?3, 'open', 'llm', ?4, ?5, ?6)",
         )?;
         let summary = d.summary.trim();
         if !summary.is_empty() {
-            ins.execute(params![thread_id, "summary", summary, 0_i64, now])?;
+            ins.execute(params![
+                thread_id,
+                "summary",
+                summary,
+                0_i64,
+                now,
+                uid_for("summary", summary)
+            ])?;
         }
         for (i, text) in d.decisions.iter().enumerate() {
             let t = text.trim();
             if !t.is_empty() {
-                ins.execute(params![thread_id, "decision", t, i as i64, now])?;
+                ins.execute(params![
+                    thread_id,
+                    "decision",
+                    t,
+                    i as i64,
+                    now,
+                    uid_for("decision", t)
+                ])?;
             }
         }
         for (i, text) in d.gotchas.iter().enumerate() {
             let t = text.trim();
             if !t.is_empty() {
-                ins.execute(params![thread_id, "gotcha", t, i as i64, now])?;
+                ins.execute(params![
+                    thread_id,
+                    "gotcha",
+                    t,
+                    i as i64,
+                    now,
+                    uid_for("gotcha", t)
+                ])?;
             }
         }
     }
@@ -603,6 +709,11 @@ pub fn store_distilled(
     )?;
     tx.commit()?;
     Ok(())
+}
+
+/// How [`store_distilled`] recognizes a fact distilled again: trimmed, lowercased text.
+fn distilled_key(text: &str) -> String {
+    text.trim().to_lowercase()
 }
 
 /// Record a distillation failure so the UI can show it and lazy-on-open won't retry it
@@ -1121,7 +1232,8 @@ pub struct MemoryFact {
     /// `claude-memory`. The SessionStart hook and the managed AGENTS.md / CLAUDE.md block
     /// drop `claude-memory` facts, which Claude Code already loads from its own auto memory,
     /// and so does `.callimachus/memory.md`, a repo file people commit; MCP results and the
-    /// Projects tab keep them.
+    /// Projects tab keep them. `repo`: imported from the repo's committed
+    /// `.callimachus/memory/` files (`originRef` names the file), shown everywhere.
     pub extractor: String,
     #[serde(rename = "originRef")]
     pub origin_ref: Option<String>,
@@ -1193,13 +1305,22 @@ fn project_facts(
     open_only: bool,
     limit: usize,
     exclude: Option<&str>,
+    borrowed: Option<&str>,
 ) -> Result<Vec<MemoryFact>> {
     // Match the canonical project key (callers pass it; falls back to project_path until
-    // backfill), so all of one repo's threads aggregate together.
+    // backfill), so all of one repo's threads aggregate together. `borrowed` (a JSON array of
+    // uids, see [`repo_memory::BORROWED`]) adds the repo memory facts this project's files
+    // share with another clone of the same repo, which hold them under that clone's key.
+    let scope = if borrowed.is_some() {
+        "(COALESCE(t.project_key, t.project_path) = ?2
+              OR f.uid IN (SELECT value FROM json_each(?3)))"
+    } else {
+        "COALESCE(t.project_key, t.project_path) = ?2"
+    };
     let mut sql = format!(
         "SELECT f.id, f.thread_id, f.text, t.title, f.created_at, f.pinned, f.extractor, {}
          FROM facts f JOIN threads t ON t.id = f.thread_id
-         WHERE f.kind = ?1 AND COALESCE(t.project_key, t.project_path) = ?2 AND f.hidden = 0
+         WHERE f.kind = ?1 AND {scope} AND f.hidden = 0
            AND (t.is_subagent = 0 OR f.pinned = 1)",
         origin_ref_sql(conn)
     );
@@ -1207,16 +1328,17 @@ fn project_facts(
     if open_only {
         sql.push_str(" AND f.status = 'open'");
     }
-    if exclude.is_some() {
-        sql.push_str(" AND f.extractor != ?3");
+    let mut params: Vec<&dyn rusqlite::ToSql> = vec![&kind, &project];
+    if let Some(b) = &borrowed {
+        params.push(b);
+    }
+    if let Some(x) = &exclude {
+        params.push(x);
+        sql.push_str(&format!(" AND f.extractor != ?{}", params.len()));
     }
     // Pinned facts first, then newest. Pinned ones are the user's trusted set.
     sql.push_str(" ORDER BY f.pinned DESC, f.created_at DESC, f.id DESC");
     let mut stmt = conn.prepare(&sql)?;
-    let mut params: Vec<&dyn rusqlite::ToSql> = vec![&kind, &project];
-    if let Some(x) = &exclude {
-        params.push(x);
-    }
     let rows = stmt.query_map(params.as_slice(), |r| {
         Ok(MemoryFact {
             id: r.get(0)?,
@@ -1322,10 +1444,16 @@ fn project_memory_facts(
     per_kind: usize,
     exclude: Option<&str>,
 ) -> Result<ProjectMemory> {
+    // Read once for the three kinds: one `app_config` row, empty for nearly every project.
+    let borrowed = repo_memory::borrowed_uids(conn, project);
+    let borrowed = (!borrowed.is_empty())
+        .then(|| serde_json::to_string(&borrowed))
+        .transpose()?;
+    let b = borrowed.as_deref();
     Ok(ProjectMemory {
-        decisions: project_facts(conn, "decision", project, false, per_kind, exclude)?,
-        gotchas: project_facts(conn, "gotcha", project, false, per_kind, exclude)?,
-        open_todos: project_facts(conn, "todo", project, true, per_kind, exclude)?,
+        decisions: project_facts(conn, "decision", project, false, per_kind, exclude, b)?,
+        gotchas: project_facts(conn, "gotcha", project, false, per_kind, exclude, b)?,
+        open_todos: project_facts(conn, "todo", project, true, per_kind, exclude, None)?,
         thread_count: 0,
         distilled_count: 0,
         pending_count: 0,
@@ -1399,8 +1527,9 @@ pub fn record_fact_with_origin(
     }
     let tid = notes_thread_id(conn, project, now)?;
     conn.execute(
-        "INSERT INTO facts (thread_id, kind, text, rationale, status, extractor, pinned, created_at)
-         VALUES (?1, ?2, ?3, ?4, 'open', ?5, ?6, ?7)",
+        "INSERT INTO facts
+            (thread_id, kind, text, rationale, status, extractor, pinned, created_at, uid)
+         VALUES (?1, ?2, ?3, ?4, 'open', ?5, ?6, ?7, ?8)",
         params![
             tid,
             kind,
@@ -1408,10 +1537,77 @@ pub fn record_fact_with_origin(
             rationale.map(str::trim),
             origin.extractor(),
             i64::from(origin == FactOrigin::User),
-            now
+            now,
+            new_fact_uid()
         ],
     )?;
     Ok(conn.last_insert_rowid())
+}
+
+/// `facts.extractor` of a failure playbook: the gotcha `issues::refresh_clusters` records when a
+/// recurring error was fixed by a linked commit. `origin_ref` is
+/// `playbook:<signature>@<project key>` ([`crate::issues::playbook_ref`]), one fact per signature
+/// and project, so a fix in another repo never moves this repo's fact.
+pub const EXTRACTOR_PLAYBOOK: &str = "playbook";
+
+/// Record or refresh a playbook gotcha, one per `origin_ref` (see [`EXTRACTOR_PLAYBOOK`]),
+/// filed under `thread_id` (the session that made the fix, so it cites it and lands in that
+/// project's memory). A new one is unpinned. An existing one is updated in place, keeping its
+/// uid, pin and hidden flag, and re-embedded when its text changed; one whose text the user
+/// edited is left as it is. Returns whether anything was written.
+pub fn upsert_playbook(
+    conn: &Connection,
+    origin_ref: &str,
+    thread_id: i64,
+    text: &str,
+    now: i64,
+) -> Result<bool> {
+    let existing: Option<(i64, String, i64, i64)> = conn
+        .query_row(
+            "SELECT id, text, thread_id, edited FROM facts WHERE origin_ref = ?1
+             ORDER BY id LIMIT 1",
+            [origin_ref],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()?;
+    match existing {
+        None => {
+            conn.execute(
+                "INSERT INTO facts (thread_id, kind, text, status, extractor, origin_ref,
+                                    created_at, uid)
+                 VALUES (?1, 'gotcha', ?2, 'open', ?3, ?4, ?5, ?6)",
+                params![
+                    thread_id,
+                    text,
+                    EXTRACTOR_PLAYBOOK,
+                    origin_ref,
+                    now,
+                    new_fact_uid()
+                ],
+            )?;
+            Ok(true)
+        }
+        Some((_, _, _, edited)) if edited != 0 => Ok(false),
+        Some((_, old_text, old_thread, _)) if old_text == text && old_thread == thread_id => {
+            Ok(false)
+        }
+        Some((id, old_text, _, _)) => {
+            if old_text == text {
+                conn.execute(
+                    "UPDATE facts SET thread_id = ?2 WHERE id = ?1",
+                    params![id, thread_id],
+                )?;
+            } else {
+                conn.execute(
+                    "UPDATE facts SET thread_id = ?2, text = ?3, embedded = 0 WHERE id = ?1",
+                    params![id, thread_id, text],
+                )?;
+                // The old vector describes the old text; the embed pass writes a new one.
+                conn.execute("DELETE FROM vec_facts WHERE fact_id = ?1", [id])?;
+            }
+            Ok(true)
+        }
+    }
 }
 
 /// The project's synthetic "Recorded memory" thread (created on first use, `updated_at`
@@ -2092,6 +2288,122 @@ mod tests {
         assert_eq!(k3.decisions.len(), 1);
         assert_eq!(k3.decisions[0].text, "use jwt with refresh");
         assert!(k3.gotchas.is_empty(), "replaced, not merged");
+    }
+
+    #[test]
+    fn a_reworded_todo_survives_the_backfill_without_its_original() {
+        use crate::indexer::{source_id, upsert_thread, ParsedMessage, ParsedThread};
+        let mut conn = temp_db();
+        let sid = source_id(&conn, "claude_code").unwrap();
+        upsert_thread(
+            &mut conn,
+            sid,
+            &ParsedThread {
+                external_id: "edited".into(),
+                messages: vec![ParsedMessage {
+                    role: "user".into(),
+                    text: "TODO: ship the docs\nTODO: tag the release".into(),
+                    tool_name: None,
+                    ts: Some(1),
+                }],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let todos = |conn: &Connection| -> Vec<(String, String)> {
+            conn.prepare("SELECT text, uid FROM facts WHERE kind = 'todo' ORDER BY text")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        let before = todos(&conn);
+        let docs: i64 = conn
+            .query_row(
+                "SELECT id FROM facts WHERE text = 'ship the docs'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        edit_fact(&conn, docs, "ship the docs site").unwrap();
+        let db = crate::db::Db(std::sync::Mutex::new(conn));
+        backfill_todos(&db, 5, &|| false).unwrap();
+        let after = todos(&db.0.lock().unwrap());
+        assert_eq!(
+            after.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>(),
+            vec!["ship the docs site", "tag the release"]
+        );
+        assert_eq!(after[1].1, before[1].1, "the untouched TODO keeps its uid");
+    }
+
+    #[test]
+    fn a_fact_distilled_again_keeps_its_uid() {
+        use crate::agent::Distilled;
+        use crate::indexer::{source_id, upsert_thread, ParsedMessage, ParsedThread};
+        let mut conn = temp_db();
+        let sid = source_id(&conn, "claude_code").unwrap();
+        upsert_thread(
+            &mut conn,
+            sid,
+            &ParsedThread {
+                external_id: "uid1".into(),
+                messages: vec![ParsedMessage {
+                    role: "user".into(),
+                    text: "hi".into(),
+                    tool_name: None,
+                    ts: Some(1),
+                }],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let tid: i64 = conn
+            .query_row("SELECT id FROM threads WHERE external_id='uid1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let uid_of = |conn: &Connection, kind: &str| -> Vec<(String, String)> {
+            conn.prepare(
+                "SELECT text, uid FROM facts WHERE thread_id = ?1 AND kind = ?2 ORDER BY seq",
+            )
+            .unwrap()
+            .query_map(params![tid, kind], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+        };
+        let first = Distilled {
+            summary: "Built the exporter.".into(),
+            decisions: vec!["Use SQLite".into(), "Ship weekly".into()],
+            gotchas: vec!["WAL needs a checkpoint".into()],
+        };
+        store_distilled(&mut conn, tid, &first, 1).unwrap();
+        let (decisions, gotchas, summary) = (
+            uid_of(&conn, "decision"),
+            uid_of(&conn, "gotcha"),
+            uid_of(&conn, "summary"),
+        );
+        // The thread grew: a re-distill finds the same facts (spelled a little differently)
+        // plus a new one.
+        let again = Distilled {
+            summary: "Built the exporter and its tests.".into(),
+            decisions: vec!["use sqlite ".into(), "Pin the toolchain".into()],
+            gotchas: vec!["WAL needs a checkpoint".into()],
+        };
+        store_distilled(&mut conn, tid, &again, 2).unwrap();
+        let decisions2 = uid_of(&conn, "decision");
+        assert_eq!(decisions2[0].1, decisions[0].1, "same decision, same uid");
+        assert_ne!(
+            decisions2[1].1, decisions[1].1,
+            "a new decision gets its own"
+        );
+        assert_eq!(uid_of(&conn, "gotcha")[0].1, gotchas[0].1);
+        assert_ne!(
+            uid_of(&conn, "summary")[0].1,
+            summary[0].1,
+            "a changed summary is new"
+        );
     }
 
     #[test]

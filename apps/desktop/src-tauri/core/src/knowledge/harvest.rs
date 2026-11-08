@@ -291,11 +291,12 @@ fn harvest_claude_memory_in(
         }
         // Keep what the user did to the old version: a hidden memory stays hidden, a
         // pinned one stays pinned.
-        let (pinned, hidden): (i64, i64) = tx.query_row(
-            "SELECT COALESCE(MAX(pinned), 0), COALESCE(MAX(hidden), 0) FROM facts
+        // And its identity: a changed topic file is the same memory, under the same uid.
+        let (pinned, hidden, uid): (i64, i64, Option<String>) = tx.query_row(
+            "SELECT COALESCE(MAX(pinned), 0), COALESCE(MAX(hidden), 0), MIN(uid) FROM facts
              WHERE origin_ref = ?1",
             [&f.origin_ref],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
         report.removed += tx.execute("DELETE FROM facts WHERE origin_ref = ?1", [&f.origin_ref])?;
         let Some(fact) = fact else {
@@ -303,8 +304,8 @@ fn harvest_claude_memory_in(
         };
         tx.execute(
             "INSERT INTO facts (thread_id, kind, text, rationale, status, extractor, pinned,
-                                hidden, origin_ref, created_at)
-             VALUES (?1, ?2, ?3, ?4, 'open', ?5, ?6, ?7, ?8, ?9)",
+                                hidden, origin_ref, created_at, uid)
+             VALUES (?1, ?2, ?3, ?4, 'open', ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 thread,
                 fact.kind,
@@ -315,6 +316,7 @@ fn harvest_claude_memory_in(
                 hidden,
                 f.origin_ref,
                 f.mtime.clamp(0, now),
+                uid.unwrap_or_else(super::new_fact_uid),
             ],
         )?;
         report.imported += 1;
@@ -582,19 +584,27 @@ pub fn store_compaction_summary(
         return Ok(false);
     }
     let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    // A later compaction replaces the summary but it stays the session's one summary fact,
+    // so it keeps the uid.
+    let uid: Option<String> = tx.query_row(
+        "SELECT MIN(uid) FROM facts WHERE thread_id = ?1 AND extractor = ?2",
+        params![thread_id, EXTRACTOR_CLAUDE_COMPACT],
+        |r| r.get(0),
+    )?;
     tx.execute(
         "DELETE FROM facts WHERE thread_id = ?1 AND extractor = ?2",
         params![thread_id, EXTRACTOR_CLAUDE_COMPACT],
     )?;
     tx.execute(
-        "INSERT INTO facts (thread_id, kind, text, status, extractor, origin_ref, created_at)
-         VALUES (?1, 'summary', ?2, 'open', ?3, ?4, ?5)",
+        "INSERT INTO facts (thread_id, kind, text, status, extractor, origin_ref, created_at, uid)
+         VALUES (?1, 'summary', ?2, 'open', ?3, ?4, ?5, ?6)",
         params![
             thread_id,
             text,
             EXTRACTOR_CLAUDE_COMPACT,
             format!("{EXTRACTOR_CLAUDE_COMPACT}:{session_id}"),
-            now
+            now,
+            uid.unwrap_or_else(super::new_fact_uid)
         ],
     )?;
     tx.commit()?;

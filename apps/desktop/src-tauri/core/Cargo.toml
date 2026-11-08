@@ -69,6 +69,9 @@ r2d2 = "0.8.10"
 # on Windows). Used by db::default_index_path and the per-agent indexers.
 # 7 only moved `preference_dir` on Windows (unused here) and matches the copy tauri pulls in.
 dirs = "7"
+# Random v4 ids for facts (`knowledge::new_fact_uid`), the merge key across machines and repo
+# memory files. Already in the lock graph through tauri; `v4` pulls getrandom, also there.
+uuid = { version = "1", features = ["v4"] }
 
 # Free-space probe before Reclaim space / Shrink index rewrites the file (cleanup.rs
 # `volume_space`). Already in the lock graph through keyring; this only turns on the

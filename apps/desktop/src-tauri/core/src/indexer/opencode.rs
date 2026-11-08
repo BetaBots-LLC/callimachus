@@ -13,15 +13,18 @@
 //! migration), `scan_combined` reads both and deduplicates by `external_id`:
 //! SQLite entries take precedence. V2 is deferred until the runtime writes there.
 //!
-//! Schema verified against opencode `packages/sdk/js/src/gen/types.gen.ts`.
+//! Schema verified against opencode `packages/sdk/js/src/gen/types.gen.ts`. An assistant
+//! message carries `modelID` and `tokens: {input, output, reasoning, cache: {read, write}}`,
+//! where `input` already excludes the cached tokens; read for spend. A message with no text
+//! part (a turn of tool calls only) still spent tokens: its usage lands on the last message.
 
 use super::common::{read_json, truncate_title};
 use super::{
     file_change_state, file_state, open_external_readonly, set_file_state, source_id,
-    upsert_thread, IndexReport, ParsedMessage, ParsedThread,
+    upsert_thread, IndexReport, MsgUsage, ParsedMessage, ParsedThread,
 };
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -160,116 +163,14 @@ fn scan_sqlite(conn: &mut Connection, db: &Path, tick: &mut dyn FnMut()) -> Resu
         "SELECT id, title, directory, parent_id, time_created, time_updated FROM session",
     )?;
     let sessions: Vec<SessionRow> = session_stmt
-        .query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,         // id
-                r.get::<_, Option<String>>(1)?, // title
-                r.get::<_, Option<String>>(2)?, // directory
-                r.get::<_, Option<String>>(3)?, // parent_id
-                r.get::<_, Option<i64>>(4)?,    // time_created
-                r.get::<_, Option<i64>>(5)?,    // time_updated
-            ))
-        })?
+        .query_map([], session_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
-    let mut msg_stmt = ro.prepare(
-        "SELECT m.id, json_extract(m.data, '$.role'), m.time_created,
-                json_extract(p.data, '$.text')
-         FROM message m
-         JOIN part p ON p.message_id = m.id
-         WHERE m.session_id = ?1 AND json_extract(p.data, '$.type') = 'text'
-         ORDER BY m.time_created, m.id, p.id",
-    )?;
-
-    for (session_id, title, directory, parent_id, time_created, time_updated) in &sessions {
+    for row in &sessions {
         tick();
-
-        // Group text parts by message id, concatenating with \n.
-        let rows = msg_stmt.query_map(params![session_id], |r| {
-            Ok((
-                r.get::<_, String>(0)?,         // message id
-                r.get::<_, Option<String>>(1)?, // role
-                r.get::<_, Option<i64>>(2)?,    // time_created
-                r.get::<_, Option<String>>(3)?, // text
-            ))
-        })?;
-
-        let mut grouped: Vec<GroupedMessage> = Vec::new();
-        for row in rows {
-            let (msg_id, role, ts, text) = row?;
-            if let Some(last) = grouped.last_mut() {
-                if last.0 == msg_id {
-                    if let Some(t) = text {
-                        let t = t.trim().to_string();
-                        if !t.is_empty() {
-                            last.3.push(t);
-                        }
-                    }
-                    continue;
-                }
-            }
-            let mut parts = Vec::new();
-            if let Some(t) = text {
-                let t = t.trim().to_string();
-                if !t.is_empty() {
-                    parts.push(t);
-                }
-            }
-            grouped.push((msg_id, role, ts, parts));
-        }
-
-        let mut messages: Vec<ParsedMessage> = Vec::new();
-        let mut first_user: Option<String> = None;
-
-        for (_msg_id, role, ts, parts) in grouped {
-            let role = match role.as_deref() {
-                Some("assistant") => "assistant",
-                Some("user") => "user",
-                _ => continue,
-            };
-            let text = parts.join("\n");
-            if text.is_empty() {
-                continue;
-            }
-            let ts = ts.map(|ms| ms / 1000);
-            if role == "user" && first_user.is_none() {
-                first_user = Some(text.clone());
-            }
-            messages.push(ParsedMessage {
-                role: role.to_string(),
-                text,
-                tool_name: None,
-                ts,
-            });
-        }
-
-        if messages.is_empty() {
+        let Some(thread) = sqlite_thread(&ro, row)? else {
             report.threads_skipped += 1;
             continue;
-        }
-
-        let created_at = time_created.map(|ms| ms / 1000);
-        let updated_at = time_updated.map(|ms| ms / 1000);
-        let title = title
-            .as_deref()
-            .filter(|t| !t.trim().is_empty())
-            .map(str::to_string)
-            .or_else(|| first_user.as_deref().map(truncate_title));
-        let is_subagent = parent_id.is_some();
-
-        let thread = ParsedThread {
-            external_id: session_id.clone(),
-            title,
-            project_path: directory
-                .as_deref()
-                .filter(|d| !d.is_empty())
-                .map(str::to_string),
-            git_branch: None,
-            created_at,
-            updated_at,
-            is_subagent,
-            usage: Vec::new(),
-            messages,
         };
         let n = upsert_thread(conn, sid, &thread)?;
         report.threads_indexed += 1;
@@ -282,6 +183,181 @@ fn scan_sqlite(conn: &mut Connection, db: &Path, tick: &mut dyn FnMut()) -> Resu
     // dropped sessions.
     set_file_state(conn, &db.to_string_lossy(), KIND, mtime, size)?;
     Ok(report)
+}
+
+fn session_row(r: &rusqlite::Row) -> rusqlite::Result<SessionRow> {
+    Ok((
+        r.get::<_, String>(0)?,         // id
+        r.get::<_, Option<String>>(1)?, // title
+        r.get::<_, Option<String>>(2)?, // directory
+        r.get::<_, Option<String>>(3)?, // parent_id
+        r.get::<_, Option<i64>>(4)?,    // time_created
+        r.get::<_, Option<i64>>(5)?,    // time_updated
+    ))
+}
+
+/// One session of the V1 SQLite DB, read for the usage backfill
+/// (`indexer::usage_backfill`): the same thread [`scan_sqlite`] stores. None when the
+/// session is gone or has no text.
+pub(super) fn sqlite_session_thread(
+    ro: &Connection,
+    session_id: &str,
+) -> Result<Option<ParsedThread>> {
+    let row = ro
+        .prepare_cached(
+            "SELECT id, title, directory, parent_id, time_created, time_updated
+             FROM session WHERE id = ?1",
+        )?
+        .query_row([session_id], session_row)
+        .optional()?;
+    match row {
+        Some(row) => sqlite_thread(ro, &row),
+        None => Ok(None),
+    }
+}
+
+/// Build one session's thread from the V1 SQLite DB. None when it has no text messages.
+fn sqlite_thread(ro: &Connection, row: &SessionRow) -> Result<Option<ParsedThread>> {
+    let (session_id, title, directory, parent_id, time_created, time_updated) = row;
+    let mut msg_stmt = ro.prepare_cached(
+        "SELECT m.id, json_extract(m.data, '$.role'), m.time_created,
+                json_extract(p.data, '$.text')
+         FROM message m
+         JOIN part p ON p.message_id = m.id
+         WHERE m.session_id = ?1 AND json_extract(p.data, '$.type') = 'text'
+         ORDER BY m.time_created, m.id, p.id",
+    )?;
+
+    // Every assistant message's usage, in the text query's order: a message with no text part
+    // is missing from that query but spent tokens all the same.
+    let mut usage_stmt = ro.prepare_cached(
+        "SELECT id, time_created, data FROM message
+         WHERE session_id = ?1 AND json_extract(data, '$.role') = 'assistant'
+           AND json_extract(data, '$.tokens') IS NOT NULL
+         ORDER BY time_created, id",
+    )?;
+    let spent: Vec<(String, Option<i64>, MsgUsage)> = usage_stmt
+        .query_map(params![session_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<i64>>(1)?,
+                r.get::<_, Option<String>>(2)?,
+            ))
+        })?
+        .filter_map(|row| {
+            let (id, ts, data) = row.ok()?;
+            let data: Value = serde_json::from_str(&data?).ok()?;
+            Some((id, ts, message_usage(&data)?))
+        })
+        .collect();
+    let mut spent = spent.into_iter().peekable();
+
+    // Group text parts by message id, concatenating with \n.
+    let rows = msg_stmt.query_map(params![session_id], |r| {
+        Ok((
+            r.get::<_, String>(0)?,         // message id
+            r.get::<_, Option<String>>(1)?, // role
+            r.get::<_, Option<i64>>(2)?,    // time_created
+            r.get::<_, Option<String>>(3)?, // text
+        ))
+    })?;
+
+    let mut grouped: Vec<GroupedMessage> = Vec::new();
+    for row in rows {
+        let (msg_id, role, ts, text) = row?;
+        if let Some(last) = grouped.last_mut() {
+            if last.0 == msg_id {
+                if let Some(t) = text {
+                    let t = t.trim().to_string();
+                    if !t.is_empty() {
+                        last.3.push(t);
+                    }
+                }
+                continue;
+            }
+        }
+        let mut parts = Vec::new();
+        if let Some(t) = text {
+            let t = t.trim().to_string();
+            if !t.is_empty() {
+                parts.push(t);
+            }
+        }
+        grouped.push((msg_id, role, ts, parts));
+    }
+
+    let mut thread = ParsedThread::default();
+    let mut first_user: Option<String> = None;
+
+    for (msg_id, role, ts_ms, parts) in grouped {
+        // Usage of the text-less messages ordered before this one goes on the last message.
+        while let Some((id, at, _)) = spent.peek() {
+            if (*at, id.as_str()) >= (ts_ms, msg_id.as_str()) {
+                break;
+            }
+            let (_, _, u) = spent.next().expect("peeked");
+            thread.attach_usage(None, u);
+        }
+        let own = spent.next_if(|(id, _, _)| *id == msg_id).map(|(_, _, u)| u);
+        let role = match role.as_deref() {
+            Some("assistant") => "assistant",
+            Some("user") => "user",
+            _ => continue,
+        };
+        let text = parts.join("\n");
+        let at = if text.is_empty() {
+            None
+        } else {
+            if role == "user" && first_user.is_none() {
+                first_user = Some(text.clone());
+            }
+            thread.messages.push(ParsedMessage {
+                role: role.to_string(),
+                text,
+                tool_name: None,
+                ts: ts_ms.map(|ms| ms / 1000),
+            });
+            Some(thread.messages.len() - 1)
+        };
+        if let Some(u) = own {
+            thread.attach_usage(at, u);
+        }
+    }
+    for (_, _, u) in spent {
+        thread.attach_usage(None, u);
+    }
+    let ParsedThread {
+        messages, usage, ..
+    } = thread;
+
+    if messages.is_empty() {
+        return Ok(None);
+    }
+
+    let created_at = time_created.map(|ms| ms / 1000);
+    let updated_at = time_updated.map(|ms| ms / 1000);
+    let title = title
+        .as_deref()
+        .filter(|t| !t.trim().is_empty())
+        .map(str::to_string)
+        .or_else(|| first_user.as_deref().map(truncate_title));
+    let is_subagent = parent_id.is_some();
+
+    let thread = ParsedThread {
+        external_id: session_id.clone(),
+        title,
+        project_path: directory
+            .as_deref()
+            .filter(|d| !d.is_empty())
+            .map(str::to_string),
+        git_branch: None,
+        created_at,
+        updated_at,
+        is_subagent,
+        usage,
+        messages,
+    };
+    Ok(Some(thread))
 }
 
 fn scan_root(conn: &mut Connection, root: &Path, tick: &mut dyn FnMut()) -> Result<IndexReport> {
@@ -345,7 +421,48 @@ fn index_session(conn: &mut Connection, sid: i64, root: &Path, sf: &Path) -> Res
         }
     }
 
-    let mut messages: Vec<ParsedMessage> = Vec::new();
+    let Some(thread) = session_thread(root, &session, session_id) else {
+        // An empty session has no upsert that could fail: safe to record now.
+        set_file_state(conn, &key, KIND, fp_mtime, fp_count)?;
+        return Ok(Some(0));
+    };
+    let n = upsert_thread(conn, sid, &thread)?;
+    // Record the session fingerprint ONLY after the upsert succeeds, so a failed upsert
+    // (e.g. a transient write-lock) leaves the fingerprint stale and the next pass retries
+    // instead of silently skipping this session forever.
+    set_file_state(conn, &key, KIND, fp_mtime, fp_count)?;
+    Ok(Some(n))
+}
+
+/// The JSON tree's session file `sf`, read for the usage backfill
+/// (`indexer::usage_backfill`): the same thread [`index_session`] stores. The storage root
+/// is the directory above `session/`.
+pub(super) fn json_session_thread(sf: &Path) -> Result<Option<ParsedThread>> {
+    let Some(root) = sf
+        .ancestors()
+        .find(|a| a.file_name().is_some_and(|n| n == "session"))
+        .and_then(Path::parent)
+    else {
+        return Ok(None);
+    };
+    let session = read_json(sf).with_context(|| format!("reading {}", sf.display()))?;
+    let session_id = session
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| sf.file_stem().and_then(|s| s.to_str()).map(str::to_string))
+        .unwrap_or_default();
+    if session_id.is_empty() {
+        return Ok(None);
+    }
+    Ok(session_thread(root, &session, session_id))
+}
+
+/// Build one JSON-tree session's thread from its message and part files. None when it has
+/// no text messages.
+fn session_thread(root: &Path, session: &Value, session_id: String) -> Option<ParsedThread> {
+    let msg_dir = root.join("message").join(&session_id);
+    let mut thread = ParsedThread::default();
     let mut first_user: Option<String> = None;
     let mut max_ts: Option<i64> = None;
 
@@ -369,24 +486,33 @@ fn index_session(conn: &mut Connection, sid: i64, root: &Path, sf: &Path) -> Res
         let message_id = msg.get("id").and_then(Value::as_str).unwrap_or_default();
         let text = read_parts_text(root, message_id);
         let text = text.trim().to_string();
+        let usage = message_usage(&msg);
         if text.is_empty() {
+            // A turn of tool calls only: its tokens still count.
+            if let Some(u) = usage {
+                thread.attach_usage(None, u);
+            }
             continue;
         }
         if role == "user" && first_user.is_none() {
             first_user = Some(text.clone());
         }
-        messages.push(ParsedMessage {
+        thread.messages.push(ParsedMessage {
             role: role.to_string(),
             text,
             tool_name: None,
             ts,
         });
+        if let Some(u) = usage {
+            thread.attach_usage(Some(thread.messages.len() - 1), u);
+        }
     }
+    let ParsedThread {
+        messages, usage, ..
+    } = thread;
 
     if messages.is_empty() {
-        // Empty session has no upsert that could fail — safe to record now.
-        set_file_state(conn, &key, KIND, fp_mtime, fp_count)?;
-        return Ok(Some(0));
+        return None;
     }
 
     let created_at = session
@@ -418,15 +544,30 @@ fn index_session(conn: &mut Connection, sid: i64, root: &Path, sf: &Path) -> Res
         created_at,
         updated_at: max_ts.or(created_at),
         is_subagent: false,
-        usage: Vec::new(),
+        usage,
         messages,
     };
-    let n = upsert_thread(conn, sid, &thread)?;
-    // Record the session fingerprint ONLY after the upsert succeeds, so a failed upsert
-    // (e.g. a transient write-lock) leaves the fingerprint stale and the next pass retries
-    // instead of silently skipping this session forever.
-    set_file_state(conn, &key, KIND, fp_mtime, fp_count)?;
-    Ok(Some(n))
+    Some(thread)
+}
+
+/// An assistant message's model and tokens, or None for a user message or one that has
+/// not reported usage yet (all zero while it streams).
+fn message_usage(msg: &Value) -> Option<MsgUsage> {
+    if msg.get("role").and_then(Value::as_str) != Some("assistant") {
+        return None;
+    }
+    let model = msg.get("modelID").and_then(Value::as_str)?;
+    let t = msg.get("tokens")?;
+    let n = |v: Option<&Value>| v.and_then(Value::as_i64).unwrap_or(0).max(0);
+    let cache = t.get("cache");
+    let u = MsgUsage {
+        model: model.to_string(),
+        input: n(t.get("input")),
+        output: n(t.get("output")) + n(t.get("reasoning")),
+        cache_write: n(cache.and_then(|c| c.get("write"))),
+        cache_read: n(cache.and_then(|c| c.get("read"))),
+    };
+    (u.input + u.output + u.cache_write + u.cache_read > 0).then_some(u)
 }
 
 /// Concatenate the text of all `type:"text"` parts of a message, ordered by file.
@@ -639,6 +780,63 @@ mod tests {
         // Second scan with no changes is skipped.
         let report2 = scan_sqlite(&mut conn, &src, &mut || {}).unwrap();
         assert_eq!(report2.threads_indexed, 0);
+    }
+
+    /// Assistant messages carry `modelID` and `tokens`; a tool-only turn (no text part)
+    /// adds its usage to the last message instead of losing it.
+    #[test]
+    fn sqlite_messages_carry_usage() {
+        let src = temp_dir("oc_usage_src.db");
+        {
+            let c = Connection::open(&src).unwrap();
+            c.execute_batch(
+                "CREATE TABLE session (id TEXT PRIMARY KEY, title TEXT, directory TEXT, parent_id TEXT, time_created INTEGER, time_updated INTEGER);
+                 CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT);
+                 CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, data TEXT);
+                 INSERT INTO session VALUES ('s', 'Usage', '/p', NULL, 1, 2);
+                 INSERT INTO message VALUES
+                   ('m1', 's', 1000, json('{\"role\":\"user\"}')),
+                   ('m2', 's', 2000, json('{\"role\":\"assistant\",\"modelID\":\"claude-sonnet-4-5\",\"tokens\":{\"input\":10,\"output\":5,\"reasoning\":1,\"cache\":{\"read\":100,\"write\":20}}}')),
+                   ('m3', 's', 3000, json('{\"role\":\"assistant\",\"modelID\":\"claude-sonnet-4-5\",\"tokens\":{\"input\":7,\"output\":3,\"reasoning\":0,\"cache\":{\"read\":50,\"write\":0}}}'));
+                 INSERT INTO part VALUES
+                   ('p1', 'm1', json('{\"type\":\"text\",\"text\":\"go\"}')),
+                   ('p2', 'm2', json('{\"type\":\"text\",\"text\":\"working\"}')),
+                   ('p3', 'm3', json('{\"type\":\"tool\",\"tool\":\"bash\"}'));",
+            )
+            .unwrap();
+        }
+        let dst = temp_dir("oc_usage_dst.db");
+        let mut conn = crate::db::open(&dst).unwrap();
+        scan_sqlite(&mut conn, &src, &mut || {}).unwrap();
+        type Row = (i64, Option<String>, [Option<i64>; 4]);
+        let rows: Vec<Row> = conn
+            .prepare(
+                "SELECT seq, model, input_tokens, output_tokens, cache_write_tokens,
+                        cache_read_tokens
+                 FROM messages ORDER BY seq",
+            )
+            .unwrap()
+            .query_map([], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    [r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?],
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (0, None, [None; 4]),
+                (
+                    1,
+                    Some("claude-sonnet-4-5".into()),
+                    [Some(17), Some(9), Some(20), Some(150)]
+                ),
+            ]
+        );
     }
 
     /// Verify scan() dispatches: combined when both exist, JSON-only when no DB.

@@ -92,6 +92,28 @@ async function searchSelection(extensionUri: vscode.Uri): Promise<void> {
   await doSearch(extensionUri, false, sel || undefined);
 }
 
+/** "Why this line": the line under the cursor in a saved file on disk. */
+async function whyThisLine(sidebar: SidebarProvider): Promise<void> {
+  const editor = vscode.window.activeTextEditor;
+  if (editor?.document.uri.scheme !== "file") {
+    vscode.window.showInformationMessage(
+      "Callimachus: open a file from a git repository, put the cursor on a line, then run Why This Line.",
+    );
+    return;
+  }
+  // git blame reads the saved file, so unsaved edits would shift the line it explains.
+  if (editor.document.isDirty) {
+    const choice = await vscode.window.showWarningMessage(
+      "Callimachus: this file has unsaved changes, so the line may not match what git has. Save it first?",
+      "Save and continue",
+      "Continue",
+    );
+    if (!choice) return;
+    if (choice === "Save and continue") await editor.document.save();
+  }
+  await sidebar.why(editor.document.uri.fsPath, editor.selection.active.line + 1);
+}
+
 /** Prompt the user to pick a recent thread; returns its id. */
 async function pickThreadId(): Promise<number | undefined> {
   const rows = await recentThreads();
@@ -170,6 +192,10 @@ export function activate(context: vscode.ExtensionContext): void {
         const id = await resolveThreadId(arg);
         if (id !== undefined) await copyThreadById(id);
       }),
+    ),
+    vscode.commands.registerCommand(
+      "callimachus.whyLine",
+      guard(() => whyThisLine(sidebar)),
     ),
     vscode.commands.registerCommand("callimachus.refreshRecent", () => sidebar.refresh()),
     vscode.commands.registerCommand(
