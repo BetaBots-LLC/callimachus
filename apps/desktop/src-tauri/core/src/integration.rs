@@ -4081,11 +4081,36 @@ mod tests {
         let hooks: Value = serde_json::from_str(&read("hooks/hooks.json")).unwrap();
         assert_eq!(hooks["hooks"], Value::Object(expected));
 
+        // Anthropic's directory flags an `npx` package as a launcher it cannot read, so the npm
+        // launcher is vendored into the plugin, byte for byte, and run with node. It downloads
+        // the release named by its own package.json, which sync-versions.mjs stamps.
         let mcp: Value = serde_json::from_str(&read(".mcp.json")).unwrap();
         let version = env!("CALLIMACHUS_VERSION");
         assert_eq!(
             mcp["mcpServers"][MCP_NAME],
-            json!({"command": "npx", "args": ["-y", format!("callimachus-mcp@{version}")]})
+            json!({"command": "node", "args": ["${CLAUDE_PLUGIN_ROOT}/mcp/bin/callimachus-mcp.mjs"]})
+        );
+        let launcher: Value = serde_json::from_str(&read("mcp/package.json")).unwrap();
+        assert_eq!(launcher["version"], version);
+        let npm = root.join("../../packages/callimachus-mcp");
+        for rel in [
+            "bin/callimachus-mcp.mjs",
+            "lib/download.mjs",
+            "lib/install-cal.mjs",
+        ] {
+            assert!(
+                read(&format!("mcp/{rel}")) == std::fs::read_to_string(npm.join(rel)).unwrap(),
+                "plugins/claude-code/mcp/{rel} is a copy of packages/callimachus-mcp/{rel}"
+            );
+        }
+
+        // The directory listing's icon: the app's own 512 px PNG.
+        let icon = std::fs::read(root.join(".claude-plugin/icon.png")).unwrap();
+        assert!(icon.starts_with(b"\x89PNG\r\n\x1a\n"), "icon.png is a PNG");
+        let app_icon = Path::new(env!("CARGO_MANIFEST_DIR")).join("../icons/icon.png");
+        assert!(
+            icon == std::fs::read(app_icon).unwrap(),
+            "plugins/claude-code/.claude-plugin/icon.png is apps/desktop/src-tauri/icons/icon.png"
         );
 
         let manifest: Value = serde_json::from_str(&read(".claude-plugin/plugin.json")).unwrap();

@@ -123,11 +123,35 @@ test("SessionStart also runs the freshness guard, which starts cal index in the 
   assert.match(usage, /^ {2}cal index {2,}\S/m, "USAGE lists `  cal index` as the probe expects");
 });
 
-test("the MCP server is the npm launcher pinned to the release, under the app's server name", () => {
+test("the MCP server is the npm launcher vendored into the plugin, on the release, under the app's server name", () => {
+  // Anthropic's directory flags an `npx` package as a launcher it cannot read, so the plugin
+  // carries a byte copy of packages/callimachus-mcp and runs it with node. The copy downloads
+  // the release named by its own package.json, which sync-versions.mjs stamps.
   const mcp = readJson(plugin, ".mcp.json");
   assert.deepEqual(mcp.mcpServers, {
-    callimachus: { command: "npx", args: ["-y", `callimachus-mcp@${releaseVersion}`] },
+    callimachus: { command: "node", args: [`\${CLAUDE_PLUGIN_ROOT}/mcp/bin/callimachus-mcp.mjs`] },
   });
+  assert.equal(readJson(plugin, "mcp", "package.json").version, releaseVersion);
+  for (const rel of ["bin/callimachus-mcp.mjs", "lib/download.mjs", "lib/install-cal.mjs"]) {
+    assert.equal(
+      read(plugin, "mcp", rel),
+      read(root, "packages", "callimachus-mcp", rel),
+      `plugins/claude-code/mcp/${rel} is a copy of packages/callimachus-mcp/${rel}`,
+    );
+  }
+});
+
+test("the listing icon is the app's own PNG", () => {
+  // The directory wants a square PNG at .claude-plugin/icon.png, 512 to 2048 px, under 2 MB.
+  const icon = readFileSync(join(plugin, ".claude-plugin", "icon.png"));
+  assert.deepEqual([...icon.subarray(0, 8)], [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  assert.equal(icon.readUInt32BE(16), icon.readUInt32BE(20), "icon.png is square");
+  assert.ok(icon.readUInt32BE(16) >= 512 && icon.readUInt32BE(16) <= 2048, "icon.png size");
+  assert.ok(icon.length < 2 * 1024 * 1024, "icon.png is under 2 MB");
+  assert.ok(
+    icon.equals(readFileSync(join(root, "apps", "desktop", "src-tauri", "icons", "icon.png"))),
+    "icon.png is apps/desktop/src-tauri/icons/icon.png",
+  );
 });
 
 test("the skill is the bundled resource plus the plugin's fixed cal note", () => {

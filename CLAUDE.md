@@ -122,7 +122,8 @@ env -u CLAUDE_CONFIG_DIR -u CODEX_HOME HOME="$S/home" CALLIMACHUS_DB="$S/index.d
 - `integration::every_shipped_skill_is_recognized`: an edit to `resources/recall/SKILL.md` needs
   its printed hash in `SHIPPED_SKILL_HASHES`.
 - `integration::claude_plugin_mirrors_the_app_install`: the plugin's skill is a byte copy of
-  that file, and its `hooks/hooks.json` matches the base `HookSpec`s and the app's version.
+  that file, its `hooks/hooks.json` matches the base `HookSpec`s and the app's version, and
+  `plugins/claude-code/mcp/` is a byte copy of `packages/callimachus-mcp`'s `bin/` and `lib/`.
 - `command_surface_tests` (lib.rs): `generate_handler!` matches the `invoke` calls in `api.ts`.
 - `telemetry::privacy_policy_names_every_event` (reads `legal.ts`),
   `sidecar_entry_points_never_touch_telemetry`, `every_source_is_on_the_telemetry_allowlist`, and
