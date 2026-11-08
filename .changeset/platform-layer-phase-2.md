@@ -1,6 +1,6 @@
 ---
-"callimachus": patch
-"callimachus-vscode": patch
+"callimachus": minor
+"callimachus-vscode": minor
 ---
 
 The platform layer, second half: contracts other tools can depend on, a complete archive as vendors change formats, and the Claude Code plugin without the desktop app.
