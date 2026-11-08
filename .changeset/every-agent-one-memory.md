@@ -1,5 +1,5 @@
 ---
-"callimachus": patch
+"callimachus": minor
 ---
 
 Every agent, one memory: the memory Callimachus fills now reaches Codex and Gemini CLI through their own hooks, Callimachus installs into Claude Code in one step, the first run walks you to a connected and remembering setup, and Stats shows what it did for your agents.

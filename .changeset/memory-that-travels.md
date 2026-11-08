@@ -1,6 +1,6 @@
 ---
-"callimachus": patch
-"callimachus-vscode": patch
+"callimachus": minor
+"callimachus-vscode": minor
 ---
 
 Memory that travels: facts keep their identity, a project's memory can live in its repo, and the index answers "why is this line like this", "what did that cost" and "how did I fix this last time".

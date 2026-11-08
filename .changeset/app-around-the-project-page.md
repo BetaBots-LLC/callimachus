@@ -1,5 +1,5 @@
 ---
-"callimachus": patch
+"callimachus": minor
 ---
 
 The app around the Project page: fewer tabs, one home per repo, search that scopes to it, and a daily reason to open the app.

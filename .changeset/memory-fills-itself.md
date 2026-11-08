@@ -1,5 +1,5 @@
 ---
-"callimachus": patch
+"callimachus": minor
 ---
 
 Memory that fills itself: every memory surface now says something useful on day one, and the knowledge layer fills from what your agents already write.
