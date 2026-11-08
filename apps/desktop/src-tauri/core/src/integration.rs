@@ -3987,7 +3987,7 @@ mod tests {
 
     /// The repo's Claude Code plugin (plugins/claude-code) ships what `install()` would: the
     /// bundled skill byte for byte, the base hooks with the same events, matchers, timeouts and
-    /// subcommands (guarded like ours, run through the `cal` link the app installs) plus
+    /// subcommands (as scripts that run the `cal` link the app installs, guarded like ours) plus
     /// `PLUGIN_ONLY_HOOKS`, the MCP server under our name, and the app's version, which
     /// sync-versions.mjs keeps in step.
     #[test]
@@ -4010,7 +4010,10 @@ mod tests {
              plugin note"
         );
 
-        let cal = "\"$HOME/.local/bin/cal\"";
+        // Anthropic's directory allows no variable but `${CLAUDE_PLUGIN_ROOT}` in a hook
+        // command, so each plugin hook is a plain sh script in scripts/ that runs the linked
+        // `cal` and exits quietly without it (the app's own install writes that guard inline).
+        let cal = "~/.local/bin/cal";
         // A plugin-only hook also runs only when the linked `cal` lists its command in `cal
         // help`: the marketplace can update the plugin ahead of the app, and an older app's
         // `cal` answers an unknown command with exit 1, a hook error in every session.
@@ -4021,21 +4024,54 @@ mod tests {
                 crate::cli_core::USAGE.contains(&line),
                 "`cal help` must list `cal {cmd}` for the plugin's probe"
             );
-            format!("! {cal} help 2>/dev/null | grep -q '^  cal {cmd} ' || ")
+            format!("{cal} help 2>/dev/null | grep -q '^  cal {cmd} ' || exit 0\n")
         };
         let mut expected = Map::new();
         let plugin_only = PLUGIN_ONLY_HOOKS.iter().map(|s| (s, true));
         for (spec, probed) in BASE_HOOKS.iter().map(|s| (*s, false)).chain(plugin_only) {
+            let name = spec.subcommand.split(' ').next().unwrap();
+            let script = format!("scripts/{name}.sh");
+            let body = read(&script);
+            assert!(
+                body.starts_with("#!/bin/sh\n"),
+                "{script} is a plain sh script"
+            );
+            assert!(
+                body.contains(&format!("[ -x {cal} ] || exit 0\n")),
+                "{script} exits quietly when cal is not installed"
+            );
+            if probed {
+                assert!(
+                    body.contains(&probe(spec)),
+                    "{script} asks `cal help` first"
+                );
+            }
+            assert!(
+                body.ends_with(&format!("exec {cal} {}\n", spec.subcommand)),
+                "{script} ends by running `cal {}`",
+                spec.subcommand
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(root.join(&script))
+                    .unwrap()
+                    .permissions()
+                    .mode();
+                assert!(
+                    mode & 0o111 != 0,
+                    "{script} is executable (git keeps the mode)"
+                );
+            }
             let mut group = Map::new();
             if let Some(m) = spec.matcher {
                 group.insert("matcher".into(), json!(m));
             }
-            let guard = if probed { probe(spec) } else { String::new() };
             group.insert(
                 "hooks".into(),
                 json!([{
                     "type": "command",
-                    "command": format!("[ ! -x {cal} ] || {guard}{cal} {}", spec.subcommand),
+                    "command": format!("\"${{CLAUDE_PLUGIN_ROOT}}\"/{script}"),
                     "timeout": spec.timeout_secs,
                 }]),
             );

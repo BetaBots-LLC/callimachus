@@ -18,7 +18,8 @@ The Callimachus plugin gives Claude Code your past AI coding sessions as memory:
   `cal session-end` command the SessionEnd hook runs and do not step aside for the plugin, so
   memory would be injected twice. Keep the app updated: the marketplace serves the plugin from
   the latest release's tag, and its MCP server is pinned to that release.
-- **The `cal` CLI at `~/.local/bin/cal`**, which the hooks run. Open the app and click
+- **The `cal` CLI at `~/.local/bin/cal`**, which the hooks run (each hook is a short shell
+  script in the plugin's `scripts/` folder; read them to see exactly what runs). Open the app and click
   **Install the cal CLI** in Settings > Agents (with the plugin enabled, the Claude Code
   button installs only `cal`), or run `npx callimachus-mcp --install-cal`. Until `cal`
   exists, the hooks exit quietly and do nothing.
