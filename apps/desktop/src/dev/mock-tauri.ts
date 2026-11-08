@@ -489,8 +489,10 @@ let telemetry: TelemetryStatus = {
 const dataRoots: DataRoots = {
   claudeConfigDir: "",
   codexHome: "",
+  copilotHome: "",
   effectiveClaudeConfigDir: `${HOME}/.claude`,
   effectiveCodexHome: `${HOME}/.codex`,
+  effectiveCopilotHome: `${HOME}/.copilot`,
 };
 const jobs: JobsStatus = {
   index: SCENARIO.jobs === "indexing",
@@ -1599,6 +1601,10 @@ const handlers: Record<string, Handler> = {
     if (typeof a.codexHome === "string") {
       dataRoots.codexHome = a.codexHome;
       dataRoots.effectiveCodexHome = a.codexHome || `${HOME}/.codex`;
+    }
+    if (typeof a.copilotHome === "string") {
+      dataRoots.copilotHome = a.copilotHome;
+      dataRoots.effectiveCopilotHome = a.copilotHome || `${HOME}/.copilot`;
     }
     return { ...dataRoots };
   },

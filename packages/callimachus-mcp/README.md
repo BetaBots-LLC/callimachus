@@ -18,13 +18,13 @@ deleting each other's binary.
 
 ## Build the index first
 
-The MCP server reads the index that the **Callimachus desktop app** builds; it
-does not index your agent history by itself. Install the app from
+The MCP server reads the index that the **Callimachus desktop app** or the `cal`
+CLI builds; it does not index your agent history by itself. Install the app from
 [Releases](https://github.com/BetaBots-LLC/callimachus/releases/latest), open it
-once and let it index (**Index my history** on first launch). Until it has
-indexed, every read tool answers with a short setup notice instead of results. On
-a machine without the desktop app (a headless server, an SSH box, a Codespace)
-there is no index to search yet.
+once and let it index (**Index my history** on first launch), or, on a machine
+without the app (a headless server, an SSH box, a Codespace), install `cal` with
+this package and run `cal index` (see below). Until something has indexed, every
+read tool answers with a short setup notice instead of results.
 
 Keep this launcher and the app on the same release. Whichever opens the index
 first after an update upgrades it, and an older build can't open an upgraded
@@ -58,6 +58,33 @@ Code → Enable for Claude Code** registers the app itself (launched with `--mcp
 as Claude Code's MCP server, and **Settings → Other agents** does the same for
 Codex, Cursor and Gemini CLI.
 
+## The `cal` CLI without the app
+
+On macOS and Linux, this package also installs the `cal` CLI from the same
+release:
+
+```bash
+npx callimachus-mcp --install-cal
+cal index      # build the index (once)
+cal embed      # optional: the semantic index (downloads a 128 MB model once)
+cal watch      # optional: keep it fresh as agents write (a terminal or a login item)
+```
+
+`--install-cal` downloads `cal-<triple>` into the same cache, checks it against
+the same SHA-256 manifest, and links it at `~/.local/bin/cal`, where the Claude
+Code plugin's hooks and the VS Code extension look for it. It never replaces a
+`~/.local/bin/cal` that belongs to another program (a regular file, or a link to
+something else) and leaves a link to a Callimachus build (the desktop app, or
+one built from source) alone. In a shell where `~/.local/bin` comes first on
+`PATH`, the link shadows the system calendar's `/usr/bin/cal`. Each time the MCP
+server starts, a `cal` linked this way moves up to the server's release (never to
+an older one), so the two agree on the index schema unless a newer launcher on
+the same machine (an unpinned `npx -y callimachus-mcp` in another client) has
+moved `cal` ahead of a pinned server. The version `cal` runs from is never pruned
+from the cache. On Windows, install `cal` from the app
+(**Settings > Agents**) or download `cal-x86_64-pc-windows-msvc.exe` from the
+release.
+
 ## Supported platforms
 
 Prebuilt binaries are released for:
@@ -89,17 +116,15 @@ With nothing mounted, the image keeps an empty index of its own in `/data`.
 
 On another platform that ONNX Runtime supports, you can build it yourself from
 the tag that matches the launcher. You need Rust and, on Linux, the
-`pkg-config`, OpenSSL, D-Bus and `webkit2gtk-4.1` development packages (on
-Debian/Ubuntu: `pkg-config libssl-dev libdbus-1-dev libwebkit2gtk-4.1-dev`; the
-server lives in the desktop app's Tauri crate). As in the repo's
-Dockerfile, an empty `dist` directory stands in for the desktop frontend, which
-the MCP server never uses:
+`pkg-config`, OpenSSL and D-Bus development packages (on Debian/Ubuntu:
+`pkg-config libssl-dev libdbus-1-dev`). As in the repo's Dockerfile, the server
+builds from the Tauri-free `callimachus-standalone` crate, so neither GTK nor
+WebKit nor the desktop frontend is needed (`--bin cal` builds the CLI):
 
 ```bash
 git clone --depth 1 --branch v<version> https://github.com/BetaBots-LLC/callimachus
-cd callimachus/apps/desktop
-mkdir dist
-cargo build --release --locked --manifest-path src-tauri/Cargo.toml -p callimachus-standalone --bin callimachus-mcp
+cd callimachus
+cargo build --release --locked --manifest-path apps/desktop/src-tauri/Cargo.toml -p callimachus-standalone --bin callimachus-mcp
 ```
 
 Then point the launcher at it with

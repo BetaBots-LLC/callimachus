@@ -1,0 +1,119 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://callimachus.app/schemas/cal/stats.v1.json",
+  "title": "cal stats --json",
+  "description": "An overview of the whole index.",
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "description": "Major version of this payload's shape. A reader refuses a version newer than it knows.",
+      "minimum": 0
+    },
+    "threads": {
+      "type": "integer"
+    },
+    "messages": {
+      "type": "integer"
+    },
+    "embedded": {
+      "type": "integer"
+    },
+    "embeddable": {
+      "type": "integer"
+    },
+    "earliest": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "latest": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "perSource": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/SourceStat"
+      }
+    },
+    "perRole": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/RoleStat"
+      }
+    },
+    "topProjects": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ProjectStat"
+      }
+    }
+  },
+  "required": [
+    "schema_version",
+    "threads",
+    "messages",
+    "embedded",
+    "embeddable",
+    "earliest",
+    "latest",
+    "perSource",
+    "perRole",
+    "topProjects"
+  ],
+  "$defs": {
+    "SourceStat": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string"
+        },
+        "threads": {
+          "type": "integer"
+        },
+        "messages": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "kind",
+        "threads",
+        "messages"
+      ]
+    },
+    "RoleStat": {
+      "type": "object",
+      "properties": {
+        "role": {
+          "type": "string"
+        },
+        "messages": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "role",
+        "messages"
+      ]
+    },
+    "ProjectStat": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string"
+        },
+        "threads": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "project",
+        "threads"
+      ]
+    }
+  }
+}

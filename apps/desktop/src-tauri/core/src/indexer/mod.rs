@@ -9,6 +9,7 @@ pub mod codex;
 pub mod common;
 pub mod continue_cli;
 pub mod copilot;
+pub mod copilot_cli;
 pub mod cursor;
 pub mod gemini;
 pub mod goose;
@@ -134,7 +135,7 @@ pub const SOURCES: &[Source] = &[
     Source {
         kind: cursor::KIND,
         scan: cursor::scan,
-        caps_tool_output: false,
+        caps_tool_output: true,
     },
     Source {
         kind: gemini::KIND,
@@ -180,6 +181,11 @@ pub const SOURCES: &[Source] = &[
         kind: copilot::KIND,
         scan: copilot::scan,
         caps_tool_output: false,
+    },
+    Source {
+        kind: copilot_cli::KIND,
+        scan: copilot_cli::scan,
+        caps_tool_output: true,
     },
 ];
 
@@ -1630,7 +1636,9 @@ mod tests {
     /// would be undone (and the thread rewritten) on its next re-index.
     #[test]
     fn caps_tool_output_matches_the_indexers() {
-        use super::{claude, cline, codex, continue_cli, copilot, cursor, gemini, goose};
+        use super::{
+            claude, cline, codex, continue_cli, copilot, copilot_cli, cursor, gemini, goose,
+        };
         use super::{kilo, opencode, qwen, roo};
         for s in super::SOURCES {
             let code = match s.kind {
@@ -1645,6 +1653,7 @@ mod tests {
                 // Roo and Kilo run Cline's engine.
                 cline::KIND | roo::KIND | kilo::KIND => include_str!("cline.rs"),
                 copilot::KIND => include_str!("copilot.rs"),
+                copilot_cli::KIND => include_str!("copilot_cli.rs"),
                 other => panic!("add {other}'s indexer source here"),
             };
             assert_eq!(
@@ -1655,7 +1664,7 @@ mod tests {
             );
         }
         let capped: Vec<&str> = super::capped_tool_sources().collect();
-        assert!(capped.contains(&claude::KIND) && !capped.contains(&cursor::KIND));
+        assert!(capped.contains(&claude::KIND) && !capped.contains(&goose::KIND));
     }
 
     #[test]

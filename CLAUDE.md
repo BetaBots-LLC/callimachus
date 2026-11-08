@@ -26,8 +26,11 @@ and PR checks; this file is what an agent needs on top of that.
     `tauri build` bundles every app-crate bin (RELEASING.md).
   Adding an agent source: `core/src/indexer/README.md`.
 - `apps/desktop/src/`: React frontend; Tauri commands go through typed wrappers in `src/lib/api.ts`.
-- `apps/vscode/`: VS Code / Cursor extension; runs `cal ... --json` (`src/cal.ts`), a contract.
+- `apps/vscode/`: VS Code / Cursor extension; runs `cal ... --json` with `CAL_JSON_VERSION=1`
+  (`src/cal.ts`), a contract.
 - `apps/web/`: callimachus.app (TanStack Start). The privacy policy is `src/content/legal.ts`.
+- `schemas/cal/`, `schemas/mcp/`: the checked-in JSON Schemas of the versioned `cal --json-version 1`
+  outputs and of each MCP tool's `output_schema` (copies under `apps/web/public/schemas/`).
 - `packages/callimachus-mcp/`: npm launcher; downloads the release binary, checks `SHA256SUMS`.
 - `plugins/claude-code/`: the Claude Code plugin (catalog: `.claude-plugin/marketplace.json`).
   While it is enabled the app installs only `cal` (`integration::claude_plugin_managed`).
@@ -87,8 +90,8 @@ env -u CLAUDE_CONFIG_DIR -u CODEX_HOME HOME="$S/home" CALLIMACHUS_DB="$S/index.d
 ## Migrations
 
 - Add `src-tauri/migrations/00NN_<name>.sql` (the directory stays there, not under `core/`)
-  with the next number (0033) and register it in `core/src/db/migrations.rs`. Never edit a
-  committed migration (0001-0032): `rusqlite_migration` tracks only `user_version`, so an
+  with the next number (0034) and register it in `core/src/db/migrations.rs`. Never edit a
+  committed migration (0001-0033): `rusqlite_migration` tracks only `user_version`, so an
   edited file never re-runs on an index that already applied it.
 - An upgrade runs in whichever process opens the index first and holds the write lock, so time
   it on a large index (`db::migrate` pre-reads big files sequentially first, unless every pending
@@ -117,6 +120,13 @@ env -u CLAUDE_CONFIG_DIR -u CODEX_HOME HOME="$S/home" CALLIMACHUS_DB="$S/index.d
   in `core/src/indexer/mod.rs` `the_source_registry_matches_the_schema_and_telemetry` (its
   telemetry half is the allowlist test, since core cannot see telemetry) and
   `caps_tool_output_matches_the_indexers`.
+- `cli_contract::cal_json_schemas_match_the_checked_in_files` and
+  `mcp_server::mcp_output_schemas_match_the_checked_in_files` rewrite `schemas/cal/*.v1.json`,
+  `schemas/mcp/<tool>.json` and their copies under `apps/web/public/schemas/` when a shape
+  changes (commit them); `mcp_server::every_tool_answer_matches_its_output_schema` checks every
+  tool's structured content against its `output_schema`. Plain `--json` stays the bare,
+  unversioned shape the released VS Code extension reads; only `--json-version 1` /
+  `CAL_JSON_VERSION=1` gives the envelopes.
 
 ## Hooks and memory budgets
 
@@ -125,13 +135,17 @@ with an `export::MemoryBudget`: `HOOK` (SessionStart startup / clear, under Clau
 hook output cap), `COMPACT` (after compaction, snapshot carry), `AGENTS_FILE` (the managed
 AGENTS.md / CLAUDE.md block) and `MCP` (`project_memory`). Change sizes there, not at call sites.
 MCP transcript tools take a `budget` (`TRANSCRIPT_BUDGET_*` in `mcp_server.rs`, default 24k).
-Hook events, matchers and timeouts are the `HookSpec` consts in `integration.rs`. Hook commands
-(`hook`, `snapshot-hook`, `session-end`, `recall-now`) exit 0 silently on any error, never create
-an index and never migrate one;
+Hook events, matchers and timeouts are the `HookSpec` consts in `integration.rs` (the plugin's
+own SessionStart guard is `PLUGIN_ONLY_HOOKS` in its tests). Hook commands (`hook`,
+`snapshot-hook`, `session-end`, `recall-now`, `index --if-stale`) exit 0 silently on any error,
+never create an index and never migrate one themselves (`index --if-stale` starts a detached
+`cal index` only on a non-empty index; that pass upgrades the schema only when it runs from
+the npm launcher's `cal` with no app running, else it logs why to `index.db.index.log`);
 `cal`, hooks and the MCP server never download the model (`embed::Embedder::cached_only`); the
 one exception is `cal embed` without `--no-download`. `cal watch` refuses while the app holds
 `index.db.gui.lock`, the app's watcher waits while `cal watch` holds `index.db.watch.lock`, and
-nobody starts an auto-distill round while `index.db.distill.lock` is held (`locks`, one set of
+nobody starts an auto-distill round while `index.db.distill.lock` is held, and two `cal index`
+passes never overlap (`index.db.index.lock`) (`locks`, one set of
 lock files per index file). Text that leaves the machine (LLM prompts, MCP results, exports)
 goes through `context::redact_secrets`.
 

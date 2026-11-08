@@ -19,9 +19,9 @@ export const COMMERCIAL_MAILTO = `mailto:${CONTACT_EMAIL}?subject=Callimachus%20
 
 export const TAGLINE = "Your AI coding history, finally catalogued.";
 export const DESCRIPTION =
-  "Callimachus indexes and searches your AI coding-agent conversations across Claude Code, Codex, Cursor, Gemini and 8 more, in one fast, local, private catalogue. Desktop app, CLI, editor extension, and MCP server.";
+  "Callimachus indexes and searches your AI coding-agent conversations across Claude Code, Codex, Cursor, Gemini and 9 more, in one fast, local, private catalogue. Desktop app, CLI, editor extension, and MCP server.";
 
-// The 12 indexed agents, numbered like catalogue entries.
+// The 13 indexed agents, numbered like catalogue entries.
 export const SOURCES = [
   "Claude Code",
   "Codex",
@@ -35,6 +35,7 @@ export const SOURCES = [
   "Roo Code",
   "Kilo Code",
   "Copilot Chat",
+  "Copilot CLI",
 ] as const;
 
 export type ProductSlug = "desktop" | "vscode" | "cli" | "mcp";

@@ -492,8 +492,14 @@ pub fn pack_thread(
     let Some(detail) = search::thread_detail(conn, thread_id)? else {
         return Ok(None);
     };
-    let turns = prepare(&detail);
-    Ok(Some(pack_turns(&detail, &turns, budget_chars)))
+    Ok(Some(pack_thread_detail(&detail, budget_chars)))
+}
+
+/// [`pack_thread`] for a thread already loaded, so a caller that also needs its metadata
+/// (`cal cat --json`) reads the messages once.
+pub fn pack_thread_detail(detail: &search::ThreadDetail, budget_chars: usize) -> String {
+    let turns = prepare(detail);
+    pack_turns(detail, &turns, budget_chars)
 }
 
 /// The budget ladder over prepared turns (shared by `pack_thread` and the no-focus

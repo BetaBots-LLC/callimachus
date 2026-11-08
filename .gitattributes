@@ -1,0 +1,5 @@
+# The schema drift tests (cli_contract, mcp_server) compare these files byte for byte with
+# what the code generates, so a Windows checkout with core.autocrlf=true must not turn them
+# into CRLF.
+schemas/**/*.json text eol=lf
+apps/web/public/schemas/**/*.json text eol=lf

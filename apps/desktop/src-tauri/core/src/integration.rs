@@ -1207,6 +1207,7 @@ const SHIPPED_SKILL_HASHES: &[u64] = &[
     0x5047d4f99f7147e9, // fe1902e
     0xd572be1865981676, // version: 1.1.0 (first with the rendered CLI note)
     0x29e126dbe1770847, // version: 1.2.0 (Batch D: prompts, fallbacks, digest note)
+    0x57df09b3095b9add, // version: 1.2.1 (Batch G: recall results under `facts` when structured)
 ];
 
 /// Stable across builds and platforms, unlike `DefaultHasher`. Only identifies known texts.
@@ -2368,7 +2369,13 @@ fn inspect_cal_slot(link: &Path, exe: &Path) -> CalSlot {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => CalSlot::Missing,
         Err(e) => CalSlot::Foreign(format!("it couldn't be inspected: {e}")),
         Ok(meta) if meta.file_type().is_symlink() => match std::fs::read_link(link) {
-            Ok(target) if target == exe || mentions_callimachus(&target) => {
+            Ok(target)
+                if target == exe
+                    || (mentions_callimachus(&target)
+                        && !target
+                            .components()
+                            .any(|c| c.as_os_str() == "callimachus-mcp")) =>
+            {
                 let live = link.exists();
                 CalSlot::Ours { target, live }
             }
@@ -3868,10 +3875,27 @@ mod tests {
         assert_eq!(read_json(&cfg)["mcpServers"][MCP_NAME]["command"], "npx");
     }
 
+    /// Hooks only the plugin ships, after the base ones in its hooks.json. The SessionStart
+    /// guard keeps the index fresh for a plugin user without the app (`cal index
+    /// --if-stale`, see `headless::stale_index_gate`); the app's own install leaves it out,
+    /// since the app's watcher does that job. On `startup` and `resume`, the starts of real
+    /// work; `clear` and `compact` happen mid-session, after one of those already checked.
+    const PLUGIN_ONLY_HOOKS: [HookSpec; 1] = [HookSpec {
+        event: "SessionStart",
+        subcommand: "index --if-stale",
+        matcher: Some("startup|resume"),
+        // The guard probes three locks and at most reads one row; the pass runs detached.
+        timeout_secs: 5,
+        millis: false,
+        name: None,
+        powershell: false,
+    }];
+
     /// The repo's Claude Code plugin (plugins/claude-code) ships what `install()` would: the
     /// bundled skill byte for byte, the base hooks with the same events, matchers, timeouts and
-    /// subcommands (guarded like ours, run through the `cal` link the app installs), the MCP
-    /// server under our name, and the app's version, which sync-versions.mjs keeps in step.
+    /// subcommands (guarded like ours, run through the `cal` link the app installs) plus
+    /// `PLUGIN_ONLY_HOOKS`, the MCP server under our name, and the app's version, which
+    /// sync-versions.mjs keeps in step.
     #[test]
     fn claude_plugin_mirrors_the_app_install() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../../plugins/claude-code");
@@ -3893,21 +3917,36 @@ mod tests {
         );
 
         let cal = "\"$HOME/.local/bin/cal\"";
+        // A plugin-only hook also runs only when the linked `cal` lists its command in `cal
+        // help`: the marketplace can update the plugin ahead of the app, and an older app's
+        // `cal` answers an unknown command with exit 1, a hook error in every session.
+        let probe = |spec: &HookSpec| {
+            let cmd = spec.subcommand.split(' ').next().unwrap();
+            let line = format!("\n  cal {cmd} ");
+            assert!(
+                crate::cli_core::USAGE.contains(&line),
+                "`cal help` must list `cal {cmd}` for the plugin's probe"
+            );
+            format!("! {cal} help 2>/dev/null | grep -q '^  cal {cmd} ' || ")
+        };
         let mut expected = Map::new();
-        for spec in BASE_HOOKS {
+        let plugin_only = PLUGIN_ONLY_HOOKS.iter().map(|s| (s, true));
+        for (spec, probed) in BASE_HOOKS.iter().map(|s| (*s, false)).chain(plugin_only) {
             let mut group = Map::new();
             if let Some(m) = spec.matcher {
                 group.insert("matcher".into(), json!(m));
             }
+            let guard = if probed { probe(spec) } else { String::new() };
             group.insert(
                 "hooks".into(),
                 json!([{
                     "type": "command",
-                    "command": format!("[ ! -x {cal} ] || {cal} {}", spec.subcommand),
+                    "command": format!("[ ! -x {cal} ] || {guard}{cal} {}", spec.subcommand),
                     "timeout": spec.timeout_secs,
                 }]),
             );
-            expected.insert(spec.event.into(), json!([group]));
+            let groups = expected.entry(spec.event).or_insert_with(|| json!([]));
+            groups.as_array_mut().unwrap().push(Value::Object(group));
         }
         let hooks: Value = serde_json::from_str(&read("hooks/hooks.json")).unwrap();
         assert_eq!(hooks["hooks"], Value::Object(expected));

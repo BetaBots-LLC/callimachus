@@ -334,7 +334,7 @@ pub fn backfill_todos_once(db: &crate::db::Db, now: i64, pause: &dyn Fn() -> boo
 }
 
 /// An open TODO surfaced to the UI / agents, with the thread it came from.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct TodoFact {
     pub id: i64,
     #[serde(rename = "threadId")]
@@ -667,7 +667,7 @@ pub fn mark_for_redistill(conn: &Connection, thread_id: i64) -> Result<()> {
 }
 
 /// A single distilled fact for the thread view.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct KFact {
     pub id: i64,
     pub text: String,
@@ -675,7 +675,7 @@ pub struct KFact {
 }
 
 /// All distilled knowledge for one thread, grouped by kind, with freshness flags.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadKnowledge {
     pub summary: Option<String>,
@@ -758,7 +758,7 @@ pub fn get_thread_knowledge(conn: &Connection, thread_id: i64) -> Result<ThreadK
 }
 
 /// A semantically-recalled fact (decision/gotcha) with the thread it came from.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct RecallHit {
     pub id: i64,
     #[serde(rename = "threadId")]
@@ -773,6 +773,9 @@ pub struct RecallHit {
     pub rationale: Option<String>,
     pub similarity: f32,
     /// See [`TodoFact::extractor`].
+    #[schemars(
+        description = "Who wrote it: llm, heuristic, user, agent, or an importer such as claude-memory."
+    )]
     pub extractor: String,
     #[serde(rename = "originRef")]
     pub origin_ref: Option<String>,
@@ -1012,7 +1015,7 @@ fn fact_search_sql(
 /// guard. Distinct from `recall` (which returns individual decision/gotcha facts): this
 /// rolls the matching facts UP to their thread, so the answer is a short list of prior
 /// SESSIONS to revisit, each with the single most-relevant decision/gotcha as the reason.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PriorWork {
     pub thread_id: i64,
@@ -1104,7 +1107,7 @@ pub fn check_contradiction(
 pub(crate) const DISTILLABLE: &str = "is_subagent = 0 AND message_count >= 4";
 
 /// One distilled fact in a project's aggregated memory, with its source thread.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct MemoryFact {
     pub id: i64,
     #[serde(rename = "threadId")]
@@ -1126,7 +1129,7 @@ pub struct MemoryFact {
 
 /// Durable, aggregated knowledge for one project: decisions + gotchas + open TODOs
 /// distilled across all its threads, plus coverage so callers can prompt to distill more.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct ProjectMemory {
     pub project: String,
     pub decisions: Vec<MemoryFact>,

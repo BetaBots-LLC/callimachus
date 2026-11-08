@@ -7,6 +7,10 @@
 //! Set CALLIMACHUS_DB to point at a specific index.db; CALLIMACHUS_VAULT to a
 //! default Obsidian vault for `cal export`.
 
+use crate::cli_contract::{
+    AuditCommitThread, AuditFile, AuditFileThread, AuditKnowledge, AuditNotes, AuditPrOutput,
+    AuditSha, CatOutput, Listing, Versioned, CAL_SCHEMA_VERSION, JSON_VERSION_ENV,
+};
 use crate::{
     agent, context, cost, db, embed, export, gitlink, issues, knowledge, ledger, search, secrets,
     snapshot,
@@ -60,7 +64,9 @@ pub const COMMANDS: &[&str] = &[
     "--version",
 ];
 
-const USAGE: &str = "\
+/// `cal help`. The plugin's SessionStart guard greps it for `  cal index ` to tell a `cal`
+/// that has the command from an older one (see `claude_plugin_mirrors_the_app_install`).
+pub(crate) const USAGE: &str = "\
 cal — search your indexed AI coding-agent history
 
 USAGE:
@@ -68,7 +74,7 @@ USAGE:
   cal related [<text…>] [-s SOURCE] [-p PROJECT] [--starred] [-t TAG] [-n LIMIT] [--json]
                                 (text via args or stdin; semantic only)
   cal recent [-s SOURCE] [-p PROJECT] [--starred] [-t TAG] [-n LIMIT] [--json]
-  cal cat <thread-id>            (aliases: show, context)
+  cal cat <thread-id> [--json]   (aliases: show, context)
   cal stats [--json]
   cal export <thread-id> [--vault DIR] [--out FILE] [-S|--synthesize]
   cal star <thread-id> [--off]   star a thread (--off to unstar)
@@ -136,6 +142,9 @@ USAGE:
                                 handoff; AGENT defaults to claude, e.g. -a codex)
   cal index                     one pass over every agent's history into the index
                                 (for machines without the app; exit 1 on errors)
+  cal index --if-stale          start that pass in the background when the index is
+                                no pass in the last hour and neither the app nor `cal watch`
+                                runs (the Claude Code plugin's SessionStart hook)
   cal watch                     keep the index fresh as agents write (the app's
                                 watcher; refuses while the app runs)
   cal embed [--no-download]     build the semantic index; may download the model
@@ -159,7 +168,11 @@ OPTIONS:
   -o, --out FILE        write `export` output to FILE instead of a vault/stdout
   -S, --synthesize      prepend an LLM summary / decisions / gotchas / TODOs
                         to `export` (uses the first stored provider key)
-      --json            machine-readable JSON output
+      --json            machine-readable JSON output (unversioned: the shape
+                        may change in a future major release)
+      --json-version 1  the versioned JSON shapes, each opening with
+                        schema_version (also CAL_JSON_VERSION=1 beside --json);
+                        schemas at callimachus.app/schemas/cal/
       --raw             show stored text unredacted (query commands redact
                         secrets by default; cat, export and hooks always do)";
 
@@ -215,11 +228,7 @@ const HOOK_COMMANDS: &[&str] = &["hook", "snapshot-hook", "recall-now", "session
 /// Run the CLI and map the result to a process exit code (printing errors). Used
 /// by both the `cal` binary and the app's cal-mode dispatch.
 pub fn run_and_exit(args: &[String]) -> i32 {
-    if args
-        .first()
-        .is_some_and(|c| HOOK_COMMANDS.contains(&c.as_str()))
-        && !is_interactive_hook(args)
-    {
+    if is_silent_hook(args) {
         return run_hook_silently(args);
     }
     match run(args) {
@@ -234,6 +243,17 @@ pub fn run_and_exit(args: &[String]) -> i32 {
             eprintln!("cal: {e}");
             1
         }
+    }
+}
+
+/// A hook invocation: one of [`HOOK_COMMANDS`] (not run with an interactive flag), or `cal
+/// index --if-stale`, the plugin's SessionStart guard, which is a hook while a plain `cal
+/// index` is a command the user runs and wants errors from.
+fn is_silent_hook(args: &[String]) -> bool {
+    match args.first().map(String::as_str) {
+        Some(c) if HOOK_COMMANDS.contains(&c) => !is_interactive_hook(args),
+        Some("index") => args.len() == 2 && args[1] == crate::headless::INDEX_IF_STALE,
+        _ => false,
     }
 }
 
@@ -327,6 +347,11 @@ struct Opts {
     for_agent: Option<String>,
     /// `--raw`: print stored text as is instead of redacting secrets (see [`Opts::shown`]).
     raw: bool,
+    /// `--json-version N`, or `CAL_JSON_VERSION=N` beside `--json`: print the versioned
+    /// envelopes of [`crate::cli_contract`]. Without it `--json` prints the bare arrays and
+    /// objects it printed before versioning, which the VS Code extension already on the
+    /// Marketplace parses (it updates on its own schedule, not with the app).
+    json_version: Option<u32>,
     positional: Vec<String>,
 }
 
@@ -358,9 +383,50 @@ impl Opts {
         let v: serde_json::Value = serde_json::from_str(&compact)?;
         Ok(serde_json::to_string_pretty(&v)?)
     }
+
+    /// A list output (`search`, `recent`, `related`, `decisions`, `gotchas`, `commits`): the
+    /// bare array, or with a JSON version the [`Listing`] envelope.
+    fn json_list<T: serde::Serialize>(&self, rows: &[T]) -> anyhow::Result<String> {
+        if self.json_version.is_some() {
+            self.json(&Listing::new(rows))
+        } else {
+            self.json(rows)
+        }
+    }
+
+    /// An object output (`stats`, `memory`): the bare object, or with a JSON version its
+    /// fields after `schema_version` ([`Versioned`]).
+    fn json_object<T: serde::Serialize>(&self, value: &T) -> anyhow::Result<String> {
+        if self.json_version.is_some() {
+            self.json(&Versioned::new(value))
+        } else {
+            self.json(value)
+        }
+    }
+
+    /// An output whose type carries `schema_version` itself (`cat`, `audit-pr`): without a
+    /// JSON version, the same object minus that field, as `audit-pr` printed before.
+    fn json_typed<T: serde::Serialize>(&self, value: &T) -> anyhow::Result<String> {
+        if self.json_version.is_some() {
+            return self.json(value);
+        }
+        let mut v = serde_json::to_value(value)?;
+        if let Some(obj) = v.as_object_mut() {
+            // shift_remove, not remove: with preserve_order, remove swaps the last key into
+            // the version's place at the front.
+            obj.shift_remove("schema_version");
+        }
+        self.json(&v)
+    }
 }
 
 fn parse(args: &[String]) -> anyhow::Result<Opts> {
+    parse_with(args, std::env::var(JSON_VERSION_ENV).ok().as_deref())
+}
+
+/// [`parse`] with the `CAL_JSON_VERSION` value passed in, so tests don't read the process
+/// environment.
+fn parse_with(args: &[String], env_json_version: Option<&str>) -> anyhow::Result<Opts> {
     let mut o = Opts::default();
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -393,12 +459,39 @@ fn parse(args: &[String]) -> anyhow::Result<Opts> {
             "--starred" => o.starred = true,
             "--off" => o.off = true,
             "--json" => o.json = true,
+            "--json-version" => {
+                o.json_version = Some(json_version(&next(&mut it, "--json-version")?)?);
+                o.json = true;
+            }
             "--raw" => o.raw = true,
             s if s.starts_with('-') && s.len() > 1 => anyhow::bail!("unknown flag '{s}'"),
             _ => o.positional.push(a.clone()),
         }
     }
+    // The variable picks the shape of JSON the caller already asked for; it never turns a
+    // human listing into JSON. The flag wins over it.
+    if o.json && o.json_version.is_none() {
+        o.json_version = env_json_version
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(json_version)
+            .transpose()?;
+    }
     Ok(o)
+}
+
+/// A requested envelope version, accepted only when this `cal` prints it: a reader that asked
+/// for a newer version gets an error naming the fix, never an older shape it would misread.
+fn json_version(v: &str) -> anyhow::Result<u32> {
+    match v.parse::<u32>() {
+        Ok(CAL_SCHEMA_VERSION) => Ok(CAL_SCHEMA_VERSION),
+        Ok(n) if n > CAL_SCHEMA_VERSION => anyhow::bail!(
+            "this cal prints JSON version {CAL_SCHEMA_VERSION}, not {n}: update Callimachus"
+        ),
+        _ => anyhow::bail!(
+            "--json-version (or {JSON_VERSION_ENV}) must be {CAL_SCHEMA_VERSION}, got '{v}'"
+        ),
+    }
 }
 
 fn next(it: &mut std::slice::Iter<'_, String>, flag: &str) -> anyhow::Result<String> {
@@ -502,7 +595,7 @@ fn search_output(conn: &Connection, o: &Opts) -> anyhow::Result<String> {
                 }
             }
         }
-        return Ok(format!("{}\n", o.json(&hits)?));
+        return Ok(format!("{}\n", o.json_list(&hits)?));
     }
     if hits.is_empty() {
         eprintln!("no matches for {query:?}");
@@ -542,7 +635,7 @@ fn cmd_related(args: &[String]) -> anyhow::Result<()> {
     let rows = search::related(&conn, &embedder, &text, &filters(&o))?;
 
     if o.json {
-        println!("{}", o.json(&rows)?);
+        println!("{}", o.json_list(&rows)?);
         return Ok(());
     }
     if rows.is_empty() {
@@ -574,7 +667,7 @@ fn recent_output(conn: &Connection, o: &Opts) -> anyhow::Result<String> {
     let rows = search::recent_threads(conn, &filters(o))?;
 
     if o.json {
-        return Ok(format!("{}\n", o.json(&rows)?));
+        return Ok(format!("{}\n", o.json_list(&rows)?));
     }
     if rows.is_empty() {
         eprintln!("no threads indexed yet");
@@ -800,7 +893,7 @@ fn cmd_memory(args: &[String]) -> anyhow::Result<()> {
     let conn = open_db()?;
     let mem = knowledge::get_project_memory(&conn, &project, o.limit.unwrap_or(40) as usize)?;
     if o.json {
-        println!("{}", o.json(&mem)?);
+        println!("{}", o.json_object(&mem)?);
         return Ok(());
     }
     println!(
@@ -1728,20 +1821,19 @@ fn cmd_check(args: &[String]) -> anyhow::Result<()> {
 /// show the timeline. Run inside a git repo, or pass its path.
 /// Compact distilled knowledge for one thread (summary + decision/gotcha/todo texts), as JSON.
 /// Null when the thread has no knowledge row. Used to inline reasoning into the audit bundle.
-fn audit_thread_knowledge(conn: &Connection, id: i64) -> serde_json::Value {
-    match knowledge::get_thread_knowledge(conn, id) {
-        Ok(k) => serde_json::json!({
-            "summary": k.summary,
-            "decisions": k.decisions.iter().map(|f| f.text.clone()).collect::<Vec<_>>(),
-            "gotchas": k.gotchas.iter().map(|f| f.text.clone()).collect::<Vec<_>>(),
-            "openTodos": k.todos.iter().map(|f| f.text.clone()).collect::<Vec<_>>(),
-            "extracted": k.extracted,
-            // A changed thread keeps its old facts with `extracted: false`; `stale` says they
-            // predate the latest turns rather than being absent.
-            "stale": k.stale,
-        }),
-        Err(_) => serde_json::Value::Null,
-    }
+fn audit_thread_knowledge(conn: &Connection, id: i64) -> Option<AuditKnowledge> {
+    let k = knowledge::get_thread_knowledge(conn, id).ok()?;
+    let texts = |facts: &[knowledge::KFact]| facts.iter().map(|f| f.text.clone()).collect();
+    Some(AuditKnowledge {
+        summary: k.summary,
+        decisions: texts(&k.decisions),
+        gotchas: texts(&k.gotchas),
+        open_todos: texts(&k.todos),
+        extracted: k.extracted,
+        // A changed thread keeps its old facts with `extracted: false`; `stale` says they
+        // predate the latest turns rather than being absent.
+        stale: k.stale,
+    })
 }
 
 /// `cal audit-pr <repo> --changed-files a,b --shas s1,s2` — the one-call PR-audit bundle for an
@@ -1756,6 +1848,10 @@ fn cmd_audit_pr(args: &[String]) -> anyhow::Result<()> {
     let mut shas: Vec<String> = Vec::new();
     let mut cap: i64 = 5; // per-file / per-sha thread cap
     let mut raw = false;
+    // JSON is this command's only output, so the variable always applies here.
+    let mut json_version_arg = std::env::var(JSON_VERSION_ENV)
+        .ok()
+        .filter(|v| !v.trim().is_empty());
     let split = |v: &str| -> Vec<String> {
         v.split(',')
             .map(|s| s.trim().to_string())
@@ -1782,12 +1878,24 @@ fn cmd_audit_pr(args: &[String]) -> anyhow::Result<()> {
                 cap = args.get(i).and_then(|v| v.parse().ok()).unwrap_or(cap);
             }
             "--json" => {} // JSON is this command's only output
+            "--json-version" => {
+                i += 1;
+                json_version_arg = Some(
+                    args.get(i)
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!("--json-version needs a value"))?,
+                );
+            }
             "--raw" => raw = true,
             s if !s.starts_with('-') && repo.is_none() => repo = Some(s.to_string()),
             _ => {}
         }
         i += 1;
     }
+    let json_version = json_version_arg
+        .as_deref()
+        .map(|v| json_version(v.trim()))
+        .transpose()?;
     let repo = repo.unwrap_or_else(cwd_git_root);
     let key = knowledge::project_key(&repo);
 
@@ -1799,7 +1907,7 @@ fn cmd_audit_pr(args: &[String]) -> anyhow::Result<()> {
         .unwrap_or(false);
 
     // One distilled-knowledge lookup per referenced thread, deduped across shas + files.
-    let mut kcache: std::collections::HashMap<i64, serde_json::Value> =
+    let mut kcache: std::collections::HashMap<i64, Option<AuditKnowledge>> =
         std::collections::HashMap::new();
 
     // 1. Commit provenance: per input sha → originating thread(s) + reasoning. Empty array, not
@@ -1818,18 +1926,19 @@ fn cmd_audit_pr(args: &[String]) -> anyhow::Result<()> {
         let produced: Vec<_> = commit_threads
             .iter()
             .filter(|c| !needle.is_empty() && c.sha.to_ascii_lowercase().starts_with(&needle))
-            .map(|c| {
-                serde_json::json!({
-                    "id": c.thread_id,
-                    "title": c.title,
-                    "overlap": c.overlap,
-                    "knowledge": kcache.get(&c.thread_id).cloned().unwrap_or(serde_json::Value::Null),
-                })
+            .map(|c| AuditCommitThread {
+                id: c.thread_id,
+                title: c.title.clone(),
+                overlap: c.overlap,
+                knowledge: kcache.get(&c.thread_id).cloned().flatten(),
             })
             .collect();
+        // A JSON map keeps the caller's sha order (serde_json's preserve_order).
         by_sha.insert(
             sha.clone(),
-            serde_json::json!({ "threadsProduced": produced }),
+            serde_json::to_value(AuditSha {
+                threads_produced: produced,
+            })?,
         );
     }
 
@@ -1842,17 +1951,15 @@ fn cmd_audit_pr(args: &[String]) -> anyhow::Result<()> {
                 .entry(t.id)
                 .or_insert_with(|| audit_thread_knowledge(&conn, t.id));
         }
-        let arr: Vec<_> = threads
+        let threads = threads
             .iter()
-            .map(|t| {
-                serde_json::json!({
-                    "id": t.id,
-                    "title": t.title,
-                    "knowledge": kcache.get(&t.id).cloned().unwrap_or(serde_json::Value::Null),
-                })
+            .map(|t| AuditFileThread {
+                id: t.id,
+                title: t.title.clone(),
+                knowledge: kcache.get(&t.id).cloned().flatten(),
             })
             .collect();
-        by_file.insert(path.clone(), serde_json::json!({ "threads": arr }));
+        by_file.insert(path.clone(), serde_json::to_value(AuditFile { threads })?);
     }
 
     // 3. Repo-scoped recurring errors (no error→file edge exists; the caller intersects with the
@@ -1861,26 +1968,28 @@ fn cmd_audit_pr(args: &[String]) -> anyhow::Result<()> {
     let errors = issues::recurring_issues(&conn, Some(&key), since, 20).unwrap_or_default();
     let memory = knowledge::get_project_memory(&conn, &key, 20).ok();
 
-    let bundle = serde_json::json!({
-        "repo": key,
-        "bySha": by_sha,
-        "byFile": by_file,
-        "recurringErrors": errors,
-        "projectMemory": memory,
-        "notes": {
-            "distillationEnabled": distill_on,
-            "linksRefreshed": links_refreshed,
+    let bundle = AuditPrOutput {
+        schema_version: CAL_SCHEMA_VERSION,
+        repo: key,
+        by_sha,
+        by_file,
+        recurring_errors: errors,
+        project_memory: memory,
+        notes: AuditNotes {
+            distillation_enabled: distill_on,
+            links_refreshed,
             // When false, knowledge fields above are null but provenance/file-touch/TODOs/errors
-            // still populate — the bundle is meant to degrade, not fail.
-            "threadKnowledgeAvailable": distill_on,
+            // still populate: the bundle is meant to degrade, not fail.
+            thread_knowledge_available: distill_on,
         },
-    });
+    };
     // Titles, distilled reasoning, error signatures and memory, all for another agent.
     let out = Opts {
         raw,
+        json_version,
         ..Opts::default()
     };
-    println!("{}", out.json(&bundle)?);
+    println!("{}", out.json_typed(&bundle)?);
     Ok(())
 }
 
@@ -1896,7 +2005,7 @@ fn cmd_commits(args: &[String]) -> anyhow::Result<()> {
     let n = gitlink::link_project(&conn, &repo)?;
     let rows = gitlink::commit_timeline(&conn, &key, o.limit.unwrap_or(40) as usize)?;
     if o.json {
-        println!("{}", o.json(&rows)?);
+        println!("{}", o.json_list(&rows)?);
         return Ok(());
     }
     if rows.is_empty() {
@@ -2002,12 +2111,18 @@ fn cmd_recall(args: &[String], kind: &str) -> anyhow::Result<()> {
     let conn = open_db()?;
     let embedder = cli_embedder();
     let Some(qv) = embed::embed_query(&embedder, &query)? else {
+        // No vector (the model isn't on this machine; cli_embedder said so on stderr). The
+        // versioned listing says so in `notice`, so a script can tell it from no match; bare
+        // `--json` prints nothing here, as it always has.
+        if o.json_version.is_some() {
+            println!("{}", o.json(&recall_without_model())?);
+        }
         return Ok(());
     };
     let limit = o.limit.unwrap_or(20) as usize;
     let hits = knowledge::recall(&conn, &qv, kind, o.project.as_deref(), limit)?;
     if o.json {
-        println!("{}", o.json(&hits)?);
+        println!("{}", o.json_list(&hits)?);
         return Ok(());
     }
     if hits.is_empty() {
@@ -2061,6 +2176,14 @@ fn cmd_similar(args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `cal decisions` / `gotchas --json-version 1` on a machine without the embedding model.
+fn recall_without_model() -> Listing<'static, knowledge::RecallHit> {
+    Listing::new(&[]).with_notice(
+        "the embedding model isn't on this machine, so nothing could be recalled: open \
+         Callimachus and build the semantic index, or run `cal embed`",
+    )
+}
+
 fn cmd_cat(args: &[String]) -> anyhow::Result<()> {
     let o = parse(args)?;
     let id: i64 = o
@@ -2070,10 +2193,33 @@ fn cmd_cat(args: &[String]) -> anyhow::Result<()> {
         .parse()
         .map_err(|_| anyhow::anyhow!("thread id must be a number"))?;
     let conn = open_db()?;
-    let packed = context::pack_thread(&conn, id, context::DEFAULT_BUDGET_CHARS)?
-        .ok_or_else(|| anyhow::anyhow!("thread {id} not found"))?;
-    println!("{packed}");
+    println!("{}", cat_output(&conn, id, &o)?);
     Ok(())
+}
+
+/// `cal cat`'s stdout: the packed transcript, or with `--json` the thread's identity plus it.
+fn cat_output(conn: &Connection, id: i64, o: &Opts) -> anyhow::Result<String> {
+    let detail =
+        search::thread_detail(conn, id)?.ok_or_else(|| anyhow::anyhow!("thread {id} not found"))?;
+    let packed = context::pack_thread_detail(&detail, context::DEFAULT_BUDGET_CHARS);
+    if !o.json {
+        return Ok(packed);
+    }
+    let out = CatOutput {
+        schema_version: CAL_SCHEMA_VERSION,
+        id: detail.id,
+        source: detail.source,
+        title: detail.title,
+        project_path: detail.project_path,
+        updated_at: detail.updated_at,
+        markdown: packed,
+    };
+    // Redacted even with --raw: `cat` never honors it (see `Opts::shown`).
+    Opts {
+        json_version: o.json_version,
+        ..Opts::default()
+    }
+    .json_typed(&out)
 }
 
 fn cmd_stats(args: &[String]) -> anyhow::Result<()> {
@@ -2082,7 +2228,7 @@ fn cmd_stats(args: &[String]) -> anyhow::Result<()> {
     let s = search::stats(&conn)?;
 
     if o.json {
-        println!("{}", o.json(&s)?);
+        println!("{}", o.json_object(&s)?);
         return Ok(());
     }
 
@@ -2811,6 +2957,60 @@ mod tests {
         assert_eq!(o.positional, vec!["auth", "bug"]);
     }
 
+    /// Only an explicit request gets the versioned envelope: the flag, or the variable beside
+    /// `--json`. The variable never turns human output into JSON, and a version this `cal`
+    /// can't print is an error rather than an older shape.
+    #[test]
+    fn json_version_comes_from_the_flag_or_the_environment() {
+        let p = |args: &[&str], env: Option<&str>| parse_with(&argv(args), env);
+        assert_eq!(p(&["--json"], None).unwrap().json_version, None);
+        let o = p(&["--json-version", "1"], None).unwrap();
+        assert!(o.json, "the flag implies --json");
+        assert_eq!(o.json_version, Some(1));
+        assert_eq!(p(&["--json"], Some("1")).unwrap().json_version, Some(1));
+        assert_eq!(p(&["--json"], Some(" ")).unwrap().json_version, None);
+        let human = p(&["auth"], Some("1")).unwrap();
+        assert!(!human.json && human.json_version.is_none());
+        let newer = p(&["--json-version", "2"], None).err().unwrap().to_string();
+        assert!(newer.contains("update Callimachus"), "{newer}");
+        assert!(p(&["--json"], Some("v1")).is_err());
+        assert!(p(&["--json-version"], None).is_err());
+    }
+
+    /// Plain `--json` prints what it printed before versioning: a bare array for a list, the
+    /// bare object for `stats` / `memory`, and `cat` / `audit-pr` without `schema_version`.
+    #[test]
+    fn bare_json_keeps_the_unversioned_shapes() {
+        let bare = parse_with(&argv(&["--json"]), None).unwrap();
+        let v1 = parse_with(&argv(&["--json-version", "1"]), None).unwrap();
+        let rows = [1, 2];
+        assert_eq!(bare.json_list(&rows).unwrap(), "[\n  1,\n  2\n]");
+        let listed: serde_json::Value =
+            serde_json::from_str(&v1.json_list(&rows).unwrap()).unwrap();
+        assert_eq!(
+            listed,
+            serde_json::json!({ "schema_version": 1, "results": [1, 2] })
+        );
+
+        let obj = serde_json::json!({ "threads": 3 });
+        assert_eq!(bare.json_object(&obj).unwrap(), "{\n  \"threads\": 3\n}");
+        let versioned: serde_json::Value =
+            serde_json::from_str(&v1.json_object(&obj).unwrap()).unwrap();
+        assert_eq!(
+            versioned,
+            serde_json::json!({ "schema_version": 1, "threads": 3 })
+        );
+
+        let typed = serde_json::json!({ "schema_version": 1, "repo": "/r", "notes": {} });
+        let stripped = bare.json_typed(&typed).unwrap();
+        assert!(stripped.starts_with("{\n  \"repo\""), "{stripped}");
+        assert!(!stripped.contains("schema_version"), "{stripped}");
+        assert!(v1
+            .json_typed(&typed)
+            .unwrap()
+            .contains("\"schema_version\": 1"));
+    }
+
     #[test]
     fn parse_repeats_tags_and_reads_limit() {
         let o = parse(&argv(&["-t", "a", "--tag", "b", "-n", "5", "--starred"])).unwrap();
@@ -2877,15 +3077,26 @@ mod tests {
             crate::indexer::upsert_thread(&mut conn, sid, &t).unwrap();
         }
         type Cmd = fn(&Connection, &Opts) -> anyhow::Result<String>;
-        let run = |cmd: Cmd, args: &[&str]| cmd(&conn, &parse(&argv(args)).unwrap()).unwrap();
+        let run =
+            |cmd: Cmd, args: &[&str]| cmd(&conn, &parse_with(&argv(args), None).unwrap()).unwrap();
         let assert_scrubbed = |out: &str| {
             assert!(out.contains("[REDACTED]"), "{out}");
             assert!(!out.contains(KEY_TAIL), "{out}");
         };
 
-        let json = run(search_output, &["gateway", "--json"]);
+        // The versioned envelope and the bare array are redacted alike.
+        let bare = run(search_output, &["gateway", "--json"]);
+        assert_scrubbed(&bare);
+        let json = run(search_output, &["gateway", "--json-version", "1"]);
         assert_scrubbed(&json);
-        let hits: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
+        let out: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(out["schema_version"], CAL_SCHEMA_VERSION);
+        let hits = out["results"].as_array().unwrap();
+        let bare: serde_json::Value = serde_json::from_str(&bare).unwrap();
+        assert_eq!(
+            &bare, &out["results"],
+            "bare --json is the envelope's results"
+        );
         let leaky = hits
             .iter()
             .find(|h| h["title"] == "wire the gateway with [REDACTED]");
@@ -2927,6 +3138,179 @@ mod tests {
             run(recent_output, &["--json"]),
             raw_json.replace(KEY, "[REDACTED]")
         );
+    }
+
+    /// Every versioned `--json` output matches the schema published for it (`schemas/cal/`):
+    /// the real outputs on a seeded index, and built rows for the commands that need a git
+    /// repo or the embedding model to produce any.
+    #[test]
+    fn json_outputs_match_their_published_schemas() {
+        let schema = |cmd: &str| {
+            crate::cli_contract::schemas()
+                .into_iter()
+                .find(|s| s.command == cmd)
+                .unwrap_or_else(|| panic!("no schema for {cmd}"))
+                .schema
+        };
+        let check = |cmd: &str, out: &str| {
+            let v: serde_json::Value =
+                serde_json::from_str(out).unwrap_or_else(|e| panic!("{cmd}: {e}: {out}"));
+            if let Err(e) = crate::schema_check::validate(&schema(cmd), &v) {
+                panic!("cal {cmd} --json: {e}\n{out}");
+            }
+        };
+        let json = |v: &dyn erased::Json| v.to_json();
+        let mut conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let sid = crate::indexer::source_id(&conn, "claude_code").unwrap();
+        let t = crate::indexer::ParsedThread {
+            external_id: "t1".into(),
+            title: Some("auth token refresh".into()),
+            project_path: Some("/proj/app".into()),
+            messages: vec![
+                crate::indexer::ParsedMessage {
+                    role: "user".into(),
+                    text: "how do we refresh the auth token".into(),
+                    tool_name: None,
+                    ts: Some(1_000),
+                },
+                crate::indexer::ParsedMessage {
+                    role: "assistant".into(),
+                    text: "rotate the refresh token on a 401".into(),
+                    tool_name: None,
+                    ts: Some(1_050),
+                },
+            ],
+            ..Default::default()
+        };
+        crate::indexer::upsert_thread(&mut conn, sid, &t).unwrap();
+        knowledge::record_fact(
+            &conn,
+            "/proj/app",
+            "decision",
+            "rotate refresh tokens",
+            Some("a stolen token dies on next use"),
+            1_100,
+        )
+        .unwrap();
+        let o = |args: &[&str]| parse_with(&argv(args), None).unwrap();
+
+        check(
+            "search",
+            &search_output(&conn, &o(&["refresh", "--json-version", "1"])).unwrap(),
+        );
+        check(
+            "recent",
+            &recent_output(&conn, &o(&["--json-version", "1"])).unwrap(),
+        );
+        let rows = search::recent_threads(&conn, &filters(&o(&[]))).unwrap();
+        check("related", &json(&Listing::new(&rows)));
+        let id = rows.iter().find(|r| r.message_count == 2).unwrap().id;
+        let cat = cat_output(&conn, id, &o(&["--json-version", "1"])).unwrap();
+        check("cat", &cat);
+        assert!(cat.contains("rotate the refresh token"), "{cat}");
+        check(
+            "stats",
+            &json(&Versioned::new(&search::stats(&conn).unwrap())),
+        );
+        let mem = knowledge::get_project_memory(&conn, "/proj/app", 40).unwrap();
+        assert_eq!(mem.decisions.len(), 1);
+        check("memory", &json(&Versioned::new(&mem)));
+
+        let hits = [knowledge::RecallHit {
+            id: 1,
+            thread_id: id,
+            kind: "decision".into(),
+            text: "rotate refresh tokens".into(),
+            source: "claude_code".into(),
+            title: None,
+            project_path: Some("/proj/app".into()),
+            rationale: None,
+            similarity: 0.8,
+            extractor: "llm".into(),
+            origin_ref: None,
+        }];
+        check("decisions", &json(&Listing::new(&hits)));
+        check("gotchas", &json(&Listing::<knowledge::RecallHit>::new(&[])));
+        let no_model = json(&recall_without_model());
+        assert!(no_model.contains("\"notice\""), "{no_model}");
+        check("decisions", &no_model);
+        let commits = [gitlink::TimelineRow {
+            sha: "abc123".into(),
+            short_sha: "abc123".into(),
+            subject: Some("fix: rotate tokens".into()),
+            committed_at: 1_200,
+            best_overlap: 2,
+            thread_count: 1,
+        }];
+        check("commits", &json(&Listing::new(&commits)));
+
+        let knowledge = Some(AuditKnowledge {
+            summary: None,
+            decisions: vec!["rotate refresh tokens".into()],
+            gotchas: vec![],
+            open_todos: vec![],
+            extracted: true,
+            stale: false,
+        });
+        let mut by_sha = serde_json::Map::new();
+        let produced = vec![AuditCommitThread {
+            id,
+            title: None,
+            overlap: 2,
+            knowledge: knowledge.clone(),
+        }];
+        by_sha.insert(
+            "abc".into(),
+            serde_json::to_value(AuditSha {
+                threads_produced: produced,
+            })
+            .unwrap(),
+        );
+        let mut by_file = serde_json::Map::new();
+        let threads = vec![AuditFileThread {
+            id,
+            title: Some("auth token refresh".into()),
+            knowledge: None,
+        }];
+        by_file.insert(
+            "src/auth.rs".into(),
+            serde_json::to_value(AuditFile { threads }).unwrap(),
+        );
+        let audit = AuditPrOutput {
+            schema_version: CAL_SCHEMA_VERSION,
+            repo: "/proj/app".into(),
+            by_sha,
+            by_file,
+            recurring_errors: vec![issues::IssueCluster {
+                example: "error[E0382]: borrow of moved value".into(),
+                count: 3,
+                threads: 2,
+                first_seen: 1_000,
+                last_seen: 1_300,
+                last_thread_id: id,
+            }],
+            project_memory: Some(mem),
+            notes: AuditNotes {
+                distillation_enabled: true,
+                links_refreshed: 1,
+                thread_knowledge_available: true,
+            },
+        };
+        let audit = json(&audit);
+        assert!(!audit.contains("lastThreadId"), "{audit}");
+        check("audit-pr", &audit);
+    }
+
+    /// Lets the schema test above print any envelope the way `--json` does.
+    mod erased {
+        pub trait Json {
+            fn to_json(&self) -> String;
+        }
+        impl<T: serde::Serialize> Json for T {
+            fn to_json(&self) -> String {
+                super::Opts::default().json(self).unwrap()
+            }
+        }
     }
 
     #[test]
@@ -3076,6 +3460,18 @@ mod tests {
         assert!(!is_interactive_hook(&argv(&["memory", "--mute"])));
         // A typed command shows its error: `--mute` with a bad flag fails visibly.
         assert_eq!(run_and_exit(&argv(&["hook", "--mute", "--nope"])), 1);
+    }
+
+    /// The plugin's SessionStart guard runs silently like the other hooks; a `cal index` the
+    /// user types (or one with a stray argument after the flag) shows its errors.
+    #[test]
+    fn index_if_stale_is_a_silent_hook_and_plain_index_is_not() {
+        assert!(is_silent_hook(&argv(&["index", "--if-stale"])));
+        assert!(is_silent_hook(&argv(&["session-end"])));
+        assert!(!is_silent_hook(&argv(&["index"])));
+        assert!(!is_silent_hook(&argv(&["index", "--if-stale", "x"])));
+        assert!(!is_silent_hook(&argv(&["hook", "--explain"])));
+        assert_eq!(run_and_exit(&argv(&["index", "--nope"])), 1);
     }
 
     // ---- SessionStart hook output ----

@@ -660,17 +660,20 @@ async fn compact_index(app: AppHandle) -> AppResult<jobs::CompactSummary> {
 }
 
 /// Relocated agent data roots, for Settings. A Finder/Dock-launched app never sees the
-/// shell's `CLAUDE_CONFIG_DIR` / `CODEX_HOME`, so these overrides are how such users point
-/// the indexer (and every other process that opens the index) at their real data.
+/// shell's `CLAUDE_CONFIG_DIR` / `CODEX_HOME` / `COPILOT_HOME`, so these overrides are how
+/// such users point the indexer (and every other process that opens the index) at their
+/// real data.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DataRoots {
     /// Saved override ("" = unset).
     claude_config_dir: String,
     codex_home: String,
+    copilot_home: String,
     /// What is actually used right now (override, else env var, else the default).
     effective_claude_config_dir: Option<String>,
     effective_codex_home: Option<String>,
+    effective_copilot_home: Option<String>,
 }
 
 fn data_roots(conn: &rusqlite::Connection) -> anyhow::Result<DataRoots> {
@@ -681,8 +684,10 @@ fn data_roots(conn: &rusqlite::Connection) -> anyhow::Result<DataRoots> {
     Ok(DataRoots {
         claude_config_dir: saved(indexer::claude::CONFIG_DIR_SETTING)?,
         codex_home: saved(indexer::codex::CODEX_HOME_SETTING)?,
+        copilot_home: saved(indexer::copilot_cli::COPILOT_HOME_SETTING)?,
         effective_claude_config_dir: shown(indexer::claude::config_dir()),
         effective_codex_home: shown(indexer::codex::codex_root()),
+        effective_copilot_home: shown(indexer::copilot_cli::copilot_home()),
     })
 }
 
@@ -691,15 +696,16 @@ async fn get_data_roots(pool: tauri::State<'_, db::ReadPool>) -> AppResult<DataR
     read_blocking(&pool, data_roots).await
 }
 
-/// Save (or clear, with "") the Claude config dir and Codex home overrides. Takes effect
-/// for this process at once; the watcher picks up new roots within a minute. A path must
-/// name an existing folder and is stored in its canonical form (see
+/// Save (or clear, with "") the Claude config dir, Codex home and Copilot CLI home
+/// overrides. Takes effect for this process at once; the watcher picks up new roots within
+/// a minute. A path must name an existing folder and is stored in its canonical form (see
 /// `indexer::claude::normalize_data_root`); anything else is refused with the reason.
 #[tauri::command]
 async fn set_data_roots(
     app: AppHandle,
     claude_config_dir: Option<String>,
     codex_home: Option<String>,
+    copilot_home: Option<String>,
 ) -> AppResult<DataRoots> {
     // Checked before taking the writer: canonicalize stats the path, which can stall on an
     // offline network share. None = leave unchanged, "" = clear.
@@ -718,6 +724,10 @@ async fn set_data_roots(
                 check(claude_config_dir)?,
             ),
             (indexer::codex::CODEX_HOME_SETTING, check(codex_home)?),
+            (
+                indexer::copilot_cli::COPILOT_HOME_SETTING,
+                check(copilot_home)?,
+            ),
         ])
     })
     .await?;
@@ -732,6 +742,7 @@ async fn set_data_roots(
         }
         indexer::claude::load_config_dir_setting(conn);
         indexer::codex::load_codex_home_setting(conn);
+        indexer::copilot_cli::load_copilot_home_setting(conn);
         data_roots(conn)
     })
     .await
@@ -2286,7 +2297,8 @@ async fn open_thread_in_cli(
     .await
 }
 
-/// Relaunch the original CLI agent on an indexed thread (Claude Code / Codex).
+/// Relaunch the original CLI agent on an indexed thread (Claude Code / Codex, and Cursor
+/// threads that came from the Cursor CLI).
 #[tauri::command]
 async fn resume_thread(pool: tauri::State<'_, db::ReadPool>, thread_id: i64) -> AppResult<()> {
     read_blocking(&pool, move |conn| {
@@ -2297,7 +2309,15 @@ async fn resume_thread(pool: tauri::State<'_, db::ReadPool>, thread_id: i64) -> 
                 [thread_id],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? != 0, r.get(3)?)),
             )?;
-        agent::cli_resume::launch(&source, &external_id, is_subagent, project.as_deref())
+        let cursor_cli =
+            source == indexer::cursor::KIND && indexer::cursor::is_cli_thread(conn, &external_id)?;
+        agent::cli_resume::launch(
+            &source,
+            &external_id,
+            is_subagent,
+            project.as_deref(),
+            cursor_cli,
+        )
     })
     .await
 }
@@ -3201,10 +3221,11 @@ fn init_backend(app: &AppHandle) -> anyhow::Result<()> {
     // backfill / re-key, legacy purges) runs in spawn_background_jobs: cold, it cost about
     // 0.35 s of splash on every launch and about 1.1 s on the first launch of a re-key.
 
-    // Settings overrides for relocated Claude / Codex data roots, for every code path that
-    // isn't a scan (scans re-read them on their own).
+    // Settings overrides for relocated Claude / Codex / Copilot CLI data roots, for every
+    // code path that isn't a scan (scans re-read them on their own).
     indexer::claude::load_config_dir_setting(&conn);
     indexer::codex::load_codex_home_setting(&conn);
+    indexer::copilot_cli::load_copilot_home_setting(&conn);
 
     // Read the close-to-tray pref before `conn` is moved into the managed writer.
     let close_to_tray_on = knowledge::get_close_to_tray(&conn).unwrap_or(false);

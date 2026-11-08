@@ -1,0 +1,57 @@
+{
+  "type": "object",
+  "anyOf": [
+    {
+      "type": "object",
+      "properties": {
+        "commits": {
+          "type": "array",
+          "items": {
+            "required": [
+              "sha",
+              "shortSha",
+              "subject",
+              "committedAt",
+              "overlap"
+            ],
+            "type": "object",
+            "properties": {
+              "sha": {
+                "type": "string"
+              },
+              "shortSha": {
+                "type": "string"
+              },
+              "subject": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "committedAt": {
+                "type": "integer"
+              },
+              "overlap": {
+                "type": "integer"
+              }
+            }
+          }
+        }
+      },
+      "required": [
+        "commits"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "notice": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "notice"
+      ]
+    }
+  ]
+}

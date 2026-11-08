@@ -321,6 +321,16 @@ pub struct DistillProgressEvent {
 
 // ---- reindex ----------------------------------------------------------------------------
 
+/// `app_config` key: when the last full pass ([`run_index_all`], from the app's Reindex and
+/// onboarding or from `cal index`) finished, in unix seconds.
+pub const LAST_PASS_AT: &str = "index.last_pass_at";
+
+/// Record that a full pass finished at `now` (best effort: a failed write only means the
+/// guard may start the next pass sooner).
+pub fn mark_pass_finished(conn: &rusqlite::Connection, now: i64) {
+    let _ = knowledge::app_config::put(conn, LAST_PASS_AT, &now.to_string());
+}
+
 /// Kick off a re-index of every source in the BACKGROUND on a dedicated connection, so
 /// the button returns instantly and the UI stays responsive. Emits `index:done` (with
 /// the report) when finished, or `index:error` when the scan failed; no-op if one is
@@ -381,6 +391,12 @@ pub fn run_index_all(host: &Host, job: JobGuard) -> anyhow::Result<indexer::Inde
                 },
             );
         })?;
+        // Read by the plugin's SessionStart guard (`cal index --if-stale`), which starts no
+        // pass within the hour after this. Stamped here, at the end of a scan that ran, not
+        // when one starts: a pass that dies at once (SQLITE_BUSY under a VACUUM) must not
+        // read as an hour of freshness. Per-file errors still count as a pass, or one bad
+        // file would start a full pass at every session start.
+        mark_pass_finished(&c, chrono::Utc::now().timestamp());
         // Fold the WAL back into the main db so the -wal file doesn't grow unbounded
         // across reindex runs. PASSIVE never blocks readers.
         let _ = c.execute_batch("PRAGMA wal_checkpoint(PASSIVE);");
@@ -515,15 +531,11 @@ pub async fn claim_rewrite(flags: &JobFlags) -> anyhow::Result<JobGuard> {
         anyhow::bail!("The index is already being rewritten. Try again when that finishes.");
     };
     const EMBED_BUSY: &str = "The semantic index is being built";
-    // The flags are per process: `cal watch` indexing, or `cal distill --auto` storing
-    // facts, in another process would make the VACUUM fail with "database is locked" after
+    // The flags are per process: `cal watch` or `cal index` indexing, or `cal distill
+    // --auto` storing facts, in another process would make the VACUUM fail with "database is locked" after
     // the busy timeout (or lose that process's write), so refuse up front.
-    let index = db::default_index_path();
-    if locks::holder(&index, locks::WATCH_LOCK).is_some() {
-        anyhow::bail!("cal watch is writing; stop it first.");
-    }
-    if locks::holder(&index, locks::DISTILL_LOCK).is_some() {
-        anyhow::bail!("cal distill --auto is writing; wait for it to finish.");
+    if let Some(why) = cal_writer_running(&db::default_index_path()) {
+        anyhow::bail!("{why}");
     }
     let busy = if flags.index.0.is_set() {
         Some("A reindex is running")
@@ -547,6 +559,25 @@ pub async fn claim_rewrite(flags: &JobFlags) -> anyhow::Result<JobGuard> {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     Ok(job)
+}
+
+/// Which `cal` process writing to `index` makes a whole-file rewrite refuse, as the
+/// message for the user, or None when none is.
+fn cal_writer_running(index: &std::path::Path) -> Option<&'static str> {
+    if locks::holder(index, locks::WATCH_LOCK).is_some() {
+        return Some("cal watch is writing; stop it first.");
+    }
+    if locks::holder(index, locks::DISTILL_LOCK).is_some() {
+        return Some("cal distill --auto is writing; wait for it to finish.");
+    }
+    // The plugin's SessionStart guard starts one in the background, so this is routine
+    // even on a machine where the user never typed `cal index`.
+    if locks::holder(index, locks::INDEX_LOCK).is_some() {
+        return Some(
+            "cal index is updating the index (the Claude Code plugin starts one at session start); try again when it finishes.",
+        );
+    }
+    None
 }
 
 /// Release a [`claim_rewrite`] claim, then pick up the auto-distill drain it held off.
@@ -1592,6 +1623,31 @@ pub async fn auto_distill_drain(host: &Host) -> DistillOutcome {
 mod tests {
     use super::{messages_pending_embed_sql, owes_full_build, EmbedEnd, JobFlag, JobGuard};
     use std::sync::Arc;
+
+    /// Shrink index and Reclaim space refuse while any `cal` writer holds its lock: a VACUUM
+    /// alongside one fails with "database is locked" after the busy timeout, or makes it fail.
+    #[test]
+    fn a_rewrite_refuses_while_a_cal_writer_runs() {
+        use crate::locks;
+        // One index per lock: a lock just dropped can stay held for an instant by a child
+        // another test is forking (the fd is inherited until its exec closes it).
+        for (name, says) in [
+            (locks::WATCH_LOCK, "cal watch"),
+            (locks::DISTILL_LOCK, "cal distill --auto"),
+            (locks::INDEX_LOCK, "cal index"),
+        ] {
+            let dir = std::env::temp_dir()
+                .join(format!("calli_jobs_writers_{name}_{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let index = dir.join("index.db");
+            assert_eq!(super::cal_writer_running(&index), None, "{name}");
+            let locks::Acquire::Acquired(_lock) = locks::acquire(&index, name).unwrap() else {
+                panic!("{name} is free");
+            };
+            let why = super::cal_writer_running(&index).expect(name);
+            assert!(why.starts_with(says), "{name}: {why}");
+        }
+    }
 
     fn temp_db(tag: &str) -> std::path::PathBuf {
         let p = std::env::temp_dir().join(format!("calli_jobs_{tag}_{}.db", std::process::id()));

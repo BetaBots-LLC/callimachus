@@ -3,7 +3,7 @@
 
 use super::ParsedMessage;
 use serde_json::Value;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Longest title derived from message text, in chars (an ellipsis marks the cut).
 const TITLE_CHARS: usize = 80;
@@ -68,6 +68,112 @@ pub fn push_message(
     }
 }
 
+/// Claude Code's (and Cursor's) slug for a path: every char that is not an ASCII letter or
+/// digit as `-`.
+pub fn slug_of(name: &str) -> String {
+    name.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
+
+/// The existing directory under `root` whose path encodes to `slug` (`-` plus the path
+/// below `root`, Claude Code's form), found by matching one path segment at a time (with
+/// backtracking, since `a-b` could be one directory or two). A few `read_dir`s per slug,
+/// and only for a slug no indexed transcript explains. Platform-free: [`dir_for_project_slug`]
+/// picks the root (`/`, or a Windows drive).
+pub fn dir_for_slug(root: &Path, slug: &str) -> Option<PathBuf> {
+    let rest = slug.strip_prefix('-')?;
+    let mut budget = 64; // read_dirs, so a pathological tree cannot stall the minute tick
+    walk_slug(root, rest, &mut budget)
+}
+
+/// The project directory a slug in Claude Code's form stands for on this machine. On Unix
+/// that is `-` plus the absolute path (`-Users-me-x`). On Windows the path starts with the
+/// drive letter, its `:\` becoming one or two dashes (`C--Users-me-x`; Cursor's names
+/// read `c-Users-me-x`), so the walk starts at that drive's root.
+pub fn dir_for_project_slug(slug: &str) -> Option<PathBuf> {
+    if cfg!(windows) {
+        let (drive, rest) = split_drive_slug(slug.strip_prefix('-').unwrap_or(slug))?;
+        dir_for_slug(Path::new(&format!("{drive}:\\")), &format!("-{rest}"))
+    } else {
+        dir_for_slug(Path::new("/"), slug)
+    }
+}
+
+/// `(drive letter, rest)` of a Windows slug: a letter, then the one or two dashes its `:\`
+/// encodes to. Upper-cased, since Cursor writes the letter in either case.
+pub fn split_drive_slug(slug: &str) -> Option<(char, &str)> {
+    let drive = slug.chars().next().filter(char::is_ascii_alphabetic)?;
+    let rest = slug[1..].strip_prefix('-')?;
+    let rest = rest.strip_prefix('-').unwrap_or(rest);
+    (!rest.is_empty()).then(|| (drive.to_ascii_uppercase(), rest))
+}
+
+/// Whether `s` is an absolute Windows path with a drive (`C:\x`, `c:/x`).
+pub fn is_drive_path(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/')
+}
+
+/// A slug in the form both agents' spellings agree on, for comparing them: no leading dash,
+/// and a Windows drive prefix as `<lower letter>-` whether it was written with one dash or
+/// two. `X--` normalizes on every host (no Unix path encodes that way short of a dotted
+/// one-letter root dir), so Windows paths compare correctly in tests run anywhere.
+pub fn normalize_slug(slug: &str) -> String {
+    let s = slug.trim_start_matches('-');
+    match split_drive_slug(s) {
+        Some((drive, rest)) if cfg!(windows) || s.get(1..3) == Some("--") => {
+            format!("{}-{rest}", drive.to_ascii_lowercase())
+        }
+        _ => s.to_string(),
+    }
+}
+
+fn walk_slug(dir: &Path, rest: &str, budget: &mut u32) -> Option<PathBuf> {
+    if rest.is_empty() || *budget == 0 {
+        return None;
+    }
+    *budget -= 1;
+    let mut candidates: Vec<(PathBuf, usize)> = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .filter_map(|e| {
+            let enc = slug_of(&e.file_name().to_string_lossy());
+            let fits = !enc.is_empty()
+                && rest.starts_with(&enc)
+                && (rest.len() == enc.len() || rest.as_bytes()[enc.len()] == b'-');
+            // Only a name that fits pays for a stat. `metadata` follows symlinks, unlike
+            // `DirEntry::file_type`: a linked project dir (Fedora Silverblue's `/home` is a
+            // link to `/var/home`, a symlinked `~/code`) must resolve under the spelling the
+            // agent recorded. The read_dir budget bounds a link cycle.
+            (fits && std::fs::metadata(e.path()).is_ok_and(|m| m.is_dir()))
+                .then(|| (e.path(), enc.len()))
+        })
+        .collect();
+    // Longest first: `callimachus-batch-d` before `callimachus`.
+    candidates.sort_by_key(|c| std::cmp::Reverse(c.1));
+    for (path, len) in candidates {
+        if len == rest.len() {
+            return Some(path);
+        }
+        if let Some(found) = walk_slug(&path, &rest[len + 1..], budget) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// FNV-1a 64: tiny, dependency-free, and stable across Rust releases (std's hasher is not
+/// guaranteed to be, and byte-cursor fingerprints built on it are persisted).
+pub fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -101,6 +207,56 @@ mod tests {
         assert_eq!(join_text_parts(Some(&serde_json::json!("plain"))), "plain");
         assert_eq!(join_text_parts(Some(&serde_json::json!(3))), "");
         assert_eq!(join_text_parts(None), "");
+    }
+
+    #[test]
+    fn windows_drive_slugs_split_and_compare_either_way() {
+        assert_eq!(split_drive_slug("C--Users-me-x"), Some(('C', "Users-me-x")));
+        assert_eq!(split_drive_slug("c-Users-me-x"), Some(('C', "Users-me-x")));
+        assert_eq!(split_drive_slug("C-"), None);
+        assert_eq!(split_drive_slug("1-x"), None);
+        assert_eq!(
+            normalize_slug("C--Users-me-x"),
+            normalize_slug("c-Users-me-x")
+        );
+        assert_eq!(normalize_slug("-Users-me-x"), "Users-me-x");
+        assert!(is_drive_path(r"C:\Users\me") && is_drive_path("d:/w"));
+        assert!(!is_drive_path("/Users/me") && !is_drive_path("C:") && !is_drive_path("ab/c"));
+    }
+
+    /// The walk starts at whatever root it is given (`/`, or a Windows drive's), so a drive
+    /// slug's rest resolves against a stand-in root here on every host.
+    #[test]
+    fn a_drive_slug_walks_from_its_root() {
+        let root = std::env::temp_dir().join(format!("calli_slugdrive_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("Users").join("me").join("my-app")).unwrap();
+        let (_, rest) = split_drive_slug("C--Users-me-my-app").unwrap();
+        assert_eq!(
+            dir_for_slug(&root, &format!("-{rest}")),
+            Some(root.join("Users").join("me").join("my-app"))
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A project reached through a symlinked directory resolves under the linked spelling
+    /// (`/home` -> `/var/home` on Fedora Silverblue, a linked `~/code`).
+    #[cfg(unix)]
+    #[test]
+    fn slug_walk_follows_symlinked_directories() {
+        let root = std::env::temp_dir().join(format!("calli_sluglink_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("var").join("home").join("me").join("app")).unwrap();
+        std::os::unix::fs::symlink(root.join("var").join("home"), root.join("home")).unwrap();
+        assert_eq!(
+            dir_for_slug(&root, "-home-me-app"),
+            Some(root.join("home").join("me").join("app"))
+        );
+        // A link to a file is not a directory.
+        std::fs::write(root.join("note"), "x").unwrap();
+        std::os::unix::fs::symlink(root.join("note"), root.join("linked")).unwrap();
+        assert_eq!(dir_for_slug(&root, "-linked"), None);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

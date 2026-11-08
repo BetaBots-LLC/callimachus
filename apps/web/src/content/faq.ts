@@ -5,7 +5,7 @@ export const FAQ: { q: string; a: string }[] = [
   },
   {
     q: "Which AI coding agents does it index?",
-    a: "Twelve today: Claude Code, Codex, Cursor, Gemini CLI, Qwen Code, Goose, OpenCode, Continue, Cline, Roo Code, Kilo Code, and Copilot Chat in VS Code-family editors, plus the in-app chat. A background watcher keeps the index current as you work, and you can reindex any source on demand.",
+    a: "Thirteen today: Claude Code, Codex, Cursor (editor and CLI), Gemini CLI, Qwen Code, Goose, OpenCode, Continue, Cline, Roo Code, Kilo Code, Copilot Chat in VS Code-family editors, and the Copilot CLI, plus the in-app chat. A background watcher keeps the index current as you work, and you can reindex any source on demand.",
   },
   {
     q: "How is the search better than grep?",

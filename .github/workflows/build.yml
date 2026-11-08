@@ -631,9 +631,13 @@ jobs:
           fi
           SUMS=packages/callimachus-mcp/lib/SHA256SUMS
           gh release download "$TAG" --repo "$GITHUB_REPOSITORY" -p SHA256SUMS -O "$SUMS" --clobber
+          # The launcher verifies both: the MCP server on every start, and `cal` for
+          # `npx callimachus-mcp --install-cal`.
           for t in aarch64-apple-darwin x86_64-unknown-linux-gnu x86_64-pc-windows-msvc.exe; do
-            grep -Eq "^[0-9a-f]{64}  callimachus-mcp-$t\$" "$SUMS" \
-              || { echo "::error::SHA256SUMS has no entry for callimachus-mcp-$t"; exit 1; }
+            for bin in callimachus-mcp cal; do
+              grep -Eq "^[0-9a-f]{64}  $bin-$t\$" "$SUMS" \
+                || { echo "::error::SHA256SUMS has no entry for $bin-$t"; exit 1; }
+            done
           done
           cat "$SUMS"
 

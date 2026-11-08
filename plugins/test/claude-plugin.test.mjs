@@ -67,19 +67,41 @@ test("every hook runs a real cal subcommand behind the missing-cal guard", () =>
   const { hooks } = readJson(plugin, "hooks", "hooks.json");
   const events = Object.keys(hooks).sort();
   assert.deepEqual(events, ["PreCompact", "SessionEnd", "SessionStart"]);
+  // A subcommand and at most one flag (`index --if-stale`, the freshness guard), which
+  // first asks `cal help` whether this `cal` has the command (see the next test).
   const guard =
-    /^\[ ! -x "\$HOME\/\.local\/bin\/cal" \] \|\| "\$HOME\/\.local\/bin\/cal" ([a-z-]+)$/;
+    /^\[ ! -x "\$HOME\/\.local\/bin\/cal" \] \|\| (?:! "\$HOME\/\.local\/bin\/cal" help 2>\/dev\/null \| grep -q '\^ {2}cal ([a-z-]+) ' \|\| )?"\$HOME\/\.local\/bin\/cal" ([a-z-]+)( --[a-z-]+)?$/;
   for (const event of events) {
     for (const group of hooks[event]) {
       for (const hook of group.hooks) {
         assert.equal(hook.type, "command");
         const m = hook.command.match(guard);
         assert.ok(m, `${event}: unguarded or unexpected command ${hook.command}`);
-        assert.ok(known.has(m[1]), `${event}: \`cal ${m[1]}\` is not in COMMANDS`);
+        assert.ok(known.has(m[2]), `${event}: \`cal ${m[2]}\` is not in COMMANDS`);
+        if (m[1]) assert.equal(m[1], m[2], `${event}: the help probe checks another command`);
         assert.ok(Number.isInteger(hook.timeout) && hook.timeout > 0, `${event}: timeout`);
       }
     }
   }
+});
+
+test("SessionStart also runs the freshness guard, which starts cal index in the background", () => {
+  const { hooks } = readJson(plugin, "hooks", "hooks.json");
+  const commands = hooks.SessionStart.flatMap((group) => group.hooks.map((h) => h.command));
+  assert.ok(commands.some((c) => c.endsWith('"$HOME/.local/bin/cal" hook')));
+  const guard = hooks.SessionStart.find((group) =>
+    group.hooks.some((h) => h.command.endsWith(" index --if-stale")),
+  );
+  assert.ok(guard, "no `cal index --if-stale` SessionStart hook");
+  // Only where a session's work starts; clear and compact come after one of these checked.
+  assert.equal(guard.matcher, "startup|resume");
+  // Released apps before this one have no `cal index`: their `cal` answered "unknown
+  // command" with exit 1, a hook error at every session start. The guard asks `cal help`
+  // first and stays silent when the line is missing.
+  const [{ command }] = guard.hooks;
+  assert.match(command, / help 2>\/dev\/null \| grep -q '\^ {2}cal index ' \|\| /);
+  const usage = read(root, "apps", "desktop", "src-tauri", "core", "src", "cli_core.rs");
+  assert.match(usage, /^ {2}cal index {2,}\S/m, "USAGE lists `  cal index` as the probe expects");
 });
 
 test("the MCP server is the npm launcher pinned to the release, under the app's server name", () => {

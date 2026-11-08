@@ -123,7 +123,10 @@ impl std::fmt::Display for SchemaMismatch {
         if self.pending > 0 {
             write!(
                 f,
-                "the index needs {} schema upgrade(s); open Callimachus to apply them",
+                // Not a bare "run `cal index`": a `cal` linked to an older app cannot apply
+                // them, and one the npm launcher downloaded would upgrade the index past the
+                // installed app, which then cannot open it.
+                "the index needs {} schema upgrade(s); open Callimachus, or on a machine without the app run `cal index`",
                 self.pending
             )
         } else {
@@ -641,7 +644,7 @@ mod tests {
         let sources: i64 = conn
             .query_row("SELECT COUNT(*) FROM sources", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(sources, 13, "pooled read sees the migrated schema");
+        assert_eq!(sources, 14, "pooled read sees the migrated schema");
         // vec0 must be loaded on pooled connections for KNN reads.
         let ver: String = conn
             .query_row("SELECT vec_version()", [], |r| r.get(0))
@@ -867,7 +870,7 @@ mod tests {
         let n: i64 = conn
             .query_row("SELECT COUNT(*) FROM sources", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(n, 13, "thirteen source kinds seeded");
+        assert_eq!(n, 14, "fourteen source kinds seeded");
     }
 
     #[test]

@@ -62,6 +62,16 @@ Re-upserting an unchanged thread churns message ids and forces re-embedding. Avo
 - **Append-only JSONL** (Claude Code) — `claude.rs` also keeps a byte cursor per file in `index_state` (`last_offset` = end of the last complete line, `hash` = FNV-1a of the 4 KB at each end of the indexed region). When a file only grew, only the new lines are read and parsed and folded onto the stored prefix; a shrink, a fingerprint mismatch or a missing thread falls back to a full parse. A half-written last line is left for the next pass. A full scan groups its writes into short batched transactions (one commit per thread spent a quarter of a cold index in COMMIT); `upsert_thread` runs as a savepoint when the caller already has a transaction open.
 - **One DB for all threads** (SQLite) — skip the whole pass with `file_change_state` (read-only) on the DB file, then `set_file_state` only after the upserts succeed (see `goose.rs`). If the store runs in WAL mode, include the `-wal` file in the change key, since new rows land there first (see `cursor.rs`).
 - **One DB, many threads that change independently** (Cursor) — fingerprint each thread from cheap metadata (`lastUpdatedAt`, row count, `octet_length` sums, which read only record headers) in `index_state` under a synthetic `<db>#composer:<id>` key, and only extract threads whose fingerprint moved.
+- **One conversation in several stores** (Cursor: a composer in state.vscdb, an agent
+  transcript, a CLI chat store, all under the same agent id): one thread per id, and the
+  store that fills it is chosen by what the stores held the last time each was read
+  (composer with text > CLI store with messages > transcript). That outcome is stored per
+  file state (the composer fingerprint's `:text` / `:empty` mark, the store's
+  `<store>#parsed` row), so the same files always pick the same winner and two stores
+  never take turns rewriting a thread. A covered transcript is skipped without recording
+  its file state, so it is picked up if the richer store ever stops covering it. A
+  composer fingerprint with no mark was written by an older build: its coverage is checked
+  against state.vscdb once and the mark stored.
 - **Many files per thread** (OpenCode) — fingerprint the message dir as `(max mtime, file count)` and store it in `file_state` keyed by the session file.
 
 ## Tool output cap
@@ -93,9 +103,13 @@ such rows in bulk with the same function: `tool` rows for the sources registered
 
 Resolve stores from the agent's own env override, not a hardcoded home path:
 `claude::config_dir()` honors `CLAUDE_CONFIG_DIR`, `codex::codex_root()` honors
-`CODEX_HOME`, and both accept a Settings value stored in `app_config`
-(`paths.claude_config_dir`, `paths.codex_home`), because a GUI launched from Finder/Dock
-never sees shell env vars.
+`CODEX_HOME` (and the state DB follows Codex's own `sqlite_home` / `CODEX_SQLITE_HOME`),
+`copilot_cli::copilot_home()` honors `COPILOT_HOME`, and all three accept a Settings
+value stored in `app_config` (`paths.claude_config_dir`, `paths.codex_home`,
+`paths.copilot_home`), because a GUI launched from Finder/Dock never sees shell env vars.
+Project slugs (`-Users-me-x`, Cursor's `Users-me-x`) resolve through
+`common::dir_for_project_slug`, which starts the walk at the drive a Windows slug names
+(`C--Users-me-x`) and follows symlinked directories.
 
 ## Watcher
 
@@ -120,8 +134,10 @@ are embedded; `tool`/`system` are searchable via FTS but skipped by the embedder
 | Kind | Path | Format |
 |------|------|--------|
 | `claude_code` | `$CLAUDE_CONFIG_DIR` or `~/.claude`, then `projects/**/*.jsonl` | JSONL, content blocks |
-| `codex` | `$CODEX_HOME` or `~/.codex` (sessions JSONL + state SQLite) | mixed |
+| `codex` | `$CODEX_HOME` or `~/.codex`: `sessions/` + `archived_sessions/` rollout JSONL, plus the newest `state_<N>.sqlite` under `sqlite_home` (config.toml), else `$CODEX_SQLITE_HOME`, else the Codex home | mixed |
 | `cursor` | `~/Library/Application Support/Cursor/User/globalStorage/state.vscdb` | SQLite (`cursorDiskKV`) |
+| `cursor` | `~/.cursor/projects/<slug>/agent-transcripts/<id>/<id>.jsonl`, plus `<id>/subagents/*.jsonl`; `<slug>` is the workspace path with non-alphanumerics as `-`, resolved against the disk. Observed on one Mac: 195 nested transcripts (the CLI session's too) and 147 subagents. A flat `agent-transcripts/<id>.jsonl` is also read but was never seen | JSONL `{role, message.content[]}`, `text` / `tool_use` parts, no clock but a user turn's `<timestamp>` |
+| `cursor` | `~/.cursor/chats/<md5 of cwd>/<agent id>/store.db` (+ `meta.json`). Observed: one store, a 4 KB store.db with every table still in its `-wal`, read from a temp copy when a plain read-only open can't see the WAL | SQLite `blobs` + `meta`: the root blob (protobuf) lists the JSON message blobs in order, field 9 the workspace URI |
 | `gemini` | `~/.gemini/tmp/<id>/chats/*.jsonl` | JSONL, `type: user`/`gemini`, `content` PartListUnion |
 | `qwen` | `~/.qwen/tmp/<hash>/chats/*.jsonl` | JSONL, `type: user`/`assistant`, `message.parts` |
 | `goose` | `~/.local/share/goose/sessions/sessions.db` | SQLite (`sessions` + `messages`, `content_json`) |
@@ -131,6 +147,7 @@ are embedded; `tool`/`system` are searchable via FTS but skipped by the embedder
 | `cline` | `<editor>/User/globalStorage/saoudrizwan.claude-dev/tasks/<id>/api_conversation_history.json` | Anthropic Messages array (multi-editor; index-only, no CLI) |
 | `roo` | `<editor>/User/globalStorage/rooveterinaryinc.roo-cline/tasks/<id>/…` | Cline-architecture fork — shares `cline::scan_ext` |
 | `kilo` | `<editor>/User/globalStorage/kilocode.kilo-code/tasks/<id>/…` | Cline-architecture fork — shares `cline::scan_ext` |
+| `copilot_cli` | Settings `paths.copilot_home`, `$COPILOT_HOME` or `~/.copilot`, then `session-state/<id>/events.jsonl` and `workspace.yaml`. Observed: 63 sessions, every one a GitHub Desktop commit-message run (`client_name: sdk`, the diff as the prompt), which are skipped; only interactive conversations are indexed. A flat `<id>.jsonl` and numbered `events.<n>.jsonl` archives are also read but were never seen | JSONL Copilot SDK session events, with a byte cursor on the live journal; usage from `session.shutdown` `modelMetrics`, calls from `requests.count` |
 | `copilot` | `<editor>/User/workspaceStorage/<hash>/chatSessions/<uuid>.{json,jsonl}` and `<editor>/User/globalStorage/emptyWindowChatSessions/<uuid>.{json,jsonl}` (Code, Code - Insiders, Cursor, VSCodium, Windsurf) | one JSON object `{ kind, v }` per file, turns in `v.requests[]`; project from the workspace's `workspace.json` |
 
 Honor `XDG_DATA_HOME` (Goose/OpenCode) and `OPENCODE_DATA_DIR` where applicable.
@@ -138,9 +155,6 @@ Honor `XDG_DATA_HOME` (Goose/OpenCode) and `OPENCODE_DATA_DIR` where applicable.
 ## Candidates not yet integrated
 
 - **Charm Crush** (`~/.crush/crush.db`, SQLite), **Factory Droid**
-  (`~/.factory/sessions/`, JSONL), **Copilot CLI** (the standalone terminal agent;
-  Copilot Chat in VS Code-family editors is already indexed as `copilot`;
-  `~/.copilot/session-store.db`, schema undocumented). Peek at a real file first to
-  confirm the schema.
+  (`~/.factory/sessions/`, JSONL). Peek at a real file first to confirm the schema.
 - **Amp** — server-side (cloud Postgres); needs an authed API, not file indexing.
 - **Zed** — thread bodies are LMDB binary; only the SQLite metadata is parseable.

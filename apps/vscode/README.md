@@ -1,6 +1,6 @@
 # Callimachus for VS Code & Cursor
 
-Search your AI coding-agent conversation history across **Claude Code, Codex, Cursor, Gemini, Qwen, Goose, OpenCode, Continue, Cline, Roo Code, Kilo Code, Copilot Chat** and in-app chats, without leaving the editor. Pick a past thread and open its full transcript as a markdown doc.
+Search your AI coding-agent conversation history across **Claude Code, Codex, Cursor, Gemini, Qwen, Goose, OpenCode, Continue, Cline, Roo Code, Kilo Code, Copilot Chat, Copilot CLI** and in-app chats, without leaving the editor. Pick a past thread and open its full transcript as a markdown doc.
 
 This extension is a thin client over the **`cal`** CLI, so it shares the exact same local index as the Callimachus desktop app and MCP server. No separate database, no separate indexing.
 

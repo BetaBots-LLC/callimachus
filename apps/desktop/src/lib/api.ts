@@ -33,6 +33,7 @@ export type SourceKind =
   | "roo"
   | "kilo"
   | "copilot"
+  | "copilot_cli"
   | "in_app";
 
 export interface DbStats {
@@ -416,13 +417,17 @@ export interface CompactSummary {
   vacuum?: VacuumReport | null;
 }
 
-/** Overrides for relocated Claude Code / Codex data, plus what is in effect right now. */
+/** Overrides for relocated Claude Code / Codex / Copilot CLI data, plus what is in effect
+ *  right now. */
 export interface DataRoots {
   claudeConfigDir: string; // saved override ("" = none)
   codexHome: string;
-  // Override, else CLAUDE_CONFIG_DIR / CODEX_HOME, else the default; null if unresolvable.
+  copilotHome: string;
+  // Override, else CLAUDE_CONFIG_DIR / CODEX_HOME / COPILOT_HOME, else the default; null if
+  // unresolvable.
   effectiveClaudeConfigDir: string | null;
   effectiveCodexHome: string | null;
+  effectiveCopilotHome: string | null;
 }
 
 /** Which background jobs hold their run flags right now (`jobs_status`, answered from
@@ -683,12 +688,14 @@ export const api = {
     }
   },
   // Relocated agent data: a Finder/Dock-launched app never sees the shell's
-  // CLAUDE_CONFIG_DIR / CODEX_HOME. Pass "" to clear an override, omit to leave it as is.
+  // CLAUDE_CONFIG_DIR / CODEX_HOME / COPILOT_HOME. Pass "" to clear an override, omit to
+  // leave it as is.
   getDataRoots: () => invoke<DataRoots>("get_data_roots"),
-  setDataRoots: (roots: { claudeConfigDir?: string; codexHome?: string }) =>
+  setDataRoots: (roots: { claudeConfigDir?: string; codexHome?: string; copilotHome?: string }) =>
     invoke<DataRoots>("set_data_roots", {
       claudeConfigDir: roots.claudeConfigDir ?? null,
       codexHome: roots.codexHome ?? null,
+      copilotHome: roots.copilotHome ?? null,
     }),
   // Write a thread as an Obsidian note (transcript + [[project]] link) into vaultDir.
   exportThread: (threadId: number, vaultDir: string) =>
@@ -1056,6 +1063,7 @@ export const SOURCE_LABELS: Record<SourceKind, string> = {
   roo: "Roo Code",
   kilo: "Kilo Code",
   copilot: "Copilot Chat",
+  copilot_cli: "Copilot CLI",
   in_app: "Chat",
 };
 
@@ -1077,4 +1085,5 @@ export const INDEXABLE_SOURCES: SourceKind[] = [
   "roo",
   "kilo",
   "copilot",
+  "copilot_cli",
 ];

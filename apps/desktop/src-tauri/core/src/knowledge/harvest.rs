@@ -20,6 +20,7 @@
 
 use super::app_config;
 use crate::context::redact_secrets;
+use crate::indexer::common::dir_for_slug;
 use anyhow::Result;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -385,56 +386,6 @@ fn project_for_slug(conn: &Connection, slug: &str) -> Result<(String, bool)> {
         return Ok((super::project_key(&dir.to_string_lossy()), true));
     }
     Ok((super::project_key(&slug.replace('-', "/")), false))
-}
-
-/// Claude Code's slug for a path: every char that is not an ASCII letter or digit as `-`.
-fn slug_of(name: &str) -> String {
-    name.chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect()
-}
-
-/// The existing directory under `root` whose path encodes to `slug`, found by matching one
-/// path segment at a time (with backtracking, since `a-b` could be one directory or two).
-/// A few `read_dir`s per slug, and only for a slug no indexed transcript explains. Unix
-/// paths only: a Windows slug starts with the drive letter.
-fn dir_for_slug(root: &Path, slug: &str) -> Option<PathBuf> {
-    if cfg!(windows) {
-        return None;
-    }
-    let rest = slug.strip_prefix('-')?;
-    let mut budget = 64; // read_dirs, so a pathological tree cannot stall the minute tick
-    walk_slug(root, rest, &mut budget)
-}
-
-fn walk_slug(dir: &Path, rest: &str, budget: &mut u32) -> Option<PathBuf> {
-    if rest.is_empty() || *budget == 0 {
-        return None;
-    }
-    *budget -= 1;
-    let mut candidates: Vec<(PathBuf, usize)> = std::fs::read_dir(dir)
-        .ok()?
-        .flatten()
-        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
-        .filter_map(|e| {
-            let enc = slug_of(&e.file_name().to_string_lossy());
-            let fits = !enc.is_empty()
-                && rest.starts_with(&enc)
-                && (rest.len() == enc.len() || rest.as_bytes()[enc.len()] == b'-');
-            fits.then(|| (e.path(), enc.len()))
-        })
-        .collect();
-    // Longest first: `callimachus-batch-d` before `callimachus`.
-    candidates.sort_by_key(|c| std::cmp::Reverse(c.1));
-    for (path, len) in candidates {
-        if len == rest.len() {
-            return Some(path);
-        }
-        if let Some(found) = walk_slug(&path, &rest[len + 1..], budget) {
-            return Some(found);
-        }
-    }
-    None
 }
 
 /// The fact one topic file contributes.

@@ -1,0 +1,113 @@
+{
+  "type": "object",
+  "anyOf": [
+    {
+      "type": "object",
+      "properties": {
+        "threads": {
+          "type": "array",
+          "items": {
+            "required": [
+              "threadId",
+              "source",
+              "title",
+              "projectPath",
+              "ts",
+              "snippets"
+            ],
+            "type": "object",
+            "properties": {
+              "threadId": {
+                "type": "integer"
+              },
+              "source": {
+                "type": "string"
+              },
+              "title": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "projectPath": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "ts": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "snippets": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            }
+          }
+        },
+        "coverage": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "properties": {
+            "sources": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string"
+                  },
+                  "threads": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "threads"
+                ]
+              }
+            },
+            "lastIndexedAt": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "blindSpots": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "sources",
+            "lastIndexedAt",
+            "blindSpots"
+          ]
+        }
+      },
+      "required": [
+        "threads"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "notice": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "notice"
+      ]
+    }
+  ]
+}

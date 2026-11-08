@@ -175,7 +175,8 @@ pub fn spend_matching(
     top_n: usize,
 ) -> Result<Spend> {
     let (sql, args) = usage_sql(since, project, mode);
-    let rows = usage_by_thread_model(conn, &sql, &args)?;
+    let mut rows = usage_by_thread_model(conn, &sql, &args)?;
+    copilot_cli_calls(conn, since, project, mode, &mut rows)?;
 
     let mut per_model: HashMap<String, ModelSpend> = HashMap::new();
     let mut per_thread: HashMap<i64, f64> = HashMap::new();
@@ -236,6 +237,25 @@ fn usage_sql(
     mode: ProjectMatch,
 ) -> (String, Vec<Box<dyn ToSql>>) {
     let mut args: Vec<Box<dyn ToSql>> = Vec::new();
+    let (join, filters) = usage_filters(since, project, mode, &mut args);
+    let sql = format!(
+        "SELECT m.thread_id, m.model, SUM(m.input_tokens), SUM(m.output_tokens),
+                SUM(m.cache_write_tokens), SUM(m.cache_read_tokens), COUNT(*)
+         FROM messages m{join}
+         WHERE m.model IS NOT NULL{filters}
+         GROUP BY m.thread_id, m.model"
+    );
+    (sql, args)
+}
+
+/// The window and project filters [`usage_sql`] adds: a `JOIN threads t` when a project is
+/// given, and the `AND ...` conditions.
+fn usage_filters(
+    since: i64,
+    project: Option<&str>,
+    mode: ProjectMatch,
+    args: &mut Vec<Box<dyn ToSql>>,
+) -> (&'static str, String) {
     let mut filters = String::new();
     if since > 0 {
         // `+` keeps the bound off every ts index: with an exact project the planner would
@@ -246,20 +266,74 @@ fn usage_sql(
     }
     let join = match project.filter(|p| !p.is_empty()) {
         Some(p) => {
-            let cond = crate::search::project_condition("t", p, mode, &mut args);
+            let cond = crate::search::project_condition("t", p, mode, args);
             filters.push_str(&format!(" AND {cond}"));
             " JOIN threads t ON t.id = m.thread_id"
         }
         None => "",
     };
+    (join, filters)
+}
+
+/// Copilot CLI's calls. Its usage arrives once per model at each session shutdown, so one
+/// usage row stands for every request of that run, and COUNT(*) would report one call per
+/// shutdown. Each row's text carries the run's `requests.count`
+/// (`copilot_cli::usage_row_requests`); a row without one counts as one call. Only that
+/// source's usage rows are read (a few per session), so the main aggregate keeps to its
+/// covering index. Its spend is dated by the shutdown, so a `--since` window that starts
+/// mid-run counts the whole run or none of it.
+fn copilot_cli_calls(
+    conn: &Connection,
+    since: i64,
+    project: Option<&str>,
+    mode: ProjectMatch,
+    rows: &mut [Usage],
+) -> Result<()> {
+    let sid: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM sources WHERE kind = ?1",
+            [crate::indexer::copilot_cli::KIND],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(sid) = sid else {
+        return Ok(());
+    };
+    let mut args: Vec<Box<dyn ToSql>> = vec![Box::new(sid)];
+    let (join, filters) = usage_filters(since, project, mode, &mut args);
+    let join = if join.is_empty() {
+        " JOIN threads t ON t.id = m.thread_id"
+    } else {
+        join
+    };
     let sql = format!(
-        "SELECT m.thread_id, m.model, SUM(m.input_tokens), SUM(m.output_tokens),
-                SUM(m.cache_write_tokens), SUM(m.cache_read_tokens), COUNT(*)
-         FROM messages m{join}
-         WHERE m.model IS NOT NULL{filters}
-         GROUP BY m.thread_id, m.model"
+        "SELECT m.thread_id, m.model, m.text FROM messages m{join}
+         WHERE t.source_id = ?1 AND m.model IS NOT NULL{filters}"
     );
-    (sql, args)
+    let arg_refs: Vec<&dyn ToSql> = args.iter().map(|b| b.as_ref()).collect();
+    let mut stmt = conn.prepare(&sql)?;
+    let mut calls: HashMap<(i64, String), i64> = HashMap::new();
+    let found = stmt.query_map(arg_refs.as_slice(), |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+        ))
+    })?;
+    for row in found {
+        let (thread, model, text) = row?;
+        let n = crate::indexer::copilot_cli::usage_row_requests(&text).unwrap_or(1);
+        *calls.entry((thread, model)).or_insert(0) += n;
+    }
+    if calls.is_empty() {
+        return Ok(());
+    }
+    for u in rows.iter_mut() {
+        if let Some(n) = calls.get(&(u.thread_id, u.model.clone())) {
+            u.calls = *n;
+        }
+    }
+    Ok(())
 }
 
 /// Run [`usage_sql`]'s statement.
@@ -334,6 +408,54 @@ mod tests {
         assert_eq!(fable.cache_write, 12.5);
         assert_eq!(fable.cache_read, 1.0);
         assert!(price_for("claude-mythos-5").is_some());
+    }
+
+    /// Copilot CLI's one usage row per run reports the run's requests as its calls.
+    #[test]
+    fn copilot_cli_calls_come_from_the_request_count() {
+        let p = std::env::temp_dir().join(format!("calli_cost_copcli_{}.db", std::process::id()));
+        for ext in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{ext}", p.display()));
+        }
+        let conn = crate::db::open(&p).unwrap();
+        let sid: i64 = conn
+            .query_row(
+                "SELECT id FROM sources WHERE kind = 'copilot_cli'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO threads (source_id, external_id, title, project_path, created_at, updated_at)
+             VALUES (?1, 's1', 'cli', '/p', 1, 1)",
+            [sid],
+        )
+        .unwrap();
+        let tid = conn.last_insert_rowid();
+        for (seq, text) in [
+            "Copilot CLI usage: gpt-5, 10 input, 0 cache read, 0 cache write, 1 output tokens, 4 requests",
+            "Copilot CLI usage: gpt-5, 10 input, 0 cache read, 0 cache write, 1 output tokens",
+        ]
+        .iter()
+        .enumerate()
+        {
+            conn.execute(
+                "INSERT INTO messages (thread_id, seq, role, text, ts, model, input_tokens, output_tokens, cache_write_tokens, cache_read_tokens)
+                 VALUES (?1, ?2, 'system', ?3, 100, 'gpt-5', 10, 1, 0, 0)",
+                rusqlite::params![tid, seq as i64, text],
+            )
+            .unwrap();
+        }
+        let s = spend(&conn, 0, None, 5).unwrap();
+        assert_eq!(
+            s.by_model[0].calls, 5,
+            "4 requests, plus 1 for the row without a count"
+        );
+        assert_eq!(spend(&conn, 0, Some("/p"), 5).unwrap().by_model[0].calls, 5);
+        assert!(spend(&conn, 200, None, 5).unwrap().by_model.is_empty());
+        for ext in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{ext}", p.display()));
+        }
     }
 
     #[test]

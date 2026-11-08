@@ -1,0 +1,103 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://callimachus.app/schemas/cal/memory.v1.json",
+  "title": "cal memory --json",
+  "description": "A project's decisions, gotchas and open TODOs.",
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "description": "Major version of this payload's shape. A reader refuses a version newer than it knows.",
+      "minimum": 0
+    },
+    "project": {
+      "type": "string"
+    },
+    "decisions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/MemoryFact"
+      }
+    },
+    "gotchas": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/MemoryFact"
+      }
+    },
+    "openTodos": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/MemoryFact"
+      }
+    },
+    "threadCount": {
+      "type": "integer"
+    },
+    "distilledCount": {
+      "type": "integer"
+    },
+    "pendingCount": {
+      "type": "integer"
+    }
+  },
+  "required": [
+    "schema_version",
+    "project",
+    "decisions",
+    "gotchas",
+    "openTodos",
+    "threadCount",
+    "distilledCount",
+    "pendingCount"
+  ],
+  "$defs": {
+    "MemoryFact": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer"
+        },
+        "threadId": {
+          "type": "integer"
+        },
+        "text": {
+          "type": "string"
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "createdAt": {
+          "type": "integer"
+        },
+        "pinned": {
+          "type": "boolean"
+        },
+        "extractor": {
+          "type": "string",
+          "description": "Who wrote it: `llm`, `heuristic`, `user`, `agent`, or a harvest origin such as\n`claude-memory`. The SessionStart hook and the managed AGENTS.md / CLAUDE.md block\ndrop `claude-memory` facts, which Claude Code already loads from its own auto memory,\nand so does `.callimachus/memory.md`, a repo file people commit; MCP results and the\nProjects tab keep them."
+        },
+        "originRef": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "threadId",
+        "text",
+        "title",
+        "createdAt",
+        "pinned",
+        "extractor",
+        "originRef"
+      ],
+      "description": "One distilled fact in a project's aggregated memory, with its source thread."
+    }
+  }
+}

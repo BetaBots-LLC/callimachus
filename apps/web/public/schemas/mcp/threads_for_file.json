@@ -1,0 +1,71 @@
+{
+  "type": "object",
+  "anyOf": [
+    {
+      "type": "object",
+      "properties": {
+        "threads": {
+          "type": "array",
+          "items": {
+            "required": [
+              "id",
+              "source",
+              "title",
+              "projectPath",
+              "messageCount",
+              "updatedAt",
+              "starred"
+            ],
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "integer"
+              },
+              "source": {
+                "type": "string"
+              },
+              "title": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "projectPath": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "messageCount": {
+                "type": "integer"
+              },
+              "updatedAt": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "starred": {
+                "type": "boolean"
+              }
+            }
+          }
+        }
+      },
+      "required": [
+        "threads"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "notice": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "notice"
+      ]
+    }
+  ]
+}

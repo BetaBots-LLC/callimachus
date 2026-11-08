@@ -481,6 +481,7 @@ pub fn source_label(kind: &str) -> &str {
         "roo" => "Roo Code",
         "kilo" => "Kilo Code",
         "copilot" => "Copilot Chat",
+        "copilot_cli" => "Copilot CLI",
         "in_app" => "Chat",
         other => other,
     }
