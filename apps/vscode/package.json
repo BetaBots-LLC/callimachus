@@ -38,6 +38,9 @@
     "Machine Learning"
   ],
   "main": "./dist/extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
   "contributes": {
     "commands": [
       {
@@ -83,6 +86,11 @@
         "category": "Callimachus"
       },
       {
+        "command": "callimachus.whyLineAt",
+        "title": "Why This Line (from a hover)",
+        "category": "Callimachus"
+      },
+      {
         "command": "callimachus.toggleAmbientRecall",
         "title": "Toggle Ambient Recall",
         "category": "Callimachus"
@@ -118,6 +126,10 @@
         {
           "command": "callimachus.whyLine",
           "when": "editorIsOpen"
+        },
+        {
+          "command": "callimachus.whyLineAt",
+          "when": "false"
         }
       ],
       "view/title": [
@@ -170,6 +182,16 @@
           "type": "number",
           "default": 5,
           "description": "Maximum related threads to show in the ambient-recall section."
+        },
+        "callimachus.whyGutter": {
+          "type": "boolean",
+          "default": true,
+          "description": "Mark the lines whose commit a past AI session produced (or an Agent Trace record in the repo attributes) in the editor gutter. Runs `cal why` once per file version, in the background."
+        },
+        "callimachus.whyHover": {
+          "type": "boolean",
+          "default": true,
+          "description": "On hover over a line a past AI session produced, show that session (title, agent, date) and up to three of its decisions or gotchas, with Open session and Why this line."
         }
       }
     }

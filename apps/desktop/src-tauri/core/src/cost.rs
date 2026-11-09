@@ -260,6 +260,74 @@ pub fn spend_matching(
     })
 }
 
+/// One agent's (source's) spend over a window.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceCost {
+    /// The source kind (`claude_code`, `codex`...).
+    pub source: String,
+    pub cost: f64,
+    /// Priced model calls.
+    pub calls: i64,
+}
+
+/// Spend over a window per model and per agent: what `cal report` shows.
+#[derive(Debug, Clone)]
+pub struct SpendBySource {
+    pub total_cost: f64,
+    pub tracked_calls: i64,
+    pub untracked_calls: i64,
+    /// Priciest first, unpriced models included (cost 0).
+    pub by_model: Vec<ModelCost>,
+    /// Priciest first; agents with no priced usage are left out.
+    pub by_source: Vec<SourceCost>,
+}
+
+/// [`SpendBySource`] since `since` (epoch secs; 0 = all time): the same one aggregate pass as
+/// [`cost_report`], with each thread's tally added to its source. A subagent transcript is
+/// its own thread of the same source, so it counts with its agent.
+pub fn spend_by_source(conn: &Connection, since: i64) -> Result<SpendBySource> {
+    let (sql, args) = usage_sql(since, None, ProjectMatch::Exact);
+    let mut rows = usage_by_thread_model(conn, &sql, &args)?;
+    copilot_cli_calls(conn, since, None, ProjectMatch::Exact, &mut rows)?;
+    let sum = summarize(rows);
+    let mut per_source: HashMap<String, Tally> = HashMap::new();
+    if !sum.per_thread.is_empty() {
+        let mut stmt = conn.prepare_cached(
+            "SELECT s.kind FROM threads t JOIN sources s ON s.id = t.source_id WHERE t.id = ?1",
+        )?;
+        for (thread_id, tally) in &sum.per_thread {
+            if tally.cost <= 0.0 {
+                continue;
+            }
+            let kind: Option<String> = stmt.query_row([thread_id], |r| r.get(0)).optional()?;
+            if let Some(kind) = kind {
+                per_source.entry(kind).or_default().add(tally);
+            }
+        }
+    }
+    let mut by_source: Vec<SourceCost> = per_source
+        .into_iter()
+        .map(|(source, t)| SourceCost {
+            source,
+            cost: t.cost,
+            calls: t.calls,
+        })
+        .collect();
+    by_source.sort_by(|a, b| {
+        b.cost
+            .total_cmp(&a.cost)
+            .then_with(|| a.source.cmp(&b.source))
+    });
+    Ok(SpendBySource {
+        total_cost: sum.total_cost,
+        tracked_calls: sum.tracked_calls,
+        untracked_calls: sum.untracked_calls,
+        by_model: sum.by_model,
+        by_source,
+    })
+}
+
 /// One thread's (or session's, or day's) usage in dollars and tokens. Only priced usage
 /// adds to `cost` and `calls`; unpriced usage still adds its tokens.
 #[derive(Debug, Clone, Copy, Default)]
@@ -1978,6 +2046,37 @@ mod tests {
             .unwrap();
         assert!(!synthetic.priced && synthetic.unpriced_reason.is_some());
         let _ = f.subagent;
+    }
+
+    #[test]
+    fn spend_by_source_adds_each_thread_to_its_agent() {
+        let f = fixture("by_source");
+        let codex: i64 = f
+            .conn
+            .query_row("SELECT id FROM sources WHERE kind = 'codex'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        f.conn
+            .execute(
+                "UPDATE threads SET source_id = ?1 WHERE id = ?2",
+                [codex, f.other],
+            )
+            .unwrap();
+        let s = spend_by_source(&f.conn, 0).unwrap();
+        assert!((s.total_cost - 34.0).abs() < 1e-6, "{}", s.total_cost);
+        let got: Vec<(&str, f64)> = s
+            .by_source
+            .iter()
+            .map(|c| (c.source.as_str(), (c.cost * 100.0).round() / 100.0))
+            .collect();
+        // The subagent's $3 counts with Claude Code; the unpriced turn adds nothing.
+        assert_eq!(got, vec![("claude_code", 33.0), ("codex", 1.0)]);
+        assert_eq!(s.untracked_calls, 1);
+        // A window after the Opus turns leaves only the other repo's usage.
+        let late = spend_by_source(&f.conn, 1_400_000).unwrap();
+        assert_eq!(late.by_source.len(), 1);
+        assert_eq!(late.by_source[0].source, "codex");
     }
 
     #[test]

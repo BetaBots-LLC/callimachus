@@ -75,13 +75,37 @@ export interface WhyThread {
   facts: WhyFact[];
 }
 
+/** What a repo's Agent Trace record (agent-trace.dev, in `.agent-trace/`) says about a
+ *  commit's lines: read from the repo, not inferred from a transcript in the index. */
+export interface WhyTraceAttribution {
+  from: "agent-trace";
+  agent: string | null;
+  contributor: string;
+  model: string | null;
+  conversationId: string | null;
+  conversationUrl: string | null;
+  /** The indexed session with that conversation id, when there is one. */
+  threadId: number | null;
+  /** Inclusive [start, end] line runs the record names; empty for the whole file. */
+  ranges: [number, number][];
+  revision: string;
+  /** Written while the change was being made, before the commit. */
+  recordedBeforeCommit: boolean;
+  recordedAt: string | null;
+  traceFile: string;
+}
+
 export interface WhyCommit {
   sha: string;
   shortSha: string;
   subject: string;
   committedAt: number;
   lines: number;
+  /** The lines the commit owns, inclusive [start, end] runs (absent from an older `cal`). */
+  ranges?: [number, number][];
   threads: WhyThread[];
+  /** Agent Trace attributions (absent when there are none, or from an older `cal`). */
+  trace?: WhyTraceAttribution[];
 }
 
 /** `cal why <file>:<line> --json` (schema: callimachus.app/schemas/cal/why.v1.json). */

@@ -7,8 +7,8 @@ use callimachus_core::jobs::{self, lock_anyhow, short_error, JobFlags};
 pub use callimachus_core::{
     agent, applog, cleanup, cli_core, context, cost, db, embed, error, export, gitlink, indexer,
     integration, issues, jobclock, knowledge, ledger, locks, mcp_server, memtrim, onboarding,
-    pick_synth_provider, prepare_ask, resolve_distill_engine, search, secrets, snapshot, today,
-    AskPrep, AskSource,
+    pick_synth_provider, prepare_ask, report, resolve_distill_engine, search, secrets, snapshot,
+    today, AskPrep, AskSource,
 };
 use callimachus_core::{is_keyless, resolve_synth};
 // Opt-in analytics, GUI only: constructed in `run()` and nowhere else (see its module docs).
@@ -557,6 +557,105 @@ async fn spend_breakdown(
 ) -> AppResult<cost::SpendBreakdown> {
     read_blocking(&pool, move |conn| {
         cost::breakdown_cached(conn, project.as_deref())
+    })
+    .await
+}
+
+/// The Report view's data: "Your agents, so far" (`report.rs`) plus the markdown `cal report`
+/// prints, so "Copy as markdown" copies exactly that.
+#[derive(Serialize)]
+struct ReportView {
+    report: report::Report,
+    markdown: String,
+}
+
+/// "Your agents, so far" over every session, or those started since `since` (epoch secs).
+/// Cached like the other aggregates (`search::cache`): seconds of SQL on a large index.
+#[tauri::command]
+async fn report(pool: tauri::State<'_, db::ReadPool>, since: Option<i64>) -> AppResult<ReportView> {
+    read_blocking(&pool, move |conn| {
+        let report = report::build_cached(conn, since, chrono::Utc::now().timestamp())?;
+        let markdown = report::to_markdown(&report);
+        Ok(ReportView { report, markdown })
+    })
+    .await
+}
+
+/// The PNG signature: the card command writes nothing else.
+const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
+/// A 1200 x 630 card is a few hundred KB; anything near this is not one.
+const MAX_CARD_BYTES: usize = 16 << 20;
+
+/// Write `png` to `dir` as `callimachus-report-<day>.png`, or `-2`, `-3`... when that name is
+/// taken (create_new, so an existing file is never overwritten).
+fn write_report_card(
+    dir: &std::path::Path,
+    day: &str,
+    png: &[u8],
+) -> anyhow::Result<std::path::PathBuf> {
+    write_report_card_with(dir, day, png, |file, bytes| {
+        use std::io::Write;
+        file.write_all(bytes)?;
+        file.sync_all()
+    })
+}
+
+/// [`write_report_card`] with the write itself injected, so a test can fail it part-way.
+fn write_report_card_with(
+    dir: &std::path::Path,
+    day: &str,
+    png: &[u8],
+    write: impl FnOnce(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
+) -> anyhow::Result<std::path::PathBuf> {
+    anyhow::ensure!(
+        png.starts_with(PNG_SIGNATURE),
+        "the card is not a PNG image"
+    );
+    anyhow::ensure!(png.len() <= MAX_CARD_BYTES, "the card is too large to save");
+    for n in 1..1000 {
+        let name = if n == 1 {
+            format!("callimachus-report-{day}.png")
+        } else {
+            format!("callimachus-report-{day}-{n}.png")
+        };
+        let path = dir.join(name);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                if let Err(e) = write(&mut file, png) {
+                    // A full disk or a synced Downloads folder that errors part-way would
+                    // leave a truncated card under the day's name, and the next save would
+                    // move on to `-2` past it: remove what was written.
+                    drop(file);
+                    let _ = std::fs::remove_file(&path);
+                    return Err(anyhow::anyhow!("can't write {}: {e}", path.display()));
+                }
+                return Ok(path);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(anyhow::anyhow!("can't write {}: {e}", path.display())),
+        }
+    }
+    anyhow::bail!("{} already holds 999 report cards for {day}", dir.display())
+}
+
+/// Save the report's share card, a PNG the webview rendered, to the Downloads folder (the
+/// home folder when there is none) and return its path, which the frontend offers to show
+/// in the file manager. The app has no save dialog (no dialog plugin), and a card is a
+/// download in all but name.
+#[tauri::command]
+async fn save_report_card(png: Vec<u8>) -> AppResult<String> {
+    blocking(move || {
+        let dir = dirs::download_dir()
+            .filter(|d| d.is_dir())
+            .or_else(dirs::home_dir)
+            .ok_or_else(|| anyhow::anyhow!("no Downloads or home folder to save the card in"))?;
+        let day = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let path = write_report_card(&dir, &day, &png)?;
+        Ok(path.to_string_lossy().into_owned())
     })
     .await
 }
@@ -2698,20 +2797,21 @@ async fn install_agent_integrations(
     Ok(result)
 }
 
-/// Remove the `callimachus` MCP registration and the Codex and Gemini CLI memory hooks
-/// from the other agents.
+/// Remove the `callimachus` MCP registration and the Codex, Gemini CLI, GitHub Copilot and
+/// Cursor memory hooks from the other agents.
 #[tauri::command]
 async fn uninstall_agent_integrations() -> AppResult<()> {
     blocking(integration::uninstall_agents_and_hooks).await
 }
 
-/// Settings > Agents: the Codex and Gemini CLI memory hooks (installed, and why not).
+/// Settings > Agents: the Codex, Gemini CLI, GitHub Copilot and Cursor memory hooks
+/// (installed, and why not).
 #[tauri::command]
 async fn agent_hooks_status() -> AppResult<Vec<integration::AgentHooksStatus>> {
     blocking(|| Ok(integration::agent_hooks_status(&current_exe()?))).await
 }
 
-/// Add the memory hooks to `agent` (`codex` or `gemini`).
+/// Add the memory hooks to `agent` (`codex`, `gemini`, `copilot` or `cursor`).
 #[tauri::command]
 async fn install_agent_hooks(agent: String) -> AppResult<integration::AgentHooksStatus> {
     blocking(move || integration::install_agent_hooks(&current_exe()?, &agent)).await
@@ -3848,6 +3948,8 @@ pub fn run() {
             recurring_issues,
             spend,
             spend_breakdown,
+            report,
+            save_report_card,
             distill_thread,
             recall_decisions,
             recall_gotchas,
@@ -4507,5 +4609,49 @@ mod lock_tests {
         assert!(second.owner.load(Ordering::Relaxed), "gui.lock is now ours");
         drop(watch);
         assert_eq!(watcher_wait(&second, &index), None);
+    }
+}
+
+#[cfg(test)]
+mod report_card_tests {
+    use super::*;
+
+    #[test]
+    fn a_card_is_saved_under_a_new_name_and_only_when_it_is_a_png() {
+        let dir = std::env::temp_dir().join(format!("calli_card_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = [PNG_SIGNATURE, b"rest"].concat();
+        let first = write_report_card(&dir, "2026-11-08", &png).unwrap();
+        assert_eq!(first, dir.join("callimachus-report-2026-11-08.png"));
+        let second = write_report_card(&dir, "2026-11-08", &png).unwrap();
+        assert_eq!(second, dir.join("callimachus-report-2026-11-08-2.png"));
+        assert_eq!(std::fs::read(&first).unwrap(), png, "never overwritten");
+        assert!(write_report_card(&dir, "2026-11-08", b"<html>").is_err());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_write_that_fails_part_way_leaves_no_file() {
+        let dir = std::env::temp_dir().join(format!("calli_card_fail_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = [PNG_SIGNATURE, b"rest"].concat();
+        let failed = write_report_card_with(&dir, "2026-11-08", &png, |file, bytes| {
+            use std::io::Write;
+            file.write_all(&bytes[..4])?;
+            Err(std::io::Error::other("disk full"))
+        });
+        assert!(failed.is_err());
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            0,
+            "no partial card"
+        );
+        // The next save takes the day's first name, not `-2`.
+        let saved = write_report_card(&dir, "2026-11-08", &png).unwrap();
+        assert_eq!(saved, dir.join("callimachus-report-2026-11-08.png"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

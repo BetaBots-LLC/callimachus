@@ -109,11 +109,15 @@ pub mod locks;
 pub mod mcp_server;
 // The first-run checklist's saved answers; GUI only.
 pub mod onboarding;
+// "Your agents, so far": `cal report` and the app's Report view.
+pub mod report;
 #[cfg(test)]
 pub(crate) mod schema_check;
 pub mod search;
 pub mod snapshot;
 pub mod today;
+// Agent Trace (agent-trace.dev) records: read by `cal why`, written by `cal trace export`.
+pub mod trace;
 // `cal why`: git blame to commits to the sessions behind them, and their decisions.
 pub mod why;
 

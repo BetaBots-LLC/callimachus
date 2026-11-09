@@ -24,6 +24,7 @@ import {
 } from "../lib/queries";
 import { errorText, notify } from "../lib/toast";
 import { useChecklist } from "../store/checklist";
+import { useUi } from "../store/ui";
 import { Button } from "@/components/ui/button";
 import { Progress, ProgressLabel } from "@/components/ui/progress";
 import { Spinner } from "@/components/ui/spinner";
@@ -44,6 +45,7 @@ const NOTHING_ANSWERED: OnboardingSteps = {
   agents: null,
   memory: null,
   semantic: null,
+  report: null,
 };
 
 const STEP_COPY: Record<OnboardingStep, { title: string; unlocks: string }> = {
@@ -63,6 +65,11 @@ const STEP_COPY: Record<OnboardingStep, { title: string; unlocks: string }> = {
   semantic: {
     title: "Semantic search",
     unlocks: "Unlocks search by meaning, so a session turns up even when you forget its words.",
+  },
+  report: {
+    title: "See your report",
+    unlocks:
+      "Your agents so far on one screen: time, spend, recurring errors and memory, ready to share.",
   },
 };
 
@@ -98,10 +105,11 @@ function stepHeader(li: HTMLLIElement | null | undefined): HTMLButtonElement | n
 /**
  * First-run setup checklist, shown in place of the Search view while the index is empty
  * and for the rest of that session (store/checklist.ts), or when the user reopens it from
- * the command palette or Settings > General. Four steps: index the history (required), then
- * connect agents, turn on memory and build semantic search (each skippable). A step's done
- * state comes from live data and is recorded in `onboarding.steps` so it sticks; skips are
- * recorded there too.
+ * the command palette or Settings > General. Five steps: index the history (required), then
+ * connect agents, turn on memory, build semantic search and see the report (each skippable).
+ * A step's done state comes from live data and is recorded in `onboarding.steps` so it
+ * sticks; skips are recorded there too. The report step has no live state: the Report view
+ * records it done when it opens.
  */
 export function Onboarding() {
   const qc = useQueryClient();
@@ -139,6 +147,7 @@ export function Onboarding() {
       claudeConnected(recall.data) || (others.data ?? []).some((a) => a.present && a.registered),
     memory: !!knowledge.data?.enabled,
     semantic: coverage !== null && coverage >= SEMANTIC_DONE_RATIO,
+    report: false,
   };
   const steps = saved.data ?? NOTHING_ANSWERED;
   const status = (step: OnboardingStep): StepStatus => {
@@ -228,7 +237,7 @@ export function Onboarding() {
           </h1>
           <p className="text-sm text-muted-foreground">
             {welcome
-              ? "One local, searchable index of every AI coding-agent conversation you've had. Four steps; only the first is required."
+              ? "One local, searchable index of every AI coding-agent conversation you've had. Five steps; only the first is required."
               : firstPending
                 ? `${doneCount} of ${ONBOARDING_STEPS.length} done. Skip what you don't need and come back to it anytime.`
                 : `${doneCount} of ${ONBOARDING_STEPS.length} done. Open a step to see or change it.`}
@@ -269,6 +278,13 @@ export function Onboarding() {
                   <SemanticStep
                     indexed={live.index}
                     onSkip={pending ? () => skip("semantic") : undefined}
+                  />
+                )}
+                {step === "report" && (
+                  <ReportStep
+                    indexed={live.index}
+                    done={statuses[i] === "done"}
+                    onSkip={pending ? () => skip("report") : undefined}
                   />
                 )}
               </StepItem>
@@ -539,19 +555,20 @@ function IndexStep() {
   );
 }
 
-/** Agents with a hook system Callimachus can add memory hooks to (Cursor has none it can
- *  use: its sessionStart payload carries no working directory to pick the repo). */
-const HOOK_AGENT_IDS: readonly string[] = ["codex", "gemini"] satisfies HookAgentId[];
+/** Agents listed here (the ones with an MCP entry) whose hook system Callimachus can add
+ *  memory hooks to. GitHub Copilot has hooks but no MCP row, so its switch is in Settings. */
+const HOOK_AGENT_IDS: readonly string[] = ["codex", "gemini", "cursor"] satisfies HookAgentId[];
 
 const AFTER_CONNECT: Record<string, string> = {
   codex:
     "Codex runs a new hook only after you trust it: run /hooks in Codex and approve the Callimachus entries, then start a new session.",
   gemini: "New Gemini CLI sessions pick up the server and the hooks.",
-  cursor: "Reload Cursor's MCP config (or restart it) to pick up the server.",
+  cursor:
+    "Reload Cursor's MCP config (or restart it) to pick up the server. New chats get the memory hooks, but Cursor does not wait for them: the first chat after Cursor starts, while its hooks load, or a first prompt sent right away can miss the memory.",
 };
 
 /** Step 2: Claude Code's own integration, and for each other agent this machine has, the
- *  MCP registration plus (Codex, Gemini CLI) its memory hooks, through the install commands
+ *  MCP registration plus (Codex, Gemini CLI, Cursor) its memory hooks, through the install commands
  *  Settings > Agents uses. */
 function AgentsStep({
   recall,
@@ -670,7 +687,7 @@ function AgentsStep({
       )}
       {hooks.isError && (
         <p role="alert" className="text-[13px] text-destructive">
-          Couldn't read the Codex and Gemini CLI hooks: {errorText(hooks.error)}
+          Couldn't read the other agents' memory hooks: {errorText(hooks.error)}
         </p>
       )}
       {done ? (
@@ -835,6 +852,44 @@ function MemoryStep({ done, onSkip }: { done: boolean; onSkip?: () => void }) {
         </p>
       )}
       <MemorySetupCard embedded onSkip={onSkip} />
+    </div>
+  );
+}
+
+/** Step 5: open the Report view, which records the step done itself. */
+function ReportStep({
+  indexed,
+  done,
+  onSkip,
+}: {
+  indexed: boolean;
+  done: boolean;
+  onSkip?: () => void;
+}) {
+  const setView = useUi((s) => s.setView);
+  if (!indexed) {
+    return (
+      <div className="flex flex-wrap items-center gap-2">
+        <p className="min-w-0 flex-1 text-[13px] text-muted-foreground">
+          Index your history first; the report is built from it.
+        </p>
+        <SkipButton onSkip={onSkip} />
+      </div>
+    );
+  }
+  return (
+    <div className="space-y-3">
+      <p className="text-[13px] leading-normal text-muted-foreground">
+        Sessions and hours per agent, estimated spend, the errors that keep coming back and how they
+        were fixed, and what your agents remember. Copy it as markdown or save a card to share; it
+        is also in Stats, and in the terminal as <code>cal report</code>.
+      </p>
+      <div className="flex flex-wrap items-center gap-2">
+        <Button size="sm" variant={done ? "outline" : "default"} onClick={() => setView("report")}>
+          {done ? "Open the report" : "See your report"}
+        </Button>
+        <SkipButton onSkip={onSkip} />
+      </div>
     </div>
   );
 }

@@ -98,7 +98,8 @@ function DesktopPage() {
           Remember, with no LLM and no key. Turn on memory and it fills with decisions, gotchas and
           summaries distilled by the engine you pick: your logged-in Claude Code or Codex CLI, local
           Ollama, or a cloud API key. Claude Code's own auto memory is imported too, and the hooks
-          hand it all to Claude Code, Codex and Gemini CLI as each session starts.
+          hand it all to Claude Code, Codex, Gemini CLI, GitHub Copilot and Cursor as each session
+          starts.
         </FeaturePanel>
         <FeaturePanel
           icon={BookOpen}

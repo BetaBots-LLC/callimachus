@@ -11,8 +11,9 @@ use serde::{Deserialize, Serialize};
 
 pub const STEPS_KEY: &str = "onboarding.steps";
 
-/// The checklist steps, in display order.
-pub const STEPS: [&str; 4] = ["index", "agents", "memory", "semantic"];
+/// The checklist steps, in display order. `report` is done once the Report view has been
+/// opened (the view records it), and skipped when its Today card is dismissed.
+pub const STEPS: [&str; 5] = ["index", "agents", "memory", "semantic", "report"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -30,6 +31,7 @@ pub struct OnboardingSteps {
     pub agents: Option<StepState>,
     pub memory: Option<StepState>,
     pub semantic: Option<StepState>,
+    pub report: Option<StepState>,
 }
 
 impl OnboardingSteps {
@@ -39,6 +41,7 @@ impl OnboardingSteps {
             "agents" => &mut self.agents,
             "memory" => &mut self.memory,
             "semantic" => &mut self.semantic,
+            "report" => &mut self.report,
             _ => return None,
         })
     }
@@ -89,10 +92,10 @@ mod tests {
         let conn = temp_db("onboarding_unset");
         let steps = get(&conn).unwrap();
         assert_eq!(steps, OnboardingSteps::default());
-        // The frontend reads all four keys, so unanswered ones serialize as null.
+        // The frontend reads every key, so unanswered ones serialize as null.
         assert_eq!(
             serde_json::to_value(&steps).unwrap(),
-            serde_json::json!({ "index": null, "agents": null, "memory": null, "semantic": null })
+            serde_json::json!({ "index": null, "agents": null, "memory": null, "semantic": null, "report": null })
         );
     }
 
@@ -101,11 +104,12 @@ mod tests {
         let conn = temp_db("onboarding_round_trip");
         set_step(&conn, "index", Some("done")).unwrap();
         set_step(&conn, "agents", Some("skipped")).unwrap();
-        let steps = set_step(&conn, "semantic", Some("done")).unwrap();
+        set_step(&conn, "semantic", Some("done")).unwrap();
+        let steps = set_step(&conn, "report", Some("done")).unwrap();
         assert_eq!(steps, get(&conn).unwrap());
         assert_eq!(
             serde_json::to_value(&steps).unwrap(),
-            serde_json::json!({ "index": "done", "agents": "skipped", "memory": null, "semantic": "done" })
+            serde_json::json!({ "index": "done", "agents": "skipped", "memory": null, "semantic": "done", "report": "done" })
         );
         // Reopening a skipped step clears it.
         let steps = set_step(&conn, "agents", None).unwrap();

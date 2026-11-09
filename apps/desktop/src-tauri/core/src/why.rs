@@ -24,6 +24,9 @@ pub const MAX_COMMITS: usize = 10;
 pub const MAX_THREADS_PER_COMMIT: usize = 5;
 /// Decisions and gotchas shown per thread, pinned first.
 pub const MAX_FACTS_PER_THREAD: usize = 6;
+/// The most commits `cal why -n` shows for a whole file. The editor gutter asks for every
+/// linked commit of a long-lived file; past this the facts queries cost more than they say.
+pub const MAX_COMMITS_LIMIT: usize = 200;
 
 /// `cal why --json`: the commits behind a file or line and the sessions behind each commit.
 #[derive(Debug, Serialize, JsonSchema)]
@@ -54,9 +57,20 @@ pub struct WhyCommit {
     pub committed_at: i64,
     /// Lines of the file this commit last changed (1 for a single line).
     pub lines: usize,
+    /// Those lines as inclusive `[start, end]` runs of 1-based line numbers in the blamed
+    /// file (the saved file, or the editor buffer with `--stdin`), ascending, so an editor can
+    /// mark them without a blame of its own. Optional in the schema only because a `cal` from
+    /// before it does not print it; it is never empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub ranges: Vec<[u32; 2]>,
     /// The sessions inferred to have produced the commit, best first: the ones that edited
     /// this file, then read it, then mentioned it.
     pub threads: Vec<WhyThread>,
+    /// Attributions from Agent Trace records the repo carries (`.agent-trace/*.jsonl`), read
+    /// at query time: what another tool recorded about this commit's lines, even for a
+    /// conversation the index has no transcript of. Omitted when there is none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub trace: Vec<crate::trace::TraceAttribution>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -102,12 +116,29 @@ pub struct Target {
 }
 
 /// One commit from `git blame --porcelain`, with how many of the blamed lines it owns.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct BlameCommit {
     pub sha: String,
     pub committed_at: i64,
     pub subject: String,
     pub lines: usize,
+    /// The 1-based numbers of those lines in the blamed file, ascending.
+    pub line_numbers: Vec<u32>,
+}
+
+impl BlameCommit {
+    /// [`Self::line_numbers`] as inclusive runs.
+    pub fn ranges(&self) -> Vec<[u32; 2]> {
+        let mut out: Vec<[u32; 2]> = Vec::new();
+        for &n in &self.line_numbers {
+            match out.last_mut() {
+                Some(r) if n == r[1] + 1 => r[1] = n,
+                Some(r) if n <= r[1] => {}
+                _ => out.push([n, n]),
+            }
+        }
+        out
+    }
 }
 
 /// `<file>[:<line>]`, or `<file> <line>`, from `cal why`'s positionals. The line is split
@@ -190,14 +221,29 @@ pub fn resolve(file: &str, base: &Path, deadline: Instant) -> Result<Target> {
 /// A file HEAD does not have (untracked, or added and not committed yet) makes git fail;
 /// it is answered as one uncommitted line instead, the same state a modified line gets.
 pub fn blame(target: &Target, line: Option<u32>, deadline: Instant) -> Result<String> {
+    blame_contents(target, line, None, deadline)
+}
+
+/// [`blame`] of `contents` in place of the saved file (`git blame --contents -`): an editor's
+/// unsaved buffer, so the line numbers match what the user sees. Lines the buffer changed
+/// come back as uncommitted.
+pub fn blame_contents(
+    target: &Target,
+    line: Option<u32>,
+    contents: Option<&[u8]>,
+    deadline: Instant,
+) -> Result<String> {
     let range = line.map(|n| format!("{n},{n}"));
     let mut args = vec!["blame", "--porcelain", "-w", "-M"];
     if let Some(r) = &range {
         args.extend(["-L", r]);
     }
+    if contents.is_some() {
+        args.extend(["--contents", "-"]);
+    }
     args.extend(["--", &target.rel]);
     let repo = Path::new(&target.repo);
-    match run_git(repo, &args, deadline) {
+    match run_git_input(repo, &args, contents, deadline) {
         Ok(out) => Ok(out),
         // Asked by exit status, not by git's message, which is translated.
         Err(e) => match run_git(
@@ -223,27 +269,30 @@ fn not_committed_porcelain(line: Option<u32>) -> String {
 /// The distinct commits in `git blame --porcelain` output, in order of first appearance,
 /// with the lines each owns. Each commit's header lines (`committer-time`, `summary`) come
 /// once, after its first `<sha> <orig> <final> [<count>]` line; every blamed line is a
-/// tab-prefixed content line under the latest sha line.
+/// tab-prefixed content line under the latest sha line, whose `<final>` is its number.
 pub fn parse_blame(porcelain: &str) -> Vec<BlameCommit> {
     let mut order: Vec<BlameCommit> = Vec::new();
     let mut at: HashMap<String, usize> = HashMap::new();
     let mut current: Option<usize> = None;
+    let mut final_line: Option<u32> = None;
     for line in porcelain.lines() {
         if line.starts_with('\t') {
             if let Some(i) = current {
                 order[i].lines += 1;
+                if let Some(n) = final_line.take() {
+                    order[i].line_numbers.push(n);
+                }
             }
             continue;
         }
         let mut parts = line.split(' ');
         let head = parts.next().unwrap_or("");
         if is_sha(head) && parts.next().is_some_and(|n| n.parse::<u64>().is_ok()) {
+            final_line = parts.next().and_then(|n| n.parse().ok());
             let i = *at.entry(head.to_string()).or_insert_with(|| {
                 order.push(BlameCommit {
                     sha: head.to_string(),
-                    committed_at: 0,
-                    subject: String::new(),
-                    lines: 0,
+                    ..Default::default()
                 });
                 order.len() - 1
             });
@@ -257,7 +306,87 @@ pub fn parse_blame(porcelain: &str) -> Vec<BlameCommit> {
             order[i].subject = s.to_string();
         }
     }
+    // A moved block (`-M`) can list a later line before an earlier one.
+    for c in &mut order {
+        c.line_numbers.sort_unstable();
+    }
     order
+}
+
+/// Each blamed line's position in the commit that owns it, from `git blame --porcelain`:
+/// sha -> `(<orig> line, the file's path at that commit)`, one per line. Agent Trace ranges
+/// are positions at the recorded revision, so they are compared with these and not with
+/// `line_numbers` (today's positions), which shift as soon as a later commit adds a line
+/// above. `filename` comes with a commit's first group only (on every group when the commit
+/// blames lines from more than one path), so the last one seen for the commit holds.
+pub fn blame_origins(porcelain: &str) -> HashMap<String, Vec<(u32, String)>> {
+    let mut out: HashMap<String, Vec<(u32, String)>> = HashMap::new();
+    let mut names: HashMap<String, String> = HashMap::new();
+    let mut current: Option<(String, Option<u32>)> = None;
+    for line in porcelain.lines() {
+        if line.starts_with('\t') {
+            if let Some((sha, orig)) = current.as_mut() {
+                if let (Some(n), Some(name)) = (orig.take(), names.get(sha.as_str())) {
+                    out.entry(sha.clone()).or_default().push((n, name.clone()));
+                }
+            }
+            continue;
+        }
+        let mut parts = line.split(' ');
+        let head = parts.next().unwrap_or("");
+        if is_sha(head) {
+            if let Some(orig) = parts.next().and_then(|n| n.parse::<u32>().ok()) {
+                current = Some((head.to_string(), Some(orig)));
+                continue;
+            }
+        }
+        if let (Some((sha, _)), Some(name)) = (&current, line.strip_prefix("filename ")) {
+            names.insert(sha.clone(), unquote_path(name));
+        }
+    }
+    out
+}
+
+/// A path as git prints it: C-quoted (`"..."` with backslash and octal escapes) when it has
+/// bytes `core.quotepath` asks to escape, as is otherwise.
+pub(crate) fn unquote_path(p: &str) -> String {
+    let p = p.trim_end_matches('\t');
+    let Some(inner) = p.strip_prefix('"').and_then(|q| q.strip_suffix('"')) else {
+        return p.to_string();
+    };
+    let mut bytes = Vec::with_capacity(inner.len());
+    let mut it = inner.bytes().peekable();
+    while let Some(b) = it.next() {
+        if b != b'\\' {
+            bytes.push(b);
+            continue;
+        }
+        match it.next() {
+            Some(d @ b'0'..=b'7') => {
+                let mut v = u32::from(d - b'0');
+                for _ in 0..2 {
+                    match it.peek() {
+                        Some(&o @ b'0'..=b'7') => {
+                            v = v * 8 + u32::from(o - b'0');
+                            it.next();
+                        }
+                        _ => break,
+                    }
+                }
+                bytes.push(v as u8);
+            }
+            Some(b'a') => bytes.push(7),
+            Some(b'b') => bytes.push(8),
+            Some(b'f') => bytes.push(12),
+            Some(b'n') => bytes.push(b'\n'),
+            Some(b'r') => bytes.push(b'\r'),
+            Some(b't') => bytes.push(b'\t'),
+            Some(b'v') => bytes.push(11),
+            Some(other) => bytes.push(other),
+            None => bytes.push(b'\\'),
+        }
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 /// A full object name: 40 hex chars (SHA-1) or 64 (SHA-256 repositories).
@@ -266,11 +395,12 @@ fn is_sha(s: &str) -> bool {
 }
 
 /// What `git blame` prints for lines in the working tree that no commit owns yet.
-fn is_uncommitted(sha: &str) -> bool {
+pub(crate) fn is_uncommitted(sha: &str) -> bool {
     sha.bytes().all(|b| b == b'0')
 }
 
-/// [`blame`] then [`explain`]: the answer for a [`resolve`]d file.
+/// [`blame`] then [`explain`], with the repo's Agent Trace records: the answer for a
+/// [`resolve`]d file.
 pub fn why(
     conn: &Connection,
     target: &Target,
@@ -278,7 +408,25 @@ pub fn why(
     deadline: Instant,
 ) -> Result<WhyOutput> {
     let porcelain = blame(target, line, deadline)?;
-    explain(conn, target, line, &parse_blame(&porcelain))
+    let blamed = parse_blame(&porcelain);
+    let trace =
+        crate::trace::load_for_file(target, &blamed, deadline).map(|t| t.with_blame(&porcelain));
+    explain_with(
+        conn,
+        target,
+        line,
+        &blamed,
+        &Explain {
+            max_commits: MAX_COMMITS,
+            trace: trace.as_ref(),
+        },
+    )
+}
+
+/// How [`explain_with`] answers: how many commits, and the repo's trace records for the file.
+pub struct Explain<'a> {
+    pub max_commits: usize,
+    pub trace: Option<&'a crate::trace::FileTrace>,
 }
 
 /// The answer for blamed commits: each commit's linked threads, ranked by what they did to
@@ -288,6 +436,26 @@ pub fn explain(
     target: &Target,
     line: Option<u32>,
     blamed: &[BlameCommit],
+) -> Result<WhyOutput> {
+    explain_with(
+        conn,
+        target,
+        line,
+        blamed,
+        &Explain {
+            max_commits: MAX_COMMITS,
+            trace: None,
+        },
+    )
+}
+
+/// [`explain`] with up to `opts.max_commits` commits and each commit's trace attributions.
+pub fn explain_with(
+    conn: &Connection,
+    target: &Target,
+    line: Option<u32>,
+    blamed: &[BlameCommit],
+    opts: &Explain<'_>,
 ) -> Result<WhyOutput> {
     let uncommitted = blamed.iter().any(|c| is_uncommitted(&c.sha));
     let has_edits = crate::db::has_table(conn, "file_edits");
@@ -304,7 +472,7 @@ pub fn explain(
          ORDER BY f.pinned DESC, f.seq, f.id LIMIT ?2"
     );
 
-    let mut linked: Vec<(BlameCommit, Vec<WhyThread>)> = Vec::new();
+    let mut linked: Vec<Picked> = Vec::new();
     for c in blamed.iter().filter(|c| !is_uncommitted(&c.sha)) {
         let mut threads = commit_threads(conn, &c.sha)?;
         for t in &mut threads {
@@ -317,14 +485,24 @@ pub fn explain(
                 .then(b.overlap.cmp(&a.overlap))
                 .then(b.last_active.cmp(&a.last_active))
         });
-        threads.truncate(MAX_THREADS_PER_COMMIT);
-        linked.push((c.clone(), threads));
+        // Not cut to MAX_THREADS_PER_COMMIT yet: `link_threads` drops an attribution whose
+        // session is linked to the commit at any rank, not only among the ones shown.
+        let trace = opts
+            .trace
+            .map(|t| t.for_commit(c, line))
+            .unwrap_or_default();
+        linked.push((c.clone(), threads, trace));
     }
-    let picked = pick_commits(linked, MAX_COMMITS);
+    let mut picked = pick_commits(linked, opts.max_commits.max(1));
+    if picked.iter().any(|p| !p.2.is_empty()) {
+        crate::trace::link_threads(conn, &mut picked)?;
+    }
 
     let mut facts = conn.prepare_cached(&fact_sql)?;
     let mut commits = Vec::with_capacity(picked.len());
-    for (c, mut threads) in picked {
+    for (c, mut threads, mut trace) in picked {
+        threads.truncate(MAX_THREADS_PER_COMMIT);
+        trace.truncate(crate::trace::MAX_ATTRIBUTIONS_PER_COMMIT);
         for t in &mut threads {
             t.facts = facts
                 .query_map(rusqlite::params![t.id, MAX_FACTS_PER_THREAD as i64], |r| {
@@ -342,11 +520,13 @@ pub fn explain(
         }
         commits.push(WhyCommit {
             short_sha: c.sha.chars().take(10).collect(),
+            ranges: c.ranges(),
             sha: c.sha,
             subject: c.subject,
             committed_at: c.committed_at,
             lines: c.lines,
             threads,
+            trace,
         });
     }
     let unlinked = commits.iter().all(|c| c.threads.is_empty());
@@ -361,15 +541,22 @@ pub fn explain(
     })
 }
 
-/// Up to `cap` commits, newest first, taking the ones a session produced before the rest:
-/// "why" is answered by a linked commit, and a file's newest commits are often unlinked
-/// formatting or merges that would crowd the linked ones out of a newest-first cut.
-fn pick_commits(
-    mut all: Vec<(BlameCommit, Vec<WhyThread>)>,
-    cap: usize,
-) -> Vec<(BlameCommit, Vec<WhyThread>)> {
+/// A blamed commit with its linked threads and its trace attributions.
+pub(crate) type Picked = (
+    BlameCommit,
+    Vec<WhyThread>,
+    Vec<crate::trace::TraceAttribution>,
+);
+
+/// Up to `cap` commits, newest first, taking the ones a session produced (or a trace record
+/// attributes) before the rest: "why" is answered by a linked commit, and a file's newest
+/// commits are often unlinked formatting or merges that would crowd the linked ones out of a
+/// newest-first cut.
+fn pick_commits(mut all: Vec<Picked>, cap: usize) -> Vec<Picked> {
     all.sort_by_key(|c| std::cmp::Reverse(c.0.committed_at));
-    let (mut picked, rest): (Vec<_>, Vec<_>) = all.into_iter().partition(|(_, t)| !t.is_empty());
+    let (mut picked, rest): (Vec<_>, Vec<_>) = all
+        .into_iter()
+        .partition(|(_, t, tr)| !t.is_empty() || !tr.is_empty());
     picked.truncate(cap);
     let room = cap - picked.len();
     picked.extend(rest.into_iter().take(room));
@@ -415,7 +602,7 @@ const CHECKOUTS_GIT_BUDGET: std::time::Duration = std::time::Duration::from_secs
 /// clones share its portable id, `knowledge::local_keys_for_portable`), and the roots the
 /// project's sessions anchored their edits to, which still name worktrees removed after
 /// their merge.
-fn project_checkouts(conn: &Connection, target: &Target) -> Vec<String> {
+pub(crate) fn project_checkouts(conn: &Connection, target: &Target) -> Vec<String> {
     let deadline = Instant::now() + CHECKOUTS_GIT_BUDGET;
     let mut keys = vec![
         crate::indexer::canonical_project(&target.repo).unwrap_or_else(|| target.repo.clone())
@@ -484,7 +671,7 @@ fn project_checkouts(conn: &Connection, target: &Target) -> Vec<String> {
 /// project the session ran in; a path outside it stays absolute (`<checkout>/<rel>` for each
 /// checkout); and a session in the main repo editing a worktree nested inside it stores the
 /// path relative to the main repo (`.claude/worktrees/x/<rel>`).
-fn path_forms(target: &Target, checkouts: &[String]) -> Vec<String> {
+pub(crate) fn path_forms(target: &Target, checkouts: &[String]) -> Vec<String> {
     let repo = target
         .repo
         .replace('\\', "/")
@@ -584,29 +771,99 @@ fn touch_rank(op: Option<&str>) -> u8 {
 /// Run git in `dir` and return its stdout, or fail with its first stderr line. Killed at
 /// `deadline`: blame of a long file with deep history can take seconds, and the MCP server
 /// answers an agent waiting on it.
-fn run_git(dir: &Path, args: &[&str], deadline: Instant) -> Result<String> {
-    use std::io::Read;
+pub(crate) fn run_git(dir: &Path, args: &[&str], deadline: Instant) -> Result<String> {
+    run_git_input(dir, args, None, deadline)
+}
+
+/// [`run_git`] with `input` on git's stdin (`blame --contents -`, `rev-list --stdin`).
+pub(crate) fn run_git_input(
+    dir: &Path,
+    args: &[&str],
+    input: Option<&[u8]>,
+    deadline: Instant,
+) -> Result<String> {
+    run_git_bounded(dir, args, input, deadline, usize::MAX)
+}
+
+/// The error [`run_git_bounded`] returns when git printed more than its bound; callers tell
+/// it apart with `downcast_ref` and fall back to a cheaper question.
+#[derive(Debug)]
+pub(crate) struct GitOutputTooLarge;
+
+impl std::fmt::Display for GitOutputTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("git printed more than this command reads")
+    }
+}
+
+impl std::error::Error for GitOutputTooLarge {}
+
+/// [`run_git_input`] that keeps at most `max_stdout` bytes of git's output: past that, git is
+/// killed and the call fails with [`GitOutputTooLarge`]. `git show` of a commit that vendors
+/// a lockfile or a data dump prints all of it, and the whole output would sit in memory.
+pub(crate) fn run_git_bounded(
+    dir: &Path,
+    args: &[&str],
+    input: Option<&[u8]>,
+    deadline: Instant,
+    max_stdout: usize,
+) -> Result<String> {
+    use std::io::{Read, Write};
     use std::process::Stdio;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
     let mut child = crate::gitlink::git_command()
         .arg("-C")
         .arg(crate::gitlink::plain_path(&dir.to_string_lossy()))
         .args(args)
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| anyhow::anyhow!("running git: {e} (is git installed?)"))?;
+    // Until git is reaped, a SIGTERM or SIGHUP to this process kills it first: the editor
+    // gutter stops a slow `cal why` after 5 s, and an orphaned `git blame` would run on.
+    let _tracked = reap::track(child.id());
+    // Written on its own thread: git reads stdin while it writes stdout, so a large buffer
+    // written here first could fill both pipes and deadlock. Dropping the handle closes it.
+    let feeder = input.map(|bytes| {
+        let bytes = bytes.to_vec();
+        let mut stdin = child.stdin.take().expect("piped stdin");
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(&bytes);
+        })
+    });
     // Drained on helper threads: output bigger than the pipe buffer would otherwise block
     // git on write and it would never exit.
-    let drain = |mut pipe: Box<dyn Read + Send>| {
+    let over = Arc::new(AtomicBool::new(false));
+    let out = {
+        let over = Arc::clone(&over);
+        let pipe = child.stdout.take().expect("piped stdout");
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let cap = u64::try_from(max_stdout).unwrap_or(u64::MAX);
+            let _ = pipe.take(cap.saturating_add(1)).read_to_end(&mut buf);
+            if buf.len() > max_stdout {
+                // Returning drops the pipe, so git stops on its next write.
+                over.store(true, Ordering::SeqCst);
+                return Vec::new();
+            }
+            buf
+        })
+    };
+    let err = {
+        let mut pipe = child.stderr.take().expect("piped stderr");
         std::thread::spawn(move || {
             let mut buf = Vec::new();
             let _ = pipe.read_to_end(&mut buf);
             buf
         })
     };
-    let out = drain(Box::new(child.stdout.take().expect("piped stdout")));
-    let err = drain(Box::new(child.stderr.take().expect("piped stderr")));
+    let too_large = || anyhow::Error::new(GitOutputTooLarge);
     loop {
         let polled = match child.try_wait() {
             Ok(polled) => polled,
@@ -618,8 +875,14 @@ fn run_git(dir: &Path, args: &[&str], deadline: Instant) -> Result<String> {
             }
         };
         if let Some(status) = polled {
+            if let Some(f) = feeder {
+                let _ = f.join();
+            }
             let stdout = out.join().unwrap_or_default();
             let stderr = err.join().unwrap_or_default();
+            if over.load(Ordering::SeqCst) {
+                return Err(too_large());
+            }
             if !status.success() {
                 let msg = String::from_utf8_lossy(&stderr);
                 let first = msg.lines().next().unwrap_or("").trim();
@@ -628,12 +891,117 @@ fn run_git(dir: &Path, args: &[&str], deadline: Instant) -> Result<String> {
             }
             return Ok(String::from_utf8_lossy(&stdout).into_owned());
         }
+        if over.load(Ordering::SeqCst) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(too_large());
+        }
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
             bail!("git {} did not finish in time", args[0]);
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// The git children this process is waiting on, killed when it is told to stop. A killed
+/// `cal` otherwise leaves its `git blame` running to the end: the editor gutter stops a
+/// slow run at 5 s, and every stopped run left one more blame of the file behind. Unix only
+/// (Windows: the extension ends the whole tree with `taskkill /T`), and only when nothing
+/// else handles SIGTERM or SIGHUP: the handler kills the children, restores the default
+/// action and re-raises, so the process still ends the way it would have.
+#[cfg(unix)]
+mod reap {
+    use std::sync::atomic::{AtomicI32, Ordering};
+    use std::sync::Once;
+
+    // <signal.h>: the same numbers on macOS, Linux and the BSDs.
+    const SIGHUP: i32 = 1;
+    const SIGKILL: i32 = 9;
+    const SIGTERM: i32 = 15;
+    const SIG_DFL: usize = 0;
+    const SIG_ERR: usize = usize::MAX;
+
+    extern "C" {
+        fn signal(sig: i32, handler: usize) -> usize;
+        fn kill(pid: i32, sig: i32) -> i32;
+        fn raise(sig: i32) -> i32;
+    }
+
+    /// Live git pids, 0 for a free slot. Atomics, because the handler reads them while other
+    /// threads (the MCP server's concurrent calls) add and remove theirs.
+    static LIVE: [AtomicI32; 32] = [const { AtomicI32::new(0) }; 32];
+    static INSTALL: Once = Once::new();
+
+    extern "C" fn on_signal(sig: i32) {
+        for slot in &LIVE {
+            let pid = slot.load(Ordering::SeqCst);
+            if pid > 0 {
+                // SAFETY: kill(2) is async-signal-safe and only signals that pid.
+                unsafe {
+                    kill(pid, SIGKILL);
+                }
+            }
+        }
+        // SAFETY: signal(2) and raise(3) are async-signal-safe. The signal is blocked while
+        // this handler runs, so the re-raised one is delivered, with the default action, as
+        // soon as it returns.
+        unsafe {
+            signal(sig, SIG_DFL);
+            raise(sig);
+        }
+    }
+
+    /// Clears its slot when the git child has been reaped.
+    pub(super) struct Tracked(Option<usize>);
+
+    impl Drop for Tracked {
+        fn drop(&mut self) {
+            if let Some(i) = self.0 {
+                LIVE[i].store(0, Ordering::SeqCst);
+            }
+        }
+    }
+
+    pub(super) fn track(pid: u32) -> Tracked {
+        INSTALL.call_once(|| {
+            for sig in [SIGHUP, SIGTERM] {
+                let handler = on_signal as extern "C" fn(i32) as usize;
+                // SAFETY: installs a handler that only calls async-signal-safe functions; a
+                // disposition someone else set (a handler, or SIG_IGN under nohup) is put
+                // back at once, so this only ever replaces the default action.
+                unsafe {
+                    let old = signal(sig, handler);
+                    if old != SIG_DFL && old != SIG_ERR {
+                        signal(sig, old);
+                    }
+                }
+            }
+        });
+        let Ok(pid) = i32::try_from(pid) else {
+            return Tracked(None);
+        };
+        // More concurrent git runs than slots go untracked; they still end at their deadline.
+        let slot = LIVE.iter().position(|s| {
+            s.compare_exchange(0, pid, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        });
+        Tracked(slot)
+    }
+
+    #[cfg(test)]
+    pub(super) fn tracked(pid: i32) -> bool {
+        LIVE.iter().any(|s| s.load(Ordering::SeqCst) == pid)
+    }
+}
+
+#[cfg(not(unix))]
+mod reap {
+    pub(super) struct Tracked;
+
+    pub(super) fn track(_pid: u32) -> Tracked {
+        Tracked
     }
 }
 
@@ -686,6 +1054,16 @@ mod tests {
         assert_eq!(got[1].subject, "chore: fmt");
         assert_eq!(got[1].lines, 1);
         assert!(is_uncommitted(&got[2].sha));
+        // Each line's number is its `<final>` field: what an editor marks.
+        assert_eq!(got[0].line_numbers, vec![1, 2]);
+        assert_eq!(got[0].ranges(), vec![[1, 2]]);
+        assert_eq!(got[1].ranges(), vec![[3, 3]]);
+        assert_eq!(got[2].line_numbers, vec![4]);
+        let split = BlameCommit {
+            line_numbers: vec![1, 2, 3, 7, 9, 10],
+            ..Default::default()
+        };
+        assert_eq!(split.ranges(), vec![[1, 3], [7, 7], [9, 10]]);
         // A content line that looks like a header is still content (it is tab-prefixed).
         let tricky = format!("{A} 1 1 1\nsummary x\n\t{B} 1 1 1\n");
         let got = parse_blame(&tricky);
@@ -987,6 +1365,7 @@ mod tests {
             committed_at: 1,
             subject: "the linked one".into(),
             lines: 1,
+            line_numbers: vec![1],
         }];
         for i in 0..MAX_COMMITS + 5 {
             blamed.push(BlameCommit {
@@ -994,6 +1373,7 @@ mod tests {
                 committed_at: 1000 + i as i64,
                 subject: format!("newer {i}"),
                 lines: 1,
+                line_numbers: vec![2 + i as u32],
             });
         }
         let out = explain(&conn, &target(), None, &blamed).unwrap();
@@ -1096,6 +1476,16 @@ mod tests {
         assert_eq!(out.commits[0].threads[0].touch.as_deref(), Some("write"));
         let whole = why(&conn, &t, None, deadline).unwrap();
         assert_eq!(whole.commits[0].lines, 2);
+        // An unsaved buffer (`--stdin`): a line inserted above shifts the committed ones,
+        // and the new line is uncommitted.
+        let buffer = b"// new\nfn a() {}\nfn b() {}\n";
+        let porcelain = blame_contents(&t, None, Some(buffer), deadline).unwrap();
+        let shifted = parse_blame(&porcelain);
+        let ours = shifted.iter().find(|c| c.sha == sha).unwrap();
+        assert_eq!(ours.ranges(), vec![[2, 3]]);
+        assert!(shifted
+            .iter()
+            .any(|c| is_uncommitted(&c.sha) && c.line_numbers == [1]));
         // Past the end: git's own message, not a panic.
         let err = why(&conn, &t, Some(99), deadline).unwrap_err().to_string();
         assert!(err.contains("git blame failed"), "{err}");
@@ -1114,5 +1504,117 @@ mod tests {
         assert_eq!(out.commits[0].sha, sha, "{out:?}");
         assert!(resolve("nope.rs", &dir, deadline).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Each line's `<orig>` position at its commit and the path there; a repeat group
+    /// without a `filename` line keeps the commit's last one, and a quoted name is decoded.
+    #[test]
+    fn blame_origins_keep_each_lines_position_at_its_commit() {
+        let porcelain = format!(
+            "{A} 3 5 2\nauthor x\ncommitter-time 1\nsummary s\nfilename src/auth.rs\n\tl5\n\
+             {A} 4 6\n\tl6\n\
+             {B} 1 1 1\nauthor y\nsummary t\nfilename \"caf\\303\\251.rs\"\n\tl1\n\
+             {A} 9 8 1\n\tl8\n"
+        );
+        let got = blame_origins(&porcelain);
+        assert_eq!(
+            got[A],
+            vec![
+                (3, "src/auth.rs".to_string()),
+                (4, "src/auth.rs".to_string()),
+                (9, "src/auth.rs".to_string()),
+            ]
+        );
+        assert_eq!(got[B], vec![(1, "caf\u{e9}.rs".to_string())]);
+        assert_eq!(unquote_path("plain name.rs"), "plain name.rs");
+        assert_eq!(unquote_path(r#""a\"b\\c\td""#), "a\"b\\c\td");
+    }
+
+    /// The commits `cal why` shows depend on whether trace attributions count: plain
+    /// `--json` (no `--json-version`) passes no trace, so a commit only a trace record names
+    /// does not displace the linked or newest ones it picked before Agent Trace was read;
+    /// with the trace (`--json-version 1`, the readable output) it is picked.
+    #[test]
+    fn trace_only_commits_are_picked_only_when_the_trace_is_passed() {
+        let conn = temp_db();
+        let traced = format!("{:040x}", 1);
+        let mut blamed = vec![BlameCommit {
+            sha: traced.clone(),
+            committed_at: 1,
+            subject: "traced".into(),
+            lines: 1,
+            line_numbers: vec![1],
+        }];
+        for i in 0..3 {
+            blamed.push(BlameCommit {
+                sha: format!("{:040x}", 100 + i),
+                committed_at: 100 + i as i64,
+                subject: format!("newer {i}"),
+                lines: 1,
+                line_numbers: vec![2 + i as u32],
+            });
+        }
+        let log = serde_json::json!({
+            "version": "0.1", "id": "x", "timestamp": "t",
+            "vcs": { "type": "git", "revision": traced },
+            "files": [{ "path": "src/auth.rs", "conversations": [{ "ranges": [] }] }],
+            "metadata": { "conversation_id": "other-tool-session" }
+        })
+        .to_string();
+        let trace = crate::trace::FileTrace::from_log_for_tests(&log, &target());
+        let pick = |trace| {
+            explain_with(
+                &conn,
+                &target(),
+                None,
+                &blamed,
+                &Explain {
+                    max_commits: 2,
+                    trace,
+                },
+            )
+            .unwrap()
+            .commits
+            .iter()
+            .map(|c| c.subject.clone())
+            .collect::<Vec<_>>()
+        };
+        assert_eq!(pick(None), vec!["newer 2", "newer 1"]);
+        assert_eq!(pick(Some(&trace)), vec!["newer 2", "traced"]);
+    }
+
+    #[test]
+    fn git_output_past_its_bound_is_refused() {
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let dir = std::env::temp_dir();
+        let err = run_git_bounded(&dir, &["--version"], None, deadline, 4).unwrap_err();
+        assert!(err.downcast_ref::<GitOutputTooLarge>().is_some(), "{err}");
+        let out = run_git_bounded(&dir, &["--version"], None, deadline, 4096).unwrap();
+        assert!(out.starts_with("git version"), "{out}");
+    }
+
+    /// A git child is tracked for the termination handler while it runs, and forgotten once
+    /// reaped.
+    #[cfg(unix)]
+    #[test]
+    fn git_children_are_tracked_while_they_run() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .unwrap();
+        let pid = i32::try_from(child.id()).unwrap();
+        let guard = reap::track(child.id());
+        assert!(reap::tracked(pid));
+        let _ = child.kill();
+        let _ = child.wait();
+        drop(guard);
+        assert!(!reap::tracked(pid));
     }
 }

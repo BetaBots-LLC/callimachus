@@ -25,10 +25,12 @@ const loadChat = () => import("./components/ChatView");
 const loadProjects = () => import("./components/ProjectPage");
 const loadStats = () => import("./components/StatsView");
 const loadSettings = () => import("./components/SettingsView");
+const loadReport = () => import("./components/ReportView");
 const ChatView = lazy(() => loadChat().then((m) => ({ default: m.ChatView })));
 const ProjectPage = lazy(() => loadProjects().then((m) => ({ default: m.ProjectPage })));
 const StatsView = lazy(() => loadStats().then((m) => ({ default: m.StatsView })));
 const SettingsView = lazy(() => loadSettings().then((m) => ({ default: m.SettingsView })));
+const ReportView = lazy(() => loadReport().then((m) => ({ default: m.ReportView })));
 
 // Parts of the Search view that first paint never shows also stay out of the entry: the
 // thread pane (with its tag combobox and knowledge sheet) until a thread is opened, the
@@ -342,6 +344,7 @@ function App() {
               {view === "projects" && <ProjectPage />}
               {view === "stats" && <StatsView />}
               {view === "settings" && <SettingsView />}
+              {view === "report" && <ReportView />}
             </div>
           </Suspense>
         </ErrorBoundary>

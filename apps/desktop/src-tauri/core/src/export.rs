@@ -286,7 +286,7 @@ pub const REPO_TRUST_LINE: &str = "_Facts marked (repo) come from this repo's co
 const REPO_MARK: &str = " (repo)";
 
 /// The repo's display name (basename of the project key).
-fn project_label(project: &str) -> &str {
+pub(crate) fn project_label(project: &str) -> &str {
     project
         .rsplit(['/', '\\'])
         .find(|s| !s.is_empty())
@@ -564,7 +564,7 @@ fn is_tool_result_header(text: &str) -> bool {
 
 /// User rows that a harness wrote, not the user: Claude Code task notifications, `!` bash
 /// echoes, pasted-content wrappers, interrupt markers, continuation preambles.
-fn is_harness_prompt(text: &str) -> bool {
+pub(crate) fn is_harness_prompt(text: &str) -> bool {
     let t = text.trim_start();
     if crate::knowledge::is_injected_context(t) {
         return true;

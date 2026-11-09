@@ -3,8 +3,9 @@ import { api, type SearchFilters, type SourceKind } from "../lib/api";
 
 /** The app's views. Today, Search, Chat and Projects are tabs (App.tsx TABS, in that order);
  *  Stats and Settings are header icons. Ask lives inside Chat (its "Ask" mode); the Coach and
- *  Knowledge tabs are gone: the heatmap is in Stats, errors and TODOs on the Project page. */
-export type View = "today" | "search" | "chat" | "projects" | "stats" | "settings";
+ *  Knowledge tabs are gone: the heatmap is in Stats, errors and TODOs on the Project page.
+ *  Report ("Your agents, so far") has no tab: Today's card and a Stats link open it. */
+export type View = "today" | "search" | "chat" | "projects" | "stats" | "settings" | "report";
 
 /** The sections of the Settings view (its left-hand navigation), in display order. */
 export type SettingsSection =

@@ -13,8 +13,8 @@ use crate::cli_contract::{
 };
 use crate::knowledge::repo_memory;
 use crate::{
-    agent, context, cost, db, embed, export, gitlink, issues, knowledge, ledger, search, secrets,
-    snapshot, why,
+    agent, context, cost, db, embed, export, gitlink, issues, knowledge, ledger, report, search,
+    secrets, snapshot, why,
 };
 use rusqlite::Connection;
 use std::borrow::Cow;
@@ -54,8 +54,10 @@ pub const COMMANDS: &[&str] = &[
     "check",
     "commits",
     "why",
+    "trace",
     "issues",
     "cost",
+    "report",
     "recall-now",
     "recall-error",
     "session-end",
@@ -120,10 +122,16 @@ USAGE:
   cal commits [<repo>] [-n LIMIT] [--json]
                                 infer + show which commits your threads produced
                                 (run inside a git repo, or pass its path)
-  cal why <file>[:<line>] [--json]
+  cal why <file>[:<line>] [-n LIMIT] [--stdin] [--json]
                                 why a line (or file) is the way it is: git blame's
                                 commits, the sessions that produced them, and their
-                                decisions and gotchas (run inside the repo)
+                                decisions and gotchas, plus what the repo's Agent Trace
+                                records say (run inside the repo)
+  cal trace export [<repo>] [--since DAYS] [-o FILE|-] [--dry-run] [--json]
+                                write Agent Trace records (agent-trace.dev, an RFC) for
+                                the commits your sessions produced, one per session and
+                                commit, to .agent-trace/traces.jsonl unless -o says
+                                where (- for stdout); records already there are kept
   cal audit-pr [<repo>] --changed-files a,b --shas s1,s2 [-n CAP]
                                 one JSON bundle for an external PR auditor: per-commit
                                 provenance (the session behind each sha), per-file prior
@@ -138,6 +146,10 @@ USAGE:
                                 sessions produced, per project or per local day
                                 (list-price equivalents; usage of sessions indexed before
                                 an update fills in on its own, once, in the background)
+  cal report [--since DAYS] [--markdown] [--json]
+                                your agents, so far: sessions, hours, spend, recurring
+                                errors and their fixes, tasks asked again, memory and the
+                                files agents changed most (prints markdown)
   cal hook [<project>] [-n PER_KIND] [--budget CHARS]
                                 print the current repo's memory for injection (a Claude
                                 Code SessionStart hook command; size-capped, ~6k chars),
@@ -181,12 +193,19 @@ OPTIONS:
   -y, --hybrid          fuse keyword + on-device semantic search
   -n, --limit N         max results (default 20; todos 50, files 40; hook: per kind)
       --budget CHARS    max chars `hook` prints (default 6000)
-      --for AGENT       hook protocol: claude (default), codex or gemini
+      --for AGENT       hook protocol: claude (default), codex, gemini, copilot
+                        or cursor
       --by KIND         `cost` breakdown: thread, commit, project or day
-      --since DAYS      `cost` window: the last DAYS days, today included
-                        (default all time; 30 for --by day)
+      --since DAYS      `cost` / `report` window: the last DAYS days, today
+                        included (default all time; 30 for --by day); `trace
+                        export`: commits from the last DAYS days
+      --markdown        `report` as markdown (what it prints without --json)
   -V, --vault DIR       Obsidian vault dir for `export` (else CALLIMACHUS_VAULT)
-  -o, --out FILE        write `export` output to FILE instead of a vault/stdout
+  -o, --out FILE        write `export` output to FILE instead of a vault/stdout;
+                        where `trace export` appends its records
+      --dry-run         `trace export`: count the records, write nothing
+      --stdin           `why`: blame the file's contents read from stdin (an
+                        editor's unsaved buffer) instead of the saved file
   -S, --synthesize      prepend an LLM summary / decisions / gotchas / TODOs
                         to `export` (uses the first stored provider key)
       --json            machine-readable JSON output (unversioned: the shape
@@ -300,7 +319,7 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
         println!("{}", usage());
         return Ok(());
     };
-    reject_cost_flags(cmd, rest)?;
+    reject_scoped_flags(cmd, rest)?;
     match cmd.as_str() {
         "search" => cmd_search(rest),
         "related" => cmd_related(rest),
@@ -331,8 +350,10 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
         "check" => cmd_check(rest),
         "commits" => cmd_commits(rest),
         "why" => cmd_why(rest),
+        "trace" => cmd_trace(rest),
         "issues" => cmd_issues(rest),
         "cost" => cmd_cost(rest),
+        "report" => cmd_report(rest),
         "recall-now" => cmd_recall_now(rest),
         "recall-error" => cmd_recall_error(rest),
         "session-end" => cmd_session_end(rest),
@@ -375,8 +396,10 @@ struct Opts {
     budget: Option<usize>,
     /// `cost --by`: the breakdown (thread, commit, project, day).
     by: Option<cost::CostBy>,
-    /// `cost --since`: the window in days, today included.
+    /// `cost --since` / `report --since`: the window in days, today included.
     since_days: Option<u32>,
+    /// `report --markdown`: the markdown form (also its default without `--json`).
+    markdown: bool,
     /// `--for`: which agent's hook protocol a hook command speaks (see [`HookAgent`]).
     for_agent: Option<String>,
     /// `--raw`: print stored text as is instead of redacting secrets (see [`Opts::shown`]).
@@ -386,6 +409,10 @@ struct Opts {
     /// objects it printed before versioning, which the VS Code extension already on the
     /// Marketplace parses (it updates on its own schedule, not with the app).
     json_version: Option<u32>,
+    /// `trace export --dry-run`: build and count the records, write nothing.
+    dry_run: bool,
+    /// `why --stdin`: blame the buffer on stdin instead of the saved file.
+    stdin: bool,
     positional: Vec<String>,
 }
 
@@ -454,22 +481,40 @@ impl Opts {
     }
 }
 
-/// Flags only `cal cost` reads.
-const COST_ONLY_FLAGS: &[&str] = &["--by", "--since"];
+/// Flags that change what an answer means or whether a command writes, with the commands
+/// that honor them.
+const SCOPED_FLAGS: &[(&str, &[&str])] = &[
+    ("--by", &["cost"]),
+    ("--since", &["cost", "report", "trace"]),
+    // Before these three were parsed, every other command failed on them with "unknown
+    // flag". Accepted and ignored, `cal memory import --dry-run` or `cal distill --dry-run`
+    // would perform the write (or the paid LLM call) the user asked only to preview.
+    ("--dry-run", &["trace"]),
+    ("--stdin", &["why"]),
+    ("--markdown", &["report"]),
+];
 
-/// Refuse `--by` and `--since` outside `cal cost`. The parser is shared, so every command
-/// would accept them and quietly ignore them, and these two change what an answer means:
-/// `cal issues --since 7` printed its 180-day list as if it had honored the window. The other
-/// shared flags (`--label`, `--budget`, `--for`) only tune output, and their OPTIONS lines
-/// name the command they are for.
-fn reject_cost_flags(cmd: &str, rest: &[String]) -> anyhow::Result<()> {
-    if cmd == "cost" {
-        return Ok(());
+/// Refuse the [`SCOPED_FLAGS`] outside the commands that read them. The parser is shared, so
+/// every command would accept them and quietly ignore them, and these change what an answer
+/// means or whether anything is written: `cal issues --since 7` printed its 180-day list as
+/// if it had honored the window. The other shared flags (`--label`, `--budget`, `--for`)
+/// only tune output, and their OPTIONS lines name the command they are for.
+fn reject_scoped_flags(cmd: &str, rest: &[String]) -> anyhow::Result<()> {
+    for a in rest {
+        if let Some((flag, cmds)) = SCOPED_FLAGS.iter().find(|(f, _)| *f == a.as_str()) {
+            if !cmds.contains(&cmd) {
+                let names: Vec<String> = cmds.iter().map(|c| format!("`cal {c}`")).collect();
+                let list = match names.split_last() {
+                    Some((last, rest)) if !rest.is_empty() => {
+                        format!("{} and {last}", rest.join(", "))
+                    }
+                    _ => names.join(""),
+                };
+                anyhow::bail!("{flag} only applies to {list}, not `cal {cmd}`");
+            }
+        }
     }
-    match rest.iter().find(|a| COST_ONLY_FLAGS.contains(&a.as_str())) {
-        Some(flag) => anyhow::bail!("{flag} only applies to `cal cost`, not `cal {cmd}`"),
-        None => Ok(()),
-    }
+    Ok(())
 }
 
 fn parse(args: &[String]) -> anyhow::Result<Opts> {
@@ -527,6 +572,7 @@ fn parse_with(args: &[String], env_json_version: Option<&str>) -> anyhow::Result
                 );
             }
             "--starred" => o.starred = true,
+            "--markdown" => o.markdown = true,
             "--off" => o.off = true,
             "--json" => o.json = true,
             "--json-version" => {
@@ -534,6 +580,8 @@ fn parse_with(args: &[String], env_json_version: Option<&str>) -> anyhow::Result
                 o.json = true;
             }
             "--raw" => o.raw = true,
+            "--dry-run" => o.dry_run = true,
+            "--stdin" => o.stdin = true,
             s if s.starts_with('-') && s.len() > 1 => anyhow::bail!("unknown flag '{s}'"),
             _ => o.positional.push(a.clone()),
         }
@@ -1195,11 +1243,11 @@ fn cmd_hook(args: &[String]) -> anyhow::Result<()> {
         _ => {}
     }
     let payload = read_hook_payload();
-    let source = payload
-        .as_ref()
-        .and_then(|v| v.get("source"))
-        .and_then(|x| x.as_str())
-        .unwrap_or("startup");
+    if agent == HookAgent::Claude && payload.as_ref().is_some_and(is_cursor_payload) {
+        // Cursor runs this as a third-party Claude Code hook; see [`is_cursor_payload`].
+        return Ok(());
+    }
+    let source = hook_source(payload.as_ref());
     let cwd = hook_cwd(payload.as_ref());
     let project = if o.positional.is_empty() {
         knowledge::project_key(&cwd.to_string_lossy())
@@ -1223,6 +1271,45 @@ fn cmd_hook(args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The payload's SessionStart `source`, in Claude Code's words. GitHub Copilot sends
+/// `startup`, `resume` or `new` (docs.github.com hooks reference, checked 2026-11-08), and
+/// VS Code's older Local harness always `new`: a fresh session either way, so `startup`.
+/// Cursor's sessionStart carries no source at all (a new composer conversation), nor does a
+/// hook run by hand, so a missing one is `startup` too.
+fn hook_source(payload: Option<&serde_json::Value>) -> &str {
+    match payload
+        .and_then(|v| v.get("source"))
+        .and_then(|x| x.as_str())
+        .unwrap_or("startup")
+    {
+        "new" => "startup",
+        s => s,
+    }
+}
+
+/// A hook payload Cursor wrote: every one carries `cursor_version` (cursor.com/docs/hooks,
+/// common schema), which no other agent sends. Cursor also runs the hooks in
+/// `~/.claude/settings.json` as third-party hooks (on by default, Settings > Agents >
+/// Third-Party Imports; cursor.com/docs/reference/third-party-hooks), so Claude Code's
+/// SessionStart, SessionEnd, UserPromptSubmit, PreCompact and PostToolUse hooks fire in
+/// Cursor sessions too. Every Claude form stays silent there: Cursor's own hook (`--for
+/// cursor`) speaks its protocol, and without it the Claude form would inject twice, queue a
+/// Cursor session as a Claude one, or open the index writable for a transcript that is no
+/// Claude thread.
+fn is_cursor_payload(v: &serde_json::Value) -> bool {
+    v.get("cursor_version").is_some()
+}
+
+/// The session id a hook payload names: `session_id` (Claude Code, Codex, Gemini CLI,
+/// Cursor, Copilot's VS Code compatible form) or `sessionId` (Copilot's camelCase form,
+/// which the `sessionStart` / `sessionEnd` event names we install select).
+fn payload_session_id(v: &serde_json::Value) -> Option<&str> {
+    ["session_id", "sessionId"]
+        .iter()
+        .find_map(|k| v.get(*k).and_then(|x| x.as_str()))
+        .filter(|s| !s.is_empty())
+}
+
 /// Whether an injection counts in the value ledger, whose Stats line reads "sessions that
 /// started with injected memory": a new session (`startup`) or a fresh context (`clear`). A
 /// `compact` refresher re-injects into a session already counted, so three compactions would
@@ -1232,7 +1319,7 @@ fn counts_as_session(source: &str) -> bool {
 }
 
 /// The agent whose hook protocol a hook command speaks (`--for`, default `claude`). The
-/// memory and digest are the same for all three; what differs is the stdout envelope, the
+/// memory and digest are the same for all of them; what differs is the stdout envelope, the
 /// context files that may already carry the managed block, whether harvested Claude Code
 /// memory is left out, and the prefix a SessionEnd queues the session under.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1240,6 +1327,10 @@ enum HookAgent {
     Claude,
     Codex,
     Gemini,
+    /// GitHub Copilot's agent harness: Copilot CLI, and Copilot sessions in VS Code, which
+    /// share it and its user hooks dir (code.visualstudio.com/docs/agent-customization/hooks).
+    Copilot,
+    Cursor,
 }
 
 impl HookAgent {
@@ -1248,7 +1339,11 @@ impl HookAgent {
             None | Some("claude") => Ok(Self::Claude),
             Some("codex") => Ok(Self::Codex),
             Some("gemini") => Ok(Self::Gemini),
-            Some(other) => anyhow::bail!("--for takes claude, codex or gemini, not '{other}'"),
+            Some("copilot") => Ok(Self::Copilot),
+            Some("cursor") => Ok(Self::Cursor),
+            Some(other) => {
+                anyhow::bail!("--for takes claude, codex, gemini, copilot or cursor, not '{other}'")
+            }
         }
     }
 
@@ -1257,6 +1352,8 @@ impl HookAgent {
             Self::Claude => "Claude Code",
             Self::Codex => "Codex",
             Self::Gemini => "Gemini CLI",
+            Self::Copilot => "GitHub Copilot",
+            Self::Cursor => "Cursor",
         }
     }
 
@@ -1266,6 +1363,8 @@ impl HookAgent {
             Self::Claude => "claude",
             Self::Codex => "codex",
             Self::Gemini => "gemini",
+            Self::Copilot => "copilot",
+            Self::Cursor => "cursor",
         }
     }
 }
@@ -1281,6 +1380,14 @@ impl HookAgent {
 /// nothing else may ever reach its stdout; the silent paths print nothing, which Gemini
 /// accepts as a success with no output (hookRunner.ts: an empty stdout skips parsing,
 /// verified 2026-11-06).
+///
+/// GitHub Copilot parses what is left of stdout as one JSON document and consumes only its
+/// top-level `additionalContext` for sessionStart; output that is empty or not JSON counts as
+/// no output (docs.github.com hooks reference, "Progress messages" and sessionStart, checked
+/// 2026-11-08). VS Code's older Local harness reads the same hooks dir but wants Claude
+/// Code's `hookSpecificOutput` (its "Legacy Local hooks reference"), so the one object
+/// carries both; each harness ignores the other's key. Cursor wants a flat, snake_case
+/// `additional_context` (cursor.com/docs/hooks, sessionStart).
 fn hook_stdout(agent: HookAgent, text: &str) -> String {
     match agent {
         HookAgent::Claude | HookAgent::Codex => text.to_string(),
@@ -1288,6 +1395,12 @@ fn hook_stdout(agent: HookAgent, text: &str) -> String {
             "hookSpecificOutput": { "additionalContext": text }
         })
         .to_string(),
+        HookAgent::Copilot => serde_json::json!({
+            "additionalContext": text,
+            "hookSpecificOutput": { "hookEventName": "SessionStart", "additionalContext": text }
+        })
+        .to_string(),
+        HookAgent::Cursor => serde_json::json!({ "additional_context": text }).to_string(),
     }
 }
 
@@ -1638,13 +1751,24 @@ fn hook_budget(source: &str) -> Option<export::MemoryBudget> {
     }
 }
 
-/// The session's working directory: the hook payload's `cwd`, else `CLAUDE_PROJECT_DIR`,
-/// else the process cwd.
+/// The session's working directory: the hook payload's `cwd`, else the first of Cursor's
+/// `workspace_roots`, else `CLAUDE_PROJECT_DIR` (Cursor sets it too, as an alias of
+/// `CURSOR_PROJECT_DIR`), else the process cwd. Cursor's payloads carry no `cwd`, and its user
+/// hooks run from `~/.cursor/` (cursor.com/docs/hooks), so the process cwd is never the repo
+/// there.
 fn hook_cwd(payload: Option<&serde_json::Value>) -> std::path::PathBuf {
     payload
-        .and_then(|v| v.get("cwd"))
-        .and_then(|x| x.as_str())
-        .filter(|s| !s.is_empty())
+        .and_then(|v| {
+            v.get("cwd")
+                .and_then(|x| x.as_str())
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    v.get("workspace_roots")?
+                        .as_array()?
+                        .iter()
+                        .find_map(|r| r.as_str().filter(|s| !s.is_empty()))
+                })
+        })
         .map(std::path::PathBuf::from)
         .or_else(|| std::env::var_os("CLAUDE_PROJECT_DIR").map(std::path::PathBuf::from))
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
@@ -1768,7 +1892,64 @@ fn managed_block_for(agent: HookAgent, cwd: &std::path::Path) -> Option<std::pat
                 ContextRule::EveryFileWithImports,
             )
         }
+        HookAgent::Copilot => copilot_block_source(
+            &project_dirs(cwd),
+            crate::indexer::copilot_cli::copilot_home().as_deref(),
+        ),
+        // Cursor reads AGENTS.md from the project root (and nested ones only for the files
+        // under them, cursor.com/docs/rules), and its hook's cwd is the workspace root. Its
+        // third-party import (on by default) also loads the root CLAUDE.md, so a block that
+        // `cal agents -o CLAUDE.md` wrote there already reaches every Cursor chat. Cursor
+        // never inlines `@file` mentions (its rules docs: "not inlined into the prompt").
+        HookAgent::Cursor => context_block_source(
+            &[cwd.to_path_buf()],
+            None,
+            &CURSOR_CONTEXT_FILES,
+            ContextRule::EveryFile,
+        ),
     }
+}
+
+/// The root files Cursor loads into every chat: AGENTS.md (its rules) and CLAUDE.md
+/// (third-party configs import, cursor.com/docs/reference/third-party-hooks).
+const CURSOR_CONTEXT_FILES: [&str; 2] = ["AGENTS.md", "CLAUDE.md"];
+
+/// The instruction files GitHub Copilot CLI combines for a session in the repo root, the cwd
+/// and the dirs between (its "standard locations"; docs.github.com, "Adding custom
+/// instructions for GitHub Copilot CLI", checked 2026-11-08). It loads every one that exists.
+const COPILOT_CONTEXT_FILES: [&str; 5] = [
+    "AGENTS.md",
+    "CLAUDE.md",
+    ".claude/CLAUDE.md",
+    "GEMINI.md",
+    ".github/copilot-instructions.md",
+];
+
+/// The one user-level file Copilot loads from `$COPILOT_HOME` (`~/.copilot`). The other
+/// names do nothing there, so a block in `$COPILOT_HOME/AGENTS.md` must not silence the hook.
+const COPILOT_GLOBAL_FILES: [&str; 1] = ["copilot-instructions.md"];
+
+/// The file carrying the managed block that Copilot loads for a session in `dirs`, with the
+/// user-level instructions in `copilot_home`.
+fn copilot_block_source(
+    dirs: &[std::path::PathBuf],
+    copilot_home: Option<&std::path::Path>,
+) -> Option<std::path::PathBuf> {
+    context_block_source(
+        dirs,
+        None,
+        &COPILOT_CONTEXT_FILES,
+        ContextRule::EveryFileWithRelativeImports,
+    )
+    .or_else(|| {
+        let home = copilot_home?;
+        context_block_source(
+            &[home.to_path_buf()],
+            None,
+            &COPILOT_GLOBAL_FILES,
+            ContextRule::EveryFileWithRelativeImports,
+        )
+    })
 }
 
 /// Codex's instruction files, by precedence: in each dir (and in `CODEX_HOME`) an
@@ -1861,6 +2042,13 @@ enum ContextRule {
     /// `findUpwardGeminiFiles`), with its `@file` imports expanded (`processImports`), so a
     /// GEMINI.md holding only `@AGENTS.md` loads the block `cal agents` wrote in AGENTS.md.
     EveryFileWithImports,
+    /// Copilot: every existing name is loaded, with `@` references expanded only when
+    /// relative and only outside GEMINI.md ("Absolute paths and paths beginning with `~/`
+    /// are not loaded"; "File references are not expanded in `GEMINI.md`"). Following one it
+    /// skips would silence the hook for a block Copilot never saw.
+    EveryFileWithRelativeImports,
+    /// Cursor: every existing name is loaded as written; `@file` mentions are not inlined.
+    EveryFile,
 }
 
 /// The context file holding the managed block among `names` in `dirs` and the agent's global
@@ -1875,7 +2063,7 @@ fn context_block_source(
         let existing = names.iter().map(|n| dir.join(n)).filter(|p| p.is_file());
         let files: Vec<std::path::PathBuf> = match rule {
             ContextRule::FirstExisting => existing.take(1).collect(),
-            ContextRule::EveryFileWithImports => existing.collect(),
+            _ => existing.collect(),
         };
         for path in files {
             let Some(text) = read_small_text(&path) else {
@@ -1884,14 +2072,26 @@ fn context_block_source(
             if text.contains(export::MANAGED_START) {
                 return Some(path);
             }
-            if rule == ContextRule::EveryFileWithImports {
-                // The same import walk as the CLAUDE.md check in `managed_block_source`.
-                let base = path.parent().unwrap_or(dir);
-                for import in claude_md_imports(&text).into_iter().take(10) {
-                    let target = resolve_import(base, import);
-                    if read_small_text(&target).is_some_and(|t| t.contains(export::MANAGED_START)) {
-                        return Some(target);
-                    }
+            let relative_only = match rule {
+                ContextRule::EveryFileWithImports => false,
+                ContextRule::EveryFileWithRelativeImports
+                    if path.file_name().is_some_and(|n| n != "GEMINI.md") =>
+                {
+                    true
+                }
+                _ => continue,
+            };
+            // The same import walk as the CLAUDE.md check in `managed_block_source`.
+            let base = path.parent().unwrap_or(dir);
+            for import in claude_md_imports(&text).into_iter().take(10) {
+                if relative_only
+                    && (import.starts_with("~/") || std::path::Path::new(import).is_absolute())
+                {
+                    continue;
+                }
+                let target = resolve_import(base, import);
+                if read_small_text(&target).is_some_and(|t| t.contains(export::MANAGED_START)) {
+                    return Some(target);
                 }
             }
         }
@@ -2262,11 +2462,42 @@ fn cmd_why(args: &[String]) -> anyhow::Result<()> {
     let cwd = std::env::current_dir()?;
     // git first: a missing file or a non-repo fails before the index is opened.
     let target = why::resolve(&file, &cwd, deadline)?;
-    let porcelain = why::blame(&target, line, deadline)?;
+    let contents = if o.stdin {
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut std::io::stdin(), &mut buf)?;
+        Some(buf)
+    } else {
+        None
+    };
+    let porcelain = why::blame_contents(&target, line, contents.as_deref(), deadline)?;
+    let blamed = why::parse_blame(&porcelain);
+    // Plain `--json` keeps the commits it picked before Agent Trace was read: the released
+    // extension reads that shape, and a trace-only commit would change which ten it lists.
+    let trace = if o.json && o.json_version.is_none() {
+        None
+    } else {
+        crate::trace::load_for_file(&target, &blamed, deadline).map(|t| t.with_blame(&porcelain))
+    };
     let conn = open_db()?;
-    let out = why::explain(&conn, &target, line, &why::parse_blame(&porcelain))?;
+    let max_commits = o.limit.map_or(why::MAX_COMMITS, |n| {
+        (n as usize).clamp(1, why::MAX_COMMITS_LIMIT)
+    });
+    let out = why::explain_with(
+        &conn,
+        &target,
+        line,
+        &blamed,
+        &why::Explain {
+            max_commits,
+            trace: trace.as_ref(),
+        },
+    )?;
     if o.json {
-        println!("{}", o.json_typed(&out)?);
+        if o.json_version.is_some() {
+            println!("{}", o.json(&out)?);
+        } else {
+            println!("{}", o.json_typed(&why_unversioned(&out)?)?);
+        }
         return Ok(());
     }
     print!("{}", why_text(&out, &o));
@@ -2274,6 +2505,19 @@ fn cmd_why(args: &[String]) -> anyhow::Result<()> {
         eprintln!("{note}");
     }
     Ok(())
+}
+
+/// `cal why --json` without a version, as it printed before `ranges` and `trace` were added:
+/// the bare output is the one an extension already released reads, and stays byte-for-byte.
+fn why_unversioned(out: &why::WhyOutput) -> anyhow::Result<serde_json::Value> {
+    let mut v = serde_json::to_value(out)?;
+    for c in v["commits"].as_array_mut().into_iter().flatten() {
+        if let Some(obj) = c.as_object_mut() {
+            obj.shift_remove("ranges");
+            obj.shift_remove("trace");
+        }
+    }
+    Ok(v)
 }
 
 /// The line `cal why` adds on stderr when it has no session to show. `unlinked` is also true
@@ -2288,7 +2532,9 @@ fn why_note(out: &why::WhyOutput) -> Option<String> {
                 .to_string()
         });
     }
-    out.unlinked.then(|| {
+    // A trace record already says who wrote it; `cal commits` would add a transcript.
+    let traced = out.commits.iter().any(|c| !c.trace.is_empty());
+    (out.unlinked && !traced).then(|| {
         format!(
             "No session is linked to {} yet. Run `cal commits` in {} to link the repo's \
              history, then ask again.",
@@ -2357,8 +2603,188 @@ fn why_text(out: &why::WhyOutput, o: &Opts) -> String {
                 let _ = writeln!(s, "      {}: {}{why}", f.kind, o.shown(&f.text));
             }
         }
+        for a in &c.trace {
+            let _ = writeln!(s, "  {}", trace_line(a, o));
+        }
     }
     s
+}
+
+/// One Agent Trace attribution in `cal why`'s block.
+fn trace_line(a: &crate::trace::TraceAttribution, o: &Opts) -> String {
+    let who = match (&a.agent, &a.model) {
+        (Some(agent), Some(model)) => format!("{} ({})", o.shown(agent), o.shown(model)),
+        (Some(agent), None) => o.shown(agent).into_owned(),
+        (None, Some(model)) => o.shown(model).into_owned(),
+        (None, None) => a.contributor.clone(),
+    };
+    let mut line = format!("[trace] {who}");
+    if let Some(id) = &a.conversation_id {
+        let _ = write!(line, ", conversation {}", o.shown(id));
+    }
+    if let Some(t) = a.thread_id {
+        let _ = write!(line, " (session [{t}])");
+    }
+    let runs: Vec<String> = a
+        .ranges
+        .iter()
+        .map(|[x, y]| {
+            if x == y {
+                x.to_string()
+            } else {
+                format!("{x}-{y}")
+            }
+        })
+        .collect();
+    if runs.is_empty() {
+        line.push_str(", whole file");
+    } else {
+        let _ = write!(line, ", lines {}", runs.join(", "));
+    }
+    if a.recorded_before_commit {
+        line.push_str(", recorded before the commit");
+    }
+    let _ = write!(line, "  ({})", a.trace_file);
+    line
+}
+
+/// How long `cal trace export` may spend in git: one `git show` per linked commit.
+const TRACE_GIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(300);
+
+fn cmd_trace(args: &[String]) -> anyhow::Result<()> {
+    match args.first().map(String::as_str) {
+        Some("export") => cmd_trace_export(&args[1..]),
+        _ => anyhow::bail!(
+            "usage: cal trace export [<repo>] [--since DAYS] [-o FILE|-] [--dry-run] [--json]"
+        ),
+    }
+}
+
+/// `cal trace export`: Agent Trace records for the commits the project's sessions produced.
+/// Opens the index read-only; the only write is the trace file in the repo.
+fn cmd_trace_export(args: &[String]) -> anyhow::Result<()> {
+    let o = parse(args)?;
+    let repo = if o.positional.is_empty() {
+        cwd_git_root()
+    } else {
+        git_root_of(std::path::Path::new(&o.positional.join(" ")))
+            .to_string_lossy()
+            .into_owned()
+    };
+    if !std::path::Path::new(&repo).join(".git").exists() {
+        anyhow::bail!("{repo} is not a git checkout: run inside the repo or pass its path");
+    }
+    let project = knowledge::project_key(&repo);
+    let out = o.out.clone().unwrap_or_else(|| {
+        crate::trace::default_out(&repo)
+            .to_string_lossy()
+            .into_owned()
+    });
+    let to_stdout = out == "-";
+    if to_stdout && o.json {
+        anyhow::bail!("--json prints a summary; with -o - the records go to stdout. Pick one.");
+    }
+    let since = o
+        .since_days
+        .map(|d| chrono::Utc::now().timestamp() - i64::from(d) * 86_400);
+    let conn = open_db()?;
+    let deadline = std::time::Instant::now() + TRACE_GIT_BUDGET;
+    let built = crate::trace::build_records(&conn, &repo, &project, since, deadline)?;
+    let (written, present) = if to_stdout {
+        if !o.dry_run {
+            for (_, line) in &built.records {
+                println!("{line}");
+            }
+        }
+        (0, 0)
+    } else {
+        crate::trace::append_new(std::path::Path::new(&out), &built.records, o.dry_run)?
+    };
+    let summary = crate::trace::TraceExport::new(
+        &repo, &project, &out, o.dry_run, since, &built, written, present,
+    );
+    if o.json {
+        println!("{}", o.json_typed(&summary)?);
+        return Ok(());
+    }
+    let what = format!(
+        "{} Agent Trace record{} ({} session{}, {} commit{})",
+        built.records.len(),
+        if built.records.len() == 1 { "" } else { "s" },
+        built.sessions,
+        if built.sessions == 1 { "" } else { "s" },
+        built.commits,
+        if built.commits == 1 { "" } else { "s" },
+    );
+    // stderr when the records themselves are on stdout.
+    let report = |line: String| {
+        if to_stdout {
+            eprintln!("{line}");
+        } else {
+            println!("{line}");
+        }
+    };
+    if o.dry_run {
+        let fresh = built.records.len() - present;
+        report(format!(
+            "{what}; would append {fresh} to {out} ({present} already there)"
+        ));
+    } else if to_stdout {
+        report(what);
+    } else {
+        report(format!(
+            "{what}; appended {written} to {out} ({present} already there)"
+        ));
+    }
+    if built.skipped_links > 0 || built.missing_commits > 0 {
+        report(format!(
+            "skipped {} link(s) whose session edited none of the commit's files and {} commit(s) \
+             this checkout does not have",
+            built.skipped_links, built.missing_commits
+        ));
+    }
+    if built.oversized_commits > 0 {
+        report(format!(
+            "{} commit(s) had a diff past 8 MiB; their files are named without line ranges",
+            built.oversized_commits
+        ));
+    }
+    if let Some(hint) = trace_empty_hint(&project, o.since_days, &built) {
+        report(hint);
+    }
+    Ok(())
+}
+
+/// Why an export came out empty, naming the step that can help. `cal commits` only helps when
+/// the project has no links at all: on the clone, 37 skipped links still printed the `cal
+/// commits` hint, but those sessions lacked `file_edits` rows, which `cal index` backfills.
+fn trace_empty_hint(
+    project: &str,
+    since_days: Option<u32>,
+    built: &crate::trace::Built,
+) -> Option<String> {
+    if !built.records.is_empty() {
+        return None;
+    }
+    let window = since_days
+        .map(|d| format!(" in the last {d} day{}", if d == 1 { "" } else { "s" }))
+        .unwrap_or_default();
+    Some(if built.skipped_links > 0 {
+        format!(
+            "No linked session{window} has recorded edits to the files its commit changed. \
+             Sessions indexed before file edits were tracked get them from `cal index` (or the \
+             app's one-time backfill); then export again."
+        )
+    } else if built.missing_commits > 0 {
+        format!(
+            "This checkout has none of the linked commits{window}: fetch them, or run in the \
+             checkout that made them."
+        )
+    } else {
+        format!(
+            "No session-commit links for {project}{window}: run `cal commits` in the repo first."
+        )
+    })
 }
 
 fn cmd_files(args: &[String]) -> anyhow::Result<()> {
@@ -2822,19 +3248,17 @@ fn cmd_snapshot_hook(args: &[String]) -> anyhow::Result<()> {
     match agent {
         HookAgent::Claude => {}
         HookAgent::Codex => return codex_snapshot_hook(&v),
-        // Not installed for Gemini CLI (its PreCompress hook is not wired).
-        HookAgent::Gemini => return Ok(()),
+        // Not installed for Gemini CLI (its PreCompress hook is not wired), GitHub Copilot
+        // or Cursor (their preCompact hooks are notification-only and carry no summary).
+        HookAgent::Gemini | HookAgent::Copilot | HookAgent::Cursor => return Ok(()),
+    }
+    if !claude_snapshot_wanted(&v) {
+        return Ok(());
     }
     let event = v
         .get("hook_event_name")
         .and_then(|x| x.as_str())
         .unwrap_or("hook");
-    // SubagentStop's transcript_path is the PARENT session, so snapshotting there re-packed
-    // the whole parent on every subagent stop (dozens per workflow) and captured nothing of
-    // the subagent. The installer no longer registers it; ignore it from older installs.
-    if event == "SubagentStop" {
-        return Ok(());
-    }
     let Some(transcript) = v.get("transcript_path").and_then(|x| x.as_str()) else {
         return Ok(());
     };
@@ -2873,6 +3297,17 @@ fn cmd_snapshot_hook(args: &[String]) -> anyhow::Result<()> {
         knowledge::harvest::store_compaction_summary(&conn, tid, session, summary, now)?;
     }
     snapshot
+}
+
+/// Whether Claude's PreCompact payload `v` is one to snapshot. SubagentStop's transcript_path
+/// is the PARENT session, so snapshotting there re-packed the whole parent on every subagent
+/// stop (dozens per workflow) and captured nothing of the subagent; the installer no longer
+/// registers it, so this ignores it from older installs. Cursor runs this hook on every
+/// preCompact as a third-party Claude hook ([`is_cursor_payload`]): its transcript is never a
+/// Claude thread, and opening the index writable would cost up to the 2 s lock wait.
+fn claude_snapshot_wanted(v: &serde_json::Value) -> bool {
+    !is_cursor_payload(v)
+        && v.get("hook_event_name").and_then(|x| x.as_str()) != Some("SubagentStop")
 }
 
 /// `cal snapshot-hook --for codex`, Codex's PreCompact hook: the same rolling snapshot as
@@ -2937,22 +3372,24 @@ fn is_uuid(s: &str) -> bool {
 /// every SessionEnd hook, so it waits at most 1 s for the lock, skips the write when memory
 /// is off, and exits 0 silently on anything else.
 ///
-/// `--for codex|gemini` is the same hook for Codex (SessionEnd: default timeout 1 s, max 3 s)
-/// and Gemini CLI (SessionEnd is not awaited), queued as `codex:<session_id>` /
-/// `gemini:<session_id>`.
+/// `--for codex|gemini|copilot|cursor` is the same hook for Codex (SessionEnd: default
+/// timeout 1 s, max 3 s), Gemini CLI (SessionEnd is not awaited), GitHub Copilot (its
+/// camelCase payload names the session `sessionId`) and Cursor (fire and forget), queued as
+/// `<agent>:<session_id>`.
 fn cmd_session_end(args: &[String]) -> anyhow::Result<()> {
     let agent = HookAgent::from_opts(&parse(args)?)?;
     let Some(v) = read_hook_payload() else {
         return Ok(());
     };
+    if agent == HookAgent::Claude && is_cursor_payload(&v) {
+        return Ok(());
+    }
     // The session is over, so its `recall-error` dedupe state has no further use. Before the
     // index checks: the file lives outside the index and goes even when there is none.
-    if let (Some(dir), Some(session)) = (recall_dir(), v.get("session_id").and_then(|x| x.as_str()))
-    {
+    if let (Some(dir), Some(session)) = (recall_dir(), payload_session_id(&v)) {
         forget_error_recall(&dir, session);
     }
-    if v.get("session_id").and_then(|x| x.as_str()).is_none() || !db::default_index_path().exists()
-    {
+    if payload_session_id(&v).is_none() || !db::default_index_path().exists() {
         return Ok(());
     }
     let conn = open_hook_db_write(std::time::Duration::from_secs(1))?;
@@ -2966,11 +3403,7 @@ fn session_end(
     now: i64,
     agent: HookAgent,
 ) -> anyhow::Result<()> {
-    let Some(session) = payload
-        .get("session_id")
-        .and_then(|x| x.as_str())
-        .filter(|s| !s.is_empty())
-    else {
+    let Some(session) = payload_session_id(payload) else {
         return Ok(());
     };
     let cfg = knowledge::get_config(conn)?;
@@ -3031,6 +3464,11 @@ fn cmd_recall_now(_args: &[String]) -> anyhow::Result<()> {
     let Some(v) = read_hook_payload() else {
         return Ok(());
     };
+    // Cursor maps this UserPromptSubmit hook to beforeSubmitPrompt, whose output can only
+    // block the prompt, never add context (cursor.com/docs/hooks).
+    if is_cursor_payload(&v) {
+        return Ok(());
+    }
     let prompt = v
         .get("prompt")
         .and_then(|x| x.as_str())
@@ -3224,6 +3662,12 @@ fn recall_error(
     state_dir: &std::path::Path,
     now: std::time::SystemTime,
 ) -> anyhow::Result<Option<ErrorRecall>> {
+    // Cursor runs Claude's PostToolUse hooks as third-party hooks; like every Claude form,
+    // this one stays out of Cursor sessions ([`is_cursor_payload`]), whose tool output and
+    // session ids it was never written for.
+    if is_cursor_payload(v) {
+        return Ok(None);
+    }
     let errors = issues::extract_errors(&hook_tool_output(v));
     if errors.is_empty() || !index.exists() {
         return Ok(None);
@@ -3474,6 +3918,27 @@ fn cmd_issues(args: &[String]) -> anyhow::Result<()> {
                 fix.thread_id
             );
         }
+    }
+    Ok(())
+}
+
+/// `cal report`: "your agents, so far" over the whole index (or the last `--since` days), as
+/// markdown, or as the report object with `--json`.
+fn cmd_report(args: &[String]) -> anyhow::Result<()> {
+    let o = parse(args)?;
+    if let Some(extra) = o.positional.first() {
+        anyhow::bail!("report takes no arguments, got '{extra}' (try --since DAYS)");
+    }
+    if o.json && o.markdown {
+        anyhow::bail!("pick one of --json and --markdown");
+    }
+    let conn = open_db()?;
+    let since = o.since_days.map(cost::local_day_start);
+    let r = report::build(&conn, since, chrono::Utc::now().timestamp())?;
+    if o.json {
+        println!("{}", o.json_object(&r)?);
+    } else {
+        print!("{}", report::to_markdown(&r));
     }
     Ok(())
 }
@@ -4049,12 +4514,65 @@ mod tests {
             committed_at: 1_200,
             subject: "fix: rotate tokens".into(),
             lines: 1,
+            line_numbers: vec![3],
         }];
         let out = why::explain(&conn, &target, Some(3), &blamed).unwrap();
         assert!(!out.commits[0].threads[0].facts.is_empty());
         check("why", &json(&out));
         let unlinked = why::explain(&conn, &target, None, &[]).unwrap();
         check("why", &json(&unlinked));
+        // With an Agent Trace attribution, which the bare output leaves out with `ranges`.
+        let mut traced = why::explain(&conn, &target, Some(3), &blamed).unwrap();
+        traced.commits[0]
+            .trace
+            .push(crate::trace::TraceAttribution {
+                from: crate::trace::FROM_AGENT_TRACE.into(),
+                agent: Some("cursor".into()),
+                contributor: "ai".into(),
+                model: Some("anthropic/claude-opus-4-5".into()),
+                conversation_id: Some("c-1".into()),
+                conversation_url: None,
+                thread_id: None,
+                ranges: vec![[3, 4]],
+                revision: "ab".repeat(20),
+                recorded_before_commit: true,
+                recorded_at: Some("2026-01-23T14:30:00Z".into()),
+                trace_file: ".agent-trace/traces.jsonl".into(),
+            });
+        check("why", &json(&traced));
+        let bare = why_unversioned(&traced).unwrap();
+        assert!(bare["commits"][0].get("ranges").is_none(), "{bare}");
+        assert!(bare["commits"][0].get("trace").is_none(), "{bare}");
+        assert_eq!(bare["commits"][0]["lines"], 1);
+        let text = why_text(&traced, &Opts::default());
+        assert!(
+            text.contains("[trace] cursor (anthropic/claude-opus-4-5), conversation c-1, lines 3-4, recorded before the commit"),
+            "{text}"
+        );
+        assert!(why_note(&why::WhyOutput {
+            unlinked: true,
+            ..traced
+        })
+        .is_none());
+        check(
+            "trace",
+            &json(&crate::trace::TraceExport::new(
+                "/proj/app",
+                "/proj/app",
+                "/proj/app/.agent-trace/traces.jsonl",
+                false,
+                Some(1),
+                &crate::trace::Built {
+                    records: vec![("id".into(), "{}".into())],
+                    sessions: 1,
+                    commits: 1,
+                    files: 2,
+                    ..Default::default()
+                },
+                1,
+                0,
+            )),
+        );
         let text = why_text(&out, &Opts::default());
         assert!(text.contains("src/auth.rs:3"), "{text}");
         assert!(text.contains("decision: "), "{text}");
@@ -4291,6 +4809,14 @@ mod tests {
         assert!(recall_error(&payload(Some("s-2")), &index, &state, now)
             .unwrap()
             .is_some());
+        let mut cursor = payload(Some("s-cursor"));
+        cursor["cursor_version"] = serde_json::json!("2.4.0");
+        assert!(
+            recall_error(&cursor, &index, &state, now)
+                .unwrap()
+                .is_none(),
+            "Cursor's third-party run of the Claude hook stays silent"
+        );
         assert!(recall_error(&payload(None), &index, &state, now)
             .unwrap()
             .is_none());
@@ -4334,7 +4860,9 @@ mod tests {
                     subject: "s".into(),
                     committed_at: 0,
                     lines: 1,
+                    ranges: vec![[1, 1]],
                     threads: Vec::new(),
+                    trace: Vec::new(),
                 })
                 .collect(),
             unlinked,
@@ -4408,10 +4936,63 @@ mod tests {
         let err = run(&argv(&["issues", "--since", "7"]))
             .unwrap_err()
             .to_string();
-        assert_eq!(err, "--since only applies to `cal cost`, not `cal issues`");
+        assert_eq!(
+            err,
+            "--since only applies to `cal cost`, `cal report` and `cal trace`, not `cal issues`"
+        );
+        assert!(reject_scoped_flags("trace", &argv(&["export", "--since", "7"])).is_ok());
+        assert!(reject_scoped_flags("trace", &argv(&["export", "--by", "day"])).is_err());
         assert!(run(&argv(&["stats", "--by", "day"])).is_err());
-        assert!(reject_cost_flags("cost", &argv(&["--by", "day", "--since", "7"])).is_ok());
-        assert!(reject_cost_flags("search", &argv(&["since", "-n", "3"])).is_ok());
+        assert!(reject_scoped_flags("report", &argv(&["--since", "30"])).is_ok());
+        assert!(reject_scoped_flags("report", &argv(&["--by", "day"])).is_err());
+        assert!(reject_scoped_flags("cost", &argv(&["--by", "day", "--since", "7"])).is_ok());
+        assert!(reject_scoped_flags("search", &argv(&["since", "-n", "3"])).is_ok());
+    }
+
+    #[test]
+    fn trace_empty_hint_names_the_step_that_helps() {
+        let mut built = crate::trace::Built::default();
+        let hint = trace_empty_hint("/r/app", None, &built).unwrap();
+        assert!(hint.contains("run `cal commits`"), "{hint}");
+        built.skipped_links = 37;
+        let hint = trace_empty_hint("/r/app", Some(7), &built).unwrap();
+        assert!(
+            hint.contains("`cal index`") && hint.contains("in the last 7 days"),
+            "{hint}"
+        );
+        assert!(!hint.contains("cal commits"), "{hint}");
+        built.skipped_links = 0;
+        built.missing_commits = 2;
+        let hint = trace_empty_hint("/r/app", None, &built).unwrap();
+        assert!(
+            hint.contains("fetch them") && !hint.contains("cal commits"),
+            "{hint}"
+        );
+        built.records.push(("id".into(), "{}".into()));
+        assert_eq!(trace_empty_hint("/r/app", None, &built), None);
+    }
+
+    /// `--dry-run`, `--stdin` and `--markdown` belong to one command each. Anywhere else they
+    /// used to be an unknown flag; ignoring them would let `cal memory import --dry-run`
+    /// write the index it was asked only to preview.
+    #[test]
+    fn write_and_input_flags_are_refused_elsewhere() {
+        assert!(reject_scoped_flags("trace", &argv(&["export", "--dry-run"])).is_ok());
+        assert!(reject_scoped_flags("why", &argv(&["src/a.rs", "--stdin"])).is_ok());
+        assert!(reject_scoped_flags("report", &argv(&["--markdown"])).is_ok());
+        let refused = |cmd: &str, flag: &str| run(&argv(&[cmd, flag])).unwrap_err().to_string();
+        assert_eq!(
+            refused("memory", "--dry-run"),
+            "--dry-run only applies to `cal trace`, not `cal memory`"
+        );
+        assert_eq!(
+            refused("search", "--stdin"),
+            "--stdin only applies to `cal why`, not `cal search`"
+        );
+        assert_eq!(
+            refused("stats", "--markdown"),
+            "--markdown only applies to `cal report`, not `cal stats`"
+        );
     }
 
     #[test]
@@ -5030,6 +5611,26 @@ mod tests {
             q.contains("\"codex:abc-123\"") && q.contains("\"gemini:abc-123\""),
             "{q}"
         );
+        // Copilot's camelCase payload names the session `sessionId`; Cursor's `session_id`.
+        session_end(
+            &conn,
+            &serde_json::json!({ "sessionId": "cop-1", "cwd": "/x", "reason": "complete" }),
+            103,
+            HookAgent::Copilot,
+        )
+        .unwrap();
+        session_end(
+            &conn,
+            &serde_json::json!({ "session_id": "cur-1", "reason": "user_close" }),
+            104,
+            HookAgent::Cursor,
+        )
+        .unwrap();
+        let q = queue(&conn).unwrap();
+        assert!(
+            q.contains("\"copilot:cop-1\"") && q.contains("\"cursor:cur-1\""),
+            "{q}"
+        );
     }
 
     /// `--for` picks the protocol; an unknown agent is an error (a hook swallows it, so
@@ -5041,7 +5642,9 @@ mod tests {
         assert_eq!(agent(&["--for", "claude"]).unwrap(), HookAgent::Claude);
         assert_eq!(agent(&["--for", "codex"]).unwrap(), HookAgent::Codex);
         assert_eq!(agent(&["--for", "gemini"]).unwrap(), HookAgent::Gemini);
-        assert!(agent(&["--for", "cursor"]).is_err());
+        assert_eq!(agent(&["--for", "copilot"]).unwrap(), HookAgent::Copilot);
+        assert_eq!(agent(&["--for", "cursor"]).unwrap(), HookAgent::Cursor);
+        assert!(agent(&["--for", "windsurf"]).is_err());
         assert!(parse(&argv(&["--for"])).is_err());
         // Bad flags on a hook still exit 0, silently.
         assert_eq!(run_and_exit(&argv(&["hook", "--for", "nope"])), 0);
@@ -5068,6 +5671,137 @@ mod tests {
         assert_eq!(
             only,
             serde_json::json!({ "hookSpecificOutput": { "additionalContext": text } })
+        );
+
+        // Copilot: one JSON document with the top-level `additionalContext` its harness
+        // consumes, and the `hookSpecificOutput` VS Code's older Local harness reads.
+        let one = |out: &str| {
+            let mut stream =
+                serde_json::Deserializer::from_str(out).into_iter::<serde_json::Value>();
+            let v = stream.next().unwrap().unwrap();
+            assert!(stream.next().is_none(), "one JSON value: {out}");
+            v
+        };
+        assert_eq!(
+            one(&hook_stdout(HookAgent::Copilot, text)),
+            serde_json::json!({
+                "additionalContext": text,
+                "hookSpecificOutput": { "hookEventName": "SessionStart", "additionalContext": text }
+            })
+        );
+        // Cursor: flat and snake_case.
+        assert_eq!(
+            one(&hook_stdout(HookAgent::Cursor, text)),
+            serde_json::json!({ "additional_context": text })
+        );
+    }
+
+    /// Payloads as the vendor docs give them (docs.github.com/en/copilot/reference/
+    /// hooks-configuration, code.visualstudio.com/docs/agents/reference/hooks-reference,
+    /// cursor.com/docs/hooks; checked 2026-11-08): the session id, source, working directory
+    /// and Cursor detection each hook reads from them.
+    #[test]
+    fn copilot_and_cursor_payloads_map_to_the_hook_request() {
+        let copilot_start: serde_json::Value = serde_json::json!({
+            "sessionId": "06bf67d7-2268-421b-8cb2-c9d833ea6389",
+            "timestamp": 1_786_000_000_000_i64,
+            "cwd": "/Users/me/repo",
+            "source": "new",
+            "initialPrompt": "fix the build"
+        });
+        let copilot_end = serde_json::json!({
+            "sessionId": "06bf67d7-2268-421b-8cb2-c9d833ea6389",
+            "timestamp": 1_786_000_100_000_i64,
+            "cwd": "/Users/me/repo",
+            "reason": "user_exit"
+        });
+        let copilot_resume = serde_json::json!({
+            "hook_event_name": "SessionStart",
+            "session_id": "06bf67d7-2268-421b-8cb2-c9d833ea6389",
+            "timestamp": "2026-11-08T10:00:00Z",
+            "cwd": "/Users/me/repo",
+            "source": "resume"
+        });
+        let vscode_local = serde_json::json!({
+            "timestamp": "2026-11-08T10:00:00.000Z",
+            "cwd": "/Users/me/repo",
+            "session_id": "a1b2c3",
+            "hook_event_name": "SessionStart",
+            "transcript_path": "/tmp/t.json",
+            "source": "new"
+        });
+        let cursor_start = serde_json::json!({
+            "conversation_id": "c0ffee00-1111-4222-8333-444455556666",
+            "generation_id": "g-1",
+            "model": "claude-4.5-sonnet",
+            "hook_event_name": "sessionStart",
+            "cursor_version": "2.3.1",
+            "workspace_roots": ["/Users/me/cursor-repo", "/Users/me/other"],
+            "user_email": null,
+            "transcript_path": null,
+            "session_id": "c0ffee00-1111-4222-8333-444455556666",
+            "is_background_agent": false,
+            "composer_mode": "agent"
+        });
+        let cursor_end = serde_json::json!({
+            "conversation_id": "c0ffee00-1111-4222-8333-444455556666",
+            "hook_event_name": "sessionEnd",
+            "cursor_version": "2.3.1",
+            "workspace_roots": ["/Users/me/cursor-repo"],
+            "transcript_path": null,
+            "session_id": "c0ffee00-1111-4222-8333-444455556666",
+            "reason": "user_close",
+            "duration_ms": 45000,
+            "is_background_agent": false,
+            "final_status": "completed"
+        });
+
+        assert_eq!(hook_source(Some(&copilot_start)), "startup");
+        assert_eq!(hook_source(Some(&vscode_local)), "startup");
+        assert_eq!(hook_source(Some(&copilot_resume)), "resume");
+        assert_eq!(
+            hook_source(Some(&cursor_start)),
+            "startup",
+            "no source: new"
+        );
+        assert_eq!(hook_source(None), "startup");
+        assert!(counts_as_session(hook_source(Some(&copilot_start))));
+
+        for v in [&copilot_start, &copilot_end, &copilot_resume] {
+            assert_eq!(
+                payload_session_id(v),
+                Some("06bf67d7-2268-421b-8cb2-c9d833ea6389")
+            );
+            assert_eq!(hook_cwd(Some(v)), std::path::Path::new("/Users/me/repo"));
+            assert!(!is_cursor_payload(v));
+        }
+        for v in [&cursor_start, &cursor_end] {
+            assert_eq!(
+                payload_session_id(v),
+                Some("c0ffee00-1111-4222-8333-444455556666")
+            );
+            // No `cwd`: the first workspace root, never the hook's own cwd (~/.cursor).
+            assert_eq!(
+                hook_cwd(Some(v)),
+                std::path::Path::new("/Users/me/cursor-repo")
+            );
+            assert!(is_cursor_payload(v));
+        }
+        assert!(!is_cursor_payload(&vscode_local));
+        // The PreCompact snapshot skips Cursor's third-party run and SubagentStop.
+        let pre_compact = serde_json::json!({
+            "hook_event_name": "PreCompact", "transcript_path": "/t.jsonl"
+        });
+        assert!(claude_snapshot_wanted(&pre_compact));
+        let mut from_cursor = pre_compact.clone();
+        from_cursor["cursor_version"] = serde_json::json!("2.4.0");
+        assert!(!claude_snapshot_wanted(&from_cursor));
+        assert!(!claude_snapshot_wanted(
+            &serde_json::json!({ "hook_event_name": "SubagentStop" })
+        ));
+        assert_eq!(
+            payload_session_id(&serde_json::json!({ "sessionId": "" })),
+            None
         );
     }
 
@@ -5117,7 +5851,12 @@ mod tests {
         );
         let claude = printed(hook_output(&conn, &hook_req("startup")).unwrap());
         assert!(!claude.contains("fridays"), "{claude}");
-        for agent in [HookAgent::Codex, HookAgent::Gemini] {
+        for agent in [
+            HookAgent::Codex,
+            HookAgent::Gemini,
+            HookAgent::Copilot,
+            HookAgent::Cursor,
+        ] {
             let mut req = hook_req("startup");
             req.agent = agent;
             let out = printed(hook_output(&conn, &req).unwrap());
@@ -5201,6 +5940,71 @@ mod tests {
                 ContextRule::EveryFileWithImports
             ),
             Some(gem.join("GEMINI.md"))
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Copilot combines every instruction file in the repo root, the cwd and the dirs between
+    /// (CLAUDE.md and .github/copilot-instructions.md included, relative `@` references
+    /// expanded) plus `$COPILOT_HOME/copilot-instructions.md`; Cursor reads AGENTS.md and
+    /// CLAUDE.md at the workspace root only, without following `@` mentions.
+    #[test]
+    fn copilot_and_cursor_check_their_own_context_files() {
+        let root = temp_dir("ctx-copilot-cursor");
+        let repo = root.join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join(".github")).unwrap();
+        std::fs::create_dir_all(repo.join("sub")).unwrap();
+        let block = format!("{}\nmemory\n", export::MANAGED_START);
+        let dirs = project_dirs(&repo.join("sub"));
+        let home = root.join("copilot-home");
+        std::fs::create_dir_all(&home).unwrap();
+        let copilot = |dirs: &[std::path::PathBuf]| copilot_block_source(dirs, Some(&home));
+        assert_eq!(copilot(&dirs), None);
+        // A block-less AGENTS.md does not hide the block in copilot-instructions.md.
+        std::fs::write(repo.join("AGENTS.md"), "rules\n").unwrap();
+        std::fs::write(repo.join(".github/copilot-instructions.md"), &block).unwrap();
+        assert_eq!(
+            copilot(&dirs),
+            Some(dirs[1].join(".github/copilot-instructions.md"))
+        );
+        std::fs::remove_file(repo.join(".github/copilot-instructions.md")).unwrap();
+        std::fs::write(repo.join("block.md"), &block).unwrap();
+        std::fs::write(repo.join("CLAUDE.md"), "@block.md\n").unwrap();
+        assert_eq!(copilot(&dirs), Some(dirs[1].join("block.md")));
+        // Copilot loads no absolute or `~/` reference, and expands none in GEMINI.md.
+        let abs = format!("@{}\n", repo.join("block.md").display());
+        std::fs::write(repo.join("CLAUDE.md"), &abs).unwrap();
+        assert_eq!(copilot(&dirs), None);
+        std::fs::remove_file(repo.join("CLAUDE.md")).unwrap();
+        std::fs::write(repo.join("GEMINI.md"), "@block.md\n").unwrap();
+        assert_eq!(copilot(&dirs), None);
+        std::fs::remove_file(repo.join("GEMINI.md")).unwrap();
+        // In $COPILOT_HOME only copilot-instructions.md counts.
+        std::fs::write(home.join("AGENTS.md"), &block).unwrap();
+        assert_eq!(copilot(&dirs), None);
+        std::fs::write(home.join("copilot-instructions.md"), &block).unwrap();
+        assert_eq!(copilot(&dirs), Some(home.join("copilot-instructions.md")));
+        std::fs::remove_file(home.join("copilot-instructions.md")).unwrap();
+
+        // Cursor: AGENTS.md at the workspace root holds the block, a subdir's does not count.
+        let cursor_root = repo.canonicalize().unwrap();
+        assert_eq!(managed_block_for(HookAgent::Cursor, &cursor_root), None);
+        std::fs::write(repo.join("sub/AGENTS.md"), &block).unwrap();
+        assert_eq!(managed_block_for(HookAgent::Cursor, &cursor_root), None);
+        // A root CLAUDE.md is loaded too (third-party import); its `@` mentions are not.
+        std::fs::write(repo.join("CLAUDE.md"), "@block.md\n").unwrap();
+        assert_eq!(managed_block_for(HookAgent::Cursor, &cursor_root), None);
+        std::fs::write(repo.join("CLAUDE.md"), &block).unwrap();
+        assert_eq!(
+            managed_block_for(HookAgent::Cursor, &cursor_root),
+            Some(cursor_root.join("CLAUDE.md"))
+        );
+        std::fs::remove_file(repo.join("CLAUDE.md")).unwrap();
+        std::fs::write(repo.join("AGENTS.md"), &block).unwrap();
+        assert_eq!(
+            managed_block_for(HookAgent::Cursor, &cursor_root),
+            Some(cursor_root.join("AGENTS.md"))
         );
         let _ = std::fs::remove_dir_all(&root);
     }

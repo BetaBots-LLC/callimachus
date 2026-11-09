@@ -17,6 +17,7 @@ import type {
   WhyCommit,
   WhyState,
   WhyThread,
+  WhyTraceAttribution,
 } from "../protocol";
 import { sourceLabel } from "../protocol";
 import {
@@ -116,7 +117,39 @@ function touchLabel(t: WhyThread): string {
   }
 }
 
+/** An Agent Trace attribution: who the repo's trace record says wrote the line. */
+function TraceRow({ a }: { a: WhyTraceAttribution }) {
+  const who = [a.agent, a.model ? `(${a.model})` : null].filter(Boolean).join(" ") || a.contributor;
+  const meta = [
+    a.conversationId ? `conversation ${a.conversationId}` : null,
+    a.recordedBeforeCommit ? "recorded before the commit" : null,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+  return (
+    <div className="flex items-start gap-1.5 px-2 py-1 text-xs">
+      <Badge variant="outline" className="h-4 shrink-0 px-1.5 py-0 text-[10px] font-normal">
+        trace
+      </Badge>
+      <span className="min-w-0">
+        <span className="font-medium">{who}</span>
+        {meta ? <span className="text-muted-foreground"> · {meta}</span> : null}
+        {a.threadId !== null ? (
+          <button
+            type="button"
+            className="ml-1 text-[var(--vscode-textLink-foreground)] hover:underline"
+            onClick={() => action("openThread", a.threadId as number)}
+          >
+            Open session
+          </button>
+        ) : null}
+      </span>
+    </div>
+  );
+}
+
 function WhyCommitBlock({ commit }: { commit: WhyCommit }) {
+  const trace = commit.trace ?? [];
   return (
     <div className="pb-1">
       <p className="px-2 pt-1.5 text-xs" title={commit.sha}>
@@ -124,7 +157,7 @@ function WhyCommitBlock({ commit }: { commit: WhyCommit }) {
         <span className="font-medium">{commit.subject}</span>
         <span className="text-muted-foreground"> · {formatTime(commit.committedAt)}</span>
       </p>
-      {commit.threads.length === 0 ? (
+      {commit.threads.length === 0 && trace.length === 0 ? (
         <p className="px-2 py-1 text-xs text-muted-foreground">No linked session.</p>
       ) : (
         commit.threads.map((t) => (
@@ -158,6 +191,12 @@ function WhyCommitBlock({ commit }: { commit: WhyCommit }) {
           </div>
         ))
       )}
+      {trace.map((a) => (
+        <TraceRow
+          key={`${a.traceFile}-${a.conversationId ?? a.conversationUrl}-${a.model}`}
+          a={a}
+        />
+      ))}
     </div>
   );
 }

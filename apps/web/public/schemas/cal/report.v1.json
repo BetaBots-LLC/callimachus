@@ -1,0 +1,742 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://callimachus.app/schemas/cal/report.v1.json",
+  "title": "cal report --json",
+  "description": "Your agents, so far: sessions and hours per agent, estimated spend, the most frequent recurring errors and their fixes, tasks asked again, project memory, the files agents changed most and the value ledger. A section with no data is left out.",
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "description": "Major version of this payload's shape. A reader refuses a version newer than it knows.",
+      "minimum": 0
+    },
+    "generatedAt": {
+      "type": "integer",
+      "description": "When it was computed (epoch seconds)."
+    },
+    "since": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "description": "Start of the window (epoch seconds); null for all time."
+    },
+    "totals": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Totals"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "spend": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ReportSpend"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "recurringErrors": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "$ref": "#/$defs/ReportIssue"
+      },
+      "description": "The most frequent recurring errors across every project."
+    },
+    "solvedAgain": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "$ref": "#/$defs/PromptGroup"
+      },
+      "description": "Sessions that opened with the same prompt on different days."
+    },
+    "memory": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ReportMemory"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "files": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "$ref": "#/$defs/ReportFile"
+      },
+      "description": "The files agents edited or wrote most, inside their project only."
+    },
+    "filesOmitted": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "description": "Edited files left out of `files` because they lie outside their session's project\n(a plan file, a temp script), whose full path would name the user's folders."
+    },
+    "ledger": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ReportLedger"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "What the hooks and the MCP server did (the local value ledger)."
+    }
+  },
+  "required": [
+    "schema_version",
+    "generatedAt",
+    "since"
+  ],
+  "$defs": {
+    "Totals": {
+      "type": "object",
+      "properties": {
+        "sessions": {
+          "type": "integer"
+        },
+        "messages": {
+          "type": "integer",
+          "description": "Messages in those sessions and their subagents."
+        },
+        "firstSession": {
+          "type": "integer",
+          "description": "When the first session in the window started (epoch seconds)."
+        },
+        "lastSession": {
+          "type": "integer",
+          "description": "When the last one was last active (epoch seconds)."
+        },
+        "activeDays": {
+          "type": "integer",
+          "description": "Local calendar days on which a session started or was last active."
+        },
+        "estimatedHours": {
+          "type": "number",
+          "description": "The sum of each session's span, each capped at 8 hours, over the sessions with a\nusable span (`hoursSessions`): an estimate."
+        },
+        "hoursSessions": {
+          "type": "integer",
+          "description": "Sessions whose span is known: the thread's own times, else its messages' first and\nlast timestamps. Cursor stores most sessions with neither."
+        },
+        "hoursSources": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "The agents (source kinds) those sessions ran in, most sessions first."
+        },
+        "byTool": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ToolShare"
+          },
+          "description": "Sessions per agent, most first."
+        }
+      },
+      "required": [
+        "sessions",
+        "messages",
+        "firstSession",
+        "lastSession",
+        "activeDays",
+        "estimatedHours",
+        "hoursSessions",
+        "hoursSources",
+        "byTool"
+      ],
+      "description": "Sessions and time across every agent. A session is a top-level transcript: subagent\ntranscripts count toward messages, not sessions, and the app's own chats are left out."
+    },
+    "ToolShare": {
+      "type": "object",
+      "properties": {
+        "source": {
+          "type": "string",
+          "description": "The source kind (`claude_code`, `cursor`...)."
+        },
+        "label": {
+          "type": "string",
+          "description": "Its display name."
+        },
+        "sessions": {
+          "type": "integer"
+        },
+        "share": {
+          "type": "number",
+          "description": "This agent's share of the sessions, 0 to 1."
+        }
+      },
+      "required": [
+        "source",
+        "label",
+        "sessions",
+        "share"
+      ]
+    },
+    "ReportSpend": {
+      "type": "object",
+      "properties": {
+        "basis": {
+          "type": "string",
+          "description": "What the figures are (list-price equivalents, not a bill)."
+        },
+        "total": {
+          "$ref": "#/$defs/SpendWindow",
+          "description": "Over the report's window (all time when `since` is null)."
+        },
+        "last30Days": {
+          "$ref": "#/$defs/SpendWindow",
+          "description": "The last 30 local days, today included (within the window)."
+        },
+        "priciestCommits": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CommitCost"
+          },
+          "description": "The commits whose sessions cost the most, priciest first."
+        }
+      },
+      "required": [
+        "basis",
+        "total",
+        "last30Days",
+        "priciestCommits"
+      ],
+      "description": "Estimated spend, in the list-price terms `cal cost` uses."
+    },
+    "SpendWindow": {
+      "type": "object",
+      "properties": {
+        "since": {
+          "type": "integer",
+          "description": "Start of the window (epoch seconds; 0 for all time)."
+        },
+        "totalCost": {
+          "type": "number"
+        },
+        "trackedCalls": {
+          "type": "integer"
+        },
+        "untrackedCalls": {
+          "type": "integer",
+          "description": "Calls on models with no list price, not counted in the cost."
+        },
+        "byTool": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ToolSpend"
+          },
+          "description": "Priciest agent first."
+        },
+        "byModel": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ModelCost"
+          },
+          "description": "Priced models, priciest first (at most 8)."
+        }
+      },
+      "required": [
+        "since",
+        "totalCost",
+        "trackedCalls",
+        "untrackedCalls",
+        "byTool",
+        "byModel"
+      ]
+    },
+    "ToolSpend": {
+      "type": "object",
+      "properties": {
+        "source": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "cost": {
+          "type": "number"
+        },
+        "calls": {
+          "type": "integer"
+        },
+        "share": {
+          "type": "number",
+          "description": "Share of the window's cost, 0 to 1."
+        }
+      },
+      "required": [
+        "source",
+        "label",
+        "cost",
+        "calls",
+        "share"
+      ]
+    },
+    "ModelCost": {
+      "type": "object",
+      "properties": {
+        "model": {
+          "type": "string"
+        },
+        "family": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The price-table family it matched (`claude-opus`, `gpt-5`...), null when none did."
+        },
+        "priced": {
+          "type": "boolean",
+          "description": "False when the model has no price: its cost is 0 and its calls are untracked."
+        },
+        "unpricedReason": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Why an unpriced model has no price (null for a priced one)."
+        },
+        "cost": {
+          "type": "number"
+        },
+        "calls": {
+          "type": "integer"
+        },
+        "input": {
+          "type": "integer"
+        },
+        "output": {
+          "type": "integer"
+        },
+        "cacheWrite": {
+          "type": "integer"
+        },
+        "cacheRead": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "model",
+        "family",
+        "priced",
+        "unpricedReason",
+        "cost",
+        "calls",
+        "input",
+        "output",
+        "cacheWrite",
+        "cacheRead"
+      ],
+      "description": "Spend on one model."
+    },
+    "CommitCost": {
+      "type": "object",
+      "properties": {
+        "sha": {
+          "type": "string"
+        },
+        "shortSha": {
+          "type": "string"
+        },
+        "subject": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "committedAt": {
+          "type": "integer"
+        },
+        "project": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cost": {
+          "type": "number",
+          "description": "The sum of its sessions' whole costs."
+        },
+        "shared": {
+          "type": "boolean",
+          "description": "True when a session behind it also produced another listed commit, so commit costs\noverlap and do not add up to the total."
+        },
+        "sessions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CommitSession"
+          }
+        }
+      },
+      "required": [
+        "sha",
+        "shortSha",
+        "subject",
+        "committedAt",
+        "project",
+        "cost",
+        "shared",
+        "sessions"
+      ],
+      "description": "What the sessions behind one commit cost (`--by commit`)."
+    },
+    "CommitSession": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer"
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cost": {
+          "type": "number",
+          "description": "The session's whole cost, subagents included."
+        },
+        "overlap": {
+          "type": "integer",
+          "description": "Files the session and the commit share (the link's confidence)."
+        },
+        "commits": {
+          "type": "integer",
+          "description": "How many of the listed commits this session is linked to. Above 1, its cost counts\ntoward each of them in full."
+        }
+      },
+      "required": [
+        "id",
+        "title",
+        "cost",
+        "overlap",
+        "commits"
+      ],
+      "description": "A session behind a commit."
+    },
+    "ReportIssue": {
+      "type": "object",
+      "properties": {
+        "example": {
+          "type": "string",
+          "description": "A representative error line from tool output (never a user turn), secrets redacted,\nabsolute paths shortened to file names, cut to one line."
+        },
+        "count": {
+          "type": "integer",
+          "description": "Messages it appeared in."
+        },
+        "sessions": {
+          "type": "integer",
+          "description": "Sessions it appeared in."
+        },
+        "firstSeen": {
+          "type": "integer"
+        },
+        "lastSeen": {
+          "type": "integer"
+        },
+        "project": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The project of the latest sighting."
+        },
+        "fix": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/IssueFix"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "example",
+        "count",
+        "sessions",
+        "firstSeen",
+        "lastSeen",
+        "project",
+        "fix"
+      ],
+      "description": "A recurring error and, once a linked commit fixed it, the fix."
+    },
+    "IssueFix": {
+      "type": "object",
+      "properties": {
+        "sha": {
+          "type": "string"
+        },
+        "shortSha": {
+          "type": "string"
+        },
+        "subject": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The commit's subject line."
+        },
+        "committedAt": {
+          "type": "integer"
+        },
+        "threadId": {
+          "type": "integer",
+          "description": "The session that hit the error and made the fix."
+        }
+      },
+      "required": [
+        "sha",
+        "shortSha",
+        "subject",
+        "committedAt",
+        "threadId"
+      ],
+      "description": "The commit that fixed a recurring error in one project: the latest session there that hit\nit, then edited the file its error named and committed a change to that file."
+    },
+    "PromptGroup": {
+      "type": "object",
+      "properties": {
+        "prompt": {
+          "type": "string",
+          "description": "The newest session's prompt, secrets redacted and cut to one line."
+        },
+        "sessions": {
+          "type": "integer",
+          "description": "Attempts at least a day apart: sessions opened closer together count once."
+        },
+        "firstSeen": {
+          "type": "integer"
+        },
+        "lastSeen": {
+          "type": "integer"
+        },
+        "project": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The project most of them ran in."
+        },
+        "threadIds": {
+          "type": "array",
+          "items": {
+            "type": "integer"
+          },
+          "description": "The sessions, newest first (at most 10), one per day-apart attempt."
+        }
+      },
+      "required": [
+        "prompt",
+        "sessions",
+        "firstSeen",
+        "lastSeen",
+        "project",
+        "threadIds"
+      ],
+      "description": "Sessions whose first prompt was the same task, asked again on another day."
+    },
+    "ReportMemory": {
+      "type": "object",
+      "properties": {
+        "decisions": {
+          "type": "integer"
+        },
+        "gotchas": {
+          "type": "integer"
+        },
+        "openTodos": {
+          "type": "integer"
+        },
+        "projectsWithMemory": {
+          "type": "integer",
+          "description": "Projects with at least one decision or gotcha."
+        },
+        "topDecisionProjects": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ProjectDecisions"
+          },
+          "description": "The projects with the most decisions, most first."
+        },
+        "injected": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Injected"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How often a session started with memory injected, from the value ledger."
+        }
+      },
+      "required": [
+        "decisions",
+        "gotchas",
+        "openTodos",
+        "projectsWithMemory",
+        "topDecisionProjects",
+        "injected"
+      ],
+      "description": "Project memory across every repo."
+    },
+    "ProjectDecisions": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string"
+        },
+        "decisions": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "project",
+        "decisions"
+      ]
+    },
+    "Injected": {
+      "type": "object",
+      "properties": {
+        "injections": {
+          "type": "integer",
+          "description": "SessionStart injections of project memory since `sinceDay`.",
+          "minimum": 0
+        },
+        "sessions": {
+          "type": "integer",
+          "description": "Sessions that started since `sinceDay`, on every agent."
+        },
+        "share": {
+          "type": "number",
+          "description": "`injections / sessions`, at most 1. A `/clear` injects again, so this can run high."
+        },
+        "sinceDay": {
+          "type": "string",
+          "description": "The first local day (`YYYY-MM-DD`) the ledger still holds."
+        }
+      },
+      "required": [
+        "injections",
+        "sessions",
+        "share",
+        "sinceDay"
+      ]
+    },
+    "ReportFile": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "Relative to the project (a file outside it is counted in `filesOmitted` instead)."
+        },
+        "project": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "edits": {
+          "type": "integer",
+          "description": "Edit and write tool calls on it."
+        },
+        "sessions": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "path",
+        "project",
+        "edits",
+        "sessions"
+      ]
+    },
+    "ReportLedger": {
+      "type": "object",
+      "properties": {
+        "counts": {
+          "$ref": "#/$defs/Counts"
+        },
+        "sinceDay": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The first local day (`YYYY-MM-DD`) the counts cover."
+        },
+        "allTime": {
+          "type": "integer",
+          "description": "Every event ever counted, pruned days included.",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "counts",
+        "sinceDay",
+        "allTime"
+      ],
+      "description": "The value ledger's counts over the days it keeps (90), plus the all-time total."
+    },
+    "Counts": {
+      "type": "object",
+      "properties": {
+        "hook": {
+          "type": "integer",
+          "default": 0,
+          "minimum": 0
+        },
+        "mcp": {
+          "type": "integer",
+          "default": 0,
+          "minimum": 0
+        },
+        "recall": {
+          "type": "integer",
+          "default": 0,
+          "minimum": 0
+        },
+        "digest": {
+          "type": "integer",
+          "default": 0,
+          "minimum": 0
+        },
+        "playbook": {
+          "type": "integer",
+          "default": 0,
+          "minimum": 0,
+          "description": "Days rolled up before this kind existed read as 0."
+        }
+      },
+      "required": [
+        "hook",
+        "mcp",
+        "recall",
+        "digest",
+        "playbook"
+      ],
+      "description": "Events per kind (the `week` shape `value_ledger` returns and each `ledger.daily` day)."
+    }
+  }
+}

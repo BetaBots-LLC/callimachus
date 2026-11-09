@@ -1,0 +1,106 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://callimachus.app/schemas/cal/trace.v1.json",
+  "title": "cal trace --json",
+  "description": "What `cal trace export` wrote (or, with --dry-run, would write): Agent Trace records (agent-trace.dev) for the commits the project's sessions produced.",
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "description": "Major version of this payload's shape. A reader refuses a version newer than it knows.",
+      "minimum": 0
+    },
+    "standard": {
+      "type": "string",
+      "description": "Always `agent-trace`: the record format written."
+    },
+    "specVersion": {
+      "type": "string",
+      "description": "The Agent Trace version the records carry."
+    },
+    "repo": {
+      "type": "string",
+      "description": "The repository the commits were read from."
+    },
+    "project": {
+      "type": "string",
+      "description": "The project key whose sessions were exported."
+    },
+    "out": {
+      "type": "string",
+      "description": "Where the records go: a file, or `-` for stdout."
+    },
+    "dryRun": {
+      "type": "boolean"
+    },
+    "since": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "description": "Only commits from this epoch second on (`--since DAYS`); null for all time."
+    },
+    "records": {
+      "type": "integer",
+      "description": "Records built: one per session and linked commit whose files the session edited.",
+      "minimum": 0
+    },
+    "written": {
+      "type": "integer",
+      "description": "Records appended to `out` (0 on a dry run or to stdout).",
+      "minimum": 0
+    },
+    "alreadyPresent": {
+      "type": "integer",
+      "description": "Records `out` already had (same id), left as they were.",
+      "minimum": 0
+    },
+    "sessions": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "commits": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "files": {
+      "type": "integer",
+      "description": "File entries across the records.",
+      "minimum": 0
+    },
+    "skippedLinks": {
+      "type": "integer",
+      "description": "Session-commit links skipped because the session edited none of the commit's files\n(linked through mentions alone, or indexed before file edits were recorded).",
+      "minimum": 0
+    },
+    "missingCommits": {
+      "type": "integer",
+      "description": "Linked commits the repository no longer has (rebased away, or another clone's).",
+      "minimum": 0
+    },
+    "oversizedCommits": {
+      "type": "integer",
+      "description": "Commits whose diff was past the 8 MiB bound (a vendored lockfile or data dump): their\nrecords name the files without line ranges.",
+      "minimum": 0
+    }
+  },
+  "required": [
+    "schema_version",
+    "standard",
+    "specVersion",
+    "repo",
+    "project",
+    "out",
+    "dryRun",
+    "since",
+    "records",
+    "written",
+    "alreadyPresent",
+    "sessions",
+    "commits",
+    "files",
+    "skippedLinks",
+    "missingCommits",
+    "oversizedCommits"
+  ]
+}

@@ -3,7 +3,15 @@
 import "./mock-tauri";
 import type { SettingsSection, SettingsSectionAlias, View } from "../store/ui";
 
-const VIEWS: readonly View[] = ["today", "search", "chat", "projects", "stats", "settings"];
+const VIEWS: readonly View[] = [
+  "today",
+  "search",
+  "chat",
+  "projects",
+  "stats",
+  "settings",
+  "report",
+];
 // The pre-merge ids ("providers", "knowledge") still open Settings > AI engine.
 const SECTIONS: readonly (SettingsSection | SettingsSectionAlias)[] = [
   "general",

@@ -10,6 +10,7 @@ import { recentThreads, searchHits, showCalSetupPrompt, stripMarks } from "./cal
 import { copyThreadById, insertThreadById } from "./actions";
 import { openThreadPanel } from "./threadPanel";
 import { SidebarProvider } from "./sidebarProvider";
+import { WhyGutter } from "./whyGutter";
 import type { SearchHit } from "./protocol";
 
 type ThreadItem = vscode.QuickPickItem & { threadId: number };
@@ -101,17 +102,35 @@ async function whyThisLine(sidebar: SidebarProvider): Promise<void> {
     );
     return;
   }
+  await whyLineOf(sidebar, editor.document, editor.selection.active.line + 1);
+}
+
+/** "Why this line" from a gutter hover: `file`'s 1-based `line`. */
+async function whyLineAt(sidebar: SidebarProvider, file: unknown, line: unknown): Promise<void> {
+  if (typeof file !== "string" || typeof line !== "number") return;
+  const doc = vscode.workspace.textDocuments.find(
+    (d) => d.uri.scheme === "file" && d.uri.fsPath === file,
+  );
+  if (doc) await whyLineOf(sidebar, doc, line);
+  else await sidebar.why(file, line);
+}
+
+async function whyLineOf(
+  sidebar: SidebarProvider,
+  doc: vscode.TextDocument,
+  line: number,
+): Promise<void> {
   // git blame reads the saved file, so unsaved edits would shift the line it explains.
-  if (editor.document.isDirty) {
+  if (doc.isDirty) {
     const choice = await vscode.window.showWarningMessage(
       "Callimachus: this file has unsaved changes, so the line may not match what git has. Save it first?",
       "Save and continue",
       "Continue",
     );
     if (!choice) return;
-    if (choice === "Save and continue") await editor.document.save();
+    if (choice === "Save and continue") await doc.save();
   }
-  await sidebar.why(editor.document.uri.fsPath, editor.selection.active.line + 1);
+  await sidebar.why(doc.uri.fsPath, line);
 }
 
 /** Prompt the user to pick a recent thread; returns its id. */
@@ -197,6 +216,10 @@ export function activate(context: vscode.ExtensionContext): void {
       "callimachus.whyLine",
       guard(() => whyThisLine(sidebar)),
     ),
+    vscode.commands.registerCommand(
+      "callimachus.whyLineAt",
+      guard((file: unknown, line: unknown) => whyLineAt(sidebar, file, line)),
+    ),
     vscode.commands.registerCommand("callimachus.refreshRecent", () => sidebar.refresh()),
     vscode.commands.registerCommand(
       "callimachus.openThread",
@@ -214,6 +237,8 @@ export function activate(context: vscode.ExtensionContext): void {
     }),
     // The provider owns the editor watcher; dispose it on shutdown.
     sidebar,
+    // Gutter marks and hovers on lines a session wrote (callimachus.whyGutter / whyHover).
+    new WhyGutter(extensionUri),
   );
 }
 
