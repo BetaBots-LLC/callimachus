@@ -23,7 +23,7 @@
     "release:tag": "node scripts/release-tag.mjs"
   },
   "devDependencies": {
-    "@biomejs/biome": "2.6.4",
+    "@biomejs/biome": "2.6.5",
     "@changesets/cli": "^3.0.3",
     "turbo": "^2.11.10"
   },
