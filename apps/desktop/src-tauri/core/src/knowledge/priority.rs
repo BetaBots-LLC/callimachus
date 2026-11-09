@@ -1,14 +1,14 @@
 //! The auto-distill priority queue: sessions that just ended, distilled ahead of the
-//! recent-and-idle worklist. The SessionEnd hooks of Claude Code, Codex and Gemini CLI
-//! (`cal session-end [--for codex|gemini]`) add the session; `auto_distill_worklist` drains
+//! recent-and-idle worklist. The SessionEnd hooks of Claude Code, Codex, Gemini CLI, GitHub
+//! Copilot and Cursor (`cal session-end [--for codex|gemini|copilot|cursor]`) add the session; `auto_distill_worklist` drains
 //! it first. A session that ended is done, so the
 //! idle wait (which only guards against distilling a live session) and the 30-day window do
 //! not apply, but each entry still counts against the daily cap.
 //!
 //! Stored in `app_config` under [`PRIORITY_KEY`] as a JSON array of `{ "ref", "ts" }`,
 //! newest first, so the hook (a separate process) and the app share it without a schema
-//! change. References are `claude:<session_id>`, `codex:<session_id>`,
-//! `gemini:<session_id>` or `thread:<id>`.
+//! change. References are `<agent>:<session_id>` (`claude`, `codex`, `gemini`, `copilot`,
+//! `cursor`) or `thread:<id>`.
 
 use super::app_config;
 use anyhow::Result;
@@ -81,7 +81,7 @@ fn valid_session_id(sid: &str) -> bool {
 
 /// The agent prefixes a session reference can carry, each resolved against its own
 /// source's threads (see [`resolve`]).
-const SESSION_PREFIXES: [&str; 3] = ["claude:", "codex:", "gemini:"];
+const SESSION_PREFIXES: [&str; 5] = ["claude:", "codex:", "gemini:", "copilot:", "cursor:"];
 
 fn valid_reference(reference: &str) -> bool {
     if let Some(sid) = SESSION_PREFIXES
@@ -95,7 +95,7 @@ fn valid_reference(reference: &str) -> bool {
         .is_some_and(|id| id.parse::<i64>().is_ok())
 }
 
-/// Put `reference` (`claude:` / `codex:` / `gemini:<session_id>` or `thread:<id>`) at the front of the priority
+/// Put `reference` (`<agent>:<session_id>` or `thread:<id>`) at the front of the priority
 /// queue, dropping an older copy of it, entries past a week, and anything past
 /// [`PRIORITY_MAX`]. One small `app_config` write: cheap enough for a SessionEnd hook.
 pub fn enqueue_distill_priority(conn: &Connection, reference: &str, now: i64) -> Result<()> {
@@ -132,6 +132,43 @@ const CLAUDE_SESSION_SQL: &str = "SELECT t.id FROM threads t
 const CODEX_SESSION_SQL: &str = "SELECT t.id FROM threads t
      WHERE t.source_id = (SELECT id FROM sources WHERE kind = 'codex')
        AND t.external_id = ?1";
+
+/// The indexed thread of `kind` keyed by external id `sid`: one seek on the
+/// (source_id, external_id) unique index.
+const THREAD_BY_EXTERNAL_ID_SQL: &str = "SELECT t.id FROM threads t
+     WHERE t.source_id = (SELECT id FROM sources WHERE kind = ?1)
+       AND t.external_id = ?2";
+
+/// The first of `kinds` holding a thread keyed by session id `sid`.
+fn thread_for_session_in(conn: &Connection, kinds: &[&str], sid: &str) -> Result<Option<i64>> {
+    if !valid_session_id(sid) {
+        return Ok(None);
+    }
+    let mut stmt = conn.prepare_cached(THREAD_BY_EXTERNAL_ID_SQL)?;
+    for kind in kinds {
+        if let Some(id) = stmt
+            .query_row(rusqlite::params![kind, sid], |r| r.get(0))
+            .optional()?
+        {
+            return Ok(Some(id));
+        }
+    }
+    Ok(None)
+}
+
+/// Where a GitHub Copilot hook's `sessionId` is indexed. Copilot CLI keys a session by its
+/// `session-state/<id>` dir, which is the thread's external id (copilot_cli.rs). The VS Code
+/// harnesses share the hook format; a chat that VS Code keeps in its own `chatSessions` file
+/// is keyed by that file's `sessionId` (copilot.rs), so it is the fallback.
+const COPILOT_SESSION_KINDS: [&str; 2] = [
+    crate::indexer::copilot_cli::KIND,
+    crate::indexer::copilot::KIND,
+];
+
+/// Cursor's hook `session_id` is the conversation id (cursor.com/docs/hooks: "same as
+/// `conversation_id`"), which is the composer id the Cursor indexer keys threads by, in
+/// state.vscdb, the agent transcripts and the CLI's chat stores alike (cursor.rs).
+const CURSOR_SESSION_KINDS: [&str; 1] = [crate::indexer::cursor::KIND];
 
 /// Gemini CLI top-level chat files are `<project>/chats/session-<YYYY-MM-DDTHH-MM>-<first 8
 /// chars of the session id>.jsonl` (chatRecordingService.ts; subagent files nest one level
@@ -211,6 +248,12 @@ fn resolve(conn: &Connection, reference: &str) -> Result<Option<i64>> {
     if let Some(sid) = reference.strip_prefix("gemini:") {
         let root = crate::indexer::gemini::tmp_root();
         return gemini_thread_for_session(conn, sid, root.as_deref());
+    }
+    if let Some(sid) = reference.strip_prefix("copilot:") {
+        return thread_for_session_in(conn, &COPILOT_SESSION_KINDS, sid);
+    }
+    if let Some(sid) = reference.strip_prefix("cursor:") {
+        return thread_for_session_in(conn, &CURSOR_SESSION_KINDS, sid);
     }
     if let Some(sid) = reference.strip_prefix("claude:") {
         if !valid_session_id(sid) {
@@ -457,6 +500,45 @@ mod tests {
         enqueue_distill_priority(&conn, &format!("codex:{sid}"), 5).unwrap();
         enqueue_distill_priority(&conn, &format!("gemini:{sid}"), 6).unwrap();
         assert!(enqueue_distill_priority(&conn, "codex:a%b", 7).is_err());
+    }
+
+    /// `copilot:<sid>` finds a Copilot CLI thread first, then a VS Code chat keyed by the
+    /// same id; `cursor:<sid>` the Cursor composer. Neither crosses into another agent's
+    /// thread with the same external id, and both are one seek on the unique index.
+    #[test]
+    fn copilot_and_cursor_sessions_resolve_by_external_id() {
+        let mut conn = temp_db();
+        let cli = "06bf67d7-2268-421b-8cb2-c9d833ea6389";
+        let chat = "7a6e1d0c-9a1b-4c2d-8e3f-0a1b2c3d4e5f";
+        let composer = "c0ffee00-1111-4222-8333-444455556666";
+        let cli_id = thread_in(&mut conn, crate::indexer::copilot_cli::KIND, cli, 4, 1_000);
+        let chat_id = thread_in(&mut conn, crate::indexer::copilot::KIND, chat, 4, 1_000);
+        let composer_id = thread_in(&mut conn, crate::indexer::cursor::KIND, composer, 4, 1_000);
+        assert_eq!(
+            resolve(&conn, &format!("copilot:{cli}")).unwrap(),
+            Some(cli_id)
+        );
+        assert_eq!(
+            resolve(&conn, &format!("copilot:{chat}")).unwrap(),
+            Some(chat_id)
+        );
+        assert_eq!(
+            resolve(&conn, &format!("cursor:{composer}")).unwrap(),
+            Some(composer_id)
+        );
+        assert_eq!(resolve(&conn, &format!("cursor:{cli}")).unwrap(), None);
+        assert_eq!(
+            resolve(&conn, &format!("copilot:{composer}")).unwrap(),
+            None
+        );
+        enqueue_distill_priority(&conn, &format!("copilot:{cli}"), 5).unwrap();
+        enqueue_distill_priority(&conn, &format!("cursor:{composer}"), 6).unwrap();
+        assert!(enqueue_distill_priority(&conn, "cursor:../x", 7).is_err());
+        let p = plan(&conn, THREAD_BY_EXTERNAL_ID_SQL, ["cursor", composer]);
+        assert!(
+            p.contains("COVERING INDEX sqlite_autoindex_threads_1 (source_id=? AND external_id=?)"),
+            "{p}"
+        );
     }
 
     /// `gemini:<sid>` narrows by the 8-char prefix in the chat file name, then the file's

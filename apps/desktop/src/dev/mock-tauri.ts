@@ -3,7 +3,7 @@
 //   http://localhost:1420/mock.html?view=settings&section=engine&theme=light
 // Params: theme, consent, memory (alias: knowledge), engines, agents, agenthooks, plugin, claude, keys,
 // update, jobs, semantic, searchMs, onboarding, ledger, chats, projectdata, lastproject, muted,
-// sections, today, scope, cliwatch, repomemory (see SCENARIO below). mock-entry.ts also reads view, section,
+// sections, today, scope, cliwatch, repomemory, report (see SCENARIO below). mock-entry.ts also reads view, section,
 // chatmode=ask and ask=<question> (sends it on load). Dev-only.
 import type {
   AgentHooksStatus,
@@ -31,6 +31,8 @@ import type {
   MemorySetup,
   OnboardingSteps,
   ProjectInfo,
+  Report,
+  ReportView,
   ProjectMemory,
   RepoFactChange,
   RepoMemoryStatus,
@@ -143,6 +145,11 @@ const SCENARIO = {
   // Repo memory (`.callimachus/memory/`): published with a teammate's fact imported (default),
   // a checkout that has none yet, or a project with no checkout on this machine.
   repomemory: pick("repomemory", ["published", "unpublished", "nocheckout"] as const, "published"),
+  // The Report view: a long history across four agents (default), a week-old install with
+  // two (no spend, no prompts asked again, no files), or an index with nothing in it. Also
+  // whether Today's report card shows (`reportstep=unset`, the default) or was answered.
+  report: pick("report", ["large", "small", "empty"] as const, "large"),
+  reportstep: pick("reportstep", ["unset", "done", "skipped"] as const, "unset"),
 };
 
 // sections=all|none: open (or close) every Project page section before the app reads the
@@ -559,23 +566,41 @@ function agentList(mode: "connected" | "partial" | "none"): AgentIntegration[] {
 }
 let agents = agentList(SCENARIO.agents);
 
-/** `agenthooks=off|on|blocked|approve`: the Codex / Gemini CLI memory hooks. */
+/** `agenthooks=off|on|blocked|approve`: the Codex, Gemini CLI, GitHub Copilot and Cursor
+ *  memory hooks. `blocked` turns Codex's and Copilot's off in their own config. Copilot has
+ *  no MCP row, so it is detected unless `agents=none`. */
 function agentHookRows(mode: "off" | "on" | "blocked" | "approve"): AgentHooksStatus[] {
-  const present = (id: string) => agents.find((a) => a.id === id)?.present ?? false;
+  const LABELS: Record<HookAgentId, string> = {
+    codex: "Codex",
+    gemini: "Gemini CLI",
+    copilot: "GitHub Copilot",
+    cursor: "Cursor",
+  };
+  const BLOCKED: Partial<Record<HookAgentId, string>> = {
+    codex: "hooks are disabled in config.toml",
+    copilot: "disableAllHooks is true in callimachus.json",
+  };
+  const present = (id: HookAgentId) =>
+    id === "copilot"
+      ? SCENARIO.agents !== "none"
+      : (agents.find((a) => a.id === id)?.present ?? false);
   const row = (agent: HookAgentId, configPath: string, dir: string): AgentHooksStatus => ({
     agent,
+    present: present(agent),
     configPath,
     installed: (mode === "on" || mode === "approve") && present(agent),
     needsApproval: mode === "approve" && agent === "codex" && present(agent),
     blocked: !present(agent)
-      ? `${agent === "codex" ? "Codex" : "Gemini CLI"} is not set up on this machine (no ${dir})`
-      : mode === "blocked" && agent === "codex"
-        ? "hooks are disabled in config.toml"
+      ? `${LABELS[agent]} is not set up on this machine (no ${dir})`
+      : mode === "blocked"
+        ? (BLOCKED[agent] ?? null)
         : null,
   });
   return [
     row("codex", `${HOME}/.codex/hooks.json`, `${HOME}/.codex`),
+    row("cursor", `${HOME}/.cursor/hooks.json`, `${HOME}/.cursor`),
     row("gemini", `${HOME}/.gemini/settings.json`, `${HOME}/.gemini`),
+    row("copilot", `${HOME}/.copilot/hooks/callimachus.json`, `${HOME}/.copilot`),
   ];
 }
 const agentHooks = agentHookRows(SCENARIO.agenthooks);
@@ -600,6 +625,12 @@ let onboardingSteps: OnboardingSteps = {
   memory: SCENARIO.onboarding === "done" ? "done" : null,
   semantic:
     SCENARIO.onboarding === "partial" ? "skipped" : SCENARIO.onboarding === "done" ? "done" : null,
+  report:
+    SCENARIO.reportstep !== "unset"
+      ? SCENARIO.reportstep
+      : SCENARIO.onboarding === "done"
+        ? "done"
+        : null,
 };
 
 function dbStats(): DbStats {
@@ -1342,6 +1373,185 @@ function spendBreakdownFor(project: string | null): SpendBreakdown {
   return { days, commits };
 }
 
+/** The Report view's data per `report=` scenario, and a short markdown in the shape
+ *  `cal report` prints (the real one comes from `report::to_markdown`). */
+function reportFor(): ReportView {
+  const empty: Report = { generatedAt: NOW, since: null };
+  if (SCENARIO.report === "empty" || !indexed)
+    return { report: empty, markdown: reportMarkdown(empty) };
+  const large = SCENARIO.report === "large";
+  const ids = threads.map((t) => t.id);
+  const tool = (source: SourceKind, label: string, sessions: number, total: number) => ({
+    source,
+    label,
+    sessions,
+    share: sessions / total,
+  });
+  const total = large ? 2_914 : 23;
+  const report: Report = {
+    generatedAt: NOW,
+    since: null,
+    totals: {
+      sessions: total,
+      messages: large ? 1_204_377 : 1_842,
+      firstSession: NOW - (large ? 640 : 6) * DAY,
+      lastSession: NOW - 3600,
+      activeDays: large ? 412 : 5,
+      estimatedHours: large ? 2_187.4 : 14.2,
+      // Large: most Cursor sessions carry no usable times, so the hours cover only some.
+      hoursSessions: large ? 2_210 : total,
+      hoursSources: large
+        ? ["claude_code", "cursor", "codex", "gemini"]
+        : ["claude_code", "cursor"],
+      byTool: large
+        ? [
+            tool("claude_code", "Claude Code", 1_602, total),
+            tool("cursor", "Cursor", 871, total),
+            tool("codex", "Codex", 388, total),
+            tool("gemini", "Gemini CLI", 53, total),
+          ]
+        : [tool("claude_code", "Claude Code", 17, total), tool("cursor", "Cursor", 6, total)],
+    },
+  };
+  if (large) {
+    const breakdown = spendBreakdownFor(null);
+    report.spend = {
+      basis:
+        "List-price equivalent of the recorded token usage: an estimate, not a billing record. A subscription bills differently.",
+      total: {
+        since: 0,
+        totalCost: 18_422.37,
+        trackedCalls: 402_118,
+        untrackedCalls: 1_204,
+        byTool: [
+          {
+            source: "claude_code",
+            label: "Claude Code",
+            cost: 16_002.1,
+            calls: 351_200,
+            share: 0.869,
+          },
+          { source: "codex", label: "Codex", cost: 2_311.9, calls: 48_100, share: 0.125 },
+          { source: "gemini", label: "Gemini CLI", cost: 108.37, calls: 2_818, share: 0.006 },
+        ],
+        byModel: [
+          ["claude-opus-4-8", 11_840.2, 201_330],
+          ["claude-sonnet-4-6", 4_161.9, 149_870],
+          ["gpt-5", 2_311.9, 48_100],
+          ["gemini-2.5-pro", 108.37, 2_818],
+        ].map(([model, cost, calls]) => ({
+          model: String(model),
+          family: null,
+          priced: true,
+          unpricedReason: null,
+          cost: Number(cost),
+          calls: Number(calls),
+          input: 0,
+          output: 0,
+          cacheWrite: 0,
+          cacheRead: 0,
+        })),
+      },
+      last30Days: {
+        since: NOW - 30 * DAY,
+        totalCost: 2_204.55,
+        trackedCalls: 51_002,
+        untrackedCalls: 0,
+        byTool: [
+          {
+            source: "claude_code",
+            label: "Claude Code",
+            cost: 1_980.4,
+            calls: 45_100,
+            share: 0.898,
+          },
+          { source: "codex", label: "Codex", cost: 224.15, calls: 5_902, share: 0.102 },
+        ],
+        byModel: [],
+      },
+      priciestCommits: breakdown.commits,
+    };
+    report.solvedAgain = [
+      {
+        prompt: "the webhook retries are double charging again, find out why and fix it",
+        sessions: 4,
+        firstSeen: NOW - 210 * DAY,
+        lastSeen: NOW - 9 * DAY,
+        project: "/Users/me/code/payments-api",
+        threadIds: ids.slice(0, 4),
+      },
+      {
+        prompt: "set up the eslint config so the monorepo packages share one ruleset",
+        sessions: 3,
+        firstSeen: NOW - 400 * DAY,
+        lastSeen: NOW - 60 * DAY,
+        project: "/Users/me/code/web-dashboard",
+        threadIds: ids.slice(1, 4),
+      },
+    ];
+    report.files = [
+      ["src/webhooks/retry.ts", "payments-api", 212, 31],
+      ["src/app/routes/dashboard.tsx", "web-dashboard", 164, 22],
+      ["src/lib/stripe.ts", "payments-api", 120, 19],
+      ["apps/desktop/src-tauri/src/lib.rs", "callimachus", 98, 17],
+      ["README.md", "web-dashboard", 51, 14],
+    ].map(([path, project, edits, sessions]) => ({
+      path: String(path),
+      project: `/Users/me/code/${project}`,
+      edits: Number(edits),
+      sessions: Number(sessions),
+    }));
+    report.ledger = {
+      counts: { hook: 612, mcp: 1_840, recall: 96, digest: 41, playbook: 12 },
+      sinceDay: new Date((NOW - 89 * DAY) * 1000).toISOString().slice(0, 10),
+      allTime: 4_302,
+    };
+  }
+  report.recurringErrors = RECURRING.slice(0, large ? 5 : 1).map((i) => ({
+    example: i.example,
+    count: i.count,
+    sessions: i.threads,
+    firstSeen: i.firstSeen,
+    lastSeen: i.lastSeen,
+    project: "/Users/me/code/payments-api",
+    fix: i.fix ?? null,
+  }));
+  report.memory = {
+    decisions: large ? 1_248 : 9,
+    gotchas: large ? 659 : 4,
+    openTodos: large ? 131 : 2,
+    projectsWithMemory: large ? 24 : 1,
+    topDecisionProjects: large
+      ? [
+          { project: "/Users/me/code/payments-api", decisions: 418 },
+          { project: "/Users/me/code/web-dashboard", decisions: 382 },
+          { project: "/Users/me/code/callimachus", decisions: 109 },
+        ]
+      : [{ project: "/Users/me/code/payments-api", decisions: 9 }],
+    injected: large
+      ? {
+          injections: 612,
+          sessions: 1_021,
+          share: 0.6,
+          sinceDay: new Date((NOW - 89 * DAY) * 1000).toISOString().slice(0, 10),
+        }
+      : null,
+  };
+  return { report, markdown: reportMarkdown(report) };
+}
+
+function reportMarkdown(r: Report): string {
+  const t = r.totals;
+  if (!t) return "# Your agents, so far\n\nNo agent sessions indexed yet.\n";
+  const rows = t.byTool
+    .map(
+      (x) =>
+        `| ${x.label} | ${x.sessions.toLocaleString("en-US")} | ${Math.round(x.share * 100)}% |`,
+    )
+    .join("\n");
+  return `# Your agents, so far\n\n**${t.sessions.toLocaleString("en-US")} sessions** and **${t.messages.toLocaleString("en-US")} messages** with your coding agents.\n\n| Agent | Sessions | Share |\n|---|---:|---:|\n${rows}\n\n---\n_Made with Callimachus (callimachus.app), from the local index._\n`;
+}
+
 /** Linked commits for the payments-api sessions (the first and fifth thread). */
 function commitsFor(threadId: number): CommitLink[] {
   if (SCENARIO.projectdata === "empty") return [];
@@ -1645,6 +1855,12 @@ const handlers: Record<string, Handler> = {
   recurring_issues: (a) => (a.project && SCENARIO.projectdata === "empty" ? [] : RECURRING),
   spend: (a) => spendFor(a.project ? String(a.project) : null, a.since ? Number(a.since) : 0),
   spend_breakdown: (a) => spendBreakdownFor(a.project ? String(a.project) : null),
+  report: () => reportFor(),
+  save_report_card: (a) => {
+    const bytes = Array.isArray(a.png) ? a.png.length : 0;
+    if (bytes < 8) throw new Error("the card is not a PNG image");
+    return "/Users/me/Downloads/callimachus-report-2026-11-08.png";
+  },
   get_close_to_tray: () => closeToTray,
 
   set_close_to_tray: (a) => {
@@ -2078,14 +2294,20 @@ const handlers: Record<string, Handler> = {
   agent_hooks_status: () => agentHooks.map((x) => ({ ...x })),
   install_agent_hooks: (a) => {
     const row = agentHooks.find((x) => x.agent === a.agent);
-    if (!row) throw new Error(`memory hooks are available for codex and gemini, not '${a.agent}'`);
+    if (!row)
+      throw new Error(
+        `memory hooks are available for codex, gemini, copilot and cursor, not '${a.agent}'`,
+      );
     if (row.blocked) throw new Error(`Can't add memory hooks: ${row.blocked}`);
     row.installed = true;
     return { ...row };
   },
   uninstall_agent_hooks: (a) => {
     const row = agentHooks.find((x) => x.agent === a.agent);
-    if (!row) throw new Error(`memory hooks are available for codex and gemini, not '${a.agent}'`);
+    if (!row)
+      throw new Error(
+        `memory hooks are available for codex, gemini, copilot and cursor, not '${a.agent}'`,
+      );
     row.installed = false;
     return { ...row };
   },

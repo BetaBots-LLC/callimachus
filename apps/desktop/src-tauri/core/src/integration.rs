@@ -813,7 +813,8 @@ struct RemovedIntegration {
     claude_mcp: bool,
     /// Ids (see [`agent_targets`]) of the other agents whose config held our MCP entry.
     agents: Vec<String>,
-    /// Ids (`codex`, `gemini`) of the agents whose hooks file held our memory hooks.
+    /// Ids (`codex`, `gemini`, `copilot`, `cursor`) of the agents whose hooks file held our
+    /// memory hooks.
     agent_hooks: Vec<String>,
     /// The `cal` entry point.
     cal: bool,
@@ -959,7 +960,7 @@ pub fn uninstall_all_with_marker() -> Result<()> {
         errors.push(format!("other agents: {e:#}"));
     }
     // Windows hook commands carry no missing-binary guard, so hooks left behind by a removed
-    // app would error in Codex and Gemini CLI at every session start.
+    // app would error in the other agents at every session start.
     if let Err(e) = uninstall_all_agent_hooks(&exe) {
         errors.push(format!("{e:#}"));
     }
@@ -1138,7 +1139,7 @@ pub fn refresh_installed(current_exe: &Path) -> Result<bool> {
         }
         Err(e) => record("agents", Err(e)),
     }
-    record("Codex and Gemini CLI hooks", refresh_agent_hooks(&exe));
+    record("other agents' memory hooks", refresh_agent_hooks(&exe));
     // The shared copy is refreshed in plugin mode too: the plugin replaces only Claude's.
     let cli = cli_entrypoint(&exe, &cal_state(&exe));
     record(
@@ -1317,8 +1318,28 @@ struct HookSpec {
     /// `powershell -NoProfile -NonInteractive -Command <cmd>`, gemini-cli `shell-utils.ts`
     /// `getShellConfiguration`), where a command starting with a quoted path is a string
     /// expression and the subcommand after it a syntax error ("Unexpected token 'hook'").
-    /// Those commands get the call operator: `& "<exe>" hook --for gemini`.
+    /// Those commands get the call operator: `& "<exe>" hook --for gemini`. GitHub Copilot
+    /// (its `powershell` command form) and Cursor (its desktop app pipes the payload into a
+    /// PowerShell command) run them the same way on Windows.
     powershell: bool,
+    /// How the agent's hooks file nests an entry.
+    layout: HookLayout,
+}
+
+/// The two shapes of a hooks file's `hooks.<event>` array.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HookLayout {
+    /// Claude Code, Codex and Gemini CLI: groups, `{ "matcher"?, "hooks": [{ "type",
+    /// "command", "timeout" }] }`.
+    Grouped,
+    /// GitHub Copilot and Cursor: the entry is the hook, `{ "command", <timeout_key>, ... }`,
+    /// in a file that must say `"version": 1`.
+    Flat {
+        timeout_key: &'static str,
+        /// The entry carries `"type": "command"` (Copilot's documented form; it defaults to
+        /// command when omitted, Cursor's examples omit it).
+        typed: bool,
+    },
 }
 
 impl HookSpec {
@@ -1328,6 +1349,14 @@ impl HookSpec {
             self.timeout_secs * 1000
         } else {
             self.timeout_secs
+        }
+    }
+
+    /// The key the agent reads the timeout from.
+    fn timeout_key(&self) -> &'static str {
+        match self.layout {
+            HookLayout::Grouped => "timeout",
+            HookLayout::Flat { timeout_key, .. } => timeout_key,
         }
     }
 }
@@ -1343,6 +1372,7 @@ const SESSION_START_HOOK: HookSpec = HookSpec {
     millis: false,
     name: None,
     powershell: false,
+    layout: HookLayout::Grouped,
 };
 
 /// Snapshots the live session before its context is compacted.
@@ -1354,6 +1384,7 @@ const PRE_COMPACT_HOOK: HookSpec = HookSpec {
     millis: false,
     name: None,
     powershell: false,
+    layout: HookLayout::Grouped,
 };
 
 /// Moves the session that just ended to the front of the auto-distill queue (`cal
@@ -1368,6 +1399,7 @@ const SESSION_END_HOOK: HookSpec = HookSpec {
     millis: false,
     name: None,
     powershell: false,
+    layout: HookLayout::Grouped,
 };
 
 /// Opt-in: injects "you may have solved this before" notes. Toggled by `set_proactive_recall`.
@@ -1379,6 +1411,7 @@ const PROACTIVE_RECALL_HOOK: HookSpec = HookSpec {
     millis: false,
     name: None,
     powershell: false,
+    layout: HookLayout::Grouped,
 };
 
 /// Opt-in: after a Bash command whose output carries an error a linked commit fixed before
@@ -1393,6 +1426,7 @@ const ERROR_RECALL_HOOK: HookSpec = HookSpec {
     millis: false,
     name: None,
     powershell: false,
+    layout: HookLayout::Grouped,
 };
 
 /// [`ERROR_RECALL_HOOK`] for a command that failed: Claude Code reports a non-zero exit as
@@ -1405,6 +1439,7 @@ const ERROR_RECALL_FAILURE_HOOK: HookSpec = HookSpec {
     millis: false,
     name: None,
     powershell: false,
+    layout: HookLayout::Grouped,
 };
 
 const ERROR_RECALL_HOOKS: [&HookSpec; 2] = [&ERROR_RECALL_HOOK, &ERROR_RECALL_FAILURE_HOOK];
@@ -1426,6 +1461,7 @@ const CODEX_SESSION_START_HOOK: HookSpec = HookSpec {
     millis: false,
     name: None,
     powershell: false,
+    layout: HookLayout::Grouped,
 };
 
 /// Codex's PreCompact hook: a rolling snapshot of the session (its payload has no summary).
@@ -1437,6 +1473,7 @@ const CODEX_PRE_COMPACT_HOOK: HookSpec = HookSpec {
     millis: false,
     name: None,
     powershell: false,
+    layout: HookLayout::Grouped,
 };
 
 /// Codex's SessionEnd hook. Codex gives SessionEnd 1 s by default and at most 3 s
@@ -1449,6 +1486,7 @@ const CODEX_SESSION_END_HOOK: HookSpec = HookSpec {
     millis: false,
     name: None,
     powershell: false,
+    layout: HookLayout::Grouped,
 };
 
 /// Gemini CLI's SessionStart hook (`~/.gemini/settings.json`). Lifecycle matchers there are
@@ -1463,6 +1501,7 @@ const GEMINI_SESSION_START_HOOK: HookSpec = HookSpec {
     millis: true,
     name: Some("callimachus-memory"),
     powershell: true,
+    layout: HookLayout::Grouped,
 };
 
 /// Gemini CLI's SessionEnd hook. Gemini does not wait for it, so the timeout only bounds a
@@ -1475,7 +1514,80 @@ const GEMINI_SESSION_END_HOOK: HookSpec = HookSpec {
     millis: true,
     name: Some("callimachus-session-end"),
     powershell: true,
+    layout: HookLayout::Grouped,
 };
+
+/// GitHub Copilot's command hook entry: `{ "type": "command", "command", "timeoutSec" }`
+/// (docs.github.com/en/copilot/reference/hooks-configuration, "Command hooks", checked
+/// 2026-11-08). `command` is the cross-platform field Copilot copies to `bash` and
+/// `powershell`; we write the form for the platform the app installs on.
+const COPILOT_LAYOUT: HookLayout = HookLayout::Flat {
+    timeout_key: "timeoutSec",
+    typed: true,
+};
+
+/// GitHub Copilot's sessionStart hook, in `~/.copilot/hooks/callimachus.json`. Copilot CLI
+/// and VS Code's Copilot sessions share this harness and its user hooks dir. The camelCase
+/// event name selects the camelCase payload (`sessionId`, `cwd`, `source`); sessionStart has
+/// no matcher, so `cal hook` itself stays silent on `resume`. The default timeout is 30 s.
+const COPILOT_SESSION_START_HOOK: HookSpec = HookSpec {
+    event: "sessionStart",
+    subcommand: "hook --for copilot",
+    matcher: None,
+    timeout_secs: 10,
+    millis: false,
+    name: None,
+    powershell: true,
+    layout: COPILOT_LAYOUT,
+};
+
+/// GitHub Copilot's sessionEnd hook (its output is not processed; on `/clear` it runs
+/// detached).
+const COPILOT_SESSION_END_HOOK: HookSpec = HookSpec {
+    event: "sessionEnd",
+    subcommand: "session-end --for copilot",
+    matcher: None,
+    timeout_secs: 5,
+    millis: false,
+    name: None,
+    powershell: true,
+    layout: COPILOT_LAYOUT,
+};
+
+/// Cursor's hook entry: `{ "command", "timeout" }` in seconds (cursor.com/docs/hooks,
+/// "Per-Script Configuration Options", checked 2026-11-08).
+const CURSOR_LAYOUT: HookLayout = HookLayout::Flat {
+    timeout_key: "timeout",
+    typed: false,
+};
+
+/// Cursor's sessionStart hook (`~/.cursor/hooks.json`), fired when a composer conversation
+/// is created. Its payload has no `cwd`; `cal hook` takes the repo from `workspace_roots`.
+const CURSOR_SESSION_START_HOOK: HookSpec = HookSpec {
+    event: "sessionStart",
+    subcommand: "hook --for cursor",
+    matcher: None,
+    timeout_secs: 10,
+    millis: false,
+    name: None,
+    powershell: true,
+    layout: CURSOR_LAYOUT,
+};
+
+/// Cursor's sessionEnd hook (fire and forget: the response is logged, not used).
+const CURSOR_SESSION_END_HOOK: HookSpec = HookSpec {
+    event: "sessionEnd",
+    subcommand: "session-end --for cursor",
+    matcher: None,
+    timeout_secs: 5,
+    millis: false,
+    name: None,
+    powershell: true,
+    layout: CURSOR_LAYOUT,
+};
+
+const COPILOT_HOOKS: [&HookSpec; 2] = [&COPILOT_SESSION_START_HOOK, &COPILOT_SESSION_END_HOOK];
+const CURSOR_HOOKS: [&HookSpec; 2] = [&CURSOR_SESSION_START_HOOK, &CURSOR_SESSION_END_HOOK];
 
 const CODEX_HOOKS: [&HookSpec; 3] = [
     &CODEX_SESSION_START_HOOK,
@@ -1551,9 +1663,9 @@ fn sh_double_quote(s: &str) -> String {
     out
 }
 
-/// The subcommands our hooks run, with the `--for` forms the Codex and Gemini CLI hooks use.
-/// No entry is a suffix of another after a space, so a command matches exactly one.
-const HOOK_SUBCOMMANDS: [&str; 10] = [
+/// The subcommands our hooks run, with the `--for` forms the other agents' hooks use. No
+/// entry is a suffix of another after a space, so a command matches exactly one.
+const HOOK_SUBCOMMANDS: [&str; 14] = [
     "hook",
     "snapshot-hook",
     "recall-now",
@@ -1564,6 +1676,10 @@ const HOOK_SUBCOMMANDS: [&str; 10] = [
     "session-end --for codex",
     "hook --for gemini",
     "session-end --for gemini",
+    "hook --for copilot",
+    "session-end --for copilot",
+    "hook --for cursor",
+    "session-end --for cursor",
 ];
 
 /// The subcommand of a command shaped like ours. Every form we've written (`"<cal>" hook`, the
@@ -1611,14 +1727,21 @@ fn hook_target(cmd: &str, unescape: bool) -> Option<PathBuf> {
     last.filter(|s| !s.is_empty()).map(PathBuf::from)
 }
 
-/// The command of the first Callimachus hook on `event`, if any.
+/// The command of the first Callimachus hook on `event`, if any: in a group's `hooks`, or
+/// a flat entry's own `command` ([`HookLayout::Flat`]).
 fn our_hook_command(obj: &Map<String, Value>, event: &str, exe: &Path) -> Option<String> {
     obj.get("hooks")?
         .get(event)?
         .as_array()?
         .iter()
-        .filter_map(|g| g.get("hooks").and_then(Value::as_array))
-        .flatten()
+        .flat_map(|g| {
+            std::iter::once(g).chain(
+                g.get("hooks")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten(),
+            )
+        })
         .filter_map(|h| h.get("command").and_then(Value::as_str))
         .find(|c| is_our_hook(c, exe))
         .map(str::to_string)
@@ -1650,6 +1773,23 @@ fn upsert_hook(
     command: &str,
     exe: &Path,
 ) -> Result<()> {
+    if let HookLayout::Flat { timeout_key, typed } = spec.layout {
+        // Both agents reject a hooks file without it.
+        obj.entry("version").or_insert(json!(1));
+        let arr = event_array(obj, spec.event)?;
+        remove_our_hooks(arr, exe);
+        let mut hook = Map::new();
+        if typed {
+            hook.insert("type".into(), json!("command"));
+        }
+        hook.insert("command".into(), json!(command));
+        if let Some(matcher) = spec.matcher {
+            hook.insert("matcher".into(), json!(matcher));
+        }
+        hook.insert(timeout_key.into(), json!(spec.timeout_value()));
+        arr.push(Value::Object(hook));
+        return Ok(());
+    }
     let arr = event_array(obj, spec.event)?;
     remove_our_hooks(arr, exe);
     let mut group = Map::new();
@@ -1673,6 +1813,12 @@ fn upsert_hook(
 fn remove_our_hooks(arr: &mut Vec<Value>, exe: &Path) -> usize {
     let mut removed = 0;
     arr.retain_mut(|group| {
+        // A flat entry (Copilot, Cursor) is the hook itself.
+        if let Some(cmd) = group.get("command").and_then(Value::as_str) {
+            let ours = is_our_hook(cmd, exe);
+            removed += usize::from(ours);
+            return !ours;
+        }
         let Some(hooks) = group.get_mut("hooks").and_then(Value::as_array_mut) else {
             return true;
         };
@@ -1838,7 +1984,8 @@ fn refresh_hooks_in(obj: &mut Map<String, Value>, exe: &Path) -> Result<()> {
 
 /// [`refresh_group`] over every group of each spec's event (shared by Claude Code's
 /// `settings.json`, Codex's `hooks.json` and Gemini CLI's `settings.json`, which use the
-/// same `hooks.<event>[].hooks[]` shape).
+/// same `hooks.<event>[].hooks[]` shape), and [`refresh_flat_entry`] over the flat entries
+/// of Copilot's and Cursor's files.
 fn refresh_specs_in(obj: &mut Map<String, Value>, specs: &[&HookSpec], exe: &Path) {
     let Some(events) = obj.get_mut("hooks").and_then(Value::as_object_mut) else {
         return;
@@ -1848,8 +1995,30 @@ fn refresh_specs_in(obj: &mut Map<String, Value>, specs: &[&HookSpec], exe: &Pat
             continue;
         };
         for group in groups.iter_mut().filter_map(Value::as_object_mut) {
-            refresh_group(group, spec, exe);
+            if group.contains_key("command") {
+                refresh_flat_entry(group, spec, exe);
+            } else {
+                refresh_group(group, spec, exe);
+            }
         }
+    }
+}
+
+/// [`refresh_group`] for a flat entry: re-point our command, and add a timeout only where
+/// the entry has none. Copilot also reads `timeout` (an alias that `timeoutSec` overrides),
+/// so a user's `timeout` is never shadowed by a `timeoutSec` added beside it.
+fn refresh_flat_entry(hook: &mut Map<String, Value>, spec: &HookSpec, exe: &Path) {
+    let Some(cmd) = hook.get("command").and_then(Value::as_str) else {
+        return;
+    };
+    if !is_our_hook(cmd, exe) {
+        return;
+    }
+    let sub = our_hook_subcommand(cmd).unwrap_or(spec.subcommand);
+    let command = spec_command(&refresh_target(cmd, exe), spec, sub);
+    hook.insert("command".into(), json!(command));
+    if !hook.contains_key("timeout") && !hook.contains_key("timeoutSec") {
+        hook.insert(spec.timeout_key().into(), json!(spec.timeout_value()));
     }
 }
 
@@ -1945,7 +2114,8 @@ fn refresh_group(group: &mut Map<String, Value>, spec: &HookSpec, exe: &Path) {
         let sub = our_hook_subcommand(cmd).unwrap_or(spec.subcommand);
         let command = spec_command(&refresh_target(cmd, exe), spec, sub);
         hook.insert("command".into(), json!(command));
-        hook.entry("timeout").or_insert(json!(spec.timeout_value()));
+        hook.entry(spec.timeout_key())
+            .or_insert(json!(spec.timeout_value()));
     }
     // A matcher scopes the whole group, so only add one to a group that holds nothing but ours.
     let all_ours = ours > 0 && ours == hooks.len();
@@ -3011,15 +3181,18 @@ pub fn uninstall_agents() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Codex and Gemini CLI memory hooks
+// Codex, Gemini CLI, GitHub Copilot and Cursor memory hooks
 // ---------------------------------------------------------------------------------------------
 
 /// One agent's memory-hook state for Settings > Agents (`agent_hooks_status`).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentHooksStatus {
-    /// `codex` or `gemini`.
+    /// `codex`, `gemini`, `copilot` or `cursor`.
     pub agent: String,
+    /// The agent's config dir exists (the user runs it here). Copilot has no MCP entry, so
+    /// Settings can't take this from the MCP rows the way it can for the others.
+    pub present: bool,
     /// The file the hooks live in.
     pub config_path: String,
     /// Our SessionStart hook is in that file.
@@ -3039,9 +3212,13 @@ struct HookTarget {
     label: &'static str,
     /// The agent's config dir (presence marker, as in [`agent_targets`]).
     dir: PathBuf,
-    /// The JSON file holding `hooks`: Codex's `hooks.json`, Gemini CLI's `settings.json`.
+    /// The JSON file holding `hooks`: Codex's `hooks.json`, Gemini CLI's `settings.json`,
+    /// Copilot's `hooks/callimachus.json`, Cursor's `hooks.json`.
     file: PathBuf,
     specs: &'static [&'static HookSpec],
+    /// The file holds only our hooks (Copilot loads every `*.json` in its hooks dir, so ours
+    /// gets its own), and Remove deletes it once they are gone.
+    owned: bool,
 }
 
 /// Codex and Gemini CLI, at the config dirs [`agent_targets`] resolves (so a Settings
@@ -3049,8 +3226,13 @@ struct HookTarget {
 /// `[hooks]` tables in `config.toml`; the JSON file keeps our edit out of the user's TOML.
 /// (Codex warns at startup when one layer defines hooks in both, so a config.toml that
 /// already defines hooks blocks the install, see [`CODEX_HOOKS_IN_TOML`].)
+///
+/// Cursor reads `~/.cursor/hooks.json` (user hooks; project and enterprise files sit beside
+/// it). GitHub Copilot loads every `*.json` in `~/.copilot/hooks/` (`$COPILOT_HOME/hooks/`
+/// when set), for Copilot CLI and for VS Code's Copilot sessions alike, so ours is a file of
+/// its own there (docs.github.com hooks reference, "Hooks locations", checked 2026-11-08).
 fn hook_targets() -> Result<Vec<HookTarget>> {
-    Ok(agent_targets()?
+    let mut targets: Vec<HookTarget> = agent_targets()?
         .into_iter()
         .filter_map(|a| match a.id {
             "codex" => Some(HookTarget {
@@ -3059,6 +3241,7 @@ fn hook_targets() -> Result<Vec<HookTarget>> {
                 file: a.dir.join("hooks.json"),
                 dir: a.dir,
                 specs: &CODEX_HOOKS,
+                owned: false,
             }),
             "gemini" => Some(HookTarget {
                 id: a.id,
@@ -3066,17 +3249,44 @@ fn hook_targets() -> Result<Vec<HookTarget>> {
                 file: a.config,
                 dir: a.dir,
                 specs: &GEMINI_HOOKS,
+                owned: false,
+            }),
+            "cursor" => Some(HookTarget {
+                id: a.id,
+                label: a.label,
+                file: a.dir.join("hooks.json"),
+                dir: a.dir,
+                specs: &CURSOR_HOOKS,
+                owned: false,
             }),
             _ => None,
         })
-        .collect())
+        .collect();
+    let copilot = crate::indexer::copilot_cli::copilot_home()
+        .ok_or_else(|| anyhow!("can't find the home directory"))?;
+    targets.push(HookTarget {
+        id: "copilot",
+        label: "GitHub Copilot",
+        file: copilot.join("hooks").join(COPILOT_HOOKS_FILE),
+        dir: copilot,
+        specs: &COPILOT_HOOKS,
+        owned: true,
+    });
+    Ok(targets)
 }
+
+/// Our file in Copilot's hooks dir.
+const COPILOT_HOOKS_FILE: &str = "callimachus.json";
 
 fn find_hook_target(agent: &str) -> Result<HookTarget> {
     hook_targets()?
         .into_iter()
         .find(|t| t.id == agent)
-        .ok_or_else(|| anyhow!("memory hooks are available for codex and gemini, not '{agent}'"))
+        .ok_or_else(|| {
+            anyhow!(
+                "memory hooks are available for codex, gemini, copilot and cursor, not '{agent}'"
+            )
+        })
 }
 
 /// Shown when the agent's own config turns its hook system off.
@@ -3086,6 +3296,8 @@ const GEMINI_HOOKS_OFF: &str = "hooks are disabled in settings.json (hooksConfig
 /// in `hooks.json` ("prefer a single representation", engine/discovery.rs), and our edits stay
 /// out of the user's TOML, so a user who already keeps hooks there adds ours by hand.
 const CODEX_HOOKS_IN_TOML: &str = "Codex hooks already live in config.toml; add ours there";
+/// `disableAllHooks` at the top of a Copilot hooks file skips every hook in it.
+const COPILOT_HOOKS_OFF: &str = "disableAllHooks is true in callimachus.json";
 /// `hooksConfig.disabled` names our SessionStart hook, so Gemini CLI never runs it.
 const GEMINI_HOOK_DISABLED: &str = "the Callimachus hook is turned off in settings.json \
      (hooksConfig.disabled lists callimachus-memory); remove it from that list";
@@ -3123,6 +3335,12 @@ fn hooks_blocked(t: &HookTarget) -> Option<String> {
                 gemini_hook_disabled_by_name(&v, t.specs[0])
                     .then(|| GEMINI_HOOK_DISABLED.to_string())
             }
+        }
+        // Cursor documents no switch that turns user hooks off.
+        "copilot" => {
+            let v = read_json_lenient(&t.file)?;
+            (v.get("disableAllHooks").and_then(Value::as_bool) == Some(true))
+                .then(|| COPILOT_HOOKS_OFF.to_string())
         }
         _ => None,
     }
@@ -3200,6 +3418,7 @@ fn agent_hooks_row(t: &HookTarget, exe: &Path) -> AgentHooksStatus {
     let installed = agent_hooks_installed(t, exe);
     AgentHooksStatus {
         agent: t.id.to_string(),
+        present: t.dir.is_dir(),
         config_path: t.file.display().to_string(),
         installed,
         blocked: hooks_blocked(t),
@@ -3207,8 +3426,8 @@ fn agent_hooks_row(t: &HookTarget, exe: &Path) -> AgentHooksStatus {
     }
 }
 
-/// Memory-hook state for Codex and Gemini CLI (both rows, detected or not; `blocked` says
-/// which are not set up).
+/// Memory-hook state for Codex, Gemini CLI, GitHub Copilot and Cursor (every row, detected
+/// or not; `present` and `blocked` say which are not set up).
 pub fn agent_hooks_status(app_exe: &Path) -> Vec<AgentHooksStatus> {
     let (exe, _) = resolve_exe(app_exe);
     hook_targets()
@@ -3228,19 +3447,45 @@ fn install_hooks_into(file: &Path, specs: &[&HookSpec], exe: &Path) -> Result<bo
     })
 }
 
-/// Strip our hooks on `specs`' events from `file`, leaving the rest of it.
+/// Strip our hooks on `specs`' events from `file`, leaving the rest of it. A flat-layout
+/// file keeps an empty `hooks` beside its `version`, the minimal valid file for Copilot and
+/// Cursor.
 fn remove_hooks_from(file: &Path, specs: &[&HookSpec], exe: &Path) -> Result<bool> {
+    let flat = specs.iter().any(|s| s.layout != HookLayout::Grouped);
     update_json_file(file, false, |obj| {
         for spec in specs {
             strip_our_hooks(obj, spec.event, exe);
+        }
+        if flat && obj.contains_key("version") && !obj.contains_key("hooks") {
+            obj.insert("hooks".into(), json!({}));
         }
         Ok(())
     })
 }
 
-/// Install the memory hooks for `agent` (`codex` or `gemini`): SessionStart injects each
-/// repo's memory (`cal hook --for <agent>`), SessionEnd queues the session for auto-distill,
-/// and for Codex PreCompact snapshots the session. Merges into the agent's file with the
+/// [`remove_hooks_from`] for `t`, deleting a file of ours ([`HookTarget::owned`]) once
+/// nothing but the empty skeleton is left in it.
+fn remove_target_hooks(t: &HookTarget, exe: &Path) -> Result<bool> {
+    let changed = remove_hooks_from(&t.file, t.specs, exe)?;
+    if t.owned
+        && read_json_lenient(&t.file).is_some_and(|v| {
+            v.as_object().is_some_and(|o| {
+                o.keys().all(|k| k == "version" || k == "hooks")
+                    && o.get("hooks")
+                        .and_then(Value::as_object)
+                        .is_none_or(Map::is_empty)
+            })
+        })
+    {
+        remove_if_exists(&t.file)?;
+        return Ok(true);
+    }
+    Ok(changed)
+}
+
+/// Install the memory hooks for `agent` (`codex`, `gemini`, `copilot` or `cursor`):
+/// SessionStart injects each repo's memory (`cal hook --for <agent>`), SessionEnd queues the
+/// session for auto-distill, and for Codex PreCompact snapshots the session. Merges into the agent's file with the
 /// same atomic writer as the Claude Code hooks, keeping the user's own hooks; idempotent.
 /// Refuses while blocked or while the app runs from a temporary location.
 pub fn install_agent_hooks(app_exe: &Path, agent: &str) -> Result<AgentHooksStatus> {
@@ -3258,7 +3503,7 @@ pub fn install_agent_hooks(app_exe: &Path, agent: &str) -> Result<AgentHooksStat
 pub fn uninstall_agent_hooks(app_exe: &Path, agent: &str) -> Result<AgentHooksStatus> {
     let t = find_hook_target(agent)?;
     let (exe, _) = resolve_exe(app_exe);
-    remove_hooks_from(&t.file, t.specs, &exe)?;
+    remove_target_hooks(&t, &exe)?;
     clear_repointed(&t)?;
     Ok(agent_hooks_row(&t, &exe))
 }
@@ -3272,7 +3517,7 @@ fn clear_repointed(t: &HookTarget) -> Result<()> {
     Ok(())
 }
 
-/// Startup refresh of the Codex and Gemini CLI hooks the user installed: the same in-place
+/// Startup refresh of the other agents' memory hooks the user installed: the same in-place
 /// re-point as [`refresh_hooks_in`]; never adds a missing hook or creates a file. Codex
 /// trusts a hook by the hash of its declaration (command, timeout, matcher; `hook_hash` in
 /// its engine/discovery.rs), so a changed Codex entry stops running until the user approves
@@ -3301,7 +3546,7 @@ fn refresh_agent_hooks(exe: &Path) -> Result<bool> {
 }
 
 /// What Settings > Agents > Other agents' Remove does: every MCP entry ([`uninstall_agents`])
-/// and every Codex and Gemini CLI memory hook. The Windows hook commands carry no
+/// and every Codex, Gemini CLI, GitHub Copilot and Cursor memory hook. The Windows hook commands carry no
 /// missing-binary guard, so hooks left behind by an uninstalled app would error at every
 /// session start. Tries both, then reports any failures.
 pub fn uninstall_agents_and_hooks() -> Result<()> {
@@ -3319,7 +3564,7 @@ pub fn uninstall_agents_and_hooks() -> Result<()> {
 fn uninstall_all_agent_hooks(exe: &Path) -> Result<()> {
     let mut errors = Vec::new();
     for t in hook_targets()? {
-        if let Err(e) = remove_hooks_from(&t.file, t.specs, exe) {
+        if let Err(e) = remove_target_hooks(&t, exe) {
             errors.push(format!("{} hooks: {e:#}", t.label));
         }
     }
@@ -3983,6 +4228,7 @@ mod tests {
         millis: false,
         name: None,
         powershell: false,
+        layout: HookLayout::Grouped,
     }];
 
     /// The repo's Claude Code plugin (plugins/claude-code) ships what `install()` would: the
@@ -4742,17 +4988,217 @@ mod tests {
     // ---- Codex and Gemini CLI memory hooks ----
 
     fn target_in(dir: &Path, id: &'static str) -> HookTarget {
-        let (file, specs): (PathBuf, &'static [&'static HookSpec]) = match id {
-            "codex" => (dir.join("hooks.json"), &CODEX_HOOKS),
-            _ => (dir.join("settings.json"), &GEMINI_HOOKS),
+        let (file, specs, label): (PathBuf, &'static [&'static HookSpec], _) = match id {
+            "codex" => (dir.join("hooks.json"), &CODEX_HOOKS, "Codex"),
+            "cursor" => (dir.join("hooks.json"), &CURSOR_HOOKS, "Cursor"),
+            "copilot" => (
+                dir.join("hooks").join(COPILOT_HOOKS_FILE),
+                &COPILOT_HOOKS,
+                "GitHub Copilot",
+            ),
+            _ => (dir.join("settings.json"), &GEMINI_HOOKS, "Gemini CLI"),
         };
         HookTarget {
             id,
-            label: if id == "codex" { "Codex" } else { "Gemini CLI" },
+            label,
             dir: dir.to_path_buf(),
             file,
             specs,
+            owned: id == "copilot",
         }
+    }
+
+    /// The flat entries of ours on `event` in a Copilot or Cursor hooks file.
+    fn flat_ours<'a>(root: &'a Value, event: &str) -> Vec<&'a Value> {
+        root["hooks"][event]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter(|h| {
+                        h["command"]
+                            .as_str()
+                            .is_some_and(|c| our_hook_subcommand(c).is_some())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// GitHub Copilot: our own file in its hooks dir (created with the dir), `version: 1`,
+    /// flat camelCase-event entries with `type` and `timeoutSec`; a reinstall adds no
+    /// duplicate, a hook the user added to the file survives, and Remove deletes the file
+    /// once only the skeleton is left.
+    #[test]
+    fn copilot_hooks_live_in_their_own_file() {
+        let tmp = TempDir::new("copilot-hooks");
+        let t = target_in(tmp.path(), "copilot");
+        let exe = Path::new("/Applications/Callimachus.app/Contents/MacOS/callimachus");
+        assert!(!agent_hooks_installed(&t, exe));
+        for _ in 0..2 {
+            install_hooks_into(&t.file, t.specs, exe).unwrap();
+        }
+        let root = read_json(&t.file);
+        assert_eq!(root["version"], 1);
+        let start = flat_ours(&root, "sessionStart");
+        assert_eq!(start.len(), 1);
+        assert_eq!(
+            *start[0],
+            json!({
+                "type": "command",
+                "command": hook_command(exe, "hook --for copilot"),
+                "timeoutSec": 10
+            })
+        );
+        let end = flat_ours(&root, "sessionEnd");
+        assert_eq!(end.len(), 1);
+        assert_eq!(end[0]["timeoutSec"], 5);
+        assert!(end[0]["command"]
+            .as_str()
+            .unwrap()
+            .ends_with("\" session-end --for copilot"));
+        assert!(agent_hooks_installed(&t, exe));
+
+        // A hook of the user's own in our file stays through reinstall and Remove.
+        let mut with_user = read_json(&t.file);
+        with_user["hooks"]["sessionStart"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"type": "command", "bash": "./mine.sh"}));
+        std::fs::write(&t.file, serde_json::to_string(&with_user).unwrap()).unwrap();
+        install_hooks_into(&t.file, t.specs, exe).unwrap();
+        assert_eq!(flat_ours(&read_json(&t.file), "sessionStart").len(), 1);
+        remove_target_hooks(&t, exe).unwrap();
+        assert_eq!(
+            read_json(&t.file),
+            json!({"version": 1, "hooks": {"sessionStart": [{"type": "command", "bash": "./mine.sh"}]}})
+        );
+        // Ours alone: the file goes.
+        std::fs::remove_file(&t.file).unwrap();
+        install_hooks_into(&t.file, t.specs, exe).unwrap();
+        remove_target_hooks(&t, exe).unwrap();
+        assert!(!t.file.exists());
+        assert!(!agent_hooks_installed(&t, exe));
+    }
+
+    /// Cursor: merged into an existing `~/.cursor/hooks.json` next to the user's hooks on
+    /// the same and other events, `version` kept, flat entries with second timeouts and no
+    /// `type`; Remove leaves the user's hooks and a valid file.
+    #[test]
+    fn cursor_hooks_merge_into_hooks_json() {
+        let tmp = TempDir::new("cursor-hooks");
+        let t = target_in(tmp.path(), "cursor");
+        std::fs::write(
+            &t.file,
+            r#"{"version":1,"hooks":{"sessionStart":[{"command":"./session-init.sh"}],"afterFileEdit":[{"command":"./hooks/format.sh","timeout":30}]}}"#,
+        )
+        .unwrap();
+        let exe = Path::new("/opt/callimachus/callimachus");
+        for _ in 0..2 {
+            install_hooks_into(&t.file, t.specs, exe).unwrap();
+        }
+        let root = read_json(&t.file);
+        assert_eq!(root["version"], 1);
+        assert_eq!(root["hooks"]["sessionStart"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            *flat_ours(&root, "sessionStart")[0],
+            json!({"command": hook_command(exe, "hook --for cursor"), "timeout": 10})
+        );
+        assert_eq!(
+            *flat_ours(&root, "sessionEnd")[0],
+            json!({"command": hook_command(exe, "session-end --for cursor"), "timeout": 5})
+        );
+        assert!(agent_hooks_installed(&t, exe));
+        assert_eq!(
+            hooks_blocked(&t),
+            None,
+            "Cursor has no off switch to report"
+        );
+
+        remove_target_hooks(&t, exe).unwrap();
+        assert_eq!(
+            read_json(&t.file),
+            json!({"version":1,"hooks":{"sessionStart":[{"command":"./session-init.sh"}],"afterFileEdit":[{"command":"./hooks/format.sh","timeout":30}]}})
+        );
+        // A file that held only ours keeps a valid skeleton (Cursor requires `version`).
+        let fresh = target_in(&tmp.path().join("fresh"), "cursor");
+        install_hooks_into(&fresh.file, fresh.specs, exe).unwrap();
+        remove_target_hooks(&fresh, exe).unwrap();
+        assert_eq!(read_json(&fresh.file), json!({"version": 1, "hooks": {}}));
+    }
+
+    /// Startup refresh re-points flat entries in place: the dead target moves, the user's
+    /// timeout stays (Copilot's `timeout` alias counts), a missing one is added under the
+    /// agent's key, and nothing is added back or created.
+    #[test]
+    fn flat_hook_refresh_repoints_and_keeps_tuning() {
+        let tmp = TempDir::new("flat-hook-refresh");
+        let dead = Path::new("/gone/Callimachus.app/Contents/MacOS/callimachus");
+        let exe = Path::new("/Applications/Callimachus.app/Contents/MacOS/callimachus");
+        for id in ["copilot", "cursor"] {
+            let dir = tmp.path().join(id);
+            let t = target_in(&dir, id);
+            install_hooks_into(&t.file, t.specs, dead).unwrap();
+            let key = t.specs[0].timeout_key();
+            let mut root = read_json(&t.file);
+            let start = root["hooks"]["sessionStart"][0].as_object_mut().unwrap();
+            start.remove(key);
+            start.insert("timeout".into(), json!(7));
+            root["hooks"]["sessionEnd"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove(key);
+            std::fs::write(&t.file, serde_json::to_string(&root).unwrap()).unwrap();
+
+            assert!(update_json_file(&t.file, false, |obj| {
+                refresh_specs_in(obj, t.specs, exe);
+                Ok(())
+            })
+            .unwrap());
+            let root = read_json(&t.file);
+            let start = &root["hooks"]["sessionStart"][0];
+            assert_eq!(
+                start["command"],
+                hook_command(exe, &format!("hook --for {id}")),
+                "{id}"
+            );
+            assert_eq!(start["timeout"], 7, "{id}");
+            assert!(start.get("timeoutSec").is_none(), "{id}");
+            assert_eq!(root["hooks"]["sessionEnd"][0][key], 5, "{id}");
+            assert!(agent_hooks_installed(&t, exe));
+        }
+        let none = target_in(&tmp.path().join("none"), "copilot");
+        assert!(!update_json_file(&none.file, false, |obj| {
+            refresh_specs_in(obj, none.specs, exe);
+            Ok(())
+        })
+        .unwrap());
+        assert!(!none.file.exists());
+    }
+
+    /// `disableAllHooks` in Copilot's hooks file skips every hook in it, so it blocks ours;
+    /// a Copilot that is not set up here blocks too.
+    #[test]
+    fn copilot_disable_all_hooks_blocks() {
+        let tmp = TempDir::new("copilot-blocked");
+        let t = target_in(tmp.path(), "copilot");
+        assert_eq!(hooks_blocked(&t), None);
+        std::fs::create_dir_all(t.file.parent().unwrap()).unwrap();
+        std::fs::write(
+            &t.file,
+            r#"{"version":1,"disableAllHooks":false,"hooks":{}}"#,
+        )
+        .unwrap();
+        assert_eq!(hooks_blocked(&t), None);
+        std::fs::write(
+            &t.file,
+            r#"{"version":1,"disableAllHooks":true,"hooks":{}}"#,
+        )
+        .unwrap();
+        assert_eq!(hooks_blocked(&t).as_deref(), Some(COPILOT_HOOKS_OFF));
+        let missing = target_in(&tmp.path().join("not-here"), "copilot");
+        assert!(hooks_blocked(&missing)
+            .unwrap()
+            .starts_with("GitHub Copilot is not set up on this machine"));
     }
 
     fn hook_entry<'a>(root: &'a Value, event: &str) -> &'a Value {
@@ -4971,7 +5417,15 @@ mod tests {
             ),
             hook_command_for("/opt/c/callimachus", "hook --for gemini", false)
         );
-        assert!(GEMINI_HOOKS.iter().all(|s| s.powershell));
+        assert!(GEMINI_HOOKS
+            .iter()
+            .chain(COPILOT_HOOKS.iter())
+            .chain(CURSOR_HOOKS.iter())
+            .all(|s| s.powershell));
+        assert_eq!(
+            spec_command_for(exe, &CURSOR_SESSION_START_HOOK, "hook --for cursor", true),
+            format!("& \"{exe}\" hook --for cursor")
+        );
         assert!(!CODEX_HOOKS
             .iter()
             .chain(BASE_HOOKS.iter())

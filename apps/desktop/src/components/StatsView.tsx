@@ -1,5 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { type KeyboardEvent, useRef, useState } from "react";
+import { ChevronRight } from "lucide-react";
 import { api, type DayCost, SOURCE_LABELS, type SourceKind, type ValueLedger } from "../lib/api";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -33,6 +34,7 @@ export function StatsView() {
 
   return (
     <div className="mx-auto w-full max-w-4xl space-y-6 overflow-y-auto p-6">
+      <ReportLink />
       {/* One row of label/value pairs, like the Settings rows, rather than hero tiles. It
           wraps to two columns below sm (the window has no minimum width); the 1px gaps over
           the border color draw the hairlines in either layout. */}
@@ -352,6 +354,26 @@ const KEEP_DAYS = 365;
 
 const plural = (n: number, one: string, many = `${one}s`) =>
   `${n.toLocaleString()} ${n === 1 ? one : many}`;
+
+/** The way into the Report view ("Your agents, so far") after Today's card is gone. */
+function ReportLink() {
+  const setView = useUi((s) => s.setView);
+  return (
+    <button
+      type="button"
+      onClick={() => setView("report")}
+      className="flex w-full cursor-pointer items-center gap-3 rounded-lg border px-4 py-3 text-left outline-none transition-colors hover:bg-muted/40 focus-visible:ring-3 focus-visible:ring-ring/50"
+    >
+      <span className="min-w-0 flex-1">
+        <span className="block text-sm font-medium">Your agents, so far</span>
+        <span className="block truncate text-[13px] text-muted-foreground">
+          Time, spend, recurring errors and memory across every session, ready to share.
+        </span>
+      </span>
+      <ChevronRight className="size-4 shrink-0 text-muted-foreground" aria-hidden="true" />
+    </button>
+  );
+}
 
 /** What the hooks and the MCP server did this week (the local ledger), and the Claude Code
  *  sessions the index still holds after Claude Code deleted their transcripts. */

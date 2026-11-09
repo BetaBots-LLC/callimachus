@@ -48,7 +48,7 @@ Specifically:
   content to Ollama's hosted service, keyed by your Ollama API key. Indexing,
   search, and embeddings are **always local** regardless of which engine you pick.
 - **Agents you connect.** The MCP server, the SessionStart hooks (Claude Code,
-  and Codex and Gemini CLI when you turn theirs on), the optional
+  and Codex, Gemini CLI, GitHub Copilot and Cursor when you turn theirs on), the optional
   proactive-recall and error-playbook hooks, and the managed `AGENTS.md` /
   `CLAUDE.md` block hand excerpts of your history (search results, threads an
   agent asks for, project memory, the recorded fix of an error), redacted the
@@ -134,6 +134,19 @@ browser storage, no cross-site tracking.
   create or upgrade it, exit silently on any error. The Codex PreCompact hook only
   takes a local snapshot. These agents also receive imported Claude Code memories,
   which they send to their own providers with the rest of their context.
+- The GitHub Copilot and Cursor memory hooks (also off until you turn them on) are
+  `--for copilot` / `--for cursor`, in their own file
+  `~/.copilot/hooks/callimachus.json` (read by Copilot CLI and VS Code's Copilot
+  sessions) and in `~/.cursor/hooks.json` next to your own hooks, under the same
+  rules. From the payload they read only these fields: at session start `source`
+  (new or resumed; Cursor sends none, which counts as a new session) and the
+  working directory (Copilot's `cwd`, Cursor's first `workspace_roots` entry); at
+  session end the session id (Copilot's `sessionId`, Cursor's `session_id`), to
+  queue that session for auto-distill. Cursor's payload also carries your account
+  email, the model and the transcript path, which they ignore. The Claude Code hooks
+  that Cursor also runs from `~/.claude/settings.json` only check whether the
+  payload has a `cursor_version` field, and exit without reading anything else when
+  it does.
 - The value ledger (`ledger.jsonl` next to the index, or `<name>.ledger.jsonl`
   for another index file) counts what the hooks and the MCP server did: one line
   per injection, recall hit or MCP tool call, with a timestamp and a short detail

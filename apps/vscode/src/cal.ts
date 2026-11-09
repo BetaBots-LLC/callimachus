@@ -8,7 +8,7 @@
 // instead of a raw error — see CalSetupError + showCalSetupPrompt.
 
 import * as vscode from "vscode";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { existsSync, realpathSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -164,24 +164,128 @@ export function calBinPath(): Promise<string> {
 // The system calendar's reply to arguments it doesn't understand (BSD exits 64).
 const SYSTEM_CAL_USAGE = /^usage: cal\b/im;
 
-/** Run `cal` with args, returning stdout. Throws CalSetupError when `cal` is
- *  missing or the index hasn't been built yet. */
-export async function runCal(
-  args: string[],
-  opts: { cwd?: string; timeoutMs?: number } = {},
-): Promise<string> {
-  const bin = await resolveCalBin();
-  try {
-    const { stdout } = await exec(bin, args, {
-      cwd: opts.cwd,
-      timeout: opts.timeoutMs,
-      maxBuffer: 64 * 1024 * 1024,
+export interface RunCalOptions {
+  cwd?: string;
+  timeoutMs?: number;
+  /** Aborting kills the `cal` process (the editor gutter cancels a superseded run). */
+  signal?: AbortSignal;
+  /** Written to `cal`'s stdin (an unsaved buffer for `cal why --stdin`). */
+  input?: string;
+}
+
+/** Most `cal` output kept, as execFile's maxBuffer was. */
+const MAX_OUTPUT_BYTES = 64 * 1024 * 1024;
+
+/** End `pid` and everything it started. `cal why` runs `git blame`, and killing `cal` alone
+ *  orphaned it: each run the gutter stopped (a timeout, a newer version) left a full-file
+ *  blame running to the end. On Unix `cal` leads its own process group (spawned detached),
+ *  so signalling the group reaches git; on Windows `taskkill /T` walks the tree. */
+function killTree(pid: number | undefined): void {
+  if (pid === undefined) return;
+  if (process.platform === "win32") {
+    const killer = spawn("taskkill", ["/pid", String(pid), "/T", "/F"], {
       windowsHide: true,
+      stdio: "ignore",
+    });
+    killer.on("error", () => {});
+    return;
+  }
+  try {
+    process.kill(-pid, "SIGTERM");
+  } catch {
+    // Already gone.
+  }
+}
+
+/** Run `cal`, with stdin input, and reject with an error carrying `code`, `stdout` and
+ *  `stderr` the way execFile's does. A timeout or an abort kills the whole process tree. */
+function execCal(
+  bin: string,
+  args: string[],
+  opts: RunCalOptions,
+): Promise<{ stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    if (opts.signal?.aborted) {
+      reject(Object.assign(new Error("aborted"), { name: "AbortError", stdout: "", stderr: "" }));
+      return;
+    }
+    const child = spawn(bin, args, {
+      cwd: opts.cwd,
+      windowsHide: true,
+      // Its own process group on Unix, so killTree reaches the git it runs.
+      detached: process.platform !== "win32",
+      stdio: ["pipe", "pipe", "pipe"],
       // Ask for the versioned `--json` envelopes through the environment, not the
       // `--json-version` flag: an older `cal` refuses an unknown flag but ignores the
       // variable and prints its bare arrays, which parseList / parseObject still read.
       env: { ...process.env, CAL_JSON_VERSION: String(CAL_SCHEMA_VERSION) },
     });
+    const out: Buffer[] = [];
+    const err: Buffer[] = [];
+    let size = 0;
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const text = (chunks: Buffer[]) => Buffer.concat(chunks).toString("utf8");
+    const finish = (error: Error | null) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      opts.signal?.removeEventListener("abort", onAbort);
+      const stdout = text(out);
+      const stderr = text(err);
+      if (error) reject(Object.assign(error, { stdout, stderr }));
+      else resolve({ stdout, stderr });
+    };
+    const stop = (error: Error) => {
+      killTree(child.pid);
+      finish(error);
+    };
+    const onAbort = () =>
+      stop(Object.assign(new Error("aborted"), { name: "AbortError", killed: true }));
+    const collect = (into: Buffer[]) => (chunk: Buffer) => {
+      size += chunk.length;
+      if (size > MAX_OUTPUT_BYTES) {
+        stop(new Error("cal printed more than the extension reads"));
+        return;
+      }
+      into.push(chunk);
+    };
+    child.stdout?.on("data", collect(out));
+    child.stderr?.on("data", collect(err));
+    child.on("error", (e) => finish(e));
+    child.on("close", (code, signal) => {
+      if (code === 0) {
+        finish(null);
+        return;
+      }
+      const e = new Error(`Command failed: ${bin} ${args.join(" ")}`);
+      finish(Object.assign(e, { code: code ?? undefined, signal: signal ?? undefined }));
+    });
+    opts.signal?.addEventListener("abort", onAbort, { once: true });
+    if (opts.timeoutMs !== undefined) {
+      timer = setTimeout(
+        () =>
+          stop(
+            Object.assign(new Error(`cal timed out after ${opts.timeoutMs} ms`), {
+              killed: true,
+            }),
+          ),
+        opts.timeoutMs,
+      );
+    }
+    // A `cal` that exits before reading everything (an error, an abort) closes the pipe.
+    child.stdin?.on("error", () => {});
+    // Closed even with no input: a command that reads stdin gets EOF instead of waiting.
+    child.stdin?.end(opts.input);
+  });
+}
+
+/** Run `cal` with args, returning stdout. Throws CalSetupError when `cal` is
+ *  missing or the index hasn't been built yet. */
+export async function runCal(args: string[], opts: RunCalOptions = {}): Promise<string> {
+  const bin = await resolveCalBin();
+  try {
+    const { stdout } = await execCal(bin, args, opts);
     return stdout;
   } catch (err: unknown) {
     const e = err as {
@@ -391,6 +495,33 @@ export async function whyLine(file: string, line: number): Promise<WhyResult> {
 
 const NO_WHY_MESSAGE =
   "This version of Callimachus has no `cal why`. Update the app, then try again.";
+
+/** Whether the resolved `cal` has `cal why`. Throws CalSetupError when there is no `cal`. */
+export async function calHasWhy(): Promise<boolean> {
+  return supportsWhy(await resolveCalBin());
+}
+
+/** Commits `whyFile` asks for: every linked one of a long-lived file (linked commits are
+ *  picked first, so the unlinked ones past this are the ones dropped). */
+const WHY_FILE_COMMITS = 100;
+
+/** `cal why <file>` for the whole file: each blamed commit with the lines it owns
+ *  (`ranges`), its sessions and its Agent Trace attributions. With `input`, blames that
+ *  buffer instead of the saved file (`--stdin`), so line numbers match an unsaved editor. */
+export async function whyFile(
+  file: string,
+  opts: { input?: string; signal?: AbortSignal; timeoutMs: number },
+): Promise<WhyResult> {
+  const args = ["why", file, "--json", "-n", String(WHY_FILE_COMMITS)];
+  if (opts.input !== undefined) args.push("--stdin");
+  const raw = await runCal(args, {
+    cwd: path.dirname(file),
+    timeoutMs: opts.timeoutMs,
+    signal: opts.signal,
+    input: opts.input,
+  });
+  return parseObject<WhyResult>(raw, "why");
+}
 
 // `cal why` gives git 30 s (WHY_GIT_BUDGET in cli_core.rs); past this something is stuck,
 // and the sidebar would otherwise wait forever.

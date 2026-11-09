@@ -1155,20 +1155,34 @@ impl Callimachus {
         let base = std::env::current_dir().unwrap_or_default();
         let blamed = crate::why::resolve(&args.path, &base, deadline).and_then(|target| {
             let porcelain = crate::why::blame(&target, Some(line), deadline)?;
-            Ok((target, crate::why::parse_blame(&porcelain)))
+            let commits = crate::why::parse_blame(&porcelain);
+            // The repo's Agent Trace records, read with the blame (files, not the index), and
+            // matched against each line's position at its commit.
+            let trace = crate::trace::load_for_file(&target, &commits, deadline)
+                .map(|t| t.with_blame(&porcelain));
+            Ok((target, commits, trace))
         });
         // An absolute or cwd-relative path names the file; the index stores paths as the
         // agents wrote them, mostly repo-relative.
         let needle = blamed
             .as_ref()
-            .map_or(args.path.as_str(), |(t, _)| t.rel.as_str());
+            .map_or(args.path.as_str(), |(t, _, _)| t.rel.as_str());
         let conn = self.lock()?;
         let threads =
             crate::search::threads_with_file(&conn, needle, limit as i64).map_err(internal)?;
         let answer = match blamed {
-            Ok((target, commits)) => {
-                let why =
-                    crate::why::explain(&conn, &target, Some(line), &commits).map_err(internal)?;
+            Ok((target, commits, trace)) => {
+                let why = crate::why::explain_with(
+                    &conn,
+                    &target,
+                    Some(line),
+                    &commits,
+                    &crate::why::Explain {
+                        max_commits: crate::why::MAX_COMMITS,
+                        trace: trace.as_ref(),
+                    },
+                )
+                .map_err(internal)?;
                 FileWhy::new(threads, why)
             }
             Err(e) => FileWhy {
@@ -2155,6 +2169,10 @@ struct FileCommit {
     subject: String,
     committed_at: i64,
     threads: Vec<FileCommitThread>,
+    /// What the repo's Agent Trace records (`.agent-trace/*.jsonl`) attribute the line to:
+    /// agent, model and conversation, even one with no indexed transcript. Omitted when none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    trace: Vec<crate::trace::TraceAttribution>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -2195,11 +2213,12 @@ impl FileWhy {
                 subject: c.subject,
                 committed_at: c.committed_at,
                 threads: rows,
+                trace: c.trace,
             });
         }
         let note = if commits.is_empty() && why.uncommitted {
             Some("The line has uncommitted changes, so no commit owns it yet.".to_string())
-        } else if why.unlinked {
+        } else if why.unlinked && commits.iter().all(|c| c.trace.is_empty()) {
             Some(
                 "No session is linked to this commit yet; the user can run `cal commits` in \
                  the repo to link its history."
@@ -2771,7 +2790,9 @@ mod tests {
             subject: "fix".into(),
             committed_at: 1,
             lines: 1,
+            ranges: vec![[1, 1]],
             threads: vec![t.clone(), t],
+            trace: Vec::new(),
         }
     }
 

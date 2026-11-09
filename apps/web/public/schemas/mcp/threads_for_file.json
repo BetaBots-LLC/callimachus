@@ -113,6 +113,90 @@
                     "touch"
                   ]
                 }
+              },
+              "trace": {
+                "items": {
+                  "required": [
+                    "from",
+                    "agent",
+                    "contributor",
+                    "model",
+                    "conversationId",
+                    "conversationUrl",
+                    "threadId",
+                    "ranges",
+                    "revision",
+                    "recordedBeforeCommit",
+                    "recordedAt",
+                    "traceFile"
+                  ],
+                  "type": "object",
+                  "properties": {
+                    "from": {
+                      "type": "string"
+                    },
+                    "agent": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "contributor": {
+                      "type": "string"
+                    },
+                    "model": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "conversationId": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "conversationUrl": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "threadId": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "ranges": {
+                      "items": {
+                        "type": "array",
+                        "items": {
+                          "type": "integer"
+                        },
+                        "minItems": 2,
+                        "maxItems": 2
+                      },
+                      "type": "array"
+                    },
+                    "revision": {
+                      "type": "string"
+                    },
+                    "recordedBeforeCommit": {
+                      "type": "boolean"
+                    },
+                    "recordedAt": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "traceFile": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "type": "array"
               }
             },
             "required": [

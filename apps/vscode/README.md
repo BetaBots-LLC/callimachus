@@ -24,6 +24,12 @@ Pick any result to open its full transcript as a rich tab, with one-click **Inse
 
 The sidebar can also work *without* you searching. With **Ambient Recall** on, it watches what you're looking at — the current selection, the symbol under the cursor, or the nearest error — and surfaces past threads related to it (via `cal related`), so prior context finds you instead of the other way around. Toggle it with the **Callimachus: Toggle Ambient Recall** command or the `callimachus.ambientRecall` setting; tune its timing and volume with the `ambientRecall*` settings below.
 
+## Provenance in the gutter
+
+Open any file in a git repository and the lines a past AI session wrote get a thin mark in the gutter: the lines whose commit (by `git blame`) Callimachus linked to a session, or that an [Agent Trace](https://agent-trace.dev) record in the repo's `.agent-trace/` attributes to an agent. Hover one to see the session's title, agent and date, how many files it shares with the commit, and up to three of its decisions or gotchas, with **Open session** (the transcript tab) and **Why this line** (the sidebar's full answer). A line another tool traced shows its agent, model and conversation too, even when Callimachus has no transcript of it.
+
+It costs one background `cal why` per file version: asked when the file is shown, again 500 ms after you stop typing (an unsaved buffer is blamed as it is, so the marks follow your edits), one process per file and two in all at a time, cancelled when a newer version supersedes it or the file is closed or hidden, and stopped after 5 seconds together with the `git blame` it runs. Files over 20,000 lines and files outside a git repository are skipped. An unsaved buffer is blamed only when the file is UTF-8 (with or without a byte order mark); other encodings keep the saved file's marks until you save. On VS Code before 1.100, which does not report a file's encoding, a file in a legacy 8-bit encoding is taken for UTF-8, and its non-ASCII lines lose their marks while it is unsaved. Commits are linked to sessions by the desktop app as it indexes (or by `cal commits`). Turn the marks or the hover off with `callimachus.whyGutter` and `callimachus.whyHover`.
+
 ## Commands
 
 | Command | What it does |
@@ -49,6 +55,8 @@ There's also a **status-bar** button (`$(history) Callimachus`) that opens searc
 - `callimachus.ambientRecallThrottle` — milliseconds to wait after the cursor/selection settles before querying for related threads (default `1500`).
 - `callimachus.ambientRecallMinContext` — minimum length of the editor context (selection or symbol) before ambient recall runs (default `10`).
 - `callimachus.ambientRecallLimit` — max related threads to show in the ambient-recall section (default `5`).
+- `callimachus.whyGutter`: mark the lines a past session produced (or an Agent Trace record attributes) in the gutter (default `true`).
+- `callimachus.whyHover`: on hover over such a line, show the session and its decisions, with Open session and Why this line (default `true`).
 
 ## Develop
 

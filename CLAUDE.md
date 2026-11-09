@@ -146,7 +146,10 @@ hook output cap), `COMPACT` (after compaction, snapshot carry), `AGENTS_FILE` (t
 AGENTS.md / CLAUDE.md block) and `MCP` (`project_memory`). Change sizes there, not at call sites.
 MCP transcript tools take a `budget` (`TRANSCRIPT_BUDGET_*` in `mcp_server.rs`, default 24k).
 Hook events, matchers and timeouts are the `HookSpec` consts in `integration.rs` (the plugin's
-own SessionStart guard is `PLUGIN_ONLY_HOOKS` in its tests). Hook commands (`hook`, `recall-error`,
+own SessionStart guard is `PLUGIN_ONLY_HOOKS` in its tests; GitHub Copilot and Cursor take flat
+entries, `HookLayout::Flat`). Cursor also runs the hooks in `~/.claude/settings.json`, so every
+Claude form (`hook`, `session-end`, `recall-now`, `recall-error`, `snapshot-hook`) stays silent
+on a payload with `cursor_version` (`cli_core::is_cursor_payload`). Hook commands (`hook`, `recall-error`,
 `snapshot-hook`, `session-end`, `recall-now`, `index --if-stale`) exit 0 silently on any error,
 never create an index and never migrate one themselves (`index --if-stale` starts a detached
 `cal index` only on a non-empty index; that pass upgrades the schema only when it runs from

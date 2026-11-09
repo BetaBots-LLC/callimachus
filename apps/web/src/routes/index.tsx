@@ -186,7 +186,8 @@ function Home() {
               Every repo starts with a digest of its recent sessions and its open TODOs, no LLM
               needed. Turn on memory and it fills with decisions, gotchas and summaries distilled by
               the engine you pick: your logged-in Claude Code or Codex CLI, local Ollama, or a cloud
-              API key. Claude Code, Codex and Gemini CLI get it injected as each session starts.
+              API key. Claude Code, Codex, Gemini CLI, GitHub Copilot and Cursor get it injected as
+              each session starts.
             </FeaturePanel>
             <FeaturePanel
               icon={MessageCircleQuestion}

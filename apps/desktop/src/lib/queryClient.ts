@@ -31,6 +31,7 @@ export const AGGREGATE_KEYS = [
   "projects",
   "cleanup",
   "today",
+  "report",
 ] as const;
 
 /**

@@ -517,6 +517,21 @@ const HOOK_AGENTS: Record<
     blockedFix: (configPath) => `Set hooksConfig.enabled to true in ${configPath}, then try again.`,
     afterInstall: "New Gemini CLI sessions pick them up.",
   },
+  copilot: {
+    label: "GitHub Copilot",
+    injects:
+      "Injects the repo's memory when a Copilot CLI or VS Code Copilot session starts (imported Claude Code memories included, marked as such), or a recent-sessions digest while it has none. Also queues an ended Copilot CLI session for auto-distill; VS Code Copilot sessions are not indexed from Copilot's session store yet.",
+    blockedFix: (configPath) => `Set disableAllHooks to false in ${configPath}, then try again.`,
+    afterInstall: "New Copilot CLI and VS Code Copilot sessions pick them up.",
+  },
+  cursor: {
+    label: "Cursor",
+    injects:
+      "Injects the repo's memory when a Cursor agent chat starts (imported Claude Code memories included, marked as such), or a recent-sessions digest while it has none. Also queues an ended chat for auto-distill.",
+    blockedFix: () => "Check the Hooks tab in Cursor's Customize view, then try again.",
+    afterInstall:
+      "Cursor reloads its hooks by itself, so new chats pick them up. Cursor does not wait for them, though: the first chat after Cursor starts, while its hooks load, or a first prompt sent right away can miss the memory.",
+  },
 };
 
 /** `name` next to `file`: Codex's hooks.json and config.toml share its config dir. */
@@ -525,8 +540,8 @@ function siblingFile(file: string, name: string): string {
   return cut < 0 ? name : `${file.slice(0, cut + 1)}${name}`;
 }
 
-/** Memory hooks in Codex's and Gemini CLI's own hook systems, one switch per detected agent.
- *  Cursor gets none: its sessionStart payload carries no working directory to pick the repo. */
+/** Memory hooks in Codex's, Gemini CLI's, GitHub Copilot's and Cursor's own hook systems,
+ *  one switch per detected agent. */
 function AgentHooksRows() {
   const integrations = useQuery({
     queryKey: ["agent_integrations"],
@@ -538,12 +553,14 @@ function AgentHooksRows() {
   const exeProblem = recall.data?.exeStable === false ? recall.data.exeProblem : null;
 
   const present = new Set((integrations.data ?? []).filter((a) => a.present).map((a) => a.id));
-  const rows = (hooks.data ?? []).filter((r) => present.has(r.agent));
+  // `present` comes with each row; an older backend leaves it out, and then the MCP rows
+  // (which have no Copilot) decide.
+  const rows = (hooks.data ?? []).filter((r) => r.present ?? present.has(r.agent));
   if (hooks.isError) {
     return (
       <SettingRow title="Memory hooks">
         <InlineError>
-          Couldn't read the Codex and Gemini CLI hooks: {errorText(hooks.error)}
+          Couldn't read the other agents' memory hooks: {errorText(hooks.error)}
         </InlineError>
       </SettingRow>
     );

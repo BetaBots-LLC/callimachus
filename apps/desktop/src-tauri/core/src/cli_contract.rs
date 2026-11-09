@@ -1,4 +1,4 @@
-//! The versioned `cal --json` contract. The thirteen query outputs other tools read (the VS Code
+//! The versioned `cal --json` contract. The fifteen query outputs other tools read (the VS Code
 //! extension, PR auditors, scripts) come as these envelopes, each opening with
 //! `schema_version`, when the caller asks for a version: `--json-version 1`, or
 //! `CAL_JSON_VERSION=1` in the environment beside `--json`. Plain `--json` keeps printing the
@@ -17,7 +17,7 @@ use schemars::generate::SchemaSettings;
 use schemars::JsonSchema;
 use serde::Serialize;
 
-use crate::{cost, issues, knowledge, search};
+use crate::{cost, issues, knowledge, report, search};
 
 /// The major version every `cal --json` envelope carries in `schema_version`.
 pub const CAL_SCHEMA_VERSION: u32 = 1;
@@ -218,6 +218,11 @@ pub fn schemas() -> Vec<CalSchema> {
             "The commits that last changed a file or line (git blame), newest first, each with \
              the sessions inferred to have produced it and their decisions and gotchas.",
         ),
+        schema::<crate::trace::TraceExport>(
+            "trace",
+            "What `cal trace export` wrote (or, with --dry-run, would write): Agent Trace \
+             records (agent-trace.dev) for the commits the project's sessions produced.",
+        ),
         schema::<Listing<issues::Issue>>(
             "issues",
             "Recurring errors over the last 180 days, most frequent first, each with the \
@@ -231,6 +236,12 @@ pub fn schemas() -> Vec<CalSchema> {
             "cost",
             "Estimated spend (list-price equivalents) per model, plus the breakdown --by asks \
              for: sessions with waste signals, commits, projects or local days.",
+        ),
+        schema::<Versioned<report::Report>>(
+            "report",
+            "Your agents, so far: sessions and hours per agent, estimated spend, the most \
+             frequent recurring errors and their fixes, tasks asked again, project memory, the \
+             files agents changed most and the value ledger. A section with no data is left out.",
         ),
     ]
 }
@@ -383,7 +394,7 @@ mod tests {
     #[test]
     fn every_schema_is_published_under_its_command() {
         let names: Vec<_> = schemas().iter().map(|s| s.command).collect();
-        assert_eq!(names.len(), 13);
+        assert_eq!(names.len(), 15);
         for s in schemas() {
             assert!(
                 crate::cli_core::COMMANDS.contains(&s.command),

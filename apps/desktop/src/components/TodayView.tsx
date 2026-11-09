@@ -1,6 +1,15 @@
 import { type KeyboardEvent, useEffect, useId, useState } from "react";
-import { keepPreviousData, useMutation, useQuery } from "@tanstack/react-query";
-import { AlertTriangle, Check, CircleDot, Copy, History, TerminalSquare } from "lucide-react";
+import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  AlertTriangle,
+  Check,
+  CircleDot,
+  Copy,
+  History,
+  Sparkles,
+  TerminalSquare,
+  X,
+} from "lucide-react";
 import { api, SOURCE_LABELS, type Today, type TodayThread } from "../lib/api";
 import { copyText } from "../lib/clipboard";
 import {
@@ -137,6 +146,7 @@ export function TodayView() {
           report.isPlaceholderData && "opacity-60",
         )}
       >
+        <ReportCard />
         <header className="flex flex-wrap items-center gap-x-4 gap-y-3 pb-5">
           <div className="min-w-0 flex-1">
             <h1 className="text-lg font-semibold tracking-tight text-balance">Since {since}</h1>
@@ -172,6 +182,61 @@ export function TodayView() {
         )}
       </div>
     </div>
+  );
+}
+
+/**
+ * "Your agents, so far": the first-run nudge toward the Report view, once the first index has
+ * finished. It goes away for good once the report has been opened (the checklist's report
+ * step is done) or dismissed here (the step is skipped; the checklist and Stats still link
+ * to it).
+ */
+function ReportCard() {
+  const qc = useQueryClient();
+  const setView = useUi((s) => s.setView);
+  const steps = useQuery({ queryKey: ["onboarding_state"], queryFn: api.onboardingState });
+  const stats = useQuery({ queryKey: ["db_stats"], queryFn: api.dbStats });
+  const indexing = useQuery({
+    queryKey: ["index_status"],
+    queryFn: api.indexingStatus,
+    refetchInterval: (q) => (q.state.data ? 2000 : false),
+  });
+  const dismiss = useMutation({
+    mutationFn: () => api.setOnboardingStep("report", "skipped"),
+    onSuccess: (s) => qc.setQueryData(["onboarding_state"], s),
+    onError: (e) => notify.error("Couldn't hide the card", { description: errorText(e) }),
+  });
+  const answered = !steps.isSuccess || (steps.data.report ?? null) !== null;
+  const indexed = !!stats.data && stats.data.threads > 0 && indexing.data === false;
+  if (answered || !indexed || dismiss.isPending) return null;
+  return (
+    <section
+      aria-label="Your agents, so far"
+      className="mb-5 flex flex-wrap items-center gap-x-4 gap-y-3 rounded-xl border bg-card p-4"
+    >
+      <Sparkles className="size-5 shrink-0 text-muted-foreground" aria-hidden="true" />
+      <div className="min-w-0 flex-1 space-y-0.5">
+        <h2 className="text-sm font-semibold">Your agents, so far</h2>
+        <p className="text-[13px] leading-normal text-muted-foreground">
+          Every session you've indexed on one screen: time, spend, the errors that keep coming back
+          and what your agents remember. Copy it as markdown or save a card to share.
+        </p>
+      </div>
+      <div className="flex shrink-0 items-center gap-1">
+        <Button size="sm" onClick={() => setView("report")}>
+          See your report
+        </Button>
+        <Button
+          size="icon-sm"
+          variant="ghost"
+          aria-label="Dismiss"
+          title="Dismiss (the report stays in Stats)"
+          onClick={() => dismiss.mutate()}
+        >
+          <X />
+        </Button>
+      </div>
+    </section>
   );
 }
 

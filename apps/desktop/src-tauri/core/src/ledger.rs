@@ -87,7 +87,9 @@ pub enum Kind {
 }
 
 /// Events per kind (the `week` shape `value_ledger` returns and each `ledger.daily` day).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
 pub struct Counts {
     #[serde(default)]
     pub hook: u64,
@@ -601,6 +603,57 @@ pub fn summary(conn: &Connection, ledger: Option<&Path>, now: i64) -> Result<Sum
     Ok(out)
 }
 
+/// Per-kind counts over every day `ledger.daily` still keeps ([`KEEP_DAYS`]) plus the lines
+/// not rolled up yet: the `cal report` totals. Only the all-time total outlives the 90 days,
+/// and it has no per-kind split.
+#[derive(Debug, Default, PartialEq, Eq, Serialize)]
+pub struct Kept {
+    pub counts: Counts,
+    /// The oldest local day (`YYYY-MM-DD`) with a count, None when there is none.
+    pub first_day: Option<String>,
+    pub all_time: u64,
+}
+
+/// [`Kept`] from local day `from` on (`YYYY-MM-DD`, None for every kept day). Read-only, like
+/// [`summary`].
+pub fn kept(conn: &Connection, ledger: Option<&Path>, from: Option<&str>) -> Result<Kept> {
+    let mut out = Kept {
+        all_time: load_total(conn)?,
+        ..Kept::default()
+    };
+    let note = |out: &mut Kept, day: &str| {
+        if out.first_day.as_deref().is_none_or(|d| day < d) {
+            out.first_day = Some(day.to_string());
+        }
+    };
+    for (day, counts) in load_daily(conn)? {
+        if from.is_none_or(|f| day.as_str() >= f) && counts.total() > 0 {
+            out.counts.merge(&counts);
+            note(&mut out, &day);
+        }
+    }
+    let Some(ledger) = ledger else {
+        return Ok(out);
+    };
+    let bytes = match std::fs::read(ledger) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", ledger.display())),
+    };
+    for line in String::from_utf8_lossy(&bytes)
+        .lines()
+        .filter_map(parse_line)
+    {
+        out.all_time += 1;
+        let day = day_key(line.ts);
+        if from.is_none_or(|f| day.as_str() >= f) {
+            out.counts.add(line.kind);
+            note(&mut out, &day);
+        }
+    }
+    Ok(out)
+}
+
 /// Indexed Claude Code sessions whose transcript is gone from `projects_root`: deleted by
 /// Claude Code's `cleanupPeriodDays` sweep (or by hand) and still searchable here, since no
 /// indexer path removes a thread whose file vanished (only the user's own Cleanup does,
@@ -719,6 +772,34 @@ mod tests {
         let unique: std::collections::HashSet<_> = all.iter().map(|l| &l.detail).collect();
         assert_eq!(unique.len(), 2_000);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn kept_sums_every_kept_day_and_the_live_lines_per_kind() {
+        let dir = temp_dir("kept");
+        let conn = temp_db(&dir);
+        let ledger = dir.join(FILE);
+        let now = noon(0);
+        append_to(&ledger, Kind::Hook, "/a", noon(40));
+        append_to(&ledger, Kind::Mcp, "search_threads", noon(3));
+        rollup_at(&conn, &ledger, now).unwrap();
+        append_to(&ledger, Kind::Hook, "/b", now);
+        let all = kept(&conn, Some(&ledger), None).unwrap();
+        assert_eq!((all.counts.hook, all.counts.mcp), (2, 1));
+        assert_eq!(all.all_time, 3);
+        assert_eq!(all.first_day, Some(day_key(noon(40))));
+        // From a later day on, the older day drops out of the per-kind counts only.
+        let recent = kept(&conn, Some(&ledger), Some(&day_key(noon(5)))).unwrap();
+        assert_eq!((recent.counts.hook, recent.counts.mcp), (1, 1));
+        assert_eq!(recent.first_day, Some(day_key(noon(3))));
+        assert_eq!(recent.all_time, 3);
+        // No file and nothing rolled up: nothing counted, no first day.
+        let empty = temp_dir("kept_empty");
+        let fresh = temp_db(&empty);
+        assert_eq!(
+            kept(&fresh, Some(&empty.join(FILE)), None).unwrap(),
+            Kept::default()
+        );
     }
 
     #[test]

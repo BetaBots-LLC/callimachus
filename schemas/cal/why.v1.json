@@ -73,12 +73,32 @@
           "description": "Lines of the file this commit last changed (1 for a single line).",
           "minimum": 0
         },
+        "ranges": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "minItems": 2,
+            "maxItems": 2
+          },
+          "description": "Those lines as inclusive `[start, end]` runs of 1-based line numbers in the blamed\nfile (the saved file, or the editor buffer with `--stdin`), ascending, so an editor can\nmark them without a blame of its own. Optional in the schema only because a `cal` from\nbefore it does not print it; it is never empty."
+        },
         "threads": {
           "type": "array",
           "items": {
             "$ref": "#/$defs/WhyThread"
           },
           "description": "The sessions inferred to have produced the commit, best first: the ones that edited\nthis file, then read it, then mentioned it."
+        },
+        "trace": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TraceAttribution"
+          },
+          "description": "Attributions from Agent Trace records the repo carries (`.agent-trace/*.jsonl`), read\nat query time: what another tool recorded about this commit's lines, even for a\nconversation the index has no transcript of. Omitted when there is none."
         }
       },
       "required": [
@@ -188,6 +208,101 @@
         "extractor",
         "originRef"
       ]
+    },
+    "TraceAttribution": {
+      "type": "object",
+      "properties": {
+        "from": {
+          "type": "string",
+          "description": "Always `agent-trace`: read from a trace record in the repository, not inferred from\na transcript in the index."
+        },
+        "agent": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The agent the record names (`metadata.agent`, else `tool.name`), e.g. `cursor`."
+        },
+        "contributor": {
+          "type": "string",
+          "description": "`human`, `ai`, `mixed` or `unknown`, as the record says."
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The model, `provider/model` per models.dev, when the record names one."
+        },
+        "conversationId": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The conversation id the record carries (`metadata.conversation_id`, else\n`metadata.session_id`)."
+        },
+        "conversationUrl": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The record's link to the conversation, often a local `file://` transcript path."
+        },
+        "threadId": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "The indexed session with that conversation id, when there is one."
+        },
+        "ranges": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "minItems": 2,
+            "maxItems": 2
+          },
+          "description": "The lines the record attributes in this file, inclusive `[start, end]` runs at the\nrecorded revision (not today's line numbers); empty when the record names the file\nwithout ranges."
+        },
+        "revision": {
+          "type": "string",
+          "description": "The record's `vcs.revision`."
+        },
+        "recordedBeforeCommit": {
+          "type": "boolean",
+          "description": "The revision is the blamed commit's parent: the record was written while the change\nwas being made (the reference hook's habit), before it was committed."
+        },
+        "recordedAt": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The newest `timestamp` among the merged records (RFC 3339)."
+        },
+        "traceFile": {
+          "type": "string",
+          "description": "The file the record came from, relative to the repository root."
+        }
+      },
+      "required": [
+        "from",
+        "agent",
+        "contributor",
+        "model",
+        "conversationId",
+        "conversationUrl",
+        "threadId",
+        "ranges",
+        "revision",
+        "recordedBeforeCommit",
+        "recordedAt",
+        "traceFile"
+      ],
+      "description": "One conversation a trace record attributes lines of a blamed commit to."
     }
   }
 }

@@ -499,6 +499,106 @@ export interface SpendBreakdown {
   commits: CommitCost[]; // the priciest commits, at most 5
 }
 
+/** One model's spend in a report window (`cost::ModelCost`). */
+export interface ModelCost {
+  model: string;
+  family: string | null;
+  priced: boolean;
+  unpricedReason: string | null;
+  cost: number;
+  calls: number;
+  input: number;
+  output: number;
+  cacheWrite: number;
+  cacheRead: number;
+}
+
+/** "Your agents, so far" (`report.rs`, also `cal report --json`). A section with no data is
+ *  absent, never empty. */
+export interface Report {
+  generatedAt: number;
+  since: number | null; // epoch secs; null = all time
+  totals?: ReportTotals;
+  spend?: ReportSpend;
+  recurringErrors?: ReportIssue[];
+  solvedAgain?: PromptGroup[];
+  memory?: ReportMemory;
+  files?: ReportFile[];
+  filesOmitted?: number; // files outside a project folder, left out of `files`
+  ledger?: ReportLedger;
+}
+export interface ReportTotals {
+  sessions: number; // top-level sessions; subagents and in-app chats left out
+  messages: number;
+  firstSession: number;
+  lastSession: number;
+  activeDays: number;
+  estimatedHours: number; // each session's span capped at 8 hours, over hoursSessions
+  hoursSessions: number; // sessions with a usable span
+  hoursSources: SourceKind[]; // the agents those sessions ran in, most sessions first
+  byTool: { source: SourceKind; label: string; sessions: number; share: number }[];
+}
+export interface ReportSpendWindow {
+  since: number;
+  totalCost: number;
+  trackedCalls: number;
+  untrackedCalls: number;
+  byTool: { source: SourceKind; label: string; cost: number; calls: number; share: number }[];
+  byModel: ModelCost[];
+}
+export interface ReportSpend {
+  basis: string; // list-price equivalents, not a bill
+  total: ReportSpendWindow;
+  last30Days: ReportSpendWindow;
+  priciestCommits: CommitCost[];
+}
+export interface ReportIssue {
+  example: string;
+  count: number;
+  sessions: number;
+  firstSeen: number;
+  lastSeen: number;
+  project: string | null;
+  fix: IssueFix | null;
+}
+export interface PromptGroup {
+  prompt: string;
+  sessions: number;
+  firstSeen: number;
+  lastSeen: number;
+  project: string | null;
+  threadIds: number[];
+}
+export interface ReportMemory {
+  decisions: number;
+  gotchas: number;
+  openTodos: number;
+  projectsWithMemory: number;
+  topDecisionProjects: { project: string; decisions: number }[];
+  injected: {
+    injections: number;
+    sessions: number;
+    share: number;
+    sinceDay: string;
+  } | null;
+}
+export interface ReportFile {
+  path: string;
+  project: string | null;
+  edits: number;
+  sessions: number;
+}
+export interface ReportLedger {
+  counts: LedgerCounts;
+  sinceDay: string | null;
+  allTime: number;
+}
+/** The `report` command's answer: the report and the markdown `cal report` prints. */
+export interface ReportView {
+  report: Report;
+  markdown: string;
+}
+
 /** What a "Shrink index" pass did (also the `compact:progress` payload, as running totals). */
 export interface CompactSummary {
   rows: number; // tool-output rows trimmed
@@ -747,6 +847,10 @@ export const api = {
   // Spend per local day (last 30) and the priciest commits the sessions produced.
   spendBreakdown: (project?: string) =>
     invoke<SpendBreakdown>("spend_breakdown", { project: project ?? null }),
+  // "Your agents, so far": the whole index, or sessions since `since` (epoch secs).
+  report: (since?: number) => invoke<ReportView>("report", { since: since ?? null }),
+  // Save the report card (PNG bytes) to Downloads; returns the written path.
+  saveReportCard: (png: Uint8Array) => invoke<string>("save_report_card", { png: Array.from(png) }),
   // Whether closing the window hides the app to the system tray instead of quitting.
   getCloseToTray: () => invoke<boolean>("get_close_to_tray"),
   setCloseToTray: (on: boolean) => invoke<void>("set_close_to_tray", { on }),
@@ -979,7 +1083,8 @@ export const api = {
   agentIntegrationsStatus: () => invoke<AgentIntegration[]>("agent_integrations_status"),
   installAgentIntegrations: () => invoke<AgentIntegration[]>("install_agent_integrations"),
   uninstallAgentIntegrations: () => invoke<void>("uninstall_agent_integrations"),
-  // Memory hooks for Codex and Gemini CLI (SessionStart injection, SessionEnd queueing).
+  // Memory hooks for Codex, Gemini CLI, GitHub Copilot and Cursor (session-start injection,
+  // session-end queueing; Codex's also snapshot before compaction).
   agentHooksStatus: () => invoke<AgentHooksStatus[]>("agent_hooks_status"),
   installAgentHooks: (agent: HookAgentId) =>
     invoke<AgentHooksStatus>("install_agent_hooks", { agent }),
@@ -1010,7 +1115,7 @@ export const api = {
 };
 
 /** The first-run checklist steps, in display order. */
-export const ONBOARDING_STEPS = ["index", "agents", "memory", "semantic"] as const;
+export const ONBOARDING_STEPS = ["index", "agents", "memory", "semantic", "report"] as const;
 export type OnboardingStep = (typeof ONBOARDING_STEPS)[number];
 /** A step's saved answer; null = not answered. "done" sticks once recorded, so a step the
  *  user finished stays finished when its live state later changes. Indexing can't be skipped. */
@@ -1070,12 +1175,16 @@ export interface AgentIntegration {
 }
 
 /** An agent whose own hook system Callimachus can install memory hooks into. */
-export type HookAgentId = "codex" | "gemini";
+export type HookAgentId = "codex" | "gemini" | "copilot" | "cursor";
 
 // One agent's memory-hook state (`agent_hooks_status`).
 export interface AgentHooksStatus {
   agent: HookAgentId;
-  /** The file the hooks live in: `~/.codex/hooks.json` or `~/.gemini/settings.json`. */
+  /** The agent's config dir exists here. Optional: an older backend doesn't send it (then
+   *  the MCP rows' `present` stands in, which has no Copilot row). */
+  present?: boolean;
+  /** The file the hooks live in: `~/.codex/hooks.json`, `~/.gemini/settings.json`,
+   *  `~/.copilot/hooks/callimachus.json` or `~/.cursor/hooks.json`. */
   configPath: string;
   installed: boolean;
   /** Why installing would do nothing (hooks turned off in the agent's config, or the agent
