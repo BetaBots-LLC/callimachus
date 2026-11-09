@@ -76,6 +76,56 @@
             "string",
             "null"
           ]
+        },
+        "decidedAt": {
+          "type": "integer"
+        },
+        "status": {
+          "$ref": "#/$defs/FactStatus"
+        },
+        "supersededBy": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LinkedFact"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "disputedBy": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/LinkedFact"
+          }
+        },
+        "replaces": {
+          "type": "array",
+          "items": {
+            "type": "integer"
+          },
+          "description": "Ids of the facts it actively supersedes."
+        },
+        "support": {
+          "type": "integer",
+          "description": "1 + the other sessions that reaffirmed it."
+        },
+        "lastConfirmed": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "match": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GuardMatch"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Set by the contradiction guard only."
         }
       },
       "required": [
@@ -89,9 +139,58 @@
         "rationale",
         "similarity",
         "extractor",
-        "originRef"
+        "originRef",
+        "decidedAt",
+        "status",
+        "support"
       ],
-      "description": "A semantically-recalled fact (decision/gotcha) with the thread it came from."
+      "description": "A semantically-recalled fact (decision/gotcha) with the thread it came from, when it was\ndecided and where it stands ([`FactStatus`]: a superseded hit names what replaced it)."
+    },
+    "FactStatus": {
+      "type": "string",
+      "enum": [
+        "current",
+        "disputed",
+        "flagged",
+        "superseded"
+      ],
+      "description": "Where a fact stands, in priority order: an active `supersedes` link points at it\n(`superseded`), an unresolved stale / wrong flag (`flagged`), an active `contradicts` link\non either side (`disputed`), else `current`."
+    },
+    "LinkedFact": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer"
+        },
+        "text": {
+          "type": "string"
+        },
+        "decidedAt": {
+          "type": "integer",
+          "description": "See [`DECIDED_AT_SQL`]."
+        },
+        "threadId": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Its session thread; None for a recorded or imported fact (no session to cite)."
+        }
+      },
+      "required": [
+        "id",
+        "text",
+        "decidedAt"
+      ],
+      "description": "The other side of an active link: the fact that replaced this one, one it replaces, or one\nthat disputes it."
+    },
+    "GuardMatch": {
+      "type": "string",
+      "enum": [
+        "close",
+        "related"
+      ],
+      "description": "How close a contradiction-guard hit is to the proposal: `close` at or above\n[`GUARD_CLOSE`] similarity, else `related`."
     }
   }
 }

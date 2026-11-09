@@ -252,6 +252,20 @@
             "$ref": "#/$defs/MemoryFact"
           }
         },
+        "superseded": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MemoryFact"
+          },
+          "description": "Replaced facts, kept as history (`history` queries only)."
+        },
+        "flagged": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MemoryFact"
+          },
+          "description": "Facts with an unresolved stale / wrong flag, pinned ones included (`history` only)."
+        },
         "threadCount": {
           "type": "integer"
         },
@@ -271,7 +285,7 @@
         "distilledCount",
         "pendingCount"
       ],
-      "description": "Durable, aggregated knowledge for one project: decisions + gotchas + open TODOs\ndistilled across all its threads, plus coverage so callers can prompt to distill more."
+      "description": "Durable, aggregated knowledge for one project: decisions + gotchas + open TODOs\ndistilled across all its threads, plus coverage so callers can prompt to distill more.\n\nThe three lists hold live facts only: never a superseded one, and a flagged one only when\nit is pinned (the user's trusted fact stays injected, labelled `flagged`). Disputed facts\nstay, labelled. `superseded` and `flagged` are filled only for a [`MemoryQuery`] with\n`history` (the Projects page): decisions and gotchas together, by the same order."
     },
     "MemoryFact": {
       "type": "object",
@@ -306,6 +320,64 @@
             "string",
             "null"
           ]
+        },
+        "kind": {
+          "type": "string",
+          "description": "`decision`, `gotcha` or `todo`."
+        },
+        "decidedAt": {
+          "type": "integer",
+          "description": "When it was decided (epoch seconds, [`DECIDED_AT_SQL`]): a distilled fact's session\nstart, else its own time."
+        },
+        "source": {
+          "type": "string",
+          "description": "The source kind of its thread (`claude_code`, `codex`; `in_app` for recorded and\nimported facts, which live on the project's \"Recorded memory\" thread)."
+        },
+        "status": {
+          "$ref": "#/$defs/FactStatus"
+        },
+        "replaces": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "`decidedAt` of the newest fact it actively supersedes."
+        },
+        "disputedBy": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/LinkedFact"
+          },
+          "description": "The facts it is disputed with (active `contradicts` links), newest first."
+        },
+        "support": {
+          "type": "integer",
+          "description": "1 + the other sessions that reaffirmed it."
+        },
+        "lastConfirmed": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "The newest start among those sessions."
+        },
+        "supersededBy": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LinkedFact"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What replaced it (superseded facts only)."
+        },
+        "flags": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/FactFlag"
+          },
+          "description": "Its unresolved stale / wrong flags (flagged facts only)."
         }
       },
       "required": [
@@ -316,9 +388,91 @@
         "createdAt",
         "pinned",
         "extractor",
-        "originRef"
+        "originRef",
+        "kind",
+        "decidedAt",
+        "source",
+        "status",
+        "support"
       ],
-      "description": "One distilled fact in a project's aggregated memory, with its source thread."
+      "description": "One distilled fact in a project's aggregated memory, with its source thread, when it was\ndecided and where it stands. The fields after `originRef` are additions (0035): empty and\nNone ones are left out of the JSON."
+    },
+    "FactStatus": {
+      "type": "string",
+      "enum": [
+        "current",
+        "disputed",
+        "flagged",
+        "superseded"
+      ],
+      "description": "Where a fact stands, in priority order: an active `supersedes` link points at it\n(`superseded`), an unresolved stale / wrong flag (`flagged`), an active `contradicts` link\non either side (`disputed`), else `current`."
+    },
+    "LinkedFact": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer"
+        },
+        "text": {
+          "type": "string"
+        },
+        "decidedAt": {
+          "type": "integer",
+          "description": "See [`DECIDED_AT_SQL`]."
+        },
+        "threadId": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Its session thread; None for a recorded or imported fact (no session to cite)."
+        }
+      },
+      "required": [
+        "id",
+        "text",
+        "decidedAt"
+      ],
+      "description": "The other side of an active link: the fact that replaced this one, one it replaces, or one\nthat disputes it."
+    },
+    "FactFlag": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer",
+          "description": "The `fact_signals` row."
+        },
+        "kind": {
+          "type": "string",
+          "description": "`stale` or `wrong`."
+        },
+        "source": {
+          "type": "string",
+          "description": "`agent`, `distill` (a memory pass retired it) or `user`."
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "createdAt": {
+          "type": "integer"
+        },
+        "threadId": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "kind",
+        "source",
+        "createdAt"
+      ],
+      "description": "An unresolved stale / wrong flag on a fact."
     },
     "AuditNotes": {
       "type": "object",

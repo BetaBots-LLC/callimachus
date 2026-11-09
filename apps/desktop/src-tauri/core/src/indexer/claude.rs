@@ -850,7 +850,9 @@ fn ingest_jsonl(
     consumed
 }
 
-fn parse_line(line: &[u8]) -> Option<Value> {
+/// One JSONL line as JSON, or None for a blank or malformed one (also read by the
+/// compaction anchor, `crate::anchor`, from the live transcript).
+pub(crate) fn parse_line(line: &[u8]) -> Option<Value> {
     let text = String::from_utf8_lossy(line);
     let text = text.trim();
     if text.is_empty() {

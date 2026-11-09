@@ -12,6 +12,49 @@
         },
         "message": {
           "type": "string"
+        },
+        "id": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "replaces": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "properties": {
+            "id": {
+              "type": "integer"
+            },
+            "result": {
+              "oneOf": [
+                {
+                  "type": "string",
+                  "const": "replaced"
+                },
+                {
+                  "type": "string",
+                  "const": "disputed"
+                },
+                {
+                  "type": "string",
+                  "const": "rejected"
+                }
+              ]
+            },
+            "reason": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "id",
+            "result"
+          ]
         }
       },
       "required": [

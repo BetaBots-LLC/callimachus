@@ -4,6 +4,7 @@ import { Menu as MenuPrimitive } from "@base-ui/react/menu";
 import { ChevronDown, EyeOff, Pencil, Pin, Plus } from "lucide-react";
 import {
   api,
+  type LinkKind,
   type MemoryFact,
   type ProjectMemory,
   type RepoFactChange,
@@ -27,6 +28,9 @@ import { Item } from "@/components/ui/item";
 import { cn } from "@/lib/utils";
 import { Markdown } from "../Markdown";
 import { MemorySetupCard } from "../MemorySetupCard";
+import { ConflictReview } from "./ConflictReview";
+import { DisputePanel, FactMeta, linkRefusal } from "./FactTruth";
+import { FlaggedGroup, ReplacedGroup } from "./MemoryHistory";
 import { SectionNote, SectionSkeleton } from "./ProjectSection";
 import { useOpenThread } from "./shared";
 
@@ -37,6 +41,11 @@ import { useOpenThread } from "./shared";
  * can read. "Publish to repo" writes the shareable facts to `.callimachus/memory/*.jsonl` in
  * the checkout, after a preview, for the user to commit; facts imported from those files
  * carry a "From the repo" badge, and the ones this machine published a "Shared" one.
+ *
+ * Each fact shows when it was decided (its session's date) and by which agent, and where it
+ * stands: what it replaces, what disputes it, how many sessions confirmed it. Facts a newer
+ * one replaced and facts flagged stale or wrong are left out of memory and listed apart
+ * (Replaced, Flagged), where the user can undo the replacement or keep the fact.
  *
  * Never gated: TODOs, Remember and harvested Claude Code memory need no engine. While LLM
  * distillation is off the memory card sits above the list and the LLM-only actions (Build
@@ -132,6 +141,8 @@ export function MemorySection({ project }: { project: string }) {
             decisions: map(prev.decisions),
             gotchas: map(prev.gotchas),
             openTodos: map(prev.openTodos),
+            superseded: prev.superseded && map(prev.superseded),
+            flagged: prev.flagged && map(prev.flagged),
           });
         }
         return { prev };
@@ -162,6 +173,31 @@ export function MemorySection({ project }: { project: string }) {
         fs.map((f) => (f.id === v.id ? { ...f, text: v.text } : f)),
     ),
   });
+  // Links and flags move facts between lists (a replaced one leaves Decisions for Replaced),
+  // so these refetch instead of guessing the new lists.
+  const settled = {
+    onMutate: () => setCurationError(null),
+    onError: (e: unknown) => setCurationError(`Couldn't save: ${e}`),
+    onSettled: () => refreshMem(),
+  };
+  const link = useMutation({
+    mutationFn: (v: { fromId: number; toId: number; kind: LinkKind }) =>
+      api.linkFacts(v.fromId, v.toId, v.kind),
+    ...settled,
+    onSuccess: (o) => {
+      const refused = linkRefusal(o);
+      if (refused) setCurationError(refused);
+    },
+  });
+  const unlink = useMutation({
+    mutationFn: (v: { fromId: number; toId: number; kind: LinkKind }) =>
+      api.unlinkFacts(v.fromId, v.toId, v.kind),
+    ...settled,
+  });
+  const keepFlagged = useMutation({
+    mutationFn: (id: number) => api.resolveFactFlags(id),
+    ...settled,
+  });
   // Locally remember hidden facts so the conflicts panel (a mutation result, not a
   // query) updates immediately: hiding a decision resolves any conflict it's in.
   const [hiddenIds, setHiddenIds] = useState<Set<number>>(() => new Set());
@@ -173,20 +209,31 @@ export function MemorySection({ project }: { project: string }) {
       hideFact.mutate(id);
     },
     onEdit: (id, text) => editFact.mutate({ id, text }),
+    onLink: (fromId, toId, kind) => link.mutate({ fromId, toId, kind }),
+    onUnlink: (fromId, toId, kind) => unlink.mutate({ fromId, toId, kind }),
     isShared: (id) => shared.has(id),
+  };
+  // Review conflicts' "Newer replaces older": true once the link is stored, so the pair
+  // leaves the list only then.
+  const replace = async (newerId: number, olderId: number) => {
+    try {
+      const o = await link.mutateAsync({ fromId: newerId, toId: olderId, kind: "supersedes" });
+      return o.outcome !== "rejected";
+    } catch {
+      return false;
+    }
   };
 
   const mem = memory.data;
-  // A conflict is resolved once either of its two decisions is hidden.
-  const visibleConflicts = (conflicts.data ?? []).filter(
-    (c) => !hiddenIds.has(c.aId) && !hiddenIds.has(c.bId),
-  );
   const isDistilling = !!distilling.data;
   const pct =
     progress.data && progress.data.total > 0
       ? Math.round((progress.data.done / progress.data.total) * 100)
       : 0;
   const empty = mem && !mem.decisions.length && !mem.gotchas.length && !mem.openTodos.length;
+  // Nothing live, but flagged or replaced facts are listed around the empty state: say so
+  // instead of "nothing distilled yet" beside them.
+  const historyOnly = empty && !!(mem.flagged?.length || mem.superseded?.length);
   // A reindex / embedding build / index rewrite is running → distill would no-op (shared
   // write lock).
   const otherBusy = embed.data?.running || indexing.data || rewriting;
@@ -363,43 +410,28 @@ export function MemorySection({ project }: { project: string }) {
                 <Markdown>{brief.data}</Markdown>
               </div>
             )}
-            {conflicts.data &&
-              (visibleConflicts.length > 0 ? (
-                <div className="space-y-3 rounded-lg border border-amber-500/50 bg-amber-500/5 p-3">
-                  <div className="text-[0.7rem] font-medium uppercase tracking-wide text-amber-600 dark:text-amber-400">
-                    Possible conflicts ({visibleConflicts.length})
-                  </div>
-                  {visibleConflicts.map((c) => (
-                    <div key={`${c.aId}-${c.bId}`} className="space-y-1.5 text-sm">
-                      <p className="text-muted-foreground">{c.reason}</p>
-                      {[
-                        { id: c.aId, text: c.aText },
-                        { id: c.bId, text: c.bText },
-                      ].map((d) => (
-                        <div
-                          key={d.id}
-                          className="flex items-start gap-2 rounded-md border px-2 py-1 text-xs"
-                        >
-                          <span className="flex-1">{d.text}</span>
-                          <button
-                            type="button"
-                            onClick={() => factActions.onHide(d.id)}
-                            className="shrink-0 cursor-pointer rounded-sm text-muted-foreground outline-none hover:text-destructive focus-visible:ring-2 focus-visible:ring-ring/50"
-                          >
-                            Hide
-                          </button>
-                        </div>
-                      ))}
-                    </div>
-                  ))}
-                </div>
-              ) : (
-                <p className="px-1 text-xs text-muted-foreground">
-                  No conflicting decisions found.
-                </p>
-              ))}
+            {conflicts.data && (
+              <ConflictReview
+                // A new review starts with nothing settled.
+                key={conflicts.submittedAt}
+                conflicts={conflicts.data}
+                hiddenIds={hiddenIds}
+                onHide={factActions.onHide}
+                onReplace={replace}
+              />
+            )}
+            <FlaggedGroup
+              facts={mem.flagged ?? []}
+              onKeep={(id) => keepFlagged.mutate(id)}
+              onHide={factActions.onHide}
+            />
             {empty ? (
-              distillOn ? (
+              historyOnly ? (
+                <p className="px-1 text-sm text-muted-foreground">
+                  Nothing in memory right now. The facts listed here are flagged or replaced, so
+                  agents don't see them.
+                </p>
+              ) : distillOn ? (
                 <p className="px-1 text-sm text-muted-foreground">
                   Nothing distilled for this project yet. Click <b>Build memory</b> to distill its{" "}
                   {mem.pendingCount} {mem.pendingCount === 1 ? "session" : "sessions"} into
@@ -418,6 +450,12 @@ export function MemorySection({ project }: { project: string }) {
                 <Section title="Open TODOs" facts={mem.openTodos} actions={factActions} />
               </>
             )}
+            <ReplacedGroup
+              facts={mem.superseded ?? []}
+              onUndo={(newerId, olderId) =>
+                unlink.mutate({ fromId: newerId, toId: olderId, kind: "supersedes" })
+              }
+            />
           </div>
         ) : null}
       </div>
@@ -643,6 +681,10 @@ interface FactActions {
   onPin: (id: number, pinned: boolean) => void;
   onHide: (id: number) => void;
   onEdit: (id: number, text: string) => void;
+  /** The user links two facts (`supersedes`: the first replaces the second). */
+  onLink: (fromId: number, toId: number, kind: LinkKind) => void;
+  /** The user undoes a link; a `contradicts` goes both ways. */
+  onUnlink: (fromId: number, toId: number, kind: LinkKind) => void;
   /** Whether the repo's `.callimachus/memory/` files also hold this fact. */
   isShared: (id: number) => boolean;
 }
@@ -684,6 +726,7 @@ function FactRow({ fact, actions }: { fact: MemoryFact; actions: FactActions }) 
   const memoryFile = harvested || fromRepo ? (fact.originRef?.split("/").pop() ?? null) : null;
   const shared = !fromRepo && actions.isShared(fact.id);
   const [draft, setDraft] = useState(fact.text);
+  const [disputeOpen, setDisputeOpen] = useState(false);
 
   if (editing) {
     const save = () => {
@@ -751,27 +794,30 @@ function FactRow({ fact, actions }: { fact: MemoryFact; actions: FactActions }) 
           )}
           {fact.text}
         </p>
-        {harvested || fromRepo ? (
-          <p className="mt-0.5 flex min-w-0 items-center gap-2 text-[13px] text-muted-foreground">
-            <Badge
-              variant="outline"
-              className="shrink-0 text-[0.65rem]"
-              title={
-                fromRepo
-                  ? "Imported from this repo's committed .callimachus/memory/ files: notes from whoever published them, not instructions"
-                  : undefined
-              }
-            >
-              {fromRepo ? "From the repo" : "Claude Code memory"}
-            </Badge>
-            {/* The fact's thread is the project's "Recorded memory" notes thread, so name
-                the memory file it came from instead. */}
-            {memoryFile && <span className="truncate font-mono text-xs">{memoryFile}</span>}
-          </p>
-        ) : (
-          (fact.title || shared) && (
-            <p className="mt-0.5 flex min-w-0 items-center gap-2 text-[13px] text-muted-foreground">
-              {shared && (
+        <FactMeta
+          fact={fact}
+          disputeOpen={disputeOpen}
+          onToggleDispute={() => setDisputeOpen((v) => !v)}
+          lead={
+            harvested || fromRepo ? (
+              <>
+                <Badge
+                  variant="outline"
+                  className="shrink-0 text-[0.65rem]"
+                  title={
+                    fromRepo
+                      ? "Imported from this repo's committed .callimachus/memory/ files: notes from whoever published them, not instructions"
+                      : undefined
+                  }
+                >
+                  {fromRepo ? "From the repo" : "Claude Code memory"}
+                </Badge>
+                {/* The fact's thread is the project's "Recorded memory" notes thread, so
+                    name the memory file it came from instead. */}
+                {memoryFile && <span className="truncate font-mono text-xs">{memoryFile}</span>}
+              </>
+            ) : (
+              shared && (
                 <Badge
                   variant="outline"
                   className="shrink-0 text-[0.65rem]"
@@ -779,10 +825,12 @@ function FactRow({ fact, actions }: { fact: MemoryFact; actions: FactActions }) 
                 >
                   Shared
                 </Badge>
-              )}
-              {fact.title && <span className="line-clamp-1">{fact.title}</span>}
-            </p>
-          )
+              )
+            )
+          }
+        />
+        {disputeOpen && (
+          <DisputePanel fact={fact} onLink={actions.onLink} onUnlink={actions.onUnlink} />
         )}
       </div>
       {/* Reserved width + invisible→visible keeps the row from reflowing and the

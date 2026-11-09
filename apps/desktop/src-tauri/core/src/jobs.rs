@@ -1856,17 +1856,19 @@ async fn run_distill_counted(
         if !job.is_current() || writer_job_running(host.flags()) {
             break;
         }
-        let packed = read_blocking(pool, move |conn| {
-            context::pack_thread(conn, tid, context::DEFAULT_BUDGET_CHARS)
+        // The existing memory is listed per thread, just before its call: a backlog distills
+        // newest first, so each thread sees what the ones before it just wrote.
+        let input = read_blocking(pool, move |conn| {
+            agent::DistillInput::load(conn, tid, context::DEFAULT_BUDGET_CHARS)
         })
         .await?;
-        let Some(packed) = packed else { continue };
+        let Some(input) = input else { continue };
         let outcome = agent::distill(
             &provider,
             &model,
             key.as_deref(),
             base_url.as_deref(),
-            &packed,
+            &input,
         )
         .await;
         let stored = {
@@ -1881,6 +1883,7 @@ async fn run_distill_counted(
                                 &mut conn,
                                 tid,
                                 &result,
+                                &input.refs,
                                 chrono::Utc::now().timestamp(),
                             )?;
                         }

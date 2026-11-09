@@ -10,12 +10,20 @@ pub mod harvest;
 pub mod identity;
 pub mod priority;
 pub mod repo_memory;
+pub mod truth;
 
 pub use identity::{
     local_keys_for_portable, new_fact_uid, portable_project_id, rebind_fact_sources,
     refresh_portable_project_id, IMPORT_FACT_SQL,
 };
 pub use priority::{distill_priority_ready, enqueue_distill_priority};
+pub use truth::{
+    agent_supersedes_recent, distill_memory_context, fact_date, fact_in_project, fact_truth,
+    flag_fact, has_truth_tables, is_session_extractor, link_facts, resolve_fact_flags,
+    unlink_facts, unlink_link, FactFlag, FactStatus, FactTruth, FlagKind, FlagOutcome, LinkKind,
+    LinkOutcome, LinkRejection, LinkSource, LinkedFact, RefEntry, RefMap, SignalSource,
+    AGENT_FLAG_CAP, AGENT_SUPERSEDE_CAP, AGENT_SUPERSEDE_WINDOW_SECS, DECIDED_AT_SQL,
+};
 
 use crate::agent::Distilled;
 use anyhow::Result;
@@ -60,10 +68,12 @@ pub fn extract_todos(text: &str) -> Vec<String> {
 
 /// Message text that an agent harness injected rather than the user or model writing it:
 /// skill bodies, slash-command expansions, system reminders, and Callimachus's own
-/// injected memory / packed threads (extracting from those would feed TODOs back to us).
+/// injected memory / packed threads / distiller memory list / compaction anchor (mining
+/// those would feed TODOs and prompts back to us: the anchor quotes the user's own prompts,
+/// so a session that pasted one back would replay them as new ones).
 pub(crate) fn is_injected_context(text: &str) -> bool {
     let t = text.trim_start();
-    const PREFIXES: [&str; 8] = [
+    const PREFIXES: [&str; 10] = [
         "Base directory for this skill",
         "<command-name>",
         "<command-message>",
@@ -72,8 +82,12 @@ pub(crate) fn is_injected_context(text: &str) -> bool {
         "Caveat: The messages below were generated",
         "<reference_thread",
         "<project_memory",
+        "<existing_memory",
+        "<session_prompts",
     ];
-    PREFIXES.iter().any(|p| t.starts_with(p)) || t.contains(crate::export::MANAGED_START)
+    PREFIXES.iter().any(|p| t.starts_with(p))
+        || t.starts_with(crate::anchor::ANCHOR_HEADING)
+        || t.contains(crate::export::MANAGED_START)
 }
 
 /// Text after a markdown unchecked task bullet, e.g. `- [ ] wire up auth` -> `wire up auth`.
@@ -620,13 +634,51 @@ pub fn enable_memory(conn: &Connection, provider: &str, model: Option<&str>) -> 
 
 /// Replace a thread's LLM-distilled facts with a fresh set and mark it extracted at
 /// the current message count. Heuristic todos (extractor='heuristic') are untouched.
+///
+/// `refs` is the [`RefMap`] of the [`distill_memory_context`] block the model was shown
+/// (`RefMap::default()` when it was shown none). In one transaction:
+/// - the thread's uncurated LLM facts are replaced, an identical text keeping its uid; but a
+///   fact another thread actively supersedes is kept as history (never deleted), and no new
+///   fact is inserted with its text, so a re-distill cannot bring the old decision back as
+///   current; `d<N>` / `g<N>` naming such a text resolves to the kept fact;
+/// - the thread's previous distilled links and unresolved distilled signals are removed
+///   (a re-distill is idempotent; a flag the user resolved stays resolved), then
+///   `d.links`, `d.reaffirms` and `d.retires` are applied with the per-thread caps and
+///   validation of [`truth::apply_distilled_truth`].
 pub fn store_distilled(
     conn: &mut Connection,
     thread_id: i64,
     d: &Distilled,
+    refs: &RefMap,
     now: i64,
 ) -> Result<()> {
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let truth = truth::has_truth_tables(&tx);
+    // Facts of this thread that a later session's fact supersedes (a link that is not this
+    // thread's own distilled one, which is about to be replaced): history, so they stay.
+    let kept: Vec<(i64, String, String, String)> = if truth {
+        let mut sel = tx.prepare(
+            "SELECT f.id, f.kind, f.text, f.uid FROM facts f
+             WHERE f.thread_id = ?1 AND f.extractor = 'llm'
+               AND f.pinned = 0 AND f.edited = 0 AND f.hidden = 0 AND f.uid IS NOT NULL
+               AND EXISTS (SELECT 1 FROM fact_links lk JOIN facts nf ON nf.uid = lk.from_uid
+                    WHERE lk.to_uid = f.uid AND lk.kind = 'supersedes' AND nf.hidden = 0
+                      AND lk.dismissed_at IS NULL AND nf.thread_id != f.thread_id
+                      AND NOT (lk.source = 'distill' AND lk.thread_id IS ?1))",
+        )?;
+        let rows = sel
+            .query_map([thread_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        rows
+    } else {
+        Vec::new()
+    };
+    let kept_uid: std::collections::HashMap<(String, String), String> = kept
+        .iter()
+        .map(|(_, kind, text, uid)| ((kind.clone(), distilled_key(text)), uid.clone()))
+        .collect();
     // The same fact distilled again keeps its uid: a copy already published to repo memory
     // (or another machine) must still match it, not come back as a duplicate. Keyed by kind
     // and trimmed, lowercased text.
@@ -652,13 +704,30 @@ pub fn store_distilled(
         uids.remove(&(kind.to_string(), distilled_key(text)))
             .unwrap_or_else(new_fact_uid)
     };
+    if truth {
+        // A link the user undid stays: it is what keeps this re-distill from declaring it again.
+        tx.execute(
+            "DELETE FROM fact_links WHERE thread_id = ?1 AND source = 'distill'
+               AND dismissed_at IS NULL",
+            [thread_id],
+        )?;
+        tx.execute(
+            "DELETE FROM fact_signals WHERE thread_id = ?1 AND source = 'distill'
+               AND (kind = 'reaffirmed' OR resolved_at IS NULL)",
+            [thread_id],
+        )?;
+    }
     // Replace only the UN-curated LLM facts; pinned / edited / hidden ones are the user's
-    // now and survive re-distillation.
+    // now and survive re-distillation, and superseded ones are kept as history.
+    let kept_ids: Vec<i64> = kept.iter().map(|k| k.0).collect();
     tx.execute(
         "DELETE FROM facts WHERE thread_id = ?1 AND extractor = 'llm'
-            AND pinned = 0 AND edited = 0 AND hidden = 0",
-        [thread_id],
+            AND pinned = 0 AND edited = 0 AND hidden = 0
+            AND id NOT IN (SELECT value FROM json_each(?2))",
+        params![thread_id, serde_json::to_string(&kept_ids)?],
     )?;
+    // `d1`, `g2`... -> the uid of the fact that holds that item now.
+    let mut own: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     {
         let mut ins = tx.prepare(
             "INSERT INTO facts (thread_id, kind, text, status, extractor, seq, created_at, uid)
@@ -675,33 +744,25 @@ pub fn store_distilled(
                 uid_for("summary", summary)
             ])?;
         }
-        for (i, text) in d.decisions.iter().enumerate() {
-            let t = text.trim();
-            if !t.is_empty() {
-                ins.execute(params![
-                    thread_id,
-                    "decision",
-                    t,
-                    i as i64,
-                    now,
-                    uid_for("decision", t)
-                ])?;
-            }
-        }
-        for (i, text) in d.gotchas.iter().enumerate() {
-            let t = text.trim();
-            if !t.is_empty() {
-                ins.execute(params![
-                    thread_id,
-                    "gotcha",
-                    t,
-                    i as i64,
-                    now,
-                    uid_for("gotcha", t)
-                ])?;
+        for (kind, prefix, items) in [("decision", 'd', &d.decisions), ("gotcha", 'g', &d.gotchas)]
+        {
+            for (i, text) in items.iter().enumerate() {
+                let t = text.trim();
+                if t.is_empty() {
+                    continue;
+                }
+                let r = format!("{prefix}{}", i + 1);
+                if let Some(uid) = kept_uid.get(&(kind.to_string(), distilled_key(t))) {
+                    own.insert(r, uid.clone());
+                    continue;
+                }
+                let uid = uid_for(kind, t);
+                ins.execute(params![thread_id, kind, t, i as i64, now, uid])?;
+                own.insert(r, uid);
             }
         }
     }
+    truth::apply_distilled_truth(&tx, thread_id, d, &own, refs, now)?;
     tx.execute(
         "UPDATE threads SET knowledge_extracted = 1, knowledge_extracted_at = ?2,
             knowledge_msg_count = distillable_count, knowledge_error = NULL WHERE id = ?1",
@@ -783,6 +844,11 @@ pub struct KFact {
     pub id: i64,
     pub text: String,
     pub pinned: bool,
+    /// See [`FactStatus`].
+    pub status: FactStatus,
+    /// When it was decided (epoch seconds): its session's start for a distilled fact.
+    #[serde(rename = "decidedAt")]
+    pub decided_at: i64,
 }
 
 /// All distilled knowledge for one thread, grouped by kind, with freshness flags.
@@ -830,27 +896,45 @@ pub fn get_thread_knowledge(conn: &Connection, thread_id: i64) -> Result<ThreadK
             |r| Ok((r.get::<_, i64>(0)? != 0, r.get(1)?, r.get(2)?, r.get(3)?)),
         )?;
 
-    let mut stmt = conn.prepare(
-        "SELECT id, kind, text, pinned FROM facts
-         WHERE thread_id = ?1 AND hidden = 0 ORDER BY pinned DESC, seq, id",
-    )?;
-    let rows = stmt.query_map([thread_id], |r| {
-        Ok((
-            r.get::<_, i64>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, String>(2)?,
-            r.get::<_, i64>(3)? != 0,
-        ))
-    })?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT f.id, f.kind, f.text, f.pinned, COALESCE(f.uid, ''), {DECIDED_AT_SQL}
+         FROM facts f JOIN threads t ON t.id = f.thread_id
+         WHERE f.thread_id = ?1 AND f.hidden = 0 ORDER BY f.pinned DESC, f.seq, f.id"
+    ))?;
+    let rows = stmt
+        .query_map([thread_id], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)? != 0,
+                r.get::<_, String>(4)?,
+                r.get::<_, i64>(5)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let uids: Vec<&str> = rows
+        .iter()
+        .filter(|r| matches!(r.1.as_str(), "decision" | "gotcha"))
+        .map(|r| r.4.as_str())
+        .collect();
+    let truth = fact_truth(conn, &uids)?;
     let mut summary = None;
     let (mut decisions, mut gotchas, mut todos) = (Vec::new(), Vec::new(), Vec::new());
-    for row in rows {
-        let (id, kind, text, pinned) = row?;
+    for (id, kind, text, pinned, uid, decided_at) in rows {
+        let status = truth.get(&uid).map(|t| t.status).unwrap_or_default();
+        let fact = KFact {
+            id,
+            text,
+            pinned,
+            status,
+            decided_at,
+        };
         match kind.as_str() {
-            "summary" => summary = Some(text),
-            "decision" => decisions.push(KFact { id, text, pinned }),
-            "gotcha" => gotchas.push(KFact { id, text, pinned }),
-            "todo" => todos.push(KFact { id, text, pinned }),
+            "summary" => summary = Some(fact.text),
+            "decision" => decisions.push(fact),
+            "gotcha" => gotchas.push(fact),
+            "todo" => todos.push(fact),
             _ => {}
         }
     }
@@ -868,8 +952,9 @@ pub fn get_thread_knowledge(conn: &Connection, thread_id: i64) -> Result<ThreadK
     })
 }
 
-/// A semantically-recalled fact (decision/gotcha) with the thread it came from.
-#[derive(Debug, Serialize, schemars::JsonSchema)]
+/// A semantically-recalled fact (decision/gotcha) with the thread it came from, when it was
+/// decided and where it stands ([`FactStatus`]: a superseded hit names what replaced it).
+#[derive(Debug, Default, Serialize, schemars::JsonSchema)]
 pub struct RecallHit {
     pub id: i64,
     #[serde(rename = "threadId")]
@@ -890,33 +975,85 @@ pub struct RecallHit {
     pub extractor: String,
     #[serde(rename = "originRef")]
     pub origin_ref: Option<String>,
+    #[serde(rename = "decidedAt")]
+    pub decided_at: i64,
+    pub status: FactStatus,
+    #[serde(rename = "supersededBy", skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<LinkedFact>,
+    #[serde(rename = "disputedBy", skip_serializing_if = "Vec::is_empty")]
+    pub disputed_by: Vec<LinkedFact>,
+    /// Ids of the facts it actively supersedes.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub replaces: Vec<i64>,
+    /// 1 + the other sessions that reaffirmed it.
+    pub support: i64,
+    #[serde(rename = "lastConfirmed", skip_serializing_if = "Option::is_none")]
+    pub last_confirmed: Option<i64>,
+    /// Set by the contradiction guard only.
+    #[serde(rename = "match", skip_serializing_if = "Option::is_none")]
+    pub match_strength: Option<GuardMatch>,
 }
+
+impl RecallHit {
+    /// Fill the derived fields from `t`.
+    fn apply_truth(&mut self, t: FactTruth) {
+        self.status = t.status;
+        self.superseded_by = t.superseded_by;
+        self.disputed_by = t.disputed_by;
+        self.replaces = t.replaces.into_iter().map(|f| f.id).collect();
+        self.support = t.support;
+        self.last_confirmed = t.last_confirmed;
+    }
+}
+
+/// How close a contradiction-guard hit is to the proposal: `close` at or above
+/// [`GUARD_CLOSE`] similarity, else `related`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum GuardMatch {
+    Close,
+    Related,
+}
+
+/// Similarity at which a guard hit counts as `close` (the proposal restates or reverses that
+/// decision) rather than merely `related`. Provisional: picked by eye on synthetic vectors;
+/// calibrate it on real fact embeddings before anything keys hard behavior on it.
+pub const GUARD_CLOSE: f32 = 0.75;
 
 /// Cross-thread semantic recall of distilled facts. `qv` is a PRECOMPUTED query vector
 /// (embed it via `embed::embed_query` BEFORE locking the DB so inference never holds the
 /// lock). `kind` is 'decision' or 'gotcha'; optionally scope to a project-path substring.
+/// Superseded facts are left out (in SQL, so `k` counts live hits) unless
+/// `include_superseded`; flagged and disputed ones stay, labelled by `status`.
 pub fn recall(
     conn: &Connection,
     qv: &[f32],
     kind: &str,
     project: Option<&str>,
     k: usize,
+    include_superseded: bool,
 ) -> Result<Vec<RecallHit>> {
     // Over-fetch chunks so the kind/project filter (applied AFTER the KNN) still leaves k.
     let knn_k = (k * 5).max(100);
     let origin_ref = origin_ref_sql(conn);
+    let live = if !include_superseded && truth::has_truth_tables(conn) {
+        format!(" AND NOT {}", truth::SUPERSEDED_SQL)
+    } else {
+        String::new()
+    };
     let mut sql = format!(
         "WITH knn AS MATERIALIZED (
             SELECT fact_id, distance FROM vec_facts
             WHERE embedding MATCH ?1 AND k = {knn_k} ORDER BY distance
          )
          SELECT f.id, f.thread_id, f.kind, f.text, f.rationale, s.kind, t.title, t.project_path,
-                MIN(knn.distance) AS d, f.extractor, {origin_ref}
+                MIN(knn.distance) AS d, f.extractor, {origin_ref}, {DECIDED_AT_SQL},
+                COALESCE(f.uid, '')
          FROM knn
          JOIN facts f ON f.id = knn.fact_id
          JOIN threads t ON t.id = f.thread_id
          JOIN sources s ON s.id = t.source_id
-         WHERE f.kind = ?2 AND f.hidden = 0"
+         WHERE f.kind = ?2 AND f.hidden = 0{live}"
     );
     let mut args: Vec<Box<dyn rusqlite::ToSql>> = vec![
         Box::new(crate::embed::vec_to_bytes(qv)),
@@ -946,23 +1083,41 @@ pub fn recall(
 
     let arg_refs: Vec<&dyn rusqlite::ToSql> = args.iter().map(|b| b.as_ref()).collect();
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(arg_refs.as_slice(), |r| {
-        let dist: f64 = r.get(8)?;
-        Ok(RecallHit {
-            id: r.get(0)?,
-            thread_id: r.get(1)?,
-            kind: r.get(2)?,
-            text: r.get(3)?,
-            rationale: r.get(4)?,
-            source: r.get(5)?,
-            title: r.get(6)?,
-            project_path: r.get(7)?,
-            similarity: (1.0 - dist) as f32,
-            extractor: r.get(9)?,
-            origin_ref: r.get(10)?,
+    let rows = stmt
+        .query_map(arg_refs.as_slice(), |r| {
+            let dist: f64 = r.get(8)?;
+            Ok((
+                RecallHit {
+                    id: r.get(0)?,
+                    thread_id: r.get(1)?,
+                    kind: r.get(2)?,
+                    text: r.get(3)?,
+                    rationale: r.get(4)?,
+                    source: r.get(5)?,
+                    title: r.get(6)?,
+                    project_path: r.get(7)?,
+                    similarity: (1.0 - dist) as f32,
+                    extractor: r.get(9)?,
+                    origin_ref: r.get(10)?,
+                    decided_at: r.get(11)?,
+                    support: 1,
+                    ..Default::default()
+                },
+                r.get::<_, String>(12)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let uids: Vec<&str> = rows.iter().map(|(_, u)| u.as_str()).collect();
+    let mut truth = fact_truth(conn, &uids)?;
+    Ok(rows
+        .into_iter()
+        .map(|(mut h, uid)| {
+            if let Some(t) = truth.remove(&uid) {
+                h.apply_truth(t);
+            }
+            h
         })
-    })?;
-    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        .collect())
 }
 
 /// A decision or gotcha matching a search, for the Search view's "Decisions and gotchas"
@@ -1048,8 +1203,9 @@ pub fn search_facts(
         let mut hits: Vec<RecallHit> = Vec::new();
         for kind in ["decision", "gotcha"] {
             // Semantic hits are a bonus on top of the keyword match, which still answers if
-            // the vector table can't be read.
-            if let Ok(found) = recall(conn, qv, kind, project, limit) {
+            // the vector table can't be read. Superseded facts stay findable here, as the
+            // keyword match finds them: Search is where history is looked up.
+            if let Ok(found) = recall(conn, qv, kind, project, limit, true) {
                 hits.extend(found);
             }
         }
@@ -1149,8 +1305,9 @@ pub fn find_prior_work(
     k: usize,
 ) -> Result<Vec<PriorWork>> {
     let over = (k * 3).max(15);
-    let mut hits = recall(conn, qv, "decision", project, over)?;
-    hits.extend(recall(conn, qv, "gotcha", project, over)?);
+    // A superseded fact is no reason to revisit its session: the newer one is.
+    let mut hits = recall(conn, qv, "decision", project, over, false)?;
+    hits.extend(recall(conn, qv, "gotcha", project, over, false)?);
 
     let mut by_thread: std::collections::HashMap<i64, PriorWork> = std::collections::HashMap::new();
     for h in hits {
@@ -1193,7 +1350,11 @@ pub fn find_prior_work(
 /// proposal an agent is about to act on), held to a stricter floor than general recall — a
 /// false "you already decided X" is worse than silence. Surface these before the agent
 /// re-litigates a settled choice. Returns decision facts (each with its rationale, when
-/// recorded) best-match first. `project` optionally scopes to one repo.
+/// recorded, its date and status, and `match`). `project` optionally scopes to one repo.
+///
+/// Superseded decisions are always included, each naming what replaced it: they are the most
+/// useful answer to "should we go back to X?". Order: live hits (`current`, `disputed`) first,
+/// then `flagged`, then `superseded`, by similarity within each group.
 pub fn check_contradiction(
     conn: &Connection,
     qv: &[f32],
@@ -1203,8 +1364,27 @@ pub fn check_contradiction(
     // Same high-stakes floor as find_prior_work: recall() already dropped the clear noise; this
     // keeps only decisions genuinely on the proposal's topic.
     const GUARD_FLOOR: f32 = 0.55;
-    let mut hits = recall(conn, qv, "decision", project, (k * 3).max(15))?;
+    let mut hits = recall(conn, qv, "decision", project, (k * 3).max(15), true)?;
     hits.retain(|h| h.similarity >= GUARD_FLOOR);
+    for h in &mut hits {
+        h.match_strength = Some(if h.similarity >= GUARD_CLOSE {
+            GuardMatch::Close
+        } else {
+            GuardMatch::Related
+        });
+    }
+    let group = |s: FactStatus| match s {
+        FactStatus::Current | FactStatus::Disputed => 0,
+        FactStatus::Flagged => 1,
+        FactStatus::Superseded => 2,
+    };
+    hits.sort_by(|a, b| {
+        group(a.status).cmp(&group(b.status)).then(
+            b.similarity
+                .partial_cmp(&a.similarity)
+                .unwrap_or(std::cmp::Ordering::Equal),
+        )
+    });
     hits.truncate(k);
     Ok(hits)
 }
@@ -1217,8 +1397,10 @@ pub fn check_contradiction(
 /// top-level thread with enough substance. Keeps batch distill off trivial/subagent rows.
 pub(crate) const DISTILLABLE: &str = "is_subagent = 0 AND message_count >= 4";
 
-/// One distilled fact in a project's aggregated memory, with its source thread.
-#[derive(Debug, Serialize, schemars::JsonSchema)]
+/// One distilled fact in a project's aggregated memory, with its source thread, when it was
+/// decided and where it stands. The fields after `originRef` are additions (0035): empty and
+/// None ones are left out of the JSON.
+#[derive(Debug, Default, Serialize, schemars::JsonSchema)]
 pub struct MemoryFact {
     pub id: i64,
     #[serde(rename = "threadId")]
@@ -1237,10 +1419,55 @@ pub struct MemoryFact {
     pub extractor: String,
     #[serde(rename = "originRef")]
     pub origin_ref: Option<String>,
+    /// `decision`, `gotcha` or `todo`.
+    pub kind: String,
+    /// When it was decided (epoch seconds, [`DECIDED_AT_SQL`]): a distilled fact's session
+    /// start, else its own time.
+    #[serde(rename = "decidedAt")]
+    pub decided_at: i64,
+    /// The source kind of its thread (`claude_code`, `codex`; `in_app` for recorded and
+    /// imported facts, which live on the project's "Recorded memory" thread).
+    pub source: String,
+    pub status: FactStatus,
+    /// `decidedAt` of the newest fact it actively supersedes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replaces: Option<i64>,
+    /// The facts it is disputed with (active `contradicts` links), newest first.
+    #[serde(rename = "disputedBy", skip_serializing_if = "Vec::is_empty")]
+    pub disputed_by: Vec<LinkedFact>,
+    /// 1 + the other sessions that reaffirmed it.
+    pub support: i64,
+    /// The newest start among those sessions.
+    #[serde(rename = "lastConfirmed", skip_serializing_if = "Option::is_none")]
+    pub last_confirmed: Option<i64>,
+    /// What replaced it (superseded facts only).
+    #[serde(rename = "supersededBy", skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<LinkedFact>,
+    /// Its unresolved stale / wrong flags (flagged facts only).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub flags: Vec<FactFlag>,
+}
+
+impl MemoryFact {
+    /// Fill the derived fields from `t`.
+    fn apply_truth(&mut self, t: FactTruth) {
+        self.status = t.status;
+        self.replaces = t.replaces.first().map(|f| f.decided_at);
+        self.disputed_by = t.disputed_by;
+        self.support = t.support;
+        self.last_confirmed = t.last_confirmed;
+        self.superseded_by = t.superseded_by;
+        self.flags = t.flags;
+    }
 }
 
 /// Durable, aggregated knowledge for one project: decisions + gotchas + open TODOs
 /// distilled across all its threads, plus coverage so callers can prompt to distill more.
+///
+/// The three lists hold live facts only: never a superseded one, and a flagged one only when
+/// it is pinned (the user's trusted fact stays injected, labelled `flagged`). Disputed facts
+/// stay, labelled. `superseded` and `flagged` are filled only for a [`MemoryQuery`] with
+/// `history` (the Projects page): decisions and gotchas together, by the same order.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct ProjectMemory {
     pub project: String,
@@ -1248,6 +1475,12 @@ pub struct ProjectMemory {
     pub gotchas: Vec<MemoryFact>,
     #[serde(rename = "openTodos")]
     pub open_todos: Vec<MemoryFact>,
+    /// Replaced facts, kept as history (`history` queries only).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub superseded: Vec<MemoryFact>,
+    /// Facts with an unresolved stale / wrong flag, pinned ones included (`history` only).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub flagged: Vec<MemoryFact>,
     #[serde(rename = "threadCount")]
     pub thread_count: i64,
     #[serde(rename = "distilledCount")]
@@ -1293,69 +1526,84 @@ pub fn list_projects(conn: &Connection) -> Result<Vec<ProjectInfo>> {
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-/// Distilled facts of one `kind` across a project, newest first, deduped by text, capped.
-/// `exclude` leaves one extractor's facts out in SQL, before the cap and the dedupe, so a
-/// project with many of them (harvested auto memories sort by file mtime, so they are often
-/// the newest) can neither push the other facts out of the window nor shadow an identical
-/// fact from another extractor.
+/// Which facts [`project_facts`] reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Slice {
+    /// What memory injects: not superseded, and not flagged unless pinned.
+    Live,
+    /// Superseded (history).
+    Superseded,
+    /// Unresolved stale / wrong flag and not superseded, pinned ones included.
+    Flagged,
+}
+
+/// Distilled facts of one `kind` (None: decisions and gotchas) across a project, pinned first, then by session time (the later
+/// of when each was decided and last reaffirmed), deduped by text, capped. The `slice` filter
+/// runs in SQL so `limit` counts only facts of that slice. `exclude` leaves one extractor's
+/// facts out in SQL, before the cap and the dedupe, so a project with many of them
+/// (harvested auto memories sort by file mtime, so they are often the newest) can neither
+/// push the other facts out of the window nor shadow an identical fact from another
+/// extractor. Each fact comes with its uid; the derived fields are left at their defaults for
+/// [`get_project_memory_with`] to fill in one batch.
+#[allow(clippy::too_many_arguments)]
 fn project_facts(
     conn: &Connection,
-    kind: &str,
+    kind: Option<&str>,
     project: &str,
     open_only: bool,
     limit: usize,
     exclude: Option<&str>,
     borrowed: Option<&str>,
-) -> Result<Vec<MemoryFact>> {
-    // Match the canonical project key (callers pass it; falls back to project_path until
-    // backfill), so all of one repo's threads aggregate together. `borrowed` (a JSON array of
-    // uids, see [`repo_memory::BORROWED`]) adds the repo memory facts this project's files
-    // share with another clone of the same repo, which hold them under that clone's key.
-    let scope = if borrowed.is_some() {
-        "(COALESCE(t.project_key, t.project_path) = ?2
-              OR f.uid IN (SELECT value FROM json_each(?3)))"
-    } else {
-        "COALESCE(t.project_key, t.project_path) = ?2"
-    };
-    let mut sql = format!(
-        "SELECT f.id, f.thread_id, f.text, t.title, f.created_at, f.pinned, f.extractor, {}
-         FROM facts f JOIN threads t ON t.id = f.thread_id
-         WHERE f.kind = ?1 AND {scope} AND f.hidden = 0
-           AND (t.is_subagent = 0 OR f.pinned = 1)",
-        origin_ref_sql(conn)
-    );
-    // Pinned facts on subagent threads stay: the user curated them (see list_open_todos).
-    if open_only {
-        sql.push_str(" AND f.status = 'open'");
+    slice: Slice,
+) -> Result<Vec<(MemoryFact, String)>> {
+    let truth = truth::has_truth_tables(conn);
+    if !truth && slice != Slice::Live {
+        return Ok(Vec::new());
     }
+    let sql = project_facts_sql(
+        conn,
+        truth,
+        kind.is_some(),
+        borrowed.is_some(),
+        open_only,
+        exclude.is_some(),
+        slice,
+    );
+    // `?1` is the kind, unused (bound to '') for decisions and gotchas together.
+    let kind = kind.unwrap_or("");
     let mut params: Vec<&dyn rusqlite::ToSql> = vec![&kind, &project];
     if let Some(b) = &borrowed {
         params.push(b);
     }
     if let Some(x) = &exclude {
         params.push(x);
-        sql.push_str(&format!(" AND f.extractor != ?{}", params.len()));
     }
-    // Pinned facts first, then newest. Pinned ones are the user's trusted set.
-    sql.push_str(" ORDER BY f.pinned DESC, f.created_at DESC, f.id DESC");
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params.as_slice(), |r| {
-        Ok(MemoryFact {
-            id: r.get(0)?,
-            thread_id: r.get(1)?,
-            text: r.get(2)?,
-            title: r.get(3)?,
-            created_at: r.get(4)?,
-            pinned: r.get::<_, i64>(5)? != 0,
-            extractor: r.get(6)?,
-            origin_ref: r.get(7)?,
-        })
+        Ok((
+            MemoryFact {
+                id: r.get(0)?,
+                thread_id: r.get(1)?,
+                text: r.get(2)?,
+                title: r.get(3)?,
+                created_at: r.get(4)?,
+                pinned: r.get::<_, i64>(5)? != 0,
+                extractor: r.get(6)?,
+                origin_ref: r.get(7)?,
+                kind: r.get(8)?,
+                source: r.get(10)?,
+                decided_at: r.get(11)?,
+                support: 1,
+                ..Default::default()
+            },
+            r.get::<_, String>(9)?,
+        ))
     })?;
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
     for row in rows {
         let f = row?;
-        if seen.insert(f.text.trim().to_lowercase()) {
+        if seen.insert(f.0.text.trim().to_lowercase()) {
             out.push(f);
             if out.len() >= limit {
                 break;
@@ -1363,6 +1611,178 @@ fn project_facts(
         }
     }
     Ok(out)
+}
+
+/// The SQL of [`project_facts`]. Parameters: `?1` the kind (`''` when `kind` is false: then
+/// decisions and gotchas), `?2` the project key, then the borrowed uids (JSON) when
+/// `borrowed`, then the excluded extractor when `exclude`. `truth`: the index has 0035's
+/// tables (see [`truth::has_truth_tables`]); without them every fact reads as live.
+fn project_facts_sql(
+    conn: &Connection,
+    truth: bool,
+    kind: bool,
+    borrowed: bool,
+    open_only: bool,
+    exclude: bool,
+    slice: Slice,
+) -> String {
+    // Match the canonical project key (callers pass it; falls back to project_path until
+    // backfill), so all of one repo's threads aggregate together. `borrowed` (a JSON array of
+    // uids, see [`repo_memory::BORROWED`]) adds the repo memory facts this project's files
+    // share with another clone of the same repo, which hold them under that clone's key.
+    let scope = if borrowed {
+        "(COALESCE(t.project_key, t.project_path) = ?2
+              OR f.uid IN (SELECT value FROM json_each(?3)))"
+    } else {
+        "COALESCE(t.project_key, t.project_path) = ?2"
+    };
+    let kind_sql = if kind {
+        "f.kind = ?1"
+    } else {
+        "f.kind IN ('decision', 'gotcha') AND ?1 = ''"
+    };
+    // In SQL, so the caller's cap counts only facts of the slice.
+    let filter = match (truth, slice) {
+        (false, _) => String::new(),
+        (true, Slice::Live) => format!(
+            " AND NOT {} AND (f.pinned = 1 OR NOT {})",
+            truth::SUPERSEDED_SQL,
+            truth::FLAGGED_SQL
+        ),
+        (true, Slice::Superseded) => format!(" AND {}", truth::SUPERSEDED_SQL),
+        (true, Slice::Flagged) => format!(
+            " AND {} AND NOT {}",
+            truth::FLAGGED_SQL,
+            truth::SUPERSEDED_SQL
+        ),
+    };
+    // Pinned facts on subagent threads stay: the user curated them (see list_open_todos).
+    let mut sql = format!(
+        "SELECT f.id, f.thread_id, f.text, t.title, f.created_at, f.pinned, f.extractor, {},
+                f.kind, COALESCE(f.uid, ''), s.kind, {DECIDED_AT_SQL}
+         FROM facts f JOIN threads t ON t.id = f.thread_id
+         JOIN sources s ON s.id = t.source_id
+         WHERE {kind_sql} AND {scope} AND f.hidden = 0
+           AND (t.is_subagent = 0 OR f.pinned = 1){filter}",
+        origin_ref_sql(conn)
+    );
+    if open_only {
+        sql.push_str(" AND f.status = 'open'");
+    }
+    if exclude {
+        sql.push_str(&format!(
+            " AND f.extractor != ?{}",
+            3 + usize::from(borrowed)
+        ));
+    }
+    // Pinned facts first (the user's trusted set), then by session time, so a backlog
+    // distilled newest-first still ranks a reversal above the decision it reversed.
+    sql.push_str(&format!(
+        " ORDER BY f.pinned DESC, {} DESC, f.id DESC",
+        truth::recency_sql(truth)
+    ));
+    sql
+}
+
+/// What a project memory read returns ([`get_project_memory_with`]).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MemoryQuery<'a> {
+    /// Cap on each list.
+    pub per_kind: usize,
+    /// Leave this extractor's facts out (in SQL): [`harvest::EXTRACTOR_CLAUDE_MEMORY`] for the
+    /// surfaces Claude Code reads next to its own auto memory.
+    pub exclude: Option<&'a str>,
+    /// Also fill [`ProjectMemory::superseded`] and [`ProjectMemory::flagged`] (the Projects
+    /// page). Injection surfaces leave it off.
+    pub history: bool,
+    /// Count the project's distillable and distilled threads (about 0.85 ms; the hook skips
+    /// it).
+    pub coverage: bool,
+}
+
+/// A project's memory as `q` asks: the live lists always, the history lists and coverage
+/// counts when asked. The other `get_project_memory*` functions are shorthands for this.
+pub fn get_project_memory_with(
+    conn: &Connection,
+    project: &str,
+    q: &MemoryQuery,
+) -> Result<ProjectMemory> {
+    // Read once for the kinds: one `app_config` row, empty for nearly every project.
+    let borrowed = repo_memory::borrowed_uids(conn, project);
+    let borrowed = (!borrowed.is_empty())
+        .then(|| serde_json::to_string(&borrowed))
+        .transpose()?;
+    let b = borrowed.as_deref();
+    let (per_kind, exclude) = (q.per_kind, q.exclude);
+    let live = |kind: &str| {
+        project_facts(
+            conn,
+            Some(kind),
+            project,
+            false,
+            per_kind,
+            exclude,
+            b,
+            Slice::Live,
+        )
+    };
+    let history = |slice| {
+        if q.history {
+            project_facts(conn, None, project, false, per_kind, exclude, b, slice)
+        } else {
+            Ok(Vec::new())
+        }
+    };
+    let lists = [
+        live("decision")?,
+        live("gotcha")?,
+        project_facts(
+            conn,
+            Some("todo"),
+            project,
+            true,
+            per_kind,
+            exclude,
+            None,
+            Slice::Live,
+        )?,
+        history(Slice::Superseded)?,
+        history(Slice::Flagged)?,
+    ];
+    // One batch of status lookups for every list (TODOs carry no links).
+    let uids: Vec<&str> = lists
+        .iter()
+        .flatten()
+        .filter(|(f, _)| f.kind != "todo")
+        .map(|(_, u)| u.as_str())
+        .collect();
+    let truths = fact_truth(conn, &uids)?;
+    let [decisions, gotchas, open_todos, superseded, flagged] = lists.map(|list| {
+        list.into_iter()
+            .map(|(mut f, uid)| {
+                if let Some(t) = truths.get(&uid) {
+                    f.apply_truth(t.clone());
+                }
+                f
+            })
+            .collect::<Vec<_>>()
+    });
+    let mut mem = ProjectMemory {
+        decisions,
+        gotchas,
+        open_todos,
+        superseded,
+        flagged,
+        thread_count: 0,
+        distilled_count: 0,
+        pending_count: 0,
+        project: project.to_string(),
+    };
+    if q.coverage {
+        (mem.thread_count, mem.distilled_count) = project_coverage(conn, project)?;
+        mem.pending_count = (mem.thread_count - mem.distilled_count).max(0);
+    }
+    Ok(mem)
 }
 
 /// Aggregate a project's distilled memory. `per_kind` caps each list (decisions/gotchas/
@@ -1393,10 +1813,16 @@ fn project_memory(
     per_kind: usize,
     exclude: Option<&str>,
 ) -> Result<ProjectMemory> {
-    let mut mem = project_memory_facts(conn, project, per_kind, exclude)?;
-    (mem.thread_count, mem.distilled_count) = project_coverage(conn, project)?;
-    mem.pending_count = (mem.thread_count - mem.distilled_count).max(0);
-    Ok(mem)
+    get_project_memory_with(
+        conn,
+        project,
+        &MemoryQuery {
+            per_kind,
+            exclude,
+            coverage: true,
+            ..Default::default()
+        },
+    )
 }
 
 /// A project's distillable thread count and how many of them are distilled.
@@ -1444,21 +1870,15 @@ fn project_memory_facts(
     per_kind: usize,
     exclude: Option<&str>,
 ) -> Result<ProjectMemory> {
-    // Read once for the three kinds: one `app_config` row, empty for nearly every project.
-    let borrowed = repo_memory::borrowed_uids(conn, project);
-    let borrowed = (!borrowed.is_empty())
-        .then(|| serde_json::to_string(&borrowed))
-        .transpose()?;
-    let b = borrowed.as_deref();
-    Ok(ProjectMemory {
-        decisions: project_facts(conn, "decision", project, false, per_kind, exclude, b)?,
-        gotchas: project_facts(conn, "gotcha", project, false, per_kind, exclude, b)?,
-        open_todos: project_facts(conn, "todo", project, true, per_kind, exclude, None)?,
-        thread_count: 0,
-        distilled_count: 0,
-        pending_count: 0,
-        project: project.to_string(),
-    })
+    get_project_memory_with(
+        conn,
+        project,
+        &MemoryQuery {
+            per_kind,
+            exclude,
+            ..Default::default()
+        },
+    )
 }
 
 /// IDs of a project's not-yet-distilled threads, newest first — the batch-distill worklist.
@@ -1505,14 +1925,44 @@ pub fn record_fact(
     rationale: Option<&str>,
     now: i64,
 ) -> Result<i64> {
-    record_fact_with_origin(conn, project, kind, text, rationale, FactOrigin::Agent, now)
+    Ok(record_fact_with_origin(
+        conn,
+        project,
+        kind,
+        text,
+        rationale,
+        FactOrigin::Agent,
+        None,
+        now,
+    )?
+    .id)
+}
+
+/// What [`record_fact_with_origin`] wrote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordedFact {
+    /// The new fact's id (the caller embeds it via embed_pending_facts).
+    pub id: i64,
+    /// The `replaces` link's outcome, when one was asked for: stored as `supersedes`, or
+    /// downgraded to `contradicts` (an agent's target was pinned or edited, or
+    /// [`Self::capped`]), or rejected.
+    pub link: Option<LinkOutcome>,
+    /// The project already took [`AGENT_SUPERSEDE_CAP`] agent replacements within the window,
+    /// so this one was asked as `contradicts` (disputed, for the user to settle) instead.
+    pub capped: bool,
 }
 
 /// Record a fact (kind 'decision' or 'gotcha') for a project. Stored in a synthetic
 /// per-project "Recorded memory" thread and left ready to embed, so it flows through
 /// Project Memory and cross-thread recall like a distilled fact. User facts are pinned;
-/// agent facts rank by recency like distilled ones. Returns the new fact id (the caller
-/// embeds via embed_pending_facts).
+/// agent facts rank by recency like distilled ones.
+///
+/// `replaces` (a fact id): the new fact supersedes it, linked with source `user` or `agent`
+/// by origin through [`link_facts`], so an agent's link to a pinned or edited fact is stored
+/// as `contradicts`, and so is an agent's link past [`AGENT_SUPERSEDE_CAP`]. The fact is recorded whatever the link's outcome (a refused link is
+/// reported, not an error), but an error while linking records nothing: the caller sees a
+/// failure only when nothing was written, so an agent that retries cannot duplicate it.
+#[allow(clippy::too_many_arguments)]
 pub fn record_fact_with_origin(
     conn: &Connection,
     project: &str,
@@ -1520,11 +1970,28 @@ pub fn record_fact_with_origin(
     text: &str,
     rationale: Option<&str>,
     origin: FactOrigin,
+    replaces: Option<i64>,
     now: i64,
-) -> Result<i64> {
+) -> Result<RecordedFact> {
     if !matches!(kind, "decision" | "gotcha") {
         anyhow::bail!("record_fact kind must be 'decision' or 'gotcha'");
     }
+    truth::atomic(conn, |conn| {
+        record_fact_once(conn, project, kind, text, rationale, origin, replaces, now)
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_fact_once(
+    conn: &Connection,
+    project: &str,
+    kind: &str,
+    text: &str,
+    rationale: Option<&str>,
+    origin: FactOrigin,
+    replaces: Option<i64>,
+    now: i64,
+) -> Result<RecordedFact> {
     let tid = notes_thread_id(conn, project, now)?;
     conn.execute(
         "INSERT INTO facts
@@ -1541,7 +2008,29 @@ pub fn record_fact_with_origin(
             new_fact_uid()
         ],
     )?;
-    Ok(conn.last_insert_rowid())
+    let id = conn.last_insert_rowid();
+    let mut capped = false;
+    let link = match replaces {
+        Some(old) => {
+            let source = match origin {
+                FactOrigin::User => LinkSource::User,
+                FactOrigin::Agent => LinkSource::Agent,
+            };
+            // Counted inside this transaction, so two writers cannot both take the last slot.
+            capped = origin == FactOrigin::Agent
+                && truth::agent_supersedes_recent(conn, project, now)? >= AGENT_SUPERSEDE_CAP;
+            let kind = if capped {
+                LinkKind::Contradicts
+            } else {
+                LinkKind::Supersedes
+            };
+            Some(link_facts(conn, id, old, kind, source, None, now)?)
+        }
+        None => None,
+    };
+    // A refused link wrote nothing, so the cap did not change what was stored.
+    let capped = capped && link.is_some_and(|l| l.link_id().is_some());
+    Ok(RecordedFact { id, link, capped })
 }
 
 /// `facts.extractor` of a failure playbook: the gotcha `issues::refresh_clusters` records when a
@@ -1642,6 +2131,29 @@ pub fn project_decisions(conn: &Connection, project: &str) -> Result<Vec<(i64, S
     let rows = stmt.query_map([project], |r| {
         Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
     })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// A project's visible decisions that are not superseded, with when each was decided, newest
+/// first: what conflict review compares (a pair a supersede already settled is not a
+/// conflict any more).
+pub fn project_decisions_dated(
+    conn: &Connection,
+    project: &str,
+) -> Result<Vec<(i64, String, i64)>> {
+    let live = if truth::has_truth_tables(conn) {
+        format!(" AND NOT {}", truth::SUPERSEDED_SQL)
+    } else {
+        String::new()
+    };
+    let mut stmt = conn.prepare(&format!(
+        "SELECT f.id, f.text, {DECIDED_AT_SQL} AS decided
+         FROM facts f JOIN threads t ON t.id = f.thread_id
+         WHERE f.kind = 'decision' AND COALESCE(t.project_key, t.project_path) = ?1
+           AND f.hidden = 0{live}
+         ORDER BY decided DESC, f.id DESC"
+    ))?;
+    let rows = stmt.query_map([project], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
@@ -1984,6 +2496,35 @@ pub fn rekey_project_keys(conn: &Connection) -> Result<usize> {
 mod tests {
     use super::*;
 
+    /// The live-only memory read (the hook's hot path) checks supersession by an index probe
+    /// per fact, never a scan of `fact_links` or `fact_signals`, for every shape of the query.
+    #[test]
+    fn live_memory_filter_probes_the_truth_indexes() {
+        let conn = temp_db();
+        for (borrowed, exclude) in [(false, false), (false, true), (true, true)] {
+            let sql = project_facts_sql(&conn, true, true, borrowed, false, exclude, Slice::Live);
+            let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            let n = stmt.parameter_count();
+            let args: Vec<String> = (0..n).map(|_| "x".to_string()).collect();
+            let plan = stmt
+                .query_map(rusqlite::params_from_iter(args.iter()), |r| {
+                    r.get::<_, String>(3)
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+                .join(" | ");
+            assert!(plan.contains("idx_fact_links_to"), "{plan}");
+            assert!(plan.contains("idx_fact_signals_fact"), "{plan}");
+            assert!(!plan.contains("SCAN lk"), "{plan}");
+            assert!(!plan.contains("SCAN sg"), "{plan}");
+            assert!(!plan.contains("SCAN nf"), "{plan}");
+            if !borrowed {
+                assert!(!plan.contains("SCAN f "), "{plan}");
+            }
+        }
+    }
+
     #[test]
     fn search_facts_matches_every_word_pinned_first_in_one_project() {
         use crate::export::digest_test_support as dts;
@@ -2152,6 +2693,27 @@ mod tests {
         assert!(extract_todos("日本語のテキスト").is_empty());
     }
 
+    /// The app's own fences are never mined: the compaction anchor (its heading or a bare
+    /// `<session_prompts>` block) quotes the user's prompts, and the distiller's
+    /// `<existing_memory>` list quotes stored facts.
+    #[test]
+    fn the_anchor_and_the_distiller_memory_list_are_injected_context() {
+        let anchor = format!(
+            "{}\n<session_prompts>\n[2026-11-08 09:14] TODO: wire up auth\n</session_prompts>",
+            crate::anchor::ANCHOR_HEADING
+        );
+        let bare = "<session_prompts omitted=\"3\">\n- [ ] add the hook test\n</session_prompts>";
+        let memory = "<existing_memory session_started=\"2026-10-12\">\nD1 (2026-10-01): TODO: \
+                      use JSON\n</existing_memory>";
+        for text in [anchor.as_str(), bare, memory] {
+            assert!(is_injected_context(text), "{text}");
+            assert!(extract_todos(text).is_empty(), "{text}");
+        }
+        assert!(!is_injected_context(
+            "TODO: a real prompt about <session_prompts"
+        ));
+    }
+
     #[test]
     fn todo_created_at_uses_message_time() {
         assert_eq!(
@@ -2246,8 +2808,9 @@ mod tests {
             summary: "did auth".into(),
             decisions: vec!["use jwt".into(), "  ".into()],
             gotchas: vec!["clock skew".into()],
+            ..Default::default()
         };
-        store_distilled(&mut conn, id, &d, 100).unwrap();
+        store_distilled(&mut conn, id, &d, &RefMap::default(), 100).unwrap();
         let k = get_thread_knowledge(&conn, id).unwrap();
         assert_eq!(k.summary.as_deref(), Some("did auth"));
         assert_eq!(k.decisions.len(), 1);
@@ -2281,8 +2844,9 @@ mod tests {
             summary: "did auth, then more".into(),
             decisions: vec!["use jwt with refresh".into()],
             gotchas: Vec::new(),
+            ..Default::default()
         };
-        store_distilled(&mut conn, id, &d2, 200).unwrap();
+        store_distilled(&mut conn, id, &d2, &RefMap::default(), 200).unwrap();
         let k3 = get_thread_knowledge(&conn, id).unwrap();
         assert!(k3.extracted && !k3.stale);
         assert_eq!(k3.decisions.len(), 1);
@@ -2377,8 +2941,9 @@ mod tests {
             summary: "Built the exporter.".into(),
             decisions: vec!["Use SQLite".into(), "Ship weekly".into()],
             gotchas: vec!["WAL needs a checkpoint".into()],
+            ..Default::default()
         };
-        store_distilled(&mut conn, tid, &first, 1).unwrap();
+        store_distilled(&mut conn, tid, &first, &RefMap::default(), 1).unwrap();
         let (decisions, gotchas, summary) = (
             uid_of(&conn, "decision"),
             uid_of(&conn, "gotcha"),
@@ -2390,8 +2955,9 @@ mod tests {
             summary: "Built the exporter and its tests.".into(),
             decisions: vec!["use sqlite ".into(), "Pin the toolchain".into()],
             gotchas: vec!["WAL needs a checkpoint".into()],
+            ..Default::default()
         };
-        store_distilled(&mut conn, tid, &again, 2).unwrap();
+        store_distilled(&mut conn, tid, &again, &RefMap::default(), 2).unwrap();
         let decisions2 = uid_of(&conn, "decision");
         assert_eq!(decisions2[0].1, decisions[0].1, "same decision, same uid");
         assert_ne!(
@@ -2443,8 +3009,9 @@ mod tests {
             summary: String::new(),
             decisions: vec![dec.into()],
             gotchas: vec![],
+            ..Default::default()
         };
-        store_distilled(&mut conn, tid, &d("use sqlite"), 1).unwrap();
+        store_distilled(&mut conn, tid, &d("use sqlite"), &RefMap::default(), 1).unwrap();
         let fid: i64 = conn
             .query_row(
                 "SELECT id FROM facts WHERE thread_id=?1 AND kind='decision'",
@@ -2455,7 +3022,7 @@ mod tests {
         set_fact_pinned(&conn, fid, true).unwrap();
 
         // Re-distill with a DIFFERENT decision: the pinned one must survive.
-        store_distilled(&mut conn, tid, &d("use postgres"), 2).unwrap();
+        store_distilled(&mut conn, tid, &d("use postgres"), &RefMap::default(), 2).unwrap();
         let texts: Vec<String> = {
             let mut s = conn
                 .prepare(
@@ -2558,6 +3125,7 @@ mod tests {
             "user says: keep sqlite",
             None,
             FactOrigin::User,
+            None,
             50,
         )
         .unwrap();
@@ -2672,12 +3240,14 @@ mod tests {
         )
         .unwrap();
 
-        let hits = recall(&conn, &v, "decision", None, 5).unwrap();
+        let hits = recall(&conn, &v, "decision", None, 5, false).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].text, "use jwt for auth");
         assert!(hits[0].similarity > 0.99);
         // Kind filter excludes non-matching kinds.
-        assert!(recall(&conn, &v, "gotcha", None, 5).unwrap().is_empty());
+        assert!(recall(&conn, &v, "gotcha", None, 5, false)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -2805,7 +3375,7 @@ mod tests {
         let qv = near.clone();
 
         // Floor: the orthogonal fact is dropped, only the genuine match returns.
-        let hits = recall(&conn, &qv, "decision", None, 5).unwrap();
+        let hits = recall(&conn, &qv, "decision", None, 5, false).unwrap();
         assert_eq!(hits.len(), 1, "similarity floor drops the orthogonal fact");
         assert_eq!(hits[0].text, "use jwt for auth");
 
@@ -2817,14 +3387,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            recall(&conn, &qv, "decision", Some("myproj"), 5)
+            recall(&conn, &qv, "decision", Some("myproj"), 5, false)
                 .unwrap()
                 .len(),
             1,
             "scoped recall matches on project_key"
         );
         assert!(
-            recall(&conn, &qv, "decision", Some("nope"), 5)
+            recall(&conn, &qv, "decision", Some("nope"), 5, false)
                 .unwrap()
                 .is_empty(),
             "non-matching project is excluded"

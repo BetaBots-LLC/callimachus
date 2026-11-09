@@ -30,9 +30,16 @@
 //!   remote (another local key with the same portable id) reads the facts the first one
 //!   holds through [`BORROWED`].
 //!
+//! - Reversals travel too: a line's `supersedes` lists the uids of the facts it replaces
+//!   (written by publish from the fact's active `supersedes` links), and an import links the
+//!   line's fact to each listed fact it holds in the same repo, with source `repo` (no
+//!   downgrade of a pinned target: a person published the line). The import keeps those
+//!   links in step with the field, so a line that drops it unlinks.
+//!
 //! Imported facts are the team's, so the SessionStart hook and the AGENTS.md block include
-//! them, marked `(repo)` under a trust line that names the files
-//! (`export::REPO_TRUST_LINE`); MCP results carry `extractor: "repo"`.
+//! them, marked `repo` in each line's provenance suffix (`export::provenance`) under a trust
+//! line that names the files (`export::REPO_TRUST_LINE`); MCP results carry
+//! `extractor: "repo"`.
 
 use crate::context::redact_secrets;
 use anyhow::{Context as _, Result};
@@ -71,6 +78,9 @@ const TEXT_MAX: usize = 2_000;
 const RATIONALE_MAX: usize = 4_000;
 /// A uid longer than this is not one Callimachus wrote (a v4 UUID is 36).
 const UID_MAX: usize = 64;
+/// Most `supersedes` uids an import reads from one line: a fact replaces one or two others,
+/// and a hostile line must not fan out over a whole project.
+const SUPERSEDES_MAX: usize = 8;
 /// Most bytes read from one file (about 10k facts; a real repo has dozens). Enforced on the
 /// read itself: a symlink to /dev/zero stats as 0 bytes.
 pub const MAX_FILE_BYTES: u64 = 4 << 20;
@@ -115,6 +125,9 @@ pub struct RepoFact {
     /// Where below the toplevel the fact's session ran, when it was not the toplevel.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subpath: Option<String>,
+    /// The uids of the facts this one replaces (its active `supersedes` links), sorted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supersedes: Vec<String>,
 }
 
 fn default_by() -> String {
@@ -355,13 +368,17 @@ fn read_file(path: &Path, strict: bool) -> Result<Option<(Vec<Line>, usize)>> {
 }
 
 fn valid(f: &RepoFact) -> bool {
-    !f.uid.is_empty()
-        && f.uid.len() <= UID_MAX
-        && f.uid
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+    valid_uid(&f.uid)
         && matches!(f.kind.as_str(), "decision" | "gotcha")
         && !f.text.trim().is_empty()
+}
+
+fn valid_uid(uid: &str) -> bool {
+    !uid.is_empty()
+        && uid.len() <= UID_MAX
+        && uid
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
 }
 
 fn cap(s: &str, max: usize) -> String {
@@ -455,7 +472,12 @@ fn subpath_of(project: &str, project_path: Option<&str>) -> Option<String> {
     (!rest.is_empty()).then(|| rest.replace('\\', "/"))
 }
 
-fn entry_of(r: &LocalRow, project_key: &str, portable: Option<&str>) -> RepoFact {
+fn entry_of(
+    r: &LocalRow,
+    project_key: &str,
+    portable: Option<&str>,
+    links: &HashMap<String, Vec<String>>,
+) -> RepoFact {
     RepoFact {
         uid: r.uid.clone(),
         kind: r.kind.clone(),
@@ -471,6 +493,7 @@ fn entry_of(r: &LocalRow, project_key: &str, portable: Option<&str>) -> RepoFact
         created_at: r.created_at,
         project: portable.map(str::to_string),
         subpath: subpath_of(project_key, r.project_path.as_deref()),
+        supersedes: links.get(&r.uid).cloned().unwrap_or_default(),
     }
 }
 
@@ -523,6 +546,21 @@ pub(crate) fn plan_publish_with(
     }
     let rows = local_rows(conn, project)?;
     let local: HashMap<&str, &LocalRow> = rows.iter().map(|r| (r.uid.as_str(), r)).collect();
+    // What each published fact supersedes, limited to facts a teammate can know: this
+    // project's own and the lines already in the files.
+    let links = {
+        let from: Vec<&str> = rows
+            .iter()
+            .filter(|r| publishable(r, all))
+            .map(|r| r.uid.as_str())
+            .collect();
+        let mut links = super::truth::superseded_uids(conn, &from)?;
+        for targets in links.values_mut() {
+            targets.retain(|t| local.contains_key(t.as_str()) || existing.contains_key(t));
+        }
+        links.retain(|_, t| !t.is_empty());
+        links
+    };
 
     let mut plan = PublishPlan {
         root: root.to_string_lossy().into_owned(),
@@ -566,7 +604,7 @@ pub(crate) fn plan_publish_with(
                 }
             }
             Some(r) if publishable(r, all) => {
-                let e = entry_of(r, project, portable);
+                let e = entry_of(r, project, portable, &links);
                 if e == *f {
                     keep(&mut next);
                 } else {
@@ -585,7 +623,7 @@ pub(crate) fn plan_publish_with(
         .collect();
     fresh.sort_by(|a, b| a.uid.cmp(&b.uid));
     for r in fresh {
-        let e = entry_of(r, project, portable);
+        let e = entry_of(r, project, portable, &links);
         plan.added.push(FactChange::of(&e.uid, &e.kind, &e.text));
         next.insert(e.uid.clone(), (e.kind.clone(), serde_json::to_string(&e)?));
     }
@@ -756,6 +794,12 @@ enum ImportWrite {
         id: i64,
         origin: String,
     },
+    /// Bring the `repo` links from `from` in line with its line's `supersedes`.
+    Links {
+        from: String,
+        add: Vec<String>,
+        remove: Vec<String>,
+    },
 }
 
 struct ImportPlan {
@@ -848,6 +892,9 @@ fn plan_import_with(
     let mut writes = Vec::new();
     let mut borrowed = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
+    // Lines whose fact the import owns (new, or an imported copy it keeps in step), for the
+    // link pass below: (line, whether it is new).
+    let mut linkable: Vec<(&RepoFact, bool)> = Vec::new();
     for (file, lines) in &files {
         let origin = origin_ref(file);
         for f in lines {
@@ -876,6 +923,7 @@ fn plan_import_with(
                 })
                 .optional()?;
             let Some(k) = found else {
+                linkable.push((f, true));
                 report.added.push(FactChange::of(&f.uid, &f.kind, &text));
                 writes.push(ImportWrite::Insert {
                     uid: f.uid.clone(),
@@ -921,6 +969,9 @@ fn plan_import_with(
                     restore: false,
                 });
             }
+            if !k.hidden || was_removed {
+                linkable.push((f, false));
+            }
             // A local edit wins over the file, as a re-distill keeps an edited fact; a copy
             // the user hid is left exactly as they hid it (only the import's own hide, a
             // removed line coming back, is undone above).
@@ -941,6 +992,95 @@ fn plan_import_with(
                 });
             }
         }
+    }
+
+    // Each owned line's `supersedes`, as links. A target counts when this repo holds it (in
+    // the family, same kind) or this import adds it; anything else (a teammate's fact not
+    // here, another repo's uid, a kind mismatch) is ignored, so a hostile line cannot reach
+    // facts outside the repo.
+    let new_kinds: HashMap<&str, &str> = linkable
+        .iter()
+        .filter(|(_, new)| *new)
+        .map(|(f, _)| (f.uid.as_str(), f.kind.as_str()))
+        .collect();
+    //
+    // A wanted target the link writer would refuse (hidden here, which was the only way to
+    // retire a replaced decision before 0035, a pair whose link the user undid in either
+    // direction or settled as "both stand", or one that would close a cycle) is `blocked`:
+    // neither added nor, if a link to it is already there, removed. Without that the line
+    // would plan the same refused write, and show as updated, on every import.
+    let truth = super::truth::has_truth_tables(conn);
+    for (f, _) in linkable.iter().filter(|_| truth) {
+        let mut want: Vec<String> = Vec::new();
+        let mut blocked: Vec<String> = Vec::new();
+        for t in f.supersedes.iter().take(SUPERSEDES_MAX) {
+            if !valid_uid(t) || *t == f.uid || want.contains(t) || blocked.contains(t) {
+                continue;
+            }
+            let ok = match new_kinds.get(t.as_str()) {
+                Some(kind) => *kind == f.kind,
+                None => {
+                    let local = conn
+                        .query_row(BY_UID_SQL, [t], |r| {
+                            Ok((
+                                r.get::<_, String>(6)?,
+                                r.get::<_, String>(8)?,
+                                r.get::<_, i64>(3)? != 0,
+                            ))
+                        })
+                        .optional()?;
+                    match local {
+                        Some((kind, project, hidden))
+                            if kind == f.kind && family.contains(&project) =>
+                        {
+                            if hidden {
+                                blocked.push(t.clone());
+                                false
+                            } else {
+                                true
+                            }
+                        }
+                        _ => false,
+                    }
+                }
+            };
+            if !ok {
+                continue;
+            }
+            if super::truth::pair_dismissed(conn, &f.uid, t)?
+                || super::truth::supersedes_path(conn, t, &f.uid)?
+            {
+                blocked.push(t.clone());
+            } else {
+                want.push(t.clone());
+            }
+        }
+        want.sort();
+        let links = super::truth::supersedes_links_from(conn, &f.uid)?;
+        let add: Vec<String> = want
+            .iter()
+            .filter(|t| !links.iter().any(|(to, _)| to == *t))
+            .cloned()
+            .collect();
+        let remove: Vec<String> = links
+            .into_iter()
+            .filter(|(to, source)| source == "repo" && !want.contains(to) && !blocked.contains(to))
+            .map(|(to, _)| to)
+            .collect();
+        if add.is_empty() && remove.is_empty() {
+            continue;
+        }
+        let listed = |l: &[FactChange]| l.iter().any(|c| c.uid == f.uid);
+        if !listed(&report.added) && !listed(&report.updated) && !listed(&report.restored) {
+            report
+                .updated
+                .push(FactChange::of(&f.uid, &f.kind, &cap(&f.text, TEXT_MAX)));
+        }
+        writes.push(ImportWrite::Links {
+            from: f.uid.clone(),
+            add,
+            remove,
+        });
     }
 
     // Lines that left the files: hide their visible imported copies, across the family,
@@ -1071,6 +1211,30 @@ pub fn import_repo(conn: &Connection, root: &Path, now: i64, review: bool) -> Re
                     "UPDATE facts SET hidden = 1, origin_ref = ?2 WHERE id = ?1",
                     params![id, origin],
                 )?;
+            }
+            // After the inserts (the plan lists them first), so a target added by this
+            // import exists. The plan checked the family; link_uids still refuses self
+            // links, cycles and hidden facts.
+            ImportWrite::Links { from, add, remove } => {
+                for to in remove {
+                    tx.execute(
+                        "DELETE FROM fact_links WHERE from_uid = ?1 AND to_uid = ?2
+                           AND kind = 'supersedes' AND source = 'repo'",
+                        params![from, to],
+                    )?;
+                }
+                for to in add {
+                    super::truth::link_uids(
+                        &tx,
+                        from,
+                        to,
+                        super::truth::LinkKind::Supersedes,
+                        super::truth::LinkSource::Repo,
+                        None,
+                        now,
+                        false,
+                    )?;
+                }
             }
         }
     }
@@ -1363,7 +1527,9 @@ mod tests {
     }
 
     fn record(conn: &Connection, project: &str, kind: &str, text: &str, origin: FactOrigin) -> i64 {
-        record_fact_with_origin(conn, project, kind, text, None, origin, 1_000).unwrap()
+        record_fact_with_origin(conn, project, kind, text, None, origin, None, 1_000)
+            .unwrap()
+            .id
     }
 
     /// A distilled fact on a real session thread of `project` running in `path`.
@@ -1421,6 +1587,224 @@ mod tests {
         .unwrap()
         .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap()
+    }
+
+    /// A reversal travels with the files: publish writes the newer line's `supersedes`, an
+    /// import links it (source `repo`, no downgrade), and the preview shows a change of the
+    /// field alone, both ways.
+    #[test]
+    fn supersedes_round_trips_through_repo_memory() {
+        use crate::knowledge::truth::{fact_truth, FactStatus, LinkKind, LinkSource};
+        let (root, key) = checkout("supersedes");
+        let a = temp_db();
+        let old = record(&a, &key, "decision", "Cache with bincode", FactOrigin::User);
+        let new = record(&a, &key, "decision", "Cache with JSON", FactOrigin::User);
+        publish_here(&a, &root, &key, false);
+        assert!(!file(&root, "decisions.jsonl").contains("supersedes"));
+
+        // Only the link changed: the preview lists the newer line as updated.
+        crate::knowledge::link_facts(
+            &a,
+            new,
+            old,
+            LinkKind::Supersedes,
+            LinkSource::User,
+            None,
+            2,
+        )
+        .unwrap();
+        let plan = plan_publish_with(&a, &root, &key, Some("github.com/acme/app"), false).unwrap();
+        assert!(plan.changed);
+        assert_eq!(plan.updated.len(), 1);
+        assert_eq!(plan.updated[0].uid, uid_of(&a, new));
+        apply_publish(&plan).unwrap();
+        let line: RepoFact = serde_json::from_str(
+            file(&root, "decisions.jsonl")
+                .lines()
+                .find(|l| l.contains(&uid_of(&a, new)))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(line.supersedes, vec![uid_of(&a, old)]);
+
+        // Another machine imports both and the link; its memory shows only the newer one.
+        let b = temp_db();
+        let r = import_repo(&b, &root, 5_000, false).unwrap();
+        assert_eq!(r.added.len(), 2);
+        let links: Vec<(String, String, String)> = b
+            .prepare("SELECT from_uid, to_uid, source FROM fact_links")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            links,
+            vec![(uid_of(&a, new), uid_of(&a, old), "repo".into())]
+        );
+        let mem = crate::knowledge::get_project_memory(&b, &key, 20).unwrap();
+        let texts: Vec<&str> = mem.decisions.iter().map(|f| f.text.as_str()).collect();
+        assert_eq!(texts, ["Cache with JSON"]);
+        assert!(!import_repo(&b, &root, 5_000, false).unwrap().changed());
+
+        // The publisher undoes the reversal: the field goes, and the import unlinks.
+        crate::knowledge::unlink_facts(&a, new, old, None, 4_000).unwrap();
+        let plan = publish_here(&a, &root, &key, false);
+        assert_eq!(plan.updated.len(), 1);
+        assert!(!file(&root, "decisions.jsonl").contains("supersedes"));
+        let preview = plan_import(&b, &root).unwrap();
+        assert_eq!(preview.updated.len(), 1, "{preview:?}");
+        import_repo(&b, &root, 5_000, false).unwrap();
+        let old_uid = uid_of(&a, old);
+        assert_eq!(
+            fact_truth(&b, &[&old_uid]).unwrap()[&old_uid].status,
+            FactStatus::Current
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A line's `supersedes` that this index already satisfies another way (the user linked
+    /// the pair), or that the link writer would refuse (the target is hidden here), plans no
+    /// write: the line does not show as updated on every import.
+    #[test]
+    fn imported_supersedes_already_satisfied_or_refused_change_nothing() {
+        use crate::knowledge::truth::{LinkKind, LinkSource};
+        let (root, key) = checkout("supersedes_settled");
+        let a = temp_db();
+        let old = record(&a, &key, "decision", "Cache with bincode", FactOrigin::User);
+        let new = record(&a, &key, "decision", "Cache with JSON", FactOrigin::User);
+        crate::knowledge::link_facts(
+            &a,
+            new,
+            old,
+            LinkKind::Supersedes,
+            LinkSource::User,
+            None,
+            2,
+        )
+        .unwrap();
+        publish_here(&a, &root, &key, false);
+        let b = temp_db();
+        import_repo(&b, &root, 5_000, false).unwrap();
+        let id_in_b = |id| -> i64 {
+            b.query_row(
+                "SELECT id FROM facts WHERE uid = ?1",
+                [uid_of(&a, id)],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let (old_b, new_b) = (id_in_b(old), id_in_b(new));
+        let unchanged = |why: &str| {
+            let preview = plan_import(&b, &root).unwrap();
+            assert!(preview.updated.is_empty(), "{why}: {preview:?}");
+            for _ in 0..2 {
+                assert!(
+                    !import_repo(&b, &root, 5_000, false).unwrap().changed(),
+                    "{why}"
+                );
+            }
+        };
+
+        // The user's own link for the pair satisfies the line and is left theirs.
+        b.execute("DELETE FROM fact_links", []).unwrap();
+        crate::knowledge::link_facts(
+            &b,
+            new_b,
+            old_b,
+            LinkKind::Supersedes,
+            LinkSource::User,
+            None,
+            6_000,
+        )
+        .unwrap();
+        unchanged("user link");
+        let source: String = b
+            .query_row("SELECT source FROM fact_links", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(source, "user");
+
+        // The target hidden here (how a replaced decision was retired before links): the
+        // link is refused, so it is not planned again and again.
+        b.execute("DELETE FROM fact_links", []).unwrap();
+        crate::knowledge::set_fact_hidden(&b, old_b, true).unwrap();
+        unchanged("hidden target");
+        crate::knowledge::set_fact_hidden(&b, old_b, false).unwrap();
+
+        // The user undid a link for the pair that is not the line's own row: the reverse
+        // `supersedes`, or a `contradicts` they settled as "both stand". The import is
+        // refused for a dismissed pair, so it must not plan the link on every run either.
+        let undone = |from: i64, to: i64, kind: LinkKind| {
+            b.execute("DELETE FROM fact_links", []).unwrap();
+            let id = match crate::knowledge::link_facts(
+                &b,
+                from,
+                to,
+                kind,
+                LinkSource::User,
+                None,
+                6_000,
+            )
+            .unwrap()
+            {
+                crate::knowledge::truth::LinkOutcome::Linked { id, .. } => id,
+                other => panic!("{other:?}"),
+            };
+            assert!(crate::knowledge::truth::unlink_link(&b, id, 7_000).unwrap());
+        };
+        undone(old_b, new_b, LinkKind::Supersedes);
+        unchanged("reverse link undone");
+        undone(new_b, old_b, LinkKind::Contradicts);
+        unchanged("both stand");
+        undone(old_b, new_b, LinkKind::Contradicts);
+        unchanged("both stand, other direction");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A line cannot reach a fact outside its repo, nor link a fact to itself.
+    #[test]
+    fn imported_supersedes_ignore_uids_outside_the_repo() {
+        let (root, key) = checkout("supersedes_hostile");
+        let conn = temp_db();
+        let elsewhere = record(
+            &conn,
+            "/other/repo",
+            "decision",
+            "Elsewhere",
+            FactOrigin::User,
+        );
+        let target = uid_of(&conn, elsewhere);
+        std::fs::create_dir_all(memory_dir(&root)).unwrap();
+        let line = RepoFact {
+            uid: "11111111-2222-4333-8444-555555555555".into(),
+            kind: "decision".into(),
+            text: "Hostile line".into(),
+            rationale: None,
+            pinned: false,
+            by: "user".into(),
+            created_at: 1,
+            project: None,
+            subpath: None,
+            supersedes: vec![
+                target.clone(),
+                "11111111-2222-4333-8444-555555555555".into(),
+                "../../etc".into(),
+            ],
+        };
+        std::fs::write(
+            memory_dir(&root).join("decisions.jsonl"),
+            format!("{}\n", serde_json::to_string(&line).unwrap()),
+        )
+        .unwrap();
+        let r = import_repo(&conn, &root, 100, false).unwrap();
+        assert_eq!(r.added.len(), 1);
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM fact_links", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        let _ = (key, std::fs::remove_dir_all(&root));
     }
 
     #[test]
@@ -2013,7 +2397,9 @@ mod tests {
             None,
             &crate::export::MemoryBudget::HOOK,
         );
-        assert!(md.ends_with("- Team gotcha (repo)"), "{md}");
+        // Dated like every line, and marked `repo` where the date's provenance goes.
+        assert!(md.contains("\n- Team gotcha ("), "{md}");
+        assert!(md.ends_with(", repo)"), "{md}");
         assert!(md.contains(crate::export::REPO_TRUST_LINE), "{md}");
         let body = crate::export::agents_file_body(&conn, &key).unwrap();
         assert!(

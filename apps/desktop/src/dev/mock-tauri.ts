@@ -3,10 +3,14 @@
 //   http://localhost:1420/mock.html?view=settings&section=engine&theme=light
 // Params: theme, consent, memory (alias: knowledge), engines, agents, agenthooks, plugin, claude, keys,
 // update, jobs, semantic, searchMs, onboarding, ledger, chats, projectdata, lastproject, muted,
-// sections, today, scope, cliwatch, repomemory, report (see SCENARIO below). mock-entry.ts also reads view, section,
+// sections, today, scope, cliwatch, repomemory, report, truth, conflicts (see SCENARIO below). mock-entry.ts also reads view, section,
 // chatmode=ask and ask=<question> (sends it on load). Dev-only.
 import type {
   AgentHooksStatus,
+  Conflict,
+  FactFlag,
+  LinkKind,
+  LinkOutcome,
   AgentIntegration,
   AutoDistillBudget,
   AgentView,
@@ -149,6 +153,12 @@ const SCENARIO = {
   // two (no spend, no prompts asked again, no files), or an index with nothing in it. Also
   // whether Today's report card shows (`reportstep=unset`, the default) or was answered.
   report: pick("report", ["large", "small", "empty"] as const, "large"),
+  // Project memory's truth: plain dated facts (default), or with a decision that replaced
+  // an older one (Replaced group), a disputed pair, flagged facts (one pinned, so it stays
+  // listed), or all of them plus a decision three sessions confirmed.
+  truth: pick("truth", ["none", "superseded", "disputed", "flagged", "all"] as const, "none"),
+  // Review conflicts: nothing found (default), or a dated reversal and a dated conflict.
+  conflicts: pick("conflicts", ["none", "some"] as const, "none"),
   reportstep: pick("reportstep", ["unset", "done", "skipped"] as const, "unset"),
 };
 
@@ -1146,6 +1156,70 @@ function repoPublishPlan(project: string, all: boolean): RepoPublishPlan {
   };
 }
 
+// Fact truth (`truth=` scenario): which fact replaces which (older id -> newer id), which
+// pairs are disputed, and the unresolved flags. link_facts / unlink_facts /
+// resolve_fact_flags edit these, so the Memory section's actions show their result.
+const truthOn = (k: "superseded" | "disputed" | "flagged") =>
+  SCENARIO.truth === k || SCENARIO.truth === "all";
+const memTruth = {
+  replacedBy: new Map<number, number>(truthOn("superseded") ? [[8, 9]] : []),
+  disputes: truthOn("disputed") ? [[10, 11] as [number, number]] : [],
+  flags: new Map<number, FactFlag>(
+    truthOn("flagged")
+      ? [
+          [
+            12,
+            {
+              id: 1,
+              kind: "stale",
+              source: "agent",
+              reason: "The sandbox accepts any amount since the v3 API.",
+              createdAt: NOW - 1 * DAY,
+            },
+          ],
+          [
+            1,
+            {
+              id: 2,
+              kind: "stale",
+              source: "distill",
+              reason: "a later session shows it no longer holds",
+              createdAt: NOW - 2 * DAY,
+            },
+          ],
+        ]
+      : [],
+  ),
+};
+
+function linkMock(a: Args): LinkOutcome {
+  const [from, to, kind] = [Number(a.fromId), Number(a.toId), String(a.kind) as LinkKind];
+  if (from === to) return { outcome: "rejected", reason: "selfLink" };
+  if (kind === "supersedes") {
+    if (memTruth.replacedBy.get(from) === to) return { outcome: "rejected", reason: "cycle" };
+    memTruth.replacedBy.set(to, from);
+    // A replace settles the pair's dispute.
+    memTruth.disputes = memTruth.disputes.filter(
+      ([x, y]) => !((x === from && y === to) || (x === to && y === from)),
+    );
+  } else {
+    memTruth.disputes.push([from, to]);
+  }
+  return { outcome: "linked", id: 100 + from, kind };
+}
+
+function unlinkMock(a: Args): number {
+  const [from, to] = [Number(a.fromId), Number(a.toId)];
+  if (a.kind === "contradicts") {
+    const before = memTruth.disputes.length;
+    memTruth.disputes = memTruth.disputes.filter(
+      ([x, y]) => !((x === from && y === to) || (x === to && y === from)),
+    );
+    return before - memTruth.disputes.length;
+  }
+  return memTruth.replacedBy.get(to) === from && memTruth.replacedBy.delete(to) ? 1 : 0;
+}
+
 function projectMemory(project: string): ProjectMemory {
   const fact = (
     id: number,
@@ -1153,61 +1227,161 @@ function projectMemory(project: string): ProjectMemory {
     daysAgo: number,
     extractor: MemoryFact["extractor"],
     pinned = false,
-  ): MemoryFact => ({
-    id,
-    threadId: threads[id % threads.length].id,
-    text,
-    title: extractor === "claude-memory" ? "Recorded memory" : threads[id % threads.length].title,
-    createdAt: NOW - daysAgo * DAY,
-    pinned,
-    extractor,
-    originRef:
-      extractor === "claude-memory"
-        ? `claude-memory:-Users-dev-code-payments-api/${id === 5 ? "project_ledger.md" : "feedback_tests.md"}`
-        : extractor === "repo"
-          ? "repo:.callimachus/memory/gotchas.jsonl"
-          : null,
-  });
+    kind: MemoryFact["kind"] = "decision",
+  ): MemoryFact => {
+    const thread = threads[id % threads.length];
+    const recorded = ["user", "agent", "claude-memory", "repo"].includes(extractor);
+    return {
+      id,
+      threadId: thread.id,
+      text,
+      title: extractor === "claude-memory" ? "Recorded memory" : thread.title,
+      createdAt: NOW - daysAgo * DAY,
+      pinned,
+      extractor,
+      originRef:
+        extractor === "claude-memory"
+          ? `claude-memory:-Users-dev-code-payments-api/${id === 5 ? "project_ledger.md" : "feedback_tests.md"}`
+          : extractor === "repo"
+            ? "repo:.callimachus/memory/gotchas.jsonl"
+            : null,
+      kind,
+      // A distilled fact is dated by its session, here a little before it was distilled.
+      decidedAt: NOW - daysAgo * DAY - (extractor === "llm" ? DAY / 3 : 0),
+      source: recorded ? "in_app" : thread.source,
+      status: "current",
+      support: 1,
+    };
+  };
   // With distillation off only the engine-free facts exist: Remember, TODO heuristics and
   // harvested Claude Code memory.
   const on = knowledge.enabled;
   const harvested = harvest.claudeMemory;
   const keep = (f: MemoryFact | false): f is MemoryFact => !!f;
+  const decisions = [
+    fact(1, "Use idempotency keys on every POST that moves money.", 3, "user", true),
+    on && {
+      ...fact(2, "Retries use exponential backoff capped at 5 minutes.", 12, "llm"),
+      ...(SCENARIO.truth === "all" && { support: 3, lastConfirmed: NOW - 2 * DAY }),
+    },
+    harvested &&
+      fact(
+        5,
+        "Ledger writes go through the outbox table, never straight to Postgres.",
+        2,
+        "claude-memory",
+      ),
+    on && truthOn("superseded") && fact(8, "Cache API responses as bincode blobs.", 40, "llm"),
+    on &&
+      truthOn("superseded") &&
+      fact(9, "Cache API responses as JSON: bincode broke across releases.", 10, "llm"),
+    on && truthOn("disputed") && fact(10, "Settle refunds nightly in one batch.", 20, "llm"),
+    on &&
+      truthOn("disputed") &&
+      fact(11, "Settle refunds as soon as the provider confirms them.", 6, "llm"),
+  ].filter(keep);
+  const gotchas = [
+    on &&
+      fact(3, "Fake timers must be advanced after `scheduler.flush()`.", 1, "llm", false, "gotcha"),
+    harvested &&
+      fact(
+        6,
+        "Run the webhook tests with --test-threads=1; they share a port.",
+        4,
+        "claude-memory",
+        false,
+        "gotcha",
+      ),
+    SCENARIO.repomemory === "published" &&
+      fact(
+        7,
+        "Staging webhooks come from a second Stripe account; use its signing secret.",
+        6,
+        "repo",
+        false,
+        "gotcha",
+      ),
+    on &&
+      truthOn("flagged") &&
+      fact(12, "The sandbox rejects amounts under 50 cents.", 30, "llm", false, "gotcha"),
+  ].filter(keep);
+
+  // Derive each fact's standing the way fact_truth does: superseded, then flagged, then
+  // disputed.
+  const all = [...decisions, ...gotchas];
+  const byId = new Map(all.map((f) => [f.id, f]));
+  const linked = (id: number) => {
+    const f = byId.get(id);
+    return f && { id: f.id, text: f.text, decidedAt: f.decidedAt, threadId: f.threadId };
+  };
+  for (const f of all) {
+    const newer = memTruth.replacedBy.get(f.id);
+    // Only facts this mock lists (a review can link one it does not).
+    const older = [...memTruth.replacedBy]
+      .filter(([o, n]) => n === f.id && byId.has(o))
+      .map(([o]) => o);
+    f.supersededBy = newer != null ? linked(newer) : undefined;
+    const replaced = older.map((o) => byId.get(o)?.decidedAt ?? 0);
+    f.replaces = replaced.length ? Math.max(...replaced) : undefined;
+    f.disputedBy = memTruth.disputes
+      .filter(([x, y]) => x === f.id || y === f.id)
+      .map(([x, y]) => linked(x === f.id ? y : x))
+      .filter((d) => !!d);
+    const flag = memTruth.flags.get(f.id);
+    f.flags = flag ? [flag] : undefined;
+    f.status = f.supersededBy
+      ? "superseded"
+      : flag
+        ? "flagged"
+        : f.disputedBy.length
+          ? "disputed"
+          : "current";
+  }
+  // Live lists: never a replaced fact, and a flagged one only when pinned.
+  const live = (f: MemoryFact) => f.status !== "superseded" && (f.status !== "flagged" || f.pinned);
   return {
     project,
-    decisions: [
-      fact(1, "Use idempotency keys on every POST that moves money.", 3, "user", true),
-      on && fact(2, "Retries use exponential backoff capped at 5 minutes.", 12, "llm"),
-      harvested &&
-        fact(
-          5,
-          "Ledger writes go through the outbox table, never straight to Postgres.",
-          2,
-          "claude-memory",
-        ),
-    ].filter(keep),
-    gotchas: [
-      on && fact(3, "Fake timers must be advanced after `scheduler.flush()`.", 1, "llm"),
-      harvested &&
-        fact(
-          6,
-          "Run the webhook tests with --test-threads=1; they share a port.",
-          4,
-          "claude-memory",
-        ),
-      SCENARIO.repomemory === "published" &&
-        fact(
-          7,
-          "Staging webhooks come from a second Stripe account; use its signing secret.",
-          6,
-          "repo",
-        ),
-    ].filter(keep),
-    openTodos: [fact(4, "Backfill idempotency keys for legacy refunds.", 5, "heuristic")],
+    decisions: decisions.filter(live),
+    gotchas: gotchas.filter(live),
+    openTodos: [
+      fact(4, "Backfill idempotency keys for legacy refunds.", 5, "heuristic", false, "todo"),
+    ],
+    superseded: all.filter((f) => f.status === "superseded"),
+    flagged: all.filter((f) => f.status === "flagged"),
     threadCount: 412,
     distilledCount: on ? 230 : 0,
     pendingCount: 182,
   };
+}
+
+/** Review conflicts (`conflicts=some`): a dated reversal and a dated conflict, each pair in
+ *  the list order the backend returns (newest first). */
+function detectConflicts(): Conflict[] {
+  if (SCENARIO.conflicts !== "some") return [];
+  return [
+    {
+      aId: 2,
+      aText: "Retries use exponential backoff capped at 5 minutes.",
+      aDecidedAt: NOW - 12 * DAY,
+      bId: 13,
+      bText: "Retries use a fixed 30 second delay.",
+      bDecidedAt: NOW - 60 * DAY,
+      kind: "supersedes",
+      newer: "a",
+      reason: "The later session replaced the fixed delay with backoff.",
+    },
+    {
+      aId: 1,
+      aText: "Use idempotency keys on every POST that moves money.",
+      aDecidedAt: NOW - 3 * DAY,
+      bId: 14,
+      bText: "Only card charges need idempotency keys.",
+      bDecidedAt: NOW - 25 * DAY,
+      kind: "conflict",
+      newer: "a",
+      reason: "They disagree on which requests need idempotency keys.",
+    },
+  ];
 }
 
 const threadKnowledge = (): ThreadKnowledge => ({
@@ -2097,7 +2271,10 @@ const handlers: Record<string, Handler> = {
   hide_fact: ok,
   set_todo_done: ok,
   edit_fact: ok,
-  detect_conflicts: () => [],
+  detect_conflicts: () => sleep(400).then(detectConflicts),
+  link_facts: linkMock,
+  unlink_facts: unlinkMock,
+  resolve_fact_flags: (a) => (memTruth.flags.delete(Number(a.factId)) ? 1 : 0),
   remember: ok,
   list_open_todos: () => [
     {
