@@ -74,6 +74,45 @@
 //! - `thread_commits` stays current without a Today load: after each index batch the watcher
 //!   links the batch's threads in a git checkout ([`jobs::CommitLinker`], at most once a minute
 //!   per checkout, 2 s budget per pass).
+//!
+//! # Fact truth (migration 0035)
+//!
+//! Which facts still hold, as `migrations/0035_fact_truth.sql` creates it; read and written only
+//! through [`knowledge::truth`] (re-exported from [`knowledge`]). Both tables key facts by
+//! `facts.uid`, so they survive a re-distill that keeps a fact's text and match across machines.
+//!
+//! - `fact_links (id, from_uid, to_uid, kind, source, thread_id, created_at, dismissed_at)`,
+//!   `kind` one of `supersedes | contradicts`, `source` one of `distill | user | agent | repo | review`,
+//!   `thread_id` the session that asserted it (`ON DELETE SET NULL`), unique per
+//!   `(from_uid, to_uid, kind)`; indexes `(to_uid, kind)` and partial `(thread_id)`.
+//!   `from_uid` is the NEWER fact of a `supersedes`. A link is active while both facts exist, the
+//!   user has not undone it (`dismissed_at`, [`knowledge::unlink_link`]: the row stays so a
+//!   machine source asserting the pair again is a no-op, and a re-distill of the session that
+//!   declared it relates none of its items to that fact again) and, for a `supersedes`, the
+//!   `from` side stands (visible, or hidden after it had itself been superseded or retired as
+//!   stale); a `contradicts` needs the other side visible and not superseded. One whose uid
+//!   matches no fact is ignored. Written by [`knowledge::link_facts`] (validation, cycle
+//!   refusal, a direction check against the declaring session's last activity, and the
+//!   downgrade to `contradicts` of a machine or repo `supersedes` on a pinned or edited target),
+//!   [`knowledge::store_distilled`] (the distiller's `links`, capped per thread; a re-distill
+//!   keeps the facts other sources' links name, and incoming links) and the repo memory import
+//!   (a line's `supersedes`).
+//! - `fact_signals (id, fact_uid, kind, source, thread_id, reason, created_at, resolved_at)`,
+//!   `kind` one of `reaffirmed | stale | wrong`, `source` one of `distill | agent | user`;
+//!   indexes `(fact_uid, kind)`, partial `(thread_id)`, and a partial unique
+//!   `(fact_uid, thread_id) WHERE kind = 'reaffirmed'` (one reaffirmation per session).
+//!   `resolved_at` set: the user kept the fact ([`knowledge::resolve_fact_flags`]). Written by
+//!   [`knowledge::flag_fact`] (agent flags capped per project) and the distiller (`reaffirms`,
+//!   `retires`, never of an item decided after the session ended).
+//! - Derived per fact ([`knowledge::fact_truth`], batched): status `superseded` (an active
+//!   `supersedes` points at it) > `flagged` (an unresolved stale / wrong signal) > `disputed`
+//!   (an active `contradicts` with a fact still in play) > `current`; `support` (1 + other sessions that
+//!   reaffirmed it) and `last_confirmed`. [`knowledge::DECIDED_AT_SQL`] dates a distilled fact by
+//!   its session's start, not by when it was distilled. Project memory reads exclude superseded
+//!   facts, and flagged ones unless pinned or edited, in SQL; recall drops superseded hits unless asked;
+//!   the contradiction guard keeps them, labelled. Readers on an index without these tables
+//!   (read-only connections never migrate) treat every fact as current
+//!   ([`knowledge::has_truth_tables`]).
 
 // First, so `app_log!` is in scope for every module declared after it.
 #[macro_use]
@@ -82,6 +121,8 @@ pub mod jobclock;
 pub mod memtrim;
 
 pub mod agent;
+// The compaction anchor: a session's own prompts, re-injected by `cal hook` after compaction.
+pub mod anchor;
 pub mod error;
 pub mod indexer;
 pub mod secrets;
@@ -94,6 +135,9 @@ pub mod context;
 pub mod cost;
 pub mod db;
 pub mod embed;
+// The memory-truth eval and GUARD_CLOSE calibration: tests only, the heavy ones `#[ignore]`.
+#[cfg(test)]
+mod eval;
 pub mod export;
 pub mod gitlink;
 // `cal index` / `watch` / `embed` / `distill --auto`: the jobs without the app.

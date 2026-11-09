@@ -197,6 +197,28 @@
             "string",
             "null"
           ]
+        },
+        "status": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FactStatus"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Where it stands now, omitted when current: `superseded` (a later fact replaced it),\n`flagged` (stale or wrong, waiting for review) or `disputed`. Still listed when not\ncurrent: it explains why the line was written, but it is no longer settled."
+        },
+        "supersededBy": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LinkedFact"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "For a superseded fact, the newest one that replaced it."
         }
       },
       "required": [
@@ -208,6 +230,44 @@
         "extractor",
         "originRef"
       ]
+    },
+    "FactStatus": {
+      "type": "string",
+      "enum": [
+        "current",
+        "disputed",
+        "flagged",
+        "superseded"
+      ],
+      "description": "Where a fact stands, in priority order: an active `supersedes` link points at it\n(`superseded`), an unresolved stale / wrong flag (`flagged`), an active `contradicts` link\non either side whose other fact is still in play, not hidden or superseded (`disputed`),\nelse `current`."
+    },
+    "LinkedFact": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer"
+        },
+        "text": {
+          "type": "string"
+        },
+        "decidedAt": {
+          "type": "integer",
+          "description": "See [`DECIDED_AT_SQL`]."
+        },
+        "threadId": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Its session thread; None for a recorded or imported fact (no session to cite)."
+        }
+      },
+      "required": [
+        "id",
+        "text",
+        "decidedAt"
+      ],
+      "description": "The other side of an active link: the fact that replaced this one, one it replaces, or one\nthat disputes it."
     },
     "TraceAttribution": {
       "type": "object",

@@ -206,16 +206,49 @@ export interface KFact {
   originRef?: string | null;
 }
 
-/** Two distilled decisions the LLM flagged as conflicting / superseding. */
+/** Two distilled decisions the LLM flagged as conflicting / superseding, with when each was
+ *  decided. Nothing is stored until the user acts on it. */
 export interface Conflict {
   aId: number;
   aText: string;
+  aDecidedAt: number;
   bId: number;
   bText: string;
+  bDecidedAt: number;
+  /** The model's reading: one replaced the other, or they disagree. */
+  kind: "supersedes" | "conflict";
+  /** The newer side, by date whenever the two dates differ. */
+  newer: "a" | "b";
   reason: string;
 }
 
-/** A distilled fact in a project's aggregated memory, with its source thread. */
+/** Where a fact stands: replaced by a newer one, flagged stale / wrong, disputed by another,
+ *  or none of those. */
+export type FactStatus = "current" | "disputed" | "flagged" | "superseded";
+
+/** The other side of a link: what replaced a fact, or what disputes it. */
+export interface LinkedFact {
+  id: number;
+  text: string;
+  /** Epoch seconds: its session's start, or when it was recorded. */
+  decidedAt: number;
+  /** Its session thread; absent for a recorded or imported fact. */
+  threadId?: number;
+}
+
+/** An unresolved stale / wrong flag on a fact. */
+export interface FactFlag {
+  id: number;
+  kind: "stale" | "wrong";
+  /** An agent (`flag_fact`), a memory pass (the distiller retired it), or the user. */
+  source: "agent" | "distill" | "user";
+  reason?: string;
+  createdAt: number;
+  threadId?: number;
+}
+
+/** A distilled fact in a project's aggregated memory, with its source thread, when it was
+ *  decided and where it stands. */
 export interface MemoryFact {
   id: number;
   threadId: number;
@@ -223,21 +256,70 @@ export interface MemoryFact {
   title: string | null;
   createdAt: number;
   pinned: boolean;
+  /** The user rewrote its text: curated like a pinned fact, so a flag leaves it in memory.
+   *  Absent when false. */
+  edited?: boolean;
   extractor: FactExtractor;
   /** e.g. "claude-memory:<slug>/<file>" for a harvested fact; null for distilled ones. */
   originRef: string | null;
+  kind: "decision" | "gotcha" | "todo";
+  /** Epoch seconds: a distilled fact's session start, else its own time. */
+  decidedAt: number;
+  /** Its thread's source (`in_app` for recorded and imported facts). */
+  source: SourceKind;
+  status: FactStatus;
+  /** The ids of the facts it actively supersedes, newest first (absent when none): the same
+   *  key as on a recall or check hit. */
+  replaces?: number[];
+  /** `decidedAt` of the newest of those, the `replaces <date>` in its memory line. */
+  replacesDecidedAt?: number;
+  /** The facts it is disputed with, newest first. */
+  disputedBy?: LinkedFact[];
+  /** 1 + the other sessions that confirmed it. */
+  support: number;
+  /** The newest start among those sessions. */
+  lastConfirmed?: number;
+  /** What replaced it (superseded facts only). */
+  supersededBy?: LinkedFact;
+  /** Its unresolved flags (flagged facts only). */
+  flags?: FactFlag[];
 }
 
-/** Durable, aggregated knowledge for one project + distillation coverage. */
+/** Durable, aggregated knowledge for one project + distillation coverage. The three lists
+ *  hold live facts (a flagged one only when pinned or edited); `superseded` and `flagged`
+ *  are the history the Projects page lists apart, absent when empty. */
 export interface ProjectMemory {
   project: string;
   decisions: MemoryFact[];
   gotchas: MemoryFact[];
   openTodos: MemoryFact[];
+  superseded?: MemoryFact[];
+  flagged?: MemoryFact[];
   threadCount: number;
   distilledCount: number;
   pendingCount: number;
 }
+
+/** `supersedes`: the first fact replaces the second. `contradicts`: they disagree. */
+export type LinkKind = "supersedes" | "contradicts";
+
+/** Why `link_facts` stored nothing. */
+export type LinkRejection =
+  | "notFound"
+  | "notLinkable"
+  | "kindMismatch"
+  | "crossProject"
+  | "selfLink"
+  | "cycle"
+  | "wrongDirection"
+  | "alreadySettled"
+  | "dismissed";
+
+/** What `link_facts` did. A user link is never downgraded; the variant exists for agents. */
+export type LinkOutcome =
+  | { outcome: "linked"; id: number; kind: LinkKind }
+  | { outcome: "downgraded"; id: number }
+  | { outcome: "rejected"; reason: LinkRejection };
 
 /** A project's repo memory (`.callimachus/memory/` in its checkout). */
 export interface RepoMemoryStatus {
@@ -258,6 +340,16 @@ export interface RepoFactChange {
   text: string;
 }
 
+/** Why publish holds a fact back: `flagged` stale or wrong and not reviewed yet (and neither
+ *  pinned nor edited; wins when both apply), or `replacementUnpublished`: replaced by facts
+ *  none of which this publish writes. */
+export type RepoHeldReason = "flagged" | "replacementUnpublished";
+
+/** A fact publish holds back, and why. */
+export interface RepoHeldFact extends RepoFactChange {
+  reason: RepoHeldReason;
+}
+
 /** What "Publish to repo" would write (the preview) or wrote. */
 export interface RepoPublishPlan {
   root: string;
@@ -270,6 +362,11 @@ export interface RepoPublishPlan {
   added: RepoFactChange[];
   updated: RepoFactChange[];
   removed: RepoFactChange[];
+  /** Facts publish would otherwise write but holds back, since they are out of memory here
+   *  and would read as current to a teammate: flagged stale or wrong and not reviewed yet
+   *  (and neither pinned nor edited), or replaced by a fact that is not published. An
+   *  earlier line of one is in `removed`. */
+  held: RepoHeldFact[];
   /** False when the files already hold exactly this. */
   changed: boolean;
 }
@@ -954,6 +1051,13 @@ export const api = {
   setTodoDone: (factId: number, done: boolean) => invoke<void>("set_todo_done", { factId, done }),
   editFact: (factId: number, text: string) => invoke<void>("edit_fact", { factId, text }),
   detectConflicts: (project: string) => invoke<Conflict[]>("detect_conflicts", { project }),
+  // Fact truth: the user links two facts (the first replaces or disputes the second), undoes
+  // a link (it stays undone: a re-distill cannot declare it again), or keeps a flagged fact.
+  linkFacts: (fromId: number, toId: number, kind: LinkKind) =>
+    invoke<LinkOutcome>("link_facts", { fromId, toId, kind }),
+  unlinkFacts: (fromId: number, toId: number, kind?: LinkKind) =>
+    invoke<number>("unlink_facts", { fromId, toId, kind: kind ?? null }),
+  resolveFactFlags: (factId: number) => invoke<number>("resolve_fact_flags", { factId }),
   // Write-back: record a decision or gotcha for a project. User-typed, so it is pinned.
   remember: (project: string, kind: "decision" | "gotcha", text: string) =>
     invoke<void>("remember", { project, kind, text }),

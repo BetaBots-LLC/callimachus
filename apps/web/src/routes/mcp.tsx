@@ -42,7 +42,10 @@ const TOOLS: { name: string; note: string; write?: boolean }[] = [
   },
   { name: "ask_history", note: "A synthesized, cited answer over your own history (RAG)" },
   { name: "threads_for_file", note: "Which past sessions touched a file path" },
-  { name: "check_decision", note: "Surface settled decisions before re-litigating a proposal" },
+  {
+    name: "check_decision",
+    note: "Surface prior decisions, dated, before re-litigating a proposal; reversed ones name their replacement",
+  },
   { name: "linked_commits", note: "The git commits a thread likely produced" },
   {
     name: "recurring_issues",
@@ -60,10 +63,15 @@ const TOOLS: { name: string; note: string; write?: boolean }[] = [
   },
   {
     name: "record_decision",
-    note: "Persist a decision (with optional rationale) into memory",
+    note: "Persist a decision (with optional rationale) into memory, or the one that replaces an older decision",
     write: true,
   },
   { name: "record_gotcha", note: "Persist a gotcha into a project's memory", write: true },
+  {
+    name: "flag_fact",
+    note: "Flag a fact in this repo as stale or wrong; it leaves memory until you review it",
+    write: true,
+  },
   {
     name: "snapshot_session",
     note: "Checkpoint a thread for handoff across compaction or tools",
@@ -77,7 +85,7 @@ function McpPage() {
       no="04"
       kicker="MCP server"
       title="Give every agent a memory."
-      description="callimachus-mcp exposes your local history to any MCP client through twenty-two tools that read and write the memory layer. Instead of re-explaining context, your agent can look it up: searching past sessions, recalling settled decisions and known gotchas, asking your history a cited question, linking threads to the git commits they produced, and pulling the exact thread it needs. It can also write back by closing TODOs, recording new decisions and gotchas, and snapshotting a session for handoff across a context-window compaction or another tool. It only ever touches Callimachus's own index and memory, never your files."
+      description="callimachus-mcp exposes your local history to any MCP client through twenty-three tools that read and write the memory layer. Instead of re-explaining context, your agent can look it up: searching past sessions, recalling settled decisions and known gotchas, asking your history a cited question, linking threads to the git commits they produced, and pulling the exact thread it needs. It can also write back by closing TODOs, recording new decisions and gotchas (and which older decision one replaces), flagging a remembered fact the code shows is stale or wrong, and snapshotting a session for handoff across a context-window compaction or another tool. It only ever touches Callimachus's own index and memory, never your files."
     >
       <div className="grid gap-10 lg:grid-cols-2">
         <div className="flex min-w-0 flex-col gap-4">
@@ -160,12 +168,16 @@ function McpPage() {
             ))}
           </ul>
           <p className="text-sm leading-relaxed text-muted-foreground">
-            Eighteen read tools and four <span className="font-mono text-amber-500">write</span>{" "}
+            Eighteen read tools and five <span className="font-mono text-amber-500">write</span>{" "}
             tools (<code className="font-mono">complete_todo</code>,{" "}
             <code className="font-mono">record_decision</code>,{" "}
             <code className="font-mono">record_gotcha</code>,{" "}
+            <code className="font-mono">flag_fact</code>,{" "}
             <code className="font-mono">snapshot_session</code>) that update Callimachus's own
-            memory, never your project files.
+            memory, never your project files. Every remembered fact carries the date its session
+            happened, a decision a later session reversed is kept as history and named as replaced,
+            and a flag from an agent hides a fact only until you review it. A fact you pinned or
+            edited stays in, and an agent can flag or replace only facts of the repo it runs in.
           </p>
           <p className="text-sm leading-relaxed text-muted-foreground">
             It also offers <code className="font-mono">recall</code>,{" "}

@@ -46,6 +46,58 @@
                       "string",
                       "null"
                     ]
+                  },
+                  "decidedAt": {
+                    "type": "integer"
+                  },
+                  "status": {
+                    "enum": [
+                      "current",
+                      "disputed",
+                      "flagged",
+                      "superseded"
+                    ],
+                    "type": "string"
+                  },
+                  "replaces": {
+                    "items": {
+                      "type": "integer"
+                    },
+                    "type": "array"
+                  },
+                  "replacesDecidedAt": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "disputedBy": {
+                    "items": {
+                      "required": [
+                        "id",
+                        "text",
+                        "decidedAt"
+                      ],
+                      "type": "object",
+                      "properties": {
+                        "id": {
+                          "type": "integer"
+                        },
+                        "text": {
+                          "type": "string"
+                        },
+                        "decidedAt": {
+                          "type": "integer"
+                        },
+                        "threadId": {
+                          "type": [
+                            "integer",
+                            "null"
+                          ]
+                        }
+                      }
+                    },
+                    "type": "array"
                   }
                 },
                 "required": [
@@ -53,7 +105,9 @@
                   "threadId",
                   "text",
                   "extractor",
-                  "originRef"
+                  "originRef",
+                  "decidedAt",
+                  "status"
                 ]
               }
             },
@@ -85,6 +139,58 @@
                       "string",
                       "null"
                     ]
+                  },
+                  "decidedAt": {
+                    "type": "integer"
+                  },
+                  "status": {
+                    "enum": [
+                      "current",
+                      "disputed",
+                      "flagged",
+                      "superseded"
+                    ],
+                    "type": "string"
+                  },
+                  "replaces": {
+                    "items": {
+                      "type": "integer"
+                    },
+                    "type": "array"
+                  },
+                  "replacesDecidedAt": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "disputedBy": {
+                    "items": {
+                      "required": [
+                        "id",
+                        "text",
+                        "decidedAt"
+                      ],
+                      "type": "object",
+                      "properties": {
+                        "id": {
+                          "type": "integer"
+                        },
+                        "text": {
+                          "type": "string"
+                        },
+                        "decidedAt": {
+                          "type": "integer"
+                        },
+                        "threadId": {
+                          "type": [
+                            "integer",
+                            "null"
+                          ]
+                        }
+                      }
+                    },
+                    "type": "array"
                   }
                 },
                 "required": [
@@ -92,7 +198,9 @@
                   "threadId",
                   "text",
                   "extractor",
-                  "originRef"
+                  "originRef",
+                  "decidedAt",
+                  "status"
                 ]
               }
             },
@@ -124,6 +232,58 @@
                       "string",
                       "null"
                     ]
+                  },
+                  "decidedAt": {
+                    "type": "integer"
+                  },
+                  "status": {
+                    "enum": [
+                      "current",
+                      "disputed",
+                      "flagged",
+                      "superseded"
+                    ],
+                    "type": "string"
+                  },
+                  "replaces": {
+                    "items": {
+                      "type": "integer"
+                    },
+                    "type": "array"
+                  },
+                  "replacesDecidedAt": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "disputedBy": {
+                    "items": {
+                      "required": [
+                        "id",
+                        "text",
+                        "decidedAt"
+                      ],
+                      "type": "object",
+                      "properties": {
+                        "id": {
+                          "type": "integer"
+                        },
+                        "text": {
+                          "type": "string"
+                        },
+                        "decidedAt": {
+                          "type": "integer"
+                        },
+                        "threadId": {
+                          "type": [
+                            "integer",
+                            "null"
+                          ]
+                        }
+                      }
+                    },
+                    "type": "array"
                   }
                 },
                 "required": [
@@ -131,7 +291,9 @@
                   "threadId",
                   "text",
                   "extractor",
-                  "originRef"
+                  "originRef",
+                  "decidedAt",
+                  "status"
                 ]
               }
             },

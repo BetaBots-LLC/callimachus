@@ -96,6 +96,9 @@ pub static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
         M::up(include_str!(
             "../../../migrations/0034_identity_and_graph.sql"
         )),
+        // 0035: fact truth: fact_links (supersedes / contradicts between two facts, by uid)
+        // and fact_signals (reaffirmed / stale / wrong on one fact).
+        M::up(include_str!("../../../migrations/0035_fact_truth.sql")),
     ])
 });
 
@@ -105,9 +108,9 @@ pub static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
 /// warm (several seconds cold) on a 5.1 GB index, far more than these migrations themselves
 /// (0032 is one ALTER ADD COLUMN and a partial index over `facts`; 0033 one row in `sources`;
 /// 0034 backfills `facts` (2k rows), creates empty tables and indexes `threads`: opening a
-/// copy of that index at 0032 ran 0033 and 0034 in 0.4 s cold). Add a migration here only when
-/// it touches no large table.
-pub const SCAN_FREE_MIGRATIONS: &[usize] = &[32, 33, 34];
+/// copy of that index at 0032 ran 0033 and 0034 in 0.4 s cold; 0035 only creates two empty
+/// tables and their indexes). Add a migration here only when it touches no large table.
+pub const SCAN_FREE_MIGRATIONS: &[usize] = &[32, 33, 34, 35];
 
 /// Whether every migration after `applied` (the index's `user_version`) up to `latest` is in
 /// [`SCAN_FREE_MIGRATIONS`].
@@ -125,6 +128,7 @@ mod tests {
         assert!(pending_are_scan_free(31, 32), "0032 alone is cheap");
         assert!(pending_are_scan_free(31, 33), "so is 0033");
         assert!(pending_are_scan_free(31, 34), "and 0034");
+        assert!(pending_are_scan_free(34, 35), "and 0035");
         assert!(
             !pending_are_scan_free(30, 32),
             "0031 builds indexes on messages"

@@ -1,0 +1,62 @@
+{
+  "type": "object",
+  "anyOf": [
+    {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer"
+        },
+        "verdict": {
+          "type": "string"
+        },
+        "outcome": {
+          "oneOf": [
+            {
+              "type": "string",
+              "enum": [
+                "flagged",
+                "alreadyFlagged",
+                "notFound"
+              ]
+            },
+            {
+              "type": "string",
+              "const": "capReached"
+            },
+            {
+              "type": "string",
+              "const": "otherProject"
+            }
+          ]
+        },
+        "keptInMemory": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "message": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "verdict",
+        "outcome",
+        "message"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "notice": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "notice"
+      ]
+    }
+  ]
+}

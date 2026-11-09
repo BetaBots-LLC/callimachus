@@ -1428,12 +1428,13 @@ async fn distill_thread(
     pool: tauri::State<'_, db::ReadPool>,
     thread_id: i64,
 ) -> AppResult<knowledge::ThreadKnowledge> {
-    // Resolve engine + pack the transcript on a read connection.
-    let (provider, model, key, base_url, packed) = read_blocking(&pool, move |conn| {
+    // Resolve engine, pack the transcript and list the project's existing memory (the refs
+    // the model may link to) on a read connection.
+    let (provider, model, key, base_url, input) = read_blocking(&pool, move |conn| {
         let (provider, model, key, base_url) = resolve_distill_engine(conn)?;
-        let packed = context::pack_thread(conn, thread_id, context::DEFAULT_BUDGET_CHARS)?
+        let input = agent::DistillInput::load(conn, thread_id, context::DEFAULT_BUDGET_CHARS)?
             .ok_or_else(|| anyhow::anyhow!("thread {thread_id} not found"))?;
-        Ok((provider, model, key, base_url, packed))
+        Ok((provider, model, key, base_url, input))
     })
     .await?;
 
@@ -1442,17 +1443,20 @@ async fn distill_thread(
         &model,
         key.as_deref(),
         base_url.as_deref(),
-        &packed,
+        &input,
     )
     .await;
     blocking(move || {
         let db = app.state::<db::Db>();
         match outcome {
-            Ok(distilled) => {
+            Ok((distilled, grounding)) => {
+                if let Some(line) = grounding.summary_line() {
+                    app_log!("[distill] thread {thread_id}: {line}");
+                }
                 {
                     let mut conn = lock_anyhow(&db)?;
                     let now = chrono::Utc::now().timestamp();
-                    knowledge::store_distilled(&mut conn, thread_id, &distilled, now)?;
+                    knowledge::store_distilled(&mut conn, thread_id, &distilled, &input.refs, now)?;
                 }
                 // Embed the new facts so they're recallable across threads (lock released
                 // during inference). Best-effort: recall just lags if it fails.
@@ -1492,6 +1496,71 @@ async fn hide_fact(app: AppHandle, fact_id: i64, hidden: bool) -> AppResult<()> 
     in_edit_order(&app, write).await
 }
 
+/// The user links two facts on the Projects page: `from` replaces `to` (`supersedes`, the
+/// newer side first) or the two disagree (`contradicts`). Source `user`: stored as asked (no
+/// downgrade, no date check), and it revives a link the user undid earlier. A refused link
+/// (cycle, other project, hidden fact) comes back as `rejected` with the reason, not an error.
+#[tauri::command]
+async fn link_facts(
+    app: AppHandle,
+    from_id: i64,
+    to_id: i64,
+    kind: String,
+) -> AppResult<knowledge::LinkOutcome> {
+    let kind = knowledge::LinkKind::parse(&kind)
+        .ok_or_else(|| anyhow::anyhow!("unknown link kind {kind:?}"))?;
+    let write = write_retry_async(&app, move |conn| {
+        knowledge::link_facts(
+            conn,
+            from_id,
+            to_id,
+            kind,
+            knowledge::LinkSource::User,
+            None,
+            chrono::Utc::now().timestamp(),
+        )
+    });
+    in_edit_order(&app, write).await
+}
+
+/// The user's Undo of a link: from `from` to `to` (of `kind`, or both kinds). A
+/// `contradicts` is undone in both directions, since a dispute has no side. The links stay as
+/// dismissed rows, so a re-distill cannot declare them again. Returns how many were undone.
+#[tauri::command]
+async fn unlink_facts(
+    app: AppHandle,
+    from_id: i64,
+    to_id: i64,
+    kind: Option<String>,
+) -> AppResult<usize> {
+    let kind = match kind.as_deref() {
+        None => None,
+        Some(k) => Some(
+            knowledge::LinkKind::parse(k)
+                .ok_or_else(|| anyhow::anyhow!("unknown link kind {k:?}"))?,
+        ),
+    };
+    let write = write_retry_async(&app, move |conn| {
+        let now = chrono::Utc::now().timestamp();
+        let mut n = knowledge::unlink_facts(conn, from_id, to_id, kind, now)?;
+        if kind == Some(knowledge::LinkKind::Contradicts) {
+            n += knowledge::unlink_facts(conn, to_id, from_id, kind, now)?;
+        }
+        Ok(n)
+    });
+    in_edit_order(&app, write).await
+}
+
+/// The user keeps a flagged fact: its stale / wrong flags are resolved (kept as history) and
+/// it returns to injected memory. Returns how many flags were resolved.
+#[tauri::command]
+async fn resolve_fact_flags(app: AppHandle, fact_id: i64) -> AppResult<usize> {
+    let write = write_retry_async(&app, move |conn| {
+        knowledge::resolve_fact_flags(conn, fact_id, chrono::Utc::now().timestamp())
+    });
+    in_edit_order(&app, write).await
+}
+
 /// Mark a TODO done (drops out of open lists) or reopen it.
 #[tauri::command]
 async fn set_todo_done(app: AppHandle, fact_id: i64, done: bool) -> AppResult<()> {
@@ -1516,6 +1585,7 @@ async fn remember(app: AppHandle, project: String, kind: String, text: String) -
                 &text,
                 None,
                 knowledge::FactOrigin::User,
+                None,
                 chrono::Utc::now().timestamp(),
             )
             .map(|_| ())
@@ -1539,21 +1609,27 @@ async fn edit_fact(app: AppHandle, fact_id: i64, text: String) -> AppResult<()> 
     .await
 }
 
-/// A pair of distilled decisions the LLM flagged as conflicting or superseding.
-#[derive(Debug, Serialize)]
+/// A pair of distilled decisions the LLM flagged as conflicting or superseding, with when each
+/// was decided. Nothing is stored: the user decides (Newer replaces older links the newer
+/// side to the older with `link_facts`).
+#[derive(Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct Conflict {
-    #[serde(rename = "aId")]
     a_id: i64,
-    #[serde(rename = "aText")]
     a_text: String,
-    #[serde(rename = "bId")]
+    a_decided_at: i64,
     b_id: i64,
-    #[serde(rename = "bText")]
     b_text: String,
+    b_decided_at: i64,
+    /// The model's reading: `supersedes` (one replaced the other) or `conflict`.
+    kind: &'static str,
+    /// `a` or `b`: the newer side, by date whenever the two differ.
+    newer: &'static str,
     reason: String,
 }
 
-/// Review a project's distilled decisions for conflicts / supersessions via the LLM.
+/// Review a project's distilled decisions for conflicts / supersessions via the LLM. Each
+/// goes with its date, and decisions a supersede already settled are left out.
 #[tauri::command]
 async fn detect_conflicts(
     pool: tauri::State<'_, db::ReadPool>,
@@ -1561,7 +1637,7 @@ async fn detect_conflicts(
 ) -> AppResult<Vec<Conflict>> {
     let (provider, model, key, base_url, decisions) = read_blocking(&pool, move |conn| {
         let (provider, model, key, base_url) = resolve_distill_engine(conn)?;
-        let decisions = knowledge::project_decisions(conn, &project)?;
+        let decisions = knowledge::project_decisions_dated(conn, &project)?;
         Ok((provider, model, key, base_url, decisions))
     })
     .await?;
@@ -1577,36 +1653,62 @@ async fn detect_conflicts(
         &texts,
     )
     .await?;
+    Ok(conflicts_from_pairs(pairs, &decisions))
+}
+
+/// Map the model's 1-based pairs back to facts: out-of-range, self and repeated pairs are
+/// dropped, `a` is always the earlier item of the list, and `newer` is checked against the
+/// dates ([`agent::ConflictPair::a_is_newer`]) while the model's kind is kept.
+fn conflicts_from_pairs(
+    pairs: Vec<agent::ConflictPair>,
+    decisions: &[(i64, String, i64)],
+) -> Vec<Conflict> {
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for p in pairs {
         if p.a < 1 || p.b < 1 || p.a > decisions.len() || p.b > decisions.len() || p.a == p.b {
             continue;
         }
-        let (a, b) = if p.a < p.b { (p.a, p.b) } else { (p.b, p.a) };
+        let swapped = p.a > p.b;
+        let (a, b) = if swapped { (p.b, p.a) } else { (p.a, p.b) };
         if !seen.insert((a, b)) {
             continue;
         }
-        let (a_id, a_text) = decisions[a - 1].clone();
-        let (b_id, b_text) = decisions[b - 1].clone();
+        let (a_id, a_text, a_at) = decisions[a - 1].clone();
+        let (b_id, b_text, b_at) = decisions[b - 1].clone();
+        // The model's `newer` names its own a / b, which the swap above may have exchanged.
+        let model_a_newer = if swapped {
+            p.a_is_newer((b_id, b_at), (a_id, a_at))
+        } else {
+            p.a_is_newer((a_id, a_at), (b_id, b_at))
+        };
+        let a_newer = model_a_newer != swapped;
         out.push(Conflict {
             a_id,
             a_text,
+            a_decided_at: a_at,
             b_id,
             b_text,
+            b_decided_at: b_at,
+            kind: if p.is_supersede() {
+                "supersedes"
+            } else {
+                "conflict"
+            },
+            newer: if a_newer { "a" } else { "b" },
             reason: p.reason,
         });
     }
-    Ok(out)
+    out
 }
 
-/// The decision texts the conflict review sends to the LLM, redacted (facts are stored as
-/// distilled from raw transcripts). The returned conflicts still carry the stored text: they
-/// only go to the app's own UI.
-fn conflict_review_texts(decisions: &[(i64, String)]) -> Vec<String> {
+/// The decisions the conflict review sends to the LLM, `(text, decided_at)`, the text
+/// redacted (facts are stored as distilled from raw transcripts). The returned conflicts
+/// still carry the stored text: they only go to the app's own UI.
+fn conflict_review_texts(decisions: &[(i64, String, i64)]) -> Vec<(String, i64)> {
     decisions
         .iter()
-        .map(|(_, t)| context::redact_secrets(t).into_owned())
+        .map(|(_, t, at)| (context::redact_secrets(t).into_owned(), *at))
         .collect()
 }
 
@@ -1620,14 +1722,24 @@ async fn list_projects(
     read_blocking(&pool, knowledge::list_projects).await
 }
 
-/// Aggregated, durable memory (decisions/gotchas/open todos + coverage) for one project.
+/// Aggregated, durable memory (decisions/gotchas/open todos + coverage) for one project, plus
+/// its history: the replaced facts and the flagged ones, which the page lists apart.
 #[tauri::command]
 async fn project_memory(
     pool: tauri::State<'_, db::ReadPool>,
     project: String,
 ) -> AppResult<knowledge::ProjectMemory> {
     read_blocking(&pool, move |conn| {
-        knowledge::get_project_memory(conn, &project, 60)
+        knowledge::get_project_memory_with(
+            conn,
+            &project,
+            &knowledge::MemoryQuery {
+                per_kind: 60,
+                history: true,
+                coverage: true,
+                ..Default::default()
+            },
+        )
     })
     .await
 }
@@ -1890,6 +2002,7 @@ async fn recall_facts(
             kind,
             project.as_deref(),
             limit.unwrap_or(20) as usize,
+            false,
         )
     })
     .await
@@ -2440,8 +2553,12 @@ async fn open_thread_in_cli(
                 if m.decisions.is_empty() && m.gotchas.is_empty() && !pinned_todo {
                     return None;
                 }
+                // The path is stored text inside the opening tag: escaped and unquoted like
+                // the `<reference_thread>` attributes, so it can neither end the attribute
+                // nor close the fence. The facts inside are escaped by `export::fact_line`.
                 Some(format!(
-                    "<project_memory project=\"{proj}\">\n{}\n</project_memory>",
+                    "<project_memory project=\"{}\">\n{}\n</project_memory>",
+                    context::escape_fences(proj).replace('"', "'"),
                     export::agent_memory_md_budgeted(&key, &m, None, &budget)
                 ))
             });
@@ -3970,6 +4087,9 @@ pub fn run() {
             publish_repo_memory,
             set_fact_pinned,
             hide_fact,
+            link_facts,
+            unlink_facts,
+            resolve_fact_flags,
             set_todo_done,
             remember,
             edit_fact,
@@ -4301,15 +4421,71 @@ mod redaction_tests {
             "{notes}"
         );
 
-        // Conflict review prompt.
-        let decisions = knowledge::project_decisions(&conn, project).unwrap();
+        // Conflict review prompt, dated by when each was decided.
+        let decisions = knowledge::project_decisions_dated(&conn, project).unwrap();
         assert_eq!(decisions.len(), 2);
         let texts = conflict_review_texts(&decisions);
-        assert_scrubbed(&texts.join("\n"));
+        let joined: Vec<&str> = texts.iter().map(|(t, _)| t.as_str()).collect();
+        assert_scrubbed(&joined.join("\n"));
         assert!(texts
             .iter()
-            .any(|t| t == "call the billing API with [REDACTED]"));
-        assert!(texts.iter().any(|t| t == "keep sqlite"));
+            .any(|t| *t == ("call the billing API with [REDACTED]".to_string(), 1_000)));
+        assert!(texts
+            .iter()
+            .any(|t| *t == ("keep sqlite".to_string(), 1_001)));
+    }
+
+    #[test]
+    fn conflict_review_maps_pairs_back_and_trusts_the_dates_for_newer() {
+        let decisions = vec![
+            (30, "use JSON".to_string(), 300),
+            (20, "use bincode".to_string(), 200),
+            (10, "use sqlite".to_string(), 200),
+        ];
+        let pair = |a, b, kind: &str, newer: &str| agent::ConflictPair {
+            a,
+            b,
+            kind: kind.into(),
+            newer: newer.into(),
+            reason: "r".into(),
+        };
+        let out = conflicts_from_pairs(
+            vec![
+                // The model calls the older one newer: the dates win, the kind stays.
+                pair(1, 2, "supersedes", "b"),
+                // Given in reverse order: `a` becomes the earlier list item, and the model's
+                // `newer` follows the swap (same dates, so its word counts).
+                pair(3, 2, "conflict", "a"),
+                pair(2, 3, "conflict", "a"),
+                pair(1, 1, "conflict", "a"),
+                pair(0, 4, "conflict", "a"),
+                pair(1, 3, "whatever", ""),
+            ],
+            &decisions,
+        );
+        assert_eq!(out.len(), 3, "{out:?}");
+        assert_eq!(
+            (out[0].a_id, out[0].b_id, out[0].kind, out[0].newer),
+            (30, 20, "supersedes", "a")
+        );
+        assert_eq!((out[0].a_decided_at, out[0].b_decided_at), (300, 200));
+        assert_eq!(
+            (out[1].a_id, out[1].b_id, out[1].kind, out[1].newer),
+            (20, 10, "conflict", "b")
+        );
+        assert_eq!((out[2].kind, out[2].newer), ("conflict", "a"));
+        let json = serde_json::to_value(&out[0]).unwrap();
+        for key in [
+            "aId",
+            "aText",
+            "aDecidedAt",
+            "bDecidedAt",
+            "kind",
+            "newer",
+            "reason",
+        ] {
+            assert!(json.get(key).is_some(), "{key}: {json}");
+        }
     }
 }
 

@@ -1,12 +1,15 @@
-import { type ReactNode, useState } from "react";
+import { type ReactNode, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Menu as MenuPrimitive } from "@base-ui/react/menu";
 import { ChevronDown, EyeOff, Pencil, Pin, Plus } from "lucide-react";
 import {
   api,
+  type LinkKind,
   type MemoryFact,
   type ProjectMemory,
   type RepoFactChange,
+  type RepoHeldFact,
+  type RepoHeldReason,
   type RepoPublishPlan,
 } from "../../lib/api";
 import { shortPath } from "../../lib/format";
@@ -27,6 +30,9 @@ import { Item } from "@/components/ui/item";
 import { cn } from "@/lib/utils";
 import { Markdown } from "../Markdown";
 import { MemorySetupCard } from "../MemorySetupCard";
+import { ConflictReview } from "./ConflictReview";
+import { DisputePanel, FactMeta, linkRefusal } from "./FactTruth";
+import { FlaggedGroup, ReplacedGroup } from "./MemoryHistory";
 import { SectionNote, SectionSkeleton } from "./ProjectSection";
 import { useOpenThread } from "./shared";
 
@@ -37,6 +43,11 @@ import { useOpenThread } from "./shared";
  * can read. "Publish to repo" writes the shareable facts to `.callimachus/memory/*.jsonl` in
  * the checkout, after a preview, for the user to commit; facts imported from those files
  * carry a "From the repo" badge, and the ones this machine published a "Shared" one.
+ *
+ * Each fact shows when it was decided (its session's date) and by which agent, and where it
+ * stands: what it replaces, what disputes it, how many sessions confirmed it. Facts a newer
+ * one replaced and facts flagged stale or wrong are left out of memory and listed apart
+ * (Replaced, Flagged), where the user can undo the replacement or keep the fact.
  *
  * Never gated: TODOs, Remember and harvested Claude Code memory need no engine. While LLM
  * distillation is off the memory card sits above the list and the LLM-only actions (Build
@@ -132,6 +143,8 @@ export function MemorySection({ project }: { project: string }) {
             decisions: map(prev.decisions),
             gotchas: map(prev.gotchas),
             openTodos: map(prev.openTodos),
+            superseded: prev.superseded && map(prev.superseded),
+            flagged: prev.flagged && map(prev.flagged),
           });
         }
         return { prev };
@@ -162,6 +175,43 @@ export function MemorySection({ project }: { project: string }) {
         fs.map((f) => (f.id === v.id ? { ...f, text: v.text } : f)),
     ),
   });
+  // Links and flags move facts between lists (a replaced one leaves Decisions for Replaced),
+  // so these refetch instead of guessing the new lists.
+  const settled = {
+    onMutate: () => setCurationError(null),
+    onError: (e: unknown) => setCurationError(`Couldn't save: ${e}`),
+    onSettled: () => refreshMem(),
+  };
+  // Settling a dispute unmounts the focused button with its panel (and "Keep the other"
+  // moves the whole row to Replaced), which would drop focus to <body>. Once the refetch
+  // lands, focus the fact that stays, or the memory list when it isn't listed.
+  const listRef = useRef<HTMLDivElement>(null);
+  const focusFact = (id: number | undefined) => {
+    if (id == null) return;
+    requestAnimationFrame(() => {
+      const list = listRef.current;
+      (list?.querySelector<HTMLElement>(`[data-fact-id="${id}"]`) ?? list)?.focus();
+    });
+  };
+  type LinkVars = { fromId: number; toId: number; kind: LinkKind; focusId?: number };
+  const link = useMutation({
+    mutationFn: (v: LinkVars) => api.linkFacts(v.fromId, v.toId, v.kind),
+    ...settled,
+    onSettled: (_o, _e, v) => refreshMem().then(() => focusFact(v.focusId)),
+    onSuccess: (o) => {
+      const refused = linkRefusal(o);
+      if (refused) setCurationError(refused);
+    },
+  });
+  const unlink = useMutation({
+    mutationFn: (v: LinkVars) => api.unlinkFacts(v.fromId, v.toId, v.kind),
+    ...settled,
+    onSettled: (_n, _e, v) => refreshMem().then(() => focusFact(v.focusId)),
+  });
+  const keepFlagged = useMutation({
+    mutationFn: (id: number) => api.resolveFactFlags(id),
+    ...settled,
+  });
   // Locally remember hidden facts so the conflicts panel (a mutation result, not a
   // query) updates immediately: hiding a decision resolves any conflict it's in.
   const [hiddenIds, setHiddenIds] = useState<Set<number>>(() => new Set());
@@ -173,20 +223,31 @@ export function MemorySection({ project }: { project: string }) {
       hideFact.mutate(id);
     },
     onEdit: (id, text) => editFact.mutate({ id, text }),
+    onLink: (fromId, toId, kind, focusId) => link.mutate({ fromId, toId, kind, focusId }),
+    onUnlink: (fromId, toId, kind, focusId) => unlink.mutate({ fromId, toId, kind, focusId }),
     isShared: (id) => shared.has(id),
+  };
+  // Review conflicts' "Newer replaces older": true once the link is stored, so the pair
+  // leaves the list only then.
+  const replace = async (newerId: number, olderId: number) => {
+    try {
+      const o = await link.mutateAsync({ fromId: newerId, toId: olderId, kind: "supersedes" });
+      return o.outcome !== "rejected";
+    } catch {
+      return false;
+    }
   };
 
   const mem = memory.data;
-  // A conflict is resolved once either of its two decisions is hidden.
-  const visibleConflicts = (conflicts.data ?? []).filter(
-    (c) => !hiddenIds.has(c.aId) && !hiddenIds.has(c.bId),
-  );
   const isDistilling = !!distilling.data;
   const pct =
     progress.data && progress.data.total > 0
       ? Math.round((progress.data.done / progress.data.total) * 100)
       : 0;
   const empty = mem && !mem.decisions.length && !mem.gotchas.length && !mem.openTodos.length;
+  // Nothing live, but flagged or replaced facts are listed around the empty state: say so
+  // instead of "nothing distilled yet" beside them.
+  const historyOnly = empty && !!(mem.flagged?.length || mem.superseded?.length);
   // A reindex / embedding build / index rewrite is running → distill would no-op (shared
   // write lock).
   const otherBusy = embed.data?.running || indexing.data || rewriting;
@@ -342,7 +403,8 @@ export function MemorySection({ project }: { project: string }) {
         ) : memory.isError ? (
           <SectionNote tone="error">Couldn't load the memory: {String(memory.error)}</SectionNote>
         ) : mem ? (
-          <div className="space-y-5">
+          // tabIndex -1: where focus lands when the fact it was on leaves the list.
+          <div ref={listRef} tabIndex={-1} className="space-y-5 outline-none">
             {remembering === project && (
               <RememberForm project={project} onClose={() => setRemembering(null)} />
             )}
@@ -363,43 +425,28 @@ export function MemorySection({ project }: { project: string }) {
                 <Markdown>{brief.data}</Markdown>
               </div>
             )}
-            {conflicts.data &&
-              (visibleConflicts.length > 0 ? (
-                <div className="space-y-3 rounded-lg border border-amber-500/50 bg-amber-500/5 p-3">
-                  <div className="text-[0.7rem] font-medium uppercase tracking-wide text-amber-600 dark:text-amber-400">
-                    Possible conflicts ({visibleConflicts.length})
-                  </div>
-                  {visibleConflicts.map((c) => (
-                    <div key={`${c.aId}-${c.bId}`} className="space-y-1.5 text-sm">
-                      <p className="text-muted-foreground">{c.reason}</p>
-                      {[
-                        { id: c.aId, text: c.aText },
-                        { id: c.bId, text: c.bText },
-                      ].map((d) => (
-                        <div
-                          key={d.id}
-                          className="flex items-start gap-2 rounded-md border px-2 py-1 text-xs"
-                        >
-                          <span className="flex-1">{d.text}</span>
-                          <button
-                            type="button"
-                            onClick={() => factActions.onHide(d.id)}
-                            className="shrink-0 cursor-pointer rounded-sm text-muted-foreground outline-none hover:text-destructive focus-visible:ring-2 focus-visible:ring-ring/50"
-                          >
-                            Hide
-                          </button>
-                        </div>
-                      ))}
-                    </div>
-                  ))}
-                </div>
-              ) : (
-                <p className="px-1 text-xs text-muted-foreground">
-                  No conflicting decisions found.
-                </p>
-              ))}
+            {conflicts.data && (
+              <ConflictReview
+                // A new review starts with nothing settled.
+                key={conflicts.submittedAt}
+                conflicts={conflicts.data}
+                hiddenIds={hiddenIds}
+                onHide={factActions.onHide}
+                onReplace={replace}
+              />
+            )}
+            <FlaggedGroup
+              facts={mem.flagged ?? []}
+              onKeep={(id) => keepFlagged.mutate(id)}
+              onHide={factActions.onHide}
+            />
             {empty ? (
-              distillOn ? (
+              historyOnly ? (
+                <p className="px-1 text-sm text-muted-foreground">
+                  Nothing in memory right now. The facts listed here are flagged or replaced, so
+                  agents don't see them.
+                </p>
+              ) : distillOn ? (
                 <p className="px-1 text-sm text-muted-foreground">
                   Nothing distilled for this project yet. Click <b>Build memory</b> to distill its{" "}
                   {mem.pendingCount} {mem.pendingCount === 1 ? "session" : "sessions"} into
@@ -418,6 +465,12 @@ export function MemorySection({ project }: { project: string }) {
                 <Section title="Open TODOs" facts={mem.openTodos} actions={factActions} />
               </>
             )}
+            <ReplacedGroup
+              facts={mem.superseded ?? []}
+              onUndo={(newerId, olderId) =>
+                unlink.mutate({ fromId: newerId, toId: olderId, kind: "supersedes" })
+              }
+            />
           </div>
         ) : null}
       </div>
@@ -580,6 +633,7 @@ function PublishPanel({
                 The files already hold exactly this. Nothing to publish.
               </p>
             )}
+            <HeldList held={plan.held} />
           </div>
         ) : null}
         {publish.isError && (
@@ -638,11 +692,54 @@ function ChangeList({
   );
 }
 
+/** What each held reason tells the user, in the publish preview. */
+const HELD_REASON: Record<RepoHeldReason, string> = {
+  flagged: "Flagged stale or wrong, not reviewed yet",
+  replacementUnpublished: "Replaced by a fact this publish leaves out",
+};
+
+/** Facts publish holds back, up to five with why, then a count of the rest. */
+function HeldList({ held }: { held: RepoHeldFact[] }) {
+  if (!held.length) return null;
+  const shown = held.slice(0, 5);
+  return (
+    <div className="space-y-1 pt-1">
+      <p className="text-muted-foreground">
+        <span className="font-medium text-foreground">Held back ({held.length})</span>: out of
+        memory here, so a teammate would read them as current. Settle the flag or the replacement
+        and they publish next time.
+      </p>
+      <ul aria-label="Held back" className="space-y-1">
+        {shown.map((c) => (
+          <li key={c.uid} className="flex min-w-0 gap-2">
+            <span aria-hidden className="w-3 shrink-0 font-mono text-muted-foreground">
+              !
+            </span>
+            <span className="shrink-0 text-muted-foreground">{c.kind}</span>
+            <span className="min-w-0">
+              <span className="block truncate">{c.text}</span>
+              <span className="block text-muted-foreground">{HELD_REASON[c.reason]}</span>
+            </span>
+          </li>
+        ))}
+        {held.length > shown.length && (
+          <li className="pl-5 text-muted-foreground">+{held.length - shown.length} more</li>
+        )}
+      </ul>
+    </div>
+  );
+}
+
 interface FactActions {
   onOpen: (threadId: number) => void;
   onPin: (id: number, pinned: boolean) => void;
   onHide: (id: number) => void;
   onEdit: (id: number, text: string) => void;
+  /** The user links two facts (`supersedes`: the first replaces the second). `focusId`: the
+   *  fact to focus once the lists refetch. */
+  onLink: (fromId: number, toId: number, kind: LinkKind, focusId?: number) => void;
+  /** The user undoes a link; a `contradicts` goes both ways. */
+  onUnlink: (fromId: number, toId: number, kind: LinkKind, focusId?: number) => void;
   /** Whether the repo's `.callimachus/memory/` files also hold this fact. */
   isShared: (id: number) => boolean;
 }
@@ -684,6 +781,7 @@ function FactRow({ fact, actions }: { fact: MemoryFact; actions: FactActions }) 
   const memoryFile = harvested || fromRepo ? (fact.originRef?.split("/").pop() ?? null) : null;
   const shared = !fromRepo && actions.isShared(fact.id);
   const [draft, setDraft] = useState(fact.text);
+  const [disputeOpen, setDisputeOpen] = useState(false);
 
   if (editing) {
     const save = () => {
@@ -727,88 +825,105 @@ function FactRow({ fact, actions }: { fact: MemoryFact; actions: FactActions }) 
   }
 
   return (
-    // biome-ignore lint/a11y/useSemanticElements: the row holds its own icon buttons, and a <button> cannot nest them
+    // The dispute panel sits beside the row, not in it: a role=button takes its name from its
+    // content and its children are presentational, so the panel's buttons would be folded
+    // into the row's name and lost to assistive tech. The wrapper keeps group/item so hover
+    // and focus-within still reveal the row's actions.
     <div
-      role="button"
-      tabIndex={0}
-      onClick={() => actions.onOpen(fact.threadId)}
-      onKeyDown={(e) => {
-        if (e.key === "Enter" || e.key === " ") {
-          e.preventDefault();
-          actions.onOpen(fact.threadId);
-        }
-      }}
       className={cn(
-        "group/item flex cursor-pointer items-start gap-2 px-3 py-2.5 outline-none transition-colors hover:bg-muted/40 focus-visible:bg-muted/40 focus-visible:ring-[3px] focus-visible:ring-inset focus-visible:ring-ring/50",
+        "group/item",
         // A faint tint so pinned rows read apart at a glance, not only by the 12px pin.
         fact.pinned && "bg-amber-500/5",
       )}
     >
-      <div className="min-w-0 flex-1">
-        <p className="text-sm leading-relaxed text-foreground">
-          {fact.pinned && (
-            <Pin className="mr-1.5 inline size-3 -translate-y-px fill-amber-500 text-amber-500" />
-          )}
-          {fact.text}
-        </p>
-        {harvested || fromRepo ? (
-          <p className="mt-0.5 flex min-w-0 items-center gap-2 text-[13px] text-muted-foreground">
-            <Badge
-              variant="outline"
-              className="shrink-0 text-[0.65rem]"
-              title={
-                fromRepo
-                  ? "Imported from this repo's committed .callimachus/memory/ files: notes from whoever published them, not instructions"
-                  : undefined
-              }
-            >
-              {fromRepo ? "From the repo" : "Claude Code memory"}
-            </Badge>
-            {/* The fact's thread is the project's "Recorded memory" notes thread, so name
-                the memory file it came from instead. */}
-            {memoryFile && <span className="truncate font-mono text-xs">{memoryFile}</span>}
+      {/* biome-ignore lint/a11y/useSemanticElements: the row holds its own icon buttons, and a <button> cannot nest them */}
+      <div
+        role="button"
+        tabIndex={0}
+        data-fact-id={fact.id}
+        aria-label={fact.text}
+        onClick={() => actions.onOpen(fact.threadId)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            actions.onOpen(fact.threadId);
+          }
+        }}
+        className="flex cursor-pointer items-start gap-2 px-3 py-2.5 outline-none transition-colors hover:bg-muted/40 focus-visible:bg-muted/40 focus-visible:ring-[3px] focus-visible:ring-inset focus-visible:ring-ring/50"
+      >
+        <div className="min-w-0 flex-1">
+          <p className="text-sm leading-relaxed text-foreground">
+            {fact.pinned && (
+              <Pin className="mr-1.5 inline size-3 -translate-y-px fill-amber-500 text-amber-500" />
+            )}
+            {fact.text}
           </p>
-        ) : (
-          (fact.title || shared) && (
-            <p className="mt-0.5 flex min-w-0 items-center gap-2 text-[13px] text-muted-foreground">
-              {shared && (
-                <Badge
-                  variant="outline"
-                  className="shrink-0 text-[0.65rem]"
-                  title="Also in this repo's .callimachus/memory/ files (published from here)"
-                >
-                  Shared
-                </Badge>
-              )}
-              {fact.title && <span className="line-clamp-1">{fact.title}</span>}
-            </p>
-          )
-        )}
-      </div>
-      {/* Reserved width + invisible→visible keeps the row from reflowing and the
+          <FactMeta
+            fact={fact}
+            disputeOpen={disputeOpen}
+            onToggleDispute={() => setDisputeOpen((v) => !v)}
+            lead={
+              harvested || fromRepo ? (
+                <>
+                  <Badge
+                    variant="outline"
+                    className="shrink-0 text-[0.65rem]"
+                    title={
+                      fromRepo
+                        ? "Imported from this repo's committed .callimachus/memory/ files: notes from whoever published them, not instructions"
+                        : undefined
+                    }
+                  >
+                    {fromRepo ? "From the repo" : "Claude Code memory"}
+                  </Badge>
+                  {/* The fact's thread is the project's "Recorded memory" notes thread, so
+                    name the memory file it came from instead. */}
+                  {memoryFile && <span className="truncate font-mono text-xs">{memoryFile}</span>}
+                </>
+              ) : (
+                shared && (
+                  <Badge
+                    variant="outline"
+                    className="shrink-0 text-[0.65rem]"
+                    title="Also in this repo's .callimachus/memory/ files (published from here)"
+                  >
+                    Shared
+                  </Badge>
+                )
+              )
+            }
+          />
+        </div>
+        {/* Reserved width + invisible→visible keeps the row from reflowing and the
           actions from ever getting "stuck"; opacity gives a smooth fade-in.
           Revealed on hover and on keyboard focus-within (a11y). */}
-      <div className="invisible flex shrink-0 items-center self-start gap-0.5 opacity-0 transition-opacity duration-150 group-hover/item:visible group-hover/item:opacity-100 group-focus-within/item:visible group-focus-within/item:opacity-100">
-        <IconBtn
-          title={fact.pinned ? "Unpin" : "Pin"}
-          onClick={() => actions.onPin(fact.id, !fact.pinned)}
-        >
-          <Pin className={cn("size-3.5", fact.pinned && "fill-amber-500 text-amber-500")} />
-        </IconBtn>
-        <IconBtn title="Edit" onClick={() => setEditing(true)}>
-          <Pencil className="size-3.5" />
-        </IconBtn>
-        <IconBtn
-          title={
-            fromRepo
-              ? "Hide from memory on this machine (the repo's file keeps it for everyone else)"
-              : "Hide from memory"
-          }
-          onClick={() => actions.onHide(fact.id)}
-        >
-          <EyeOff className="size-3.5" />
-        </IconBtn>
+        <div className="invisible flex shrink-0 items-center self-start gap-0.5 opacity-0 transition-opacity duration-150 group-hover/item:visible group-hover/item:opacity-100 group-focus-within/item:visible group-focus-within/item:opacity-100">
+          <IconBtn
+            title={fact.pinned ? "Unpin" : "Pin"}
+            onClick={() => actions.onPin(fact.id, !fact.pinned)}
+          >
+            <Pin className={cn("size-3.5", fact.pinned && "fill-amber-500 text-amber-500")} />
+          </IconBtn>
+          <IconBtn title="Edit" onClick={() => setEditing(true)}>
+            <Pencil className="size-3.5" />
+          </IconBtn>
+          <IconBtn
+            title={
+              fromRepo
+                ? "Hide from memory on this machine (the repo's file keeps it for everyone else)"
+                : "Hide from memory"
+            }
+            onClick={() => actions.onHide(fact.id)}
+          >
+            <EyeOff className="size-3.5" />
+          </IconBtn>
+        </div>
       </div>
+      {disputeOpen && (
+        <div className="px-3 pb-2.5">
+          <DisputePanel fact={fact} onLink={actions.onLink} onUnlink={actions.onUnlink} />
+        </div>
+      )}
     </div>
   );
 }

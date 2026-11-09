@@ -26,7 +26,12 @@ Specifically:
   (1) the **in-app chat**, including the history results and threads its tools
   fetch; (2) **Knowledge distillation** (`agent::distill`) of decisions, gotchas,
   and summaries, including background auto-distill when you turn it on (threads
-  active in the last 30 days, up to the daily limit you set, 50 by default);
+  active in the last 30 days, up to the daily limit you set, 50 by default),
+  which beside the thread also sends the project's current decisions and gotchas
+  (up to 30 and 20, each cut to 200 characters: the ones distilled from other
+  threads, the ones you or an agent recorded and the ones imported from the
+  repo's memory files, never Claude Code auto memory) so the engine can tell
+  what the session changed (`knowledge::distill_memory_context`);
   (3) **Ask your history / RAG** (Chat's Ask mode, `agent::answer`, also reachable
   as `cal ask` and the `ask_history` MCP tool); (4) the Project page's **Synthesize brief**,
   **Write memory file** and **Review conflicts** (`agent::project_brief`,
@@ -105,18 +110,32 @@ browser storage, no cross-site tracking.
   memory block, the context Open in CLI passes to a new agent session, and
   Obsidian exports. Common secret formats (OpenAI, Anthropic and OpenRouter
   `sk-` keys, Stripe keys and webhook secrets, GitHub and Slack tokens, AWS
-  access key IDs, bearer tokens, JWTs, private-key blocks, and
-  `api_key=`/`password:`-style assignments; other keys, such as a bare Google
-  `AIza...` key, are caught only in that assignment form) are replaced with
-  `[REDACTED]` in transcripts, thread titles, search snippets, distilled facts
-  and error signatures alike. The index itself keeps the original text. This is
-  a best-effort safety net, not a guarantee: it matches known patterns, so a key
-  in an unusual format can slip through. Treat any secret that appeared in a
+  access key IDs, Google `AIza...` API keys, bearer tokens, JWTs, private-key
+  blocks including one cut off before its END line, the password in a URL such
+  as `postgres://user:password@host` (even one holding an `@` or `#`), and `api_key=`/`password:`-style
+  assignments) are replaced with `[REDACTED]` in transcripts, thread titles,
+  search snippets, distilled facts and error signatures alike. A key with
+  zero-width or other invisible characters inside it, or partly spelled as JSON
+  `\uXXXX` escapes, is still matched, and the whole original span is removed.
+  The index itself keeps the original text. This is a best-effort safety net,
+  not a guarantee: it matches known patterns, so a key in an unusual format can
+  slip through. Treat any secret that appeared in a
   transcript as exposed to the providers you use. The `cal` query commands
   (`cal search`, `cal memory` and the like) redact their output the same way,
   human and `--json` alike, since agents run them too; pass `--raw` to print
   your history as stored in your own terminal (`cal cat` and the hooks ignore
   it). What you type into the chat yourself is not redacted.
+- Text Callimachus injects into an agent's context or writes where a terminal
+  shows it (project memory lines, the SessionStart session digest, the
+  compaction prompt anchor, the managed AGENTS.md / CLAUDE.md block, packed
+  transcripts and snapshots, MCP tool results, and the human output of the
+  `cal` query commands such as `cal search` and `cal memory` unless you pass
+  `--raw`) is stripped of terminal escape sequences, control characters,
+  bidirectional overrides and invisible Unicode tag characters, so a stored
+  transcript cannot restyle your terminal or hide instructions from you. JSON
+  output (`--json`, MCP structured results) drops the bidirectional overrides
+  and tag characters and escapes the control characters. The index keeps the
+  text as recorded.
 - The in-app agent's `run_shell` tool requires **explicit per-command approval**
   before anything executes.
 - The Claude Code hooks Callimachus installs (SessionStart `cal hook`, PreCompact
@@ -175,9 +194,33 @@ browser storage, no cross-site tracking.
   text is redacted, and Claude Code auto memory is never published. The files
   leave the machine only when you commit and push them. Imported repo facts come
   from whoever can push to the repo, so they are never pinned, are marked
-  "From the repo" in the app and `(repo)` in injected memory under a line that
-  names the files, and `cal memory import --review` shows what an import would
-  change without writing it.
+  "From the repo" in the app and `repo` in each injected line's provenance
+  suffix, e.g. `(2026-10-03, repo)`, under a line that names the files, and
+  `cal memory import --review` shows what an import would change without
+  writing it. A committed line's `supersedes` list can take a local fact out of
+  injected memory on import, but only a visible fact of the same kind in the
+  same repo; one you pinned or edited is not replaced but marked disputed for
+  you to settle, and a pair you undid is not linked again.
+- Writes that take a fact out of injected memory are bounded, and each one
+  shows in the Projects tab, where you can undo it. Replaced facts stay as
+  history; nothing is deleted.
+  - `flag_fact` (an agent marks a fact stale or wrong): at most 10 unreviewed
+    agent flags hide facts in a project at a time, a fact you pinned or edited
+    stays in memory (labelled flagged), and the MCP server reaches only facts of
+    the repo it runs in (or another clone of it), whatever project the agent
+    names.
+  - `record_decision` / `record_gotcha` with `replaces`, and
+    `cal remember --replaces`: a target you pinned or edited is not replaced but
+    marked disputed; an agent gets 5 replacements per project in 24 hours, after
+    which further ones are marked disputed too. Over MCP the target must be in
+    the repo the server runs in.
+  - The distiller's links: a session can only point at the existing items it
+    was shown for that project (a closed list of references, never a free id),
+    only for a reversal or disagreement the session plainly states, at most 3
+    replacements, 3 disputes, 3 retirements and 5 confirmations per session. It
+    never replaces or hides a fact you pinned or edited (it is marked disputed
+    or stays in, labelled), and a link you undo is remembered, so re-distilling
+    the session does not bring it back.
 - Agent-recorded and LLM-distilled facts that Callimachus injects into new
   sessions (hooks, `AGENTS.md` / `CLAUDE.md`) are labelled as notes from past
   sessions, not instructions. Review a repo's memory (`cal memory`, or the

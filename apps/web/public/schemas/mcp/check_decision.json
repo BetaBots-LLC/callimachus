@@ -18,7 +18,10 @@
               "rationale",
               "similarity",
               "extractor",
-              "originRef"
+              "originRef",
+              "decidedAt",
+              "status",
+              "support"
             ],
             "type": "object",
             "properties": {
@@ -62,6 +65,100 @@
                 "type": "string"
               },
               "originRef": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "decidedAt": {
+                "type": "integer"
+              },
+              "status": {
+                "enum": [
+                  "current",
+                  "disputed",
+                  "flagged",
+                  "superseded"
+                ],
+                "type": "string"
+              },
+              "supersededBy": {
+                "required": [
+                  "id",
+                  "text",
+                  "decidedAt"
+                ],
+                "type": [
+                  "object",
+                  "null"
+                ],
+                "properties": {
+                  "id": {
+                    "type": "integer"
+                  },
+                  "text": {
+                    "type": "string"
+                  },
+                  "decidedAt": {
+                    "type": "integer"
+                  },
+                  "threadId": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  }
+                }
+              },
+              "disputedBy": {
+                "type": "array",
+                "items": {
+                  "required": [
+                    "id",
+                    "text",
+                    "decidedAt"
+                  ],
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "integer"
+                    },
+                    "text": {
+                      "type": "string"
+                    },
+                    "decidedAt": {
+                      "type": "integer"
+                    },
+                    "threadId": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    }
+                  }
+                }
+              },
+              "replaces": {
+                "items": {
+                  "type": "integer"
+                },
+                "type": "array"
+              },
+              "support": {
+                "type": "integer"
+              },
+              "lastConfirmed": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "match": {
+                "enum": [
+                  "close",
+                  "related",
+                  null
+                ],
                 "type": [
                   "string",
                   "null"

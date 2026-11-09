@@ -16,7 +16,9 @@
             "required": [
               "id",
               "text",
-              "pinned"
+              "pinned",
+              "status",
+              "decidedAt"
             ],
             "type": "object",
             "properties": {
@@ -28,6 +30,18 @@
               },
               "pinned": {
                 "type": "boolean"
+              },
+              "status": {
+                "enum": [
+                  "current",
+                  "disputed",
+                  "flagged",
+                  "superseded"
+                ],
+                "type": "string"
+              },
+              "decidedAt": {
+                "type": "integer"
               }
             }
           }
@@ -38,7 +52,9 @@
             "required": [
               "id",
               "text",
-              "pinned"
+              "pinned",
+              "status",
+              "decidedAt"
             ],
             "type": "object",
             "properties": {
@@ -50,6 +66,18 @@
               },
               "pinned": {
                 "type": "boolean"
+              },
+              "status": {
+                "enum": [
+                  "current",
+                  "disputed",
+                  "flagged",
+                  "superseded"
+                ],
+                "type": "string"
+              },
+              "decidedAt": {
+                "type": "integer"
               }
             }
           }
@@ -60,7 +88,9 @@
             "required": [
               "id",
               "text",
-              "pinned"
+              "pinned",
+              "status",
+              "decidedAt"
             ],
             "type": "object",
             "properties": {
@@ -72,6 +102,18 @@
               },
               "pinned": {
                 "type": "boolean"
+              },
+              "status": {
+                "enum": [
+                  "current",
+                  "disputed",
+                  "flagged",
+                  "superseded"
+                ],
+                "type": "string"
+              },
+              "decidedAt": {
+                "type": "integer"
               }
             }
           }

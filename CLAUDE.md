@@ -14,7 +14,10 @@ and PR checks; this file is what an agent needs on top of that.
     telemetry.
     Its build.rs stamps the app crate's version as `CALLIMACHUS_VERSION` (core stays 0.0.0).
     The graph tables from 0034 (`facts.uid` / `source_seq`, `projects`, `file_edits`,
-    `issue_clusters`) and their functions are documented at the top of `core/src/lib.rs`. The
+    `issue_clusters`) and the fact truth tables from 0035 (`fact_links`: supersedes /
+    contradicts between facts; `fact_signals`: reaffirmed / stale / wrong; read and written
+    only through `knowledge::truth`) and their functions are documented at the top of
+    `core/src/lib.rs`. The
     watcher keeps them current (`jobs::CommitLinker` after each batch, the off-writer
     `issue_clusters_kick` when the index changed since the stored refresh, and after its launch
     catch-up the one-time `file_edits` backfill that 0034 flags in `app_config`); `cal index`
@@ -55,6 +58,7 @@ cd apps/desktop/src-tauri
 cargo fmt --check && cargo clippy --locked --workspace --lib --bins --tests -- -D warnings
 cargo test --locked --workspace
 cargo test -p callimachus-core -- --ignored real_claude_index --nocapture  # #[ignore] by name
+cargo test -p callimachus-core eval_memory_truth -- --ignored --nocapture  # recall eval (CONTRIBUTING.md)
 ```
 
 - fmt, clippy (`-D warnings`) and tests block CI (`RUST_TOOLCHAIN` in ci.yml pins Rust). All
@@ -102,8 +106,8 @@ env -u CLAUDE_CONFIG_DIR -u CODEX_HOME HOME="$S/home" CALLIMACHUS_DB="$S/index.d
 ## Migrations
 
 - Add `src-tauri/migrations/00NN_<name>.sql` (the directory stays there, not under `core/`)
-  with the next number (0035) and register it in `core/src/db/migrations.rs`. Never edit a
-  committed migration (0001-0034): `rusqlite_migration` tracks only `user_version`, so an
+  with the next number (0036) and register it in `core/src/db/migrations.rs`. Never edit a
+  committed migration (0001-0035): `rusqlite_migration` tracks only `user_version`, so an
   edited file never re-runs on an index that already applied it.
 - An upgrade runs in whichever process opens the index first and holds the write lock, so time
   it on a large index (`db::migrate` pre-reads big files sequentially first, unless every pending
