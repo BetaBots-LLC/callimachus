@@ -138,6 +138,26 @@ fn read_pid(file: &mut File) -> Option<u32> {
     text.trim().parse().ok()
 }
 
+/// Wait up to `timeout` for nobody to hold `name` for `index`, and say whether it is free.
+/// A lock this process just dropped can still read as held for a moment: a child that another
+/// thread is spawning holds a copy of every open file description between its fork and its
+/// exec (files open close-on-exec, so the copy goes at exec). With one thread spawning
+/// `/usr/bin/true` in a loop, relocking right after a drop failed within 20,000 rounds; with
+/// none, it never did. Production probes ride this out (the watcher rechecks, `acquire`
+/// retries); tests that assert a lock is free right after dropping it use this instead.
+pub fn wait_until_free(index: &Path, name: &str, timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if holder(index, name).is_none() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 /// " (pid N)" for a message, or "" when the pid is unknown.
 pub fn pid_note(pid: Option<u32>) -> String {
     pid.map(|p| format!(" (pid {p})")).unwrap_or_default()
@@ -152,6 +172,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         dir.join("index.db")
     }
+
+    /// Generous: CI runs every test thread at once, and a spawning one can hold a dropped
+    /// lock for as long as its child takes to reach exec.
+    const FREED: std::time::Duration = std::time::Duration::from_secs(5);
 
     /// One holder at a time, the holder's pid is readable, and dropping the lock frees it
     /// without deleting the file (a stale file never reads as live).
@@ -181,7 +205,7 @@ mod tests {
         drop(lock);
         assert!(lock_path(&index, WATCH_LOCK).exists(), "the file stays");
         assert!(
-            holder(&index, WATCH_LOCK).is_none(),
+            wait_until_free(&index, WATCH_LOCK, FREED),
             "a stale file is not live"
         );
         assert!(matches!(
@@ -223,6 +247,7 @@ mod tests {
             panic!("a free lock is acquired");
         };
         drop(lock);
+        assert!(wait_until_free(&index, WATCH_LOCK, FREED));
         // A probe's shared lock held open, as a second probe would see it mid-flight.
         let probe = File::open(lock_path(&index, WATCH_LOCK)).unwrap();
         probe.try_lock_shared().unwrap();
@@ -231,10 +256,40 @@ mod tests {
             "a probe is not a holder"
         );
         drop(probe);
+        assert!(wait_until_free(&index, WATCH_LOCK, FREED));
         assert!(matches!(
             acquire(&index, WATCH_LOCK).unwrap(),
             Acquire::Acquired(_)
         ));
+    }
+
+    /// The race behind the flaky "stale" asserts, run on purpose: another thread keeps
+    /// spawning children while this one takes and drops a lock, and every dropped lock must
+    /// read free once the child holding a copy of it has exec'd.
+    #[cfg(unix)]
+    #[test]
+    fn a_dropped_lock_frees_while_other_threads_spawn_children() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let index = index_in("spawning");
+        let stop = Arc::new(AtomicBool::new(false));
+        let spawner = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = std::process::Command::new("true").status();
+                }
+            })
+        };
+        for _ in 0..200 {
+            let Acquire::Acquired(lock) = acquire(&index, WATCH_LOCK).unwrap() else {
+                panic!("a freed lock is acquired again");
+            };
+            drop(lock);
+            assert!(wait_until_free(&index, WATCH_LOCK, FREED));
+        }
+        stop.store(true, Ordering::Relaxed);
+        spawner.join().unwrap();
     }
 
     /// A lock file that exists but cannot be opened reads as held (pid unknown), never as

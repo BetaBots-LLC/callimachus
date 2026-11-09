@@ -4557,6 +4557,9 @@ mod command_surface_tests {
 mod lock_tests {
     use super::*;
 
+    /// How long a dropped lock may read as held while another test thread's child execs.
+    const FREED: std::time::Duration = std::time::Duration::from_secs(5);
+
     fn index_in(tag: &str) -> std::path::PathBuf {
         let dir =
             std::env::temp_dir().join(format!("calli_app_locks_{tag}_{}", std::process::id()));
@@ -4576,6 +4579,9 @@ mod lock_tests {
             };
             assert!(distilled_elsewhere(&index), "{name} is live");
             drop(lock);
+            // Other test threads spawn children, which hold a copy of the dropped lock until
+            // they exec: wait that out (see `locks::wait_until_free`).
+            assert!(locks::wait_until_free(&index, name, FREED), "{name} frees");
             assert!(!distilled_elsewhere(&index), "{name} is stale");
         }
     }
@@ -4598,6 +4604,7 @@ mod lock_tests {
 
         first.release();
         assert!(!first.owner.load(Ordering::Relaxed));
+        assert!(locks::wait_until_free(&index, locks::GUI_LOCK, FREED));
         let locks::Acquire::Acquired(watch) = locks::acquire(&index, locks::WATCH_LOCK).unwrap()
         else {
             panic!("watch.lock is free");
@@ -4608,6 +4615,7 @@ mod lock_tests {
         ));
         assert!(second.owner.load(Ordering::Relaxed), "gui.lock is now ours");
         drop(watch);
+        assert!(locks::wait_until_free(&index, locks::WATCH_LOCK, FREED));
         assert_eq!(watcher_wait(&second, &index), None);
     }
 }
