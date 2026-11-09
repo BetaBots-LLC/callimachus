@@ -923,6 +923,13 @@ mod tests {
             };
             assert_eq!(gate(&path), StaleGate::Skip(why));
             drop(lock);
+            // A child another test thread is spawning can hold the dropped lock until it
+            // execs; the next case must not see this one.
+            assert!(locks::wait_until_free(
+                &path,
+                name,
+                std::time::Duration::from_secs(5)
+            ));
         }
         assert_eq!(
             gate(&path),
