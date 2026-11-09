@@ -61,6 +61,14 @@ export function flagLine(flag: FactFlag): string {
   return `Flagged ${flag.kind} by ${who} on ${factDate(flag.createdAt)}`;
 }
 
+/** Whether a flagged fact is still in memory, and why: a pin or an edit keeps the user's
+ *  fact injected until they keep or hide it; otherwise the flag takes it out. */
+export function flaggedStanding(f: MemoryFact): string {
+  if (f.pinned) return "Pinned, so it stays in memory";
+  if (f.edited) return "Edited, so it stays in memory";
+  return "Left out of memory";
+}
+
 /** What to tell the user when a link they asked for was refused. */
 export function linkRefusal(o: LinkOutcome): string | null {
   if (o.outcome !== "rejected") return null;
@@ -145,15 +153,13 @@ export function FactMeta({
           Disputed
         </Badge>
       )}
-      {/* Only the live lists render this line, and a flagged fact is live only when the user
-          pinned or edited it, so one that is not pinned was edited. */}
       {fact.status === "flagged" && (
         <Badge
           variant="outline"
           className="shrink-0 border-amber-500/50 text-[0.65rem] text-amber-700 dark:text-amber-400"
           title={
             fact.flags?.[0]
-              ? `${flagLine(fact.flags[0])}${fact.flags[0].reason ? `: ${fact.flags[0].reason}` : ""}. ${fact.pinned ? "Pinned" : "Edited"}, so it stays in memory until you keep or hide it.`
+              ? `${flagLine(fact.flags[0])}${fact.flags[0].reason ? `: ${fact.flags[0].reason}` : ""}. ${flaggedStanding(fact)} until you keep or hide it.`
               : undefined
           }
         >

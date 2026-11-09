@@ -110,18 +110,32 @@ browser storage, no cross-site tracking.
   memory block, the context Open in CLI passes to a new agent session, and
   Obsidian exports. Common secret formats (OpenAI, Anthropic and OpenRouter
   `sk-` keys, Stripe keys and webhook secrets, GitHub and Slack tokens, AWS
-  access key IDs, bearer tokens, JWTs, private-key blocks, and
-  `api_key=`/`password:`-style assignments; other keys, such as a bare Google
-  `AIza...` key, are caught only in that assignment form) are replaced with
-  `[REDACTED]` in transcripts, thread titles, search snippets, distilled facts
-  and error signatures alike. The index itself keeps the original text. This is
-  a best-effort safety net, not a guarantee: it matches known patterns, so a key
-  in an unusual format can slip through. Treat any secret that appeared in a
+  access key IDs, Google `AIza...` API keys, bearer tokens, JWTs, private-key
+  blocks including one cut off before its END line, the password in a URL such
+  as `postgres://user:password@host` (even one holding an `@` or `#`), and `api_key=`/`password:`-style
+  assignments) are replaced with `[REDACTED]` in transcripts, thread titles,
+  search snippets, distilled facts and error signatures alike. A key with
+  zero-width or other invisible characters inside it, or partly spelled as JSON
+  `\uXXXX` escapes, is still matched, and the whole original span is removed.
+  The index itself keeps the original text. This is a best-effort safety net,
+  not a guarantee: it matches known patterns, so a key in an unusual format can
+  slip through. Treat any secret that appeared in a
   transcript as exposed to the providers you use. The `cal` query commands
   (`cal search`, `cal memory` and the like) redact their output the same way,
   human and `--json` alike, since agents run them too; pass `--raw` to print
   your history as stored in your own terminal (`cal cat` and the hooks ignore
   it). What you type into the chat yourself is not redacted.
+- Text Callimachus injects into an agent's context or writes where a terminal
+  shows it (project memory lines, the SessionStart session digest, the
+  compaction prompt anchor, the managed AGENTS.md / CLAUDE.md block, packed
+  transcripts and snapshots, MCP tool results, and the human output of the
+  `cal` query commands such as `cal search` and `cal memory` unless you pass
+  `--raw`) is stripped of terminal escape sequences, control characters,
+  bidirectional overrides and invisible Unicode tag characters, so a stored
+  transcript cannot restyle your terminal or hide instructions from you. JSON
+  output (`--json`, MCP structured results) drops the bidirectional overrides
+  and tag characters and escapes the control characters. The index keeps the
+  text as recorded.
 - The in-app agent's `run_shell` tool requires **explicit per-command approval**
   before anything executes.
 - The Claude Code hooks Callimachus installs (SessionStart `cal hook`, PreCompact

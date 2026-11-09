@@ -433,9 +433,12 @@ fn truncate_at_word(s: &str, max: usize) -> String {
     format!("{cut}…")
 }
 
-/// One fact as a single bullet-safe line: secrets redacted, whitespace collapsed (a stray
-/// newline would break the bullet list), our block markers removed (so a fact can't close
-/// the managed block early), every other fence tag escaped, then cut to `max` chars.
+/// One fact as a single bullet-safe line: terminal escapes and invisible controls stripped
+/// (`context::strip_controls`, so a stored ANSI or bidi sequence never reaches a terminal or
+/// an agent), secrets redacted, whitespace collapsed (a stray newline would break the bullet
+/// list), our block markers removed (so a fact can't close the managed block early), every
+/// other fence tag escaped, then cut to `max` chars. Stripped before the redaction, so an
+/// escape sequence inside a key cannot split it.
 ///
 /// The escape is here because every surface that prints a stored fact or session text to an
 /// agent goes through this line: the hook (where `<session_prompts>` follows the facts after a
@@ -443,7 +446,8 @@ fn truncate_at_word(s: &str, max: usize) -> String {
 /// snapshot carry. A distilled fact quoting `</project_memory>` must not close that fence or
 /// forge a fake one. Escaped before the cut, so any prefix the budget keeps is still escaped.
 pub fn fact_line(text: &str, max: usize) -> String {
-    let redacted = redact_secrets(text);
+    let visible = crate::context::strip_controls(text);
+    let redacted = redact_secrets(&visible);
     let flat = redacted.split_whitespace().collect::<Vec<_>>().join(" ");
     let flat = flat.replace(MANAGED_START, "").replace(MANAGED_END, "");
     truncate_at_word(crate::context::escape_fences(flat.trim()).as_ref(), max)
@@ -469,7 +473,7 @@ pub fn agent_memory_md_budgeted(
     // `<session_prompts>` after it) that neither may close.
     let mut head = format!(
         "## Project memory ({})\n\n",
-        crate::context::escape_fences(project_label(project))
+        crate::context::escape_fences(&crate::context::strip_controls(project_label(project)))
     );
     head.push_str("_Prior decisions and gotchas for this repo, recorded by Callimachus._\n");
     head.push_str(MEMORY_TRUST_LINE);
@@ -486,7 +490,8 @@ pub fn agent_memory_md_budgeted(
     }
     head.push('\n');
     if let Some(text) = brief.map(str::trim).filter(|t| !t.is_empty()) {
-        let text = redact_secrets(text);
+        let text = crate::context::strip_controls(text);
+        let text = redact_secrets(&text);
         let text = crate::context::escape_fences(&text);
         head.push_str(&truncate_at_word(&text, (b.max_chars / 3).max(80)));
         head.push_str("\n\n");
@@ -1046,8 +1051,13 @@ pub fn session_digest(
         out.push_str(&footer);
     }
     let out = out.trim_end();
-    // Only reachable with a budget too small for the header itself.
-    Ok(Some(truncate_at_word(out, opts.max_chars)))
+    // Only reachable with a budget too small for the header itself. Session text already
+    // went through `fact_line`, stripped before it was fence-escaped; this pass catches the
+    // rest (the project path in the `cal recent` hint), and stripping only ever shortens, so
+    // the cap still holds. It cannot revive an escaped tag either: the escaper reads through
+    // controls (`context::escape_fences`).
+    let out = truncate_at_word(out, opts.max_chars);
+    Ok(Some(crate::context::strip_controls(&out).into_owned()))
 }
 
 /// SessionStart hook settings in `app_config`, shared by `cal hook` and the Settings UI.
@@ -1136,7 +1146,11 @@ pub const MANAGED_END: &str = "<!-- callimachus:memory:end -->";
 /// Insert or replace the Callimachus-managed block in an existing agent context file,
 /// leaving everything else (the user's own content) untouched. Never produces a second
 /// block, and never pairs our START with an END that belongs to something else.
+///
+/// The body is stripped of terminal escapes and invisible controls (`strip_controls`): the
+/// file is read by agents and `cat` alike. The user's own content around it is not touched.
 pub fn upsert_managed_block(existing: &str, body: &str) -> String {
+    let body = crate::context::strip_controls(body);
     let managed = format!("{MANAGED_START}\n{body}\n{MANAGED_END}");
     let Some(start) = existing.find(MANAGED_START) else {
         // No block yet. Drop any orphaned END marker (the user deleted the START line) so a
@@ -1162,7 +1176,7 @@ pub fn upsert_managed_block(existing: &str, body: &str) -> String {
         // again (older versions appended a second block in exactly this state).
         (Some(e), Some(n)) if n < e => {
             let repaired = format!("{}{}", &existing[..start], &existing[after_start..]);
-            upsert_managed_block(&repaired, body)
+            upsert_managed_block(&repaired, &body)
         }
         // The normal case: replace START..END in place.
         (Some(e), _) => format!(
@@ -1181,7 +1195,7 @@ pub fn upsert_managed_block(existing: &str, body: &str) -> String {
             if rest.contains(MANAGED_START) {
                 // Another END-less block follows: drop this stale one, then repair that one.
                 let repaired = format!("{}{rest}", &existing[..start]);
-                return upsert_managed_block(&repaired, body);
+                return upsert_managed_block(&repaired, &body);
             }
             let before = existing[..start].replace(MANAGED_END, "");
             if rest.trim().is_empty() {
@@ -2333,6 +2347,60 @@ mod tests {
         // max_sessions is honored and capped at five.
         assert_eq!(digest(&conn, 2, 2500).unwrap().matches("\n- ").count(), 2);
         assert_eq!(digest(&conn, 50, 9000).unwrap().matches("\n- ").count(), 5);
+    }
+
+    /// Stored text carrying terminal escapes, bidi overrides or tag characters reaches no
+    /// agent-facing surface with them: not a fact line, not the digest, not the managed block.
+    #[test]
+    fn memory_surfaces_strip_terminal_escapes_and_invisible_controls() {
+        let hostile =
+            "Use \u{1B}[31mred\u{1B}[0m \u{202E}cod.exe\u{202C} \u{1B}]0;t\u{7}\u{E0041}x\0y";
+        let line = fact_line(hostile, 200);
+        assert_eq!(line, "Use red cod.exe xy");
+        // An escape sequence inside a key cannot split it out of the redaction.
+        let split = "key sk-ant-api03-AbCdEf\u{1B}[0mGhIjKlMnOpQrStUv0123456789";
+        assert_eq!(fact_line(split, 200), "key [REDACTED]");
+
+        let mut conn = dts::temp_db("controls");
+        dts::session(
+            &mut conn,
+            "c1",
+            "/x/controls",
+            "Title \u{1B}[2J\u{202E}flip",
+            60,
+            &["gist with \u{1B}]8;;https://evil.example\u{7}a link and \u{E0001}tags"],
+        );
+        let opts = DigestOpts {
+            max_sessions: 3,
+            max_chars: 2500,
+        };
+        let out = session_digest(&conn, "/x/controls", &opts)
+            .unwrap()
+            .unwrap();
+        assert!(out.contains("Title flip"), "{out:?}");
+        assert!(
+            !out.chars().any(|c| c == '\u{1B}'
+                || c == '\u{7}'
+                || c == '\u{202E}'
+                || ('\u{E0000}'..='\u{E007F}').contains(&c)),
+            "{out:?}"
+        );
+
+        let block = upsert_managed_block(
+            "# Mine \u{1B}[1mbold\u{1B}[0m",
+            "body \u{1B}[31mred\u{2066}",
+        );
+        // Our body is stripped; the user's own text is left exactly as they wrote it.
+        assert!(
+            block.starts_with("# Mine \u{1B}[1mbold\u{1B}[0m\n\n"),
+            "{block:?}"
+        );
+        assert!(block.contains("\nbody red\n"), "{block:?}");
+        // Already up to date: rewriting with the same body changes nothing.
+        assert_eq!(
+            upsert_managed_block(&block, "body \u{1B}[31mred\u{2066}"),
+            block
+        );
     }
 
     /// Session titles and gists are raw text printed beside the hook's fenced blocks, so a

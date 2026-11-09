@@ -58,6 +58,7 @@ cd apps/desktop/src-tauri
 cargo fmt --check && cargo clippy --locked --workspace --lib --bins --tests -- -D warnings
 cargo test --locked --workspace
 cargo test -p callimachus-core -- --ignored real_claude_index --nocapture  # #[ignore] by name
+cargo test -p callimachus-core eval_memory_truth -- --ignored --nocapture  # recall eval (CONTRIBUTING.md)
 ```
 
 - fmt, clippy (`-D warnings`) and tests block CI (`RUST_TOOLCHAIN` in ci.yml pins Rust). All

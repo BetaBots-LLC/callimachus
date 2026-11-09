@@ -3,7 +3,7 @@ import { ChevronRight } from "lucide-react";
 import type { MemoryFact } from "../../lib/api";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
-import { dateTitle, factDate, flagLine } from "./FactTruth";
+import { dateTitle, factDate, flaggedStanding, flagLine } from "./FactTruth";
 
 /**
  * The Memory section's history: facts that are out of injected memory but kept, so the user
@@ -98,14 +98,10 @@ export function ReplacedGroup({
 /** Facts with an unresolved stale / wrong flag. Shown only when there are any. */
 export function FlaggedGroup({
   facts,
-  inMemory,
   onKeep,
   onHide,
 }: {
   facts: MemoryFact[];
-  /** Whether the live lists hold it: a flagged fact stays in memory when the user pinned or
-   *  edited it, and the fact carries `pinned` but no edited bit, so the lists stand in. */
-  inMemory: (id: number) => boolean;
   onKeep: (id: number) => void;
   onHide: (id: number) => void;
 }) {
@@ -133,11 +129,7 @@ export function FlaggedGroup({
                   </p>
                 )}
                 <p className="mt-0.5 text-[13px] text-muted-foreground">
-                  {f.pinned
-                    ? "Pinned, so it stays in memory until you choose."
-                    : inMemory(f.id)
-                      ? "Edited, so it stays in memory until you choose."
-                      : "Left out of memory until you choose."}
+                  {flaggedStanding(f)} until you choose.
                 </p>
               </div>
               <div className="flex shrink-0 gap-1">

@@ -794,13 +794,26 @@ pub fn cmd_distill_auto(args: &[String]) -> anyhow::Result<()> {
     let dyn_host: Host = host.clone();
     let out = runtime.block_on(jobs::auto_distill_drain(&dyn_host));
     let n = out.distilled;
+    // The grounding gate's drops are otherwise only in per-round log lines; the summary is
+    // what a scheduled `cal distill --auto` run shows its user.
+    let mut notes = Vec::new();
+    if out.failed > 0 {
+        notes.push(format!("{} failed", out.failed));
+    }
+    if out.ungrounded > 0 {
+        notes.push(format!(
+            "{} ungrounded fact{} dropped",
+            out.ungrounded,
+            if out.ungrounded == 1 { "" } else { "s" }
+        ));
+    }
     println!(
         "distilled {n} thread{}{}",
         if n == 1 { "" } else { "s" },
-        if out.failed > 0 {
-            format!(" ({} failed)", out.failed)
-        } else {
+        if notes.is_empty() {
             String::new()
+        } else {
+            format!(" ({})", notes.join(", "))
         }
     );
     if n == 0 && out.failed > 0 {

@@ -114,6 +114,27 @@ writes and then deletes a test entry in your OS credential store, and live calls
 through your logged-in `claude` CLI. To run one, name it, e.g.
 `cargo test -p callimachus-core -- --ignored real_claude_index`.
 
+### Memory recall eval
+
+`core/src/eval/` holds a small synthetic corpus (`fixtures/memory_truth_v1.json`: eight
+projects with planted corrections, fixes, reversals and restatements) and two ignored
+tests that run it through the real search, `check_decision` and hook-memory paths with
+hand-written distill output, so no LLM is involved. Run them after changing search,
+recall, fact links or the memory renderer:
+
+```bash
+cd apps/desktop/src-tauri
+export FASTEMBED_CACHE_DIR="$HOME/Library/Application Support/dev.shaller.callimachus/models"
+cargo test -p callimachus-core eval_memory_truth -- --ignored --nocapture      # report + floors
+cargo test -p callimachus-core calibrate_guard_close -- --ignored --nocapture  # GUARD_CLOSE
+```
+
+They only read the model files (never the index next to them) and skip with a message
+when the model is missing; `CALLIMACHUS_EVAL_DOWNLOAD=1` lets them download it. The
+eval prints a markdown report (hit@1/@5 and recall@5 per slice, superseded labelling,
+latency) and fails below floors set from its first run. Add cases in a new corpus
+version rather than editing v1, so the numbers quoted in comments stay comparable.
+
 ### Drift guards
 
 `cargo test` also checks that code and docs agree, so some changes need a

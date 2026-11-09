@@ -14,7 +14,7 @@
 //! of type `user_message`, which carry the typed text without the harness's environment and
 //! AGENTS.md preambles). Anything else parses to no prompts.
 
-use crate::context::{escape_fences, redact_secrets};
+use crate::context::{escape_fences, redact_secrets, strip_controls};
 use serde_json::Value;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
@@ -286,9 +286,10 @@ enum Fit {
 /// Lay out `prompts` in at most `max` chars. The oldest prompts claim about
 /// [`HEAD_SHARE_PCT`] of the room and the latest the rest; whatever is not shown is counted
 /// in the fence's `omitted` attribute (`N+` when the middle of the file went unread before
-/// prompt `gap_at`, so more may exist), and a `…` line marks each hole. Text is redacted,
-/// then fence-escaped, then cut at a word boundary, in that order, so a cut can neither
-/// expose half a secret nor leave a usable closing tag.
+/// prompt `gap_at`, so more may exist), and a `…` line marks each hole. Text is stripped of
+/// terminal escapes and invisible controls, redacted, then fence-escaped, then cut at a word
+/// boundary, in that order, so a cut can neither expose half a secret nor leave a usable
+/// closing tag.
 fn render(prompts: &[Prompt], gap_at: Option<usize>, max: usize) -> Option<String> {
     if prompts.is_empty() {
         return None;
@@ -296,7 +297,9 @@ fn render(prompts: &[Prompt], gap_at: Option<usize>, max: usize) -> Option<Strin
     let lines: Vec<Line> = prompts
         .iter()
         .map(|p| {
-            let redacted = redact_secrets(&p.text);
+            // Controls first, so an escape sequence inside a key cannot split it.
+            let visible = strip_controls(&p.text);
+            let redacted = redact_secrets(&visible);
             let flat = redacted.split_whitespace().collect::<Vec<_>>().join(" ");
             Line {
                 prefix: p
@@ -602,6 +605,26 @@ mod tests {
         assert!(!lower.contains("</reference_thread"), "{out}");
         // No timestamp, no bracket.
         assert!(out.contains("\n&lt;/SESSION_PROMPTS > and"), "{out}");
+    }
+
+    /// A typed prompt that pasted terminal output or hid text in bidi or tag characters comes
+    /// back to the agent as plain text.
+    #[test]
+    fn anchor_strips_terminal_escapes_and_invisible_controls() {
+        let prompts = vec![Prompt {
+            ts: None,
+            text: "fix \u{1B}[31mthe\u{1B}[0m \u{1B}]0;title\u{7}build \u{202E}now\u{2069}\u{E0041}\u{0}"
+                .into(),
+        }];
+        let out = render(&prompts, None, ANCHOR_MAX_CHARS).unwrap();
+        assert!(out.contains("\nfix the build now\n"), "{out:?}");
+        assert!(
+            !out.chars().any(|c| c == '\u{1B}'
+                || c == '\u{0}'
+                || c == '\u{202E}'
+                || ('\u{E0000}'..='\u{E007F}').contains(&c)),
+            "{out:?}"
+        );
     }
 
     #[test]

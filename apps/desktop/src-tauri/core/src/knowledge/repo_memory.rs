@@ -157,6 +157,29 @@ impl FactChange {
     }
 }
 
+/// Why publish holds a fact back ([`PublishPlan::held`]). Core says it, so neither the CLI
+/// nor the desktop preview has to work it out again (the preview used to match the plan's
+/// redacted text against the page's history lists, which a fact with a secret in it missed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum HeldReason {
+    /// An unresolved stale / wrong flag on a fact that is neither pinned nor edited. Wins
+    /// over [`HeldReason::ReplacementUnpublished`] when both apply: settling the flag is the
+    /// step the user can take here.
+    Flagged,
+    /// Superseded by newer facts none of which this publish writes (a distilled replacement
+    /// without `all`, or one held back itself).
+    ReplacementUnpublished,
+}
+
+/// A fact publish holds back, and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HeldFact {
+    #[serde(flatten)]
+    pub fact: FactChange,
+    pub reason: HeldReason,
+}
+
 /// What a publish would write (the preview) or wrote.
 #[derive(Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -178,8 +201,8 @@ pub struct PublishPlan {
     /// Facts publish would otherwise write that are out of memory here and would read as
     /// current to a teammate: flagged stale or wrong and not reviewed yet (and neither pinned
     /// nor edited), or superseded by a fact that is not published. Held until that changes;
-    /// an earlier line of one is in `removed`.
-    pub held: Vec<FactChange>,
+    /// an earlier line of one is in `removed`. Each carries its [`HeldReason`].
+    pub held: Vec<HeldFact>,
     /// Whether publishing writes anything: false when the files already hold these lines in
     /// this order (line endings and blank lines aside).
     pub changed: bool,
@@ -515,15 +538,16 @@ fn entry_of(
 ///   files names it in its own `supersedes`. Repeated until nothing changes, since a newer
 ///   fact held back carries no link either.
 ///
-/// Empty on an index without 0035's tables.
+/// Each uid maps to the first rule that held it (flags are checked first). Empty on an index
+/// without 0035's tables.
 fn held_uids(
     conn: &Connection,
     rows: &[LocalRow],
     local: &HashMap<&str, &LocalRow>,
     existing: &HashMap<String, Line>,
     all: bool,
-) -> Result<HashSet<String>> {
-    let mut held = HashSet::new();
+) -> Result<HashMap<String, HeldReason>> {
+    let mut held = HashMap::new();
     if !super::truth::has_truth_tables(conn) {
         return Ok(held);
     }
@@ -544,7 +568,7 @@ fn held_uids(
         ))?
         .query_map([&list], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
-    held.extend(flagged);
+    held.extend(flagged.into_iter().map(|u| (u, HeldReason::Flagged)));
     // to -> the newer sides of its standing supersedes links.
     let mut by: HashMap<String, Vec<String>> = HashMap::new();
     let mut stmt = conn.prepare_cached(&format!(
@@ -560,7 +584,9 @@ fn held_uids(
     }
     loop {
         let travels = |from: &str, to: &str| match local.get(from) {
-            Some(r) if r.extractor != EXTRACTOR_REPO => publishable(r, all) && !held.contains(from),
+            Some(r) if r.extractor != EXTRACTOR_REPO => {
+                publishable(r, all) && !held.contains_key(from)
+            }
             // A teammate's line (imported here or not): kept as written, so the link travels
             // only if the line itself lists the fact.
             _ => existing
@@ -569,13 +595,16 @@ fn held_uids(
         };
         let more: Vec<String> = by
             .iter()
-            .filter(|(to, froms)| !held.contains(*to) && !froms.iter().any(|f| travels(f, to)))
+            .filter(|(to, froms)| !held.contains_key(*to) && !froms.iter().any(|f| travels(f, to)))
             .map(|(to, _)| to.clone())
             .collect();
         if more.is_empty() {
             return Ok(held);
         }
-        held.extend(more);
+        held.extend(
+            more.into_iter()
+                .map(|u| (u, HeldReason::ReplacementUnpublished)),
+        );
     }
 }
 
@@ -629,7 +658,7 @@ pub(crate) fn plan_publish_with(
     let rows = local_rows(conn, project)?;
     let local: HashMap<&str, &LocalRow> = rows.iter().map(|r| (r.uid.as_str(), r)).collect();
     let held = held_uids(conn, &rows, &local, &existing, all)?;
-    let publishable = |r: &LocalRow, all: bool| publishable(r, all) && !held.contains(&r.uid);
+    let publishable = |r: &LocalRow, all: bool| publishable(r, all) && !held.contains_key(&r.uid);
     // What each published fact supersedes, limited to facts a teammate can know: this
     // project's own and the lines already in the files.
     let links = {
@@ -653,11 +682,17 @@ pub(crate) fn plan_publish_with(
         all,
         ..Default::default()
     };
-    let mut held_rows: Vec<&LocalRow> = rows.iter().filter(|r| held.contains(&r.uid)).collect();
-    held_rows.sort_by(|a, b| a.uid.cmp(&b.uid));
+    let mut held_rows: Vec<(&LocalRow, HeldReason)> = rows
+        .iter()
+        .filter_map(|r| held.get(&r.uid).map(|&why| (r, why)))
+        .collect();
+    held_rows.sort_by(|a, b| a.0.uid.cmp(&b.0.uid));
     plan.held = held_rows
         .into_iter()
-        .map(|r| FactChange::of(&r.uid, &r.kind, &r.text))
+        .map(|(r, reason)| HeldFact {
+            fact: FactChange::of(&r.uid, &r.kind, &r.text),
+            reason,
+        })
         .collect();
     let mut existing_sorted: Vec<&Line> = existing.values().collect();
     existing_sorted.sort_by(|a, b| a.fact.uid.cmp(&b.fact.uid));
@@ -1916,8 +1951,33 @@ mod tests {
         let plan = publish_here(&conn, &root, &key, false);
         assert_eq!(plan.removed.len(), 1);
         assert_eq!(plan.removed[0].uid, uid_of(&conn, a));
-        assert_eq!(plan.held.len(), 1);
+        assert_eq!(
+            plan.held,
+            [HeldFact {
+                fact: FactChange::of(&uid_of(&conn, a), "decision", "Cache with bincode"),
+                reason: HeldReason::ReplacementUnpublished,
+            }]
+        );
         assert!(line_uids(&root, "decisions.jsonl").is_empty());
+        // The preview's JSON: the change's fields and a camelCase reason, side by side.
+        let json = serde_json::to_value(&plan.held[0]).unwrap();
+        assert_eq!(json["reason"], "replacementUnpublished");
+        assert_eq!(json["text"], "Cache with bincode");
+        // Flagged as well: the flag is what the user can settle here, so it is the reason.
+        crate::knowledge::truth::flag_fact(
+            &conn,
+            a,
+            crate::knowledge::truth::FlagKind::Wrong,
+            crate::knowledge::truth::SignalSource::User,
+            None,
+            None,
+            4_500,
+        )
+        .unwrap();
+        let plan = publish_here(&conn, &root, &key, false);
+        assert_eq!(plan.held.len(), 1);
+        assert_eq!(plan.held[0].reason, HeldReason::Flagged);
+        crate::knowledge::truth::resolve_fact_flags(&conn, a, 4_600).unwrap();
 
         let plan = publish_here(&conn, &root, &key, true);
         assert!(plan.held.is_empty());
@@ -1962,8 +2022,11 @@ mod tests {
         }
         let plan = publish_here(&conn, &root, &key, false);
         assert_eq!(
-            plan.held.iter().map(|c| c.uid.clone()).collect::<Vec<_>>(),
-            [uid_of(&conn, f)]
+            plan.held
+                .iter()
+                .map(|c| (c.fact.uid.clone(), c.reason))
+                .collect::<Vec<_>>(),
+            [(uid_of(&conn, f), HeldReason::Flagged)]
         );
         assert_eq!(line_uids(&root, "decisions.jsonl"), [uid_of(&conn, p)]);
         resolve_fact_flags(&conn, f, 3_000).unwrap();

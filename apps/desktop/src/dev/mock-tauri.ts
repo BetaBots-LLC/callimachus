@@ -39,6 +39,8 @@ import type {
   ReportView,
   ProjectMemory,
   RepoFactChange,
+  RepoHeldFact,
+  RepoHeldReason,
   RepoMemoryStatus,
   RepoPublishPlan,
   SearchFilters,
@@ -1135,6 +1137,12 @@ function repoPublishPlan(project: string, all: boolean): RepoPublishPlan {
     kind,
     text,
   });
+  const held = (
+    uid: string,
+    kind: RepoFactChange["kind"],
+    text: string,
+    reason: RepoHeldReason,
+  ): RepoHeldFact => ({ ...change(uid, kind, text), reason });
   const distilled = [
     change("4b1f", "decision", "Retries use exponential backoff capped at 5 minutes."),
     change("9c2e", "gotcha", "Fake timers must be advanced after `scheduler.flush()`."),
@@ -1160,15 +1168,26 @@ function repoPublishPlan(project: string, all: boolean): RepoPublishPlan {
     removed,
     // The flagged distilled gotcha (fact 12, `truth=flagged|all`) is out of memory here, so
     // publish holds it back instead of handing teammates a fact flagged stale. Distilled facts
-    // publish only with `all`, so only then is it held. The second is a recorded decision a
+    // publish only with `all`, so only then is it held. Recorded facts publish either way, so
+    // a flagged one an agent recorded is always held. The last is a recorded decision a
     // distilled one replaced: with `all` off that replacement does not travel, so it is held
-    // too (it matches no fact here, which shows the preview's generic reason).
+    // too. `truth=all` with `all` off shows both reasons at once.
     held: [
       ...(truthOn("flagged") && all
-        ? [change("5e0c", "gotcha", "The sandbox rejects amounts under 50 cents.")]
+        ? [held("5e0c", "gotcha", "The sandbox rejects amounts under 50 cents.", "flagged")]
+        : []),
+      ...(truthOn("flagged")
+        ? [held("7a21", "decision", "Webhook handlers ack before they process.", "flagged")]
         : []),
       ...(truthOn("superseded") && !all
-        ? [change("6f3d", "decision", "Refund webhooks retry for 24 hours, then stop.")]
+        ? [
+            held(
+              "6f3d",
+              "decision",
+              "Refund webhooks retry for 24 hours, then stop.",
+              "replacementUnpublished",
+            ),
+          ]
         : []),
     ],
     changed: added.length + removed.length > 0,
@@ -1209,6 +1228,17 @@ const memTruth = {
               createdAt: NOW - 2 * DAY,
             },
           ],
+          // The user edited this gotcha, so the flag leaves it in memory, labelled.
+          [
+            3,
+            {
+              id: 4,
+              kind: "wrong",
+              source: "agent",
+              reason: "flush() no longer exists in the v2 scheduler.",
+              createdAt: NOW - 3 * DAY,
+            },
+          ] as [number, FactFlag],
           // History only: the decision that replaced fact 8 is itself flagged, so neither
           // is in memory.
           ...(historyOnly
@@ -1326,8 +1356,8 @@ function projectMemory(project: string): ProjectMemory {
   const gotchas = historyOnly
     ? []
     : [
-        on &&
-          fact(
+        on && {
+          ...fact(
             3,
             "Fake timers must be advanced after `scheduler.flush()`.",
             1,
@@ -1335,6 +1365,9 @@ function projectMemory(project: string): ProjectMemory {
             false,
             "gotcha",
           ),
+          // Edited by the user (`truth=flagged|all`), so its flag keeps it in memory.
+          ...(truthOn("flagged") && { edited: true }),
+        },
         harvested &&
           fact(
             6,
@@ -1394,9 +1427,9 @@ function projectMemory(project: string): ProjectMemory {
           ? "disputed"
           : "current";
   }
-  // Live lists: never a replaced fact, and a flagged one only when pinned or edited (the
-  // mock tracks no edits, so pinned stands in for both).
-  const live = (f: MemoryFact) => f.status !== "superseded" && (f.status !== "flagged" || f.pinned);
+  // Live lists: never a replaced fact, and a flagged one only when pinned or edited.
+  const live = (f: MemoryFact) =>
+    f.status !== "superseded" && (f.status !== "flagged" || f.pinned || !!f.edited);
   return {
     project,
     decisions: decisions.filter(live),

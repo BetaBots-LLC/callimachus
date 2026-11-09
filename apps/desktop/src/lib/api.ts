@@ -256,6 +256,9 @@ export interface MemoryFact {
   title: string | null;
   createdAt: number;
   pinned: boolean;
+  /** The user rewrote its text: curated like a pinned fact, so a flag leaves it in memory.
+   *  Absent when false. */
+  edited?: boolean;
   extractor: FactExtractor;
   /** e.g. "claude-memory:<slug>/<file>" for a harvested fact; null for distilled ones. */
   originRef: string | null;
@@ -337,6 +340,16 @@ export interface RepoFactChange {
   text: string;
 }
 
+/** Why publish holds a fact back: `flagged` stale or wrong and not reviewed yet (and neither
+ *  pinned nor edited; wins when both apply), or `replacementUnpublished`: replaced by facts
+ *  none of which this publish writes. */
+export type RepoHeldReason = "flagged" | "replacementUnpublished";
+
+/** A fact publish holds back, and why. */
+export interface RepoHeldFact extends RepoFactChange {
+  reason: RepoHeldReason;
+}
+
 /** What "Publish to repo" would write (the preview) or wrote. */
 export interface RepoPublishPlan {
   root: string;
@@ -353,7 +366,7 @@ export interface RepoPublishPlan {
    *  and would read as current to a teammate: flagged stale or wrong and not reviewed yet
    *  (and neither pinned nor edited), or replaced by a fact that is not published. An
    *  earlier line of one is in `removed`. */
-  held: RepoFactChange[];
+  held: RepoHeldFact[];
   /** False when the files already hold exactly this. */
   changed: boolean;
 }

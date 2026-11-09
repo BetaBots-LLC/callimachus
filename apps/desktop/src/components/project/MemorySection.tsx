@@ -8,6 +8,8 @@ import {
   type MemoryFact,
   type ProjectMemory,
   type RepoFactChange,
+  type RepoHeldFact,
+  type RepoHeldReason,
   type RepoPublishPlan,
 } from "../../lib/api";
 import { shortPath } from "../../lib/format";
@@ -29,7 +31,7 @@ import { cn } from "@/lib/utils";
 import { Markdown } from "../Markdown";
 import { MemorySetupCard } from "../MemorySetupCard";
 import { ConflictReview } from "./ConflictReview";
-import { DisputePanel, FactMeta, flagLine, linkRefusal } from "./FactTruth";
+import { DisputePanel, FactMeta, linkRefusal } from "./FactTruth";
 import { FlaggedGroup, ReplacedGroup } from "./MemoryHistory";
 import { SectionNote, SectionSkeleton } from "./ProjectSection";
 import { useOpenThread } from "./shared";
@@ -409,7 +411,6 @@ export function MemorySection({ project }: { project: string }) {
             {publishing === project && (
               <PublishPanel
                 project={project}
-                history={[...(mem.flagged ?? []), ...(mem.superseded ?? [])]}
                 onClose={() => setPublishing(null)}
                 onPublished={(plan) => {
                   setPublishing(null);
@@ -436,9 +437,6 @@ export function MemorySection({ project }: { project: string }) {
             )}
             <FlaggedGroup
               facts={mem.flagged ?? []}
-              inMemory={(id) =>
-                mem.decisions.some((f) => f.id === id) || mem.gotchas.some((f) => f.id === id)
-              }
               onKeep={(id) => keepFlagged.mutate(id)}
               onHide={factActions.onHide}
             />
@@ -557,13 +555,10 @@ function RememberForm({ project, onClose }: { project: string; onClose: () => vo
  *  written until the user clicks Publish, and nothing is committed. */
 function PublishPanel({
   project,
-  history,
   onClose,
   onPublished,
 }: {
   project: string;
-  /** The page's flagged and replaced facts, to say why each held fact is held. */
-  history: MemoryFact[];
   onClose: () => void;
   onPublished: (plan: RepoPublishPlan) => void;
 }) {
@@ -638,7 +633,7 @@ function PublishPanel({
                 The files already hold exactly this. Nothing to publish.
               </p>
             )}
-            <HeldList held={plan.held} history={history} />
+            <HeldList held={plan.held} />
           </div>
         ) : null}
         {publish.isError && (
@@ -697,20 +692,14 @@ function ChangeList({
   );
 }
 
-/** Why publish holds `c` back. The plan carries no reason, so it is read off the page's
- *  flagged and replaced facts by kind and text (the plan's text is trimmed and redacted, so a
- *  fact with a secret in it falls through to the line that names both reasons). */
-function heldReason(c: RepoFactChange, history: MemoryFact[]): string {
-  const text = c.text.trim();
-  const f = history.find((h) => h.kind === c.kind && h.text.trim() === text);
-  const flag = f?.status === "flagged" ? f.flags?.[0] : undefined;
-  if (flag) return `${flagLine(flag)}, not reviewed yet`;
-  if (f?.status === "superseded") return "Replaced by a fact this publish leaves out";
-  return "Flagged and not reviewed yet, or replaced by a fact this publish leaves out";
-}
+/** What each held reason tells the user, in the publish preview. */
+const HELD_REASON: Record<RepoHeldReason, string> = {
+  flagged: "Flagged stale or wrong, not reviewed yet",
+  replacementUnpublished: "Replaced by a fact this publish leaves out",
+};
 
 /** Facts publish holds back, up to five with why, then a count of the rest. */
-function HeldList({ held, history }: { held: RepoFactChange[]; history: MemoryFact[] }) {
+function HeldList({ held }: { held: RepoHeldFact[] }) {
   if (!held.length) return null;
   const shown = held.slice(0, 5);
   return (
@@ -729,7 +718,7 @@ function HeldList({ held, history }: { held: RepoFactChange[]; history: MemoryFa
             <span className="shrink-0 text-muted-foreground">{c.kind}</span>
             <span className="min-w-0">
               <span className="block truncate">{c.text}</span>
-              <span className="block text-muted-foreground">{heldReason(c, history)}</span>
+              <span className="block text-muted-foreground">{HELD_REASON[c.reason]}</span>
             </span>
           </li>
         ))}

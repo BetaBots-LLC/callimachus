@@ -135,6 +135,9 @@ pub mod context;
 pub mod cost;
 pub mod db;
 pub mod embed;
+// The memory-truth eval and GUARD_CLOSE calibration: tests only, the heavy ones `#[ignore]`.
+#[cfg(test)]
+mod eval;
 pub mod export;
 pub mod gitlink;
 // `cal index` / `watch` / `embed` / `distill --auto`: the jobs without the app.

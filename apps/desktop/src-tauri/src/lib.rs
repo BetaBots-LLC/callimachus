@@ -1449,7 +1449,10 @@ async fn distill_thread(
     blocking(move || {
         let db = app.state::<db::Db>();
         match outcome {
-            Ok(distilled) => {
+            Ok((distilled, grounding)) => {
+                if let Some(line) = grounding.summary_line() {
+                    app_log!("[distill] thread {thread_id}: {line}");
+                }
                 {
                     let mut conn = lock_anyhow(&db)?;
                     let now = chrono::Utc::now().timestamp();

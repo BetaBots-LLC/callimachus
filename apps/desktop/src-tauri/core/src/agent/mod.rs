@@ -6,6 +6,7 @@
 pub mod cli_resume;
 
 use crate::indexer::{self, ParsedMessage, ParsedThread};
+use crate::knowledge::grounding::{Corpus, GroundingReport};
 use anyhow::{bail, Result};
 use futures_util::StreamExt;
 use genai::adapter::AdapterKind;
@@ -1550,30 +1551,38 @@ pub fn distill_user_prompt_spanning(
 
 /// What one distill call sends, read from the index before the LLM call (which runs without
 /// the DB lock): the packed transcript and the project's existing memory, with the
-/// [`crate::knowledge::RefMap`] that resolves the model's `D1` / `G1` refs. Every caller
-/// (the app's Distill, the background and project distill jobs, `cal distill`) loads it here
-/// and hands `refs` to `knowledge::store_distilled` with the result, so none can forget the
-/// memory list or pair a result with the wrong refs.
+/// [`crate::knowledge::RefMap`] that resolves the model's `D1` / `G1` refs, and the grounding
+/// corpus [`distill`] checks the answer against. Every caller (the app's Distill, the
+/// background and project distill jobs, `cal distill`) loads it here and hands `refs` to
+/// `knowledge::store_distilled` with the result, so none can forget the memory list, pair a
+/// result with the wrong refs, or store a fact the session never supported.
 #[derive(Debug, Clone)]
 pub struct DistillInput {
     pub transcript: String,
     /// `knowledge::distill_memory_context`'s block, unfenced.
     pub memory: String,
     pub refs: crate::knowledge::RefMap,
+    /// The thread's full stored text plus `memory`: the packed `transcript` elides the middle
+    /// of a long thread, and a real path from there must still ground.
+    pub grounding: Corpus,
 }
 
 impl DistillInput {
     /// Pack thread `thread_id` (at `budget` chars) and list its project's memory. None when the
     /// thread does not exist.
     pub fn load(conn: &Connection, thread_id: i64, budget: usize) -> Result<Option<Self>> {
-        let Some(transcript) = crate::context::pack_thread(conn, thread_id, budget)? else {
+        // One read of the messages serves both the packed transcript and the grounding corpus.
+        let Some(detail) = crate::search::thread_detail(conn, thread_id)? else {
             return Ok(None);
         };
+        let transcript = crate::context::pack_thread_detail(&detail, budget);
         let (memory, refs) = crate::knowledge::distill_memory_context(conn, thread_id)?;
+        let grounding = Corpus::from_detail(&detail, &memory);
         Ok(Some(DistillInput {
             transcript,
             memory,
             refs,
+            grounding,
         }))
     }
 
@@ -1589,15 +1598,16 @@ impl DistillInput {
 }
 
 /// One-shot structured distillation of a packed transcript and the project's existing memory
-/// ([`DistillInput`]). Same provider plumbing as `synthesize`; returns parsed facts (tolerant
-/// of fences / surrounding prose). Store the result with `input.refs`.
+/// ([`DistillInput`]). Same provider plumbing as `synthesize`; returns the parsed facts
+/// (tolerant of fences / surrounding prose) after the grounding gate ([`parse_grounded`]),
+/// with its report for the caller's diagnostics. Store the result with `input.refs`.
 pub async fn distill(
     provider: &str,
     model: &str,
     api_key: Option<&str>,
     base_url: Option<&str>,
     input: &DistillInput,
-) -> Result<Distilled> {
+) -> Result<(Distilled, GroundingReport)> {
     let user = input.user_prompt();
     // 1200 was sized for summary + 6 items; links / reaffirms / retires add up to 14 short
     // entries on top.
@@ -1612,7 +1622,18 @@ pub async fn distill(
         1500,
     )
     .await?;
-    Ok(parse_distilled(&text))
+    Ok(parse_grounded(&text, input))
+}
+
+/// [`parse_distilled`], then the grounding gate: every decision and gotcha naming a path,
+/// identifier or other specific that neither the thread's full text nor the existing memory
+/// contains is dropped, with the links and refs naming it
+/// ([`crate::knowledge::grounding::Corpus::ground`]). It runs here, inside [`distill`], so no
+/// distill path can store an unchecked answer.
+pub fn parse_grounded(raw: &str, input: &DistillInput) -> (Distilled, GroundingReport) {
+    let mut d = parse_distilled(raw);
+    let report = input.grounding.ground(&mut d);
+    (d, report)
 }
 
 /// Lenient JSON extraction: strip code fences, take the outer `{…}`, parse. On failure,
@@ -2371,8 +2392,10 @@ mod tests {
             transcript: transcript.into(),
             memory: String::new(),
             refs: Default::default(),
+            grounding: Corpus::new([transcript], []),
         };
-        let d = distill("claude-cli", "", None, None, &input).await.unwrap();
+        let (d, grounding) = distill("claude-cli", "", None, None, &input).await.unwrap();
+        eprintln!("grounding: {grounding:?}");
         eprintln!("summary: {}", d.summary);
         eprintln!("decisions: {:?}", d.decisions);
         eprintln!("gotchas: {:?}", d.gotchas);

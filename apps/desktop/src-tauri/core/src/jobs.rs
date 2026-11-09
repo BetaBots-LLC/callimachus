@@ -1826,6 +1826,8 @@ pub struct DistillOutcome {
     pub failed: usize,
     /// The last of those failures, for a caller that reports them (`cal distill --auto`).
     pub last_error: Option<String>,
+    /// Decisions and gotchas the grounding gate dropped (`agent::parse_grounded`).
+    pub ungrounded: usize,
 }
 
 /// [`run_distill`] that also counts the failures, so `cal distill --auto` can tell an
@@ -1876,7 +1878,10 @@ async fn run_distill_counted(
             blocking(move || {
                 let db = writer(&*host);
                 match outcome {
-                    Ok(result) => {
+                    Ok((result, grounding)) => {
+                        if let Some(line) = grounding.summary_line() {
+                            app_log!("[distill] thread {tid}: {line}");
+                        }
                         {
                             let mut conn = lock_anyhow(db)?;
                             knowledge::store_distilled(
@@ -1888,7 +1893,7 @@ async fn run_distill_counted(
                             )?;
                         }
                         embed_facts_if_model_ready(&*host, "distill");
-                        Ok(Ok(()))
+                        Ok(Ok(grounding.dropped.len()))
                     }
                     Err(e) => {
                         let msg = short_error(&e);
@@ -1901,7 +1906,10 @@ async fn run_distill_counted(
             .await?
         };
         match stored {
-            Ok(()) => outcome_total.distilled += 1,
+            Ok(ungrounded) => {
+                outcome_total.distilled += 1;
+                outcome_total.ungrounded += ungrounded;
+            }
             Err(msg) => {
                 outcome_total.failed += 1;
                 outcome_total.last_error = Some(msg);
@@ -1964,9 +1972,13 @@ async fn auto_distill_round(host: &Host, job: JobGuard, ids: Vec<i64>) -> (Disti
     let distilled = match run_distill_counted(host, &job, ids).await {
         Ok(o) => {
             app_log!(
-                "[auto-distill] round: {} of {queued} threads distilled in {}",
+                "[auto-distill] round: {} of {queued} threads distilled in {}{}",
                 o.distilled,
-                jobclock::fmt_duration(started.elapsed())
+                jobclock::fmt_duration(started.elapsed()),
+                match o.ungrounded {
+                    0 => String::new(),
+                    n => format!(", {n} ungrounded facts dropped"),
+                }
             );
             o
         }
@@ -1976,6 +1988,7 @@ async fn auto_distill_round(host: &Host, job: JobGuard, ids: Vec<i64>) -> (Disti
                 distilled: 0,
                 failed: 1,
                 last_error: Some(short_error(&e)),
+                ungrounded: 0,
             }
         }
     };
@@ -2040,6 +2053,7 @@ pub async fn auto_distill_drain(host: &Host) -> DistillOutcome {
         let (round, cancelled) = auto_distill_round(host, job, ids).await;
         total.distilled += round.distilled;
         total.failed += round.failed;
+        total.ungrounded += round.ungrounded;
         if round.last_error.is_some() {
             total.last_error = round.last_error;
         }

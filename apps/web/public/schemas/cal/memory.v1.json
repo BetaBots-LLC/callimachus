@@ -90,6 +90,10 @@
         "pinned": {
           "type": "boolean"
         },
+        "edited": {
+          "type": "boolean",
+          "description": "The user rewrote its text: curated like a pinned fact, so an unresolved flag leaves it\nin memory. With `pinned` it says why a flagged fact is still in memory, which the\nProjects page used to infer from the live lists. Left out of the JSON when false."
+        },
         "extractor": {
           "type": "string",
           "description": "Who wrote it: `llm`, `heuristic`, `user`, `agent`, or a harvest origin such as\n`claude-memory`. The SessionStart hook and the managed AGENTS.md / CLAUDE.md block\ndrop `claude-memory` facts, which Claude Code already loads from its own auto memory,\nand so does `.callimachus/memory.md`, a repo file people commit; MCP results and the\nProjects tab keep them. `repo`: imported from the repo's committed\n`.callimachus/memory/` files (`originRef` names the file), shown everywhere."

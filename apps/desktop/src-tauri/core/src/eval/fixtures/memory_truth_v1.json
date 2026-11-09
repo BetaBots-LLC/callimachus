@@ -1,0 +1,656 @@
+{
+  "version": "memory_truth_v1",
+  "note": "Synthetic coding-domain corpus for the memory-truth eval (eval::tests). Every session is a ParsedThread literal; `distilled` is the hand-written distill output stored for it, with links by fact id. Fact ids are local to this file. Never edit a version in place: copy it to v2 so measured numbers stay comparable.",
+  "projects": [
+    {
+      "path": "/eval/ingest-worker",
+      "sessions": [
+        {
+          "id": "ingest-1",
+          "title": "Upstream feed client setup",
+          "date": "2026-09-01",
+          "messages": [
+            ["user", "Set up the HTTP client that pulls the upstream product feed in fetch_feed. What timeout should it use?"],
+            ["assistant", "The feed endpoint usually answers in two or three seconds. I propose a 15 s timeout on the reqwest client in fetch_feed so a hung connection never blocks the worker."],
+            ["user", "Sounds fine, go with 15 seconds. Also wire up logging."],
+            ["assistant", "Done: fetch_feed builds the client with Duration::from_secs(15). Logging goes through the tracing crate with an EnvFilter defaulting to info level."],
+            ["user", "Run the tests."],
+            ["assistant", "cargo test passes: 14 tests, including the new fetch_feed timeout test with a mock server that never answers."]
+          ],
+          "distilled": {
+            "summary": "Built the upstream feed client and logging.",
+            "decisions": [
+              {"id": "A1", "text": "Set the upstream feed HTTP client timeout to 15 s in fetch_feed"},
+              {"id": "A2", "text": "Log with the tracing crate at info level by default"}
+            ]
+          }
+        },
+        {
+          "id": "ingest-2",
+          "title": "Nightly feed import failing",
+          "date": "2026-09-04",
+          "messages": [
+            ["user", "The nightly import failed again. The log says reqwest error: operation timed out while fetching the feed."],
+            ["assistant", "I checked the network metrics: no packet loss and the upstream answered. The large catalogue feeds take 20 to 30 seconds to stream, so the 15 s client timeout cuts them off. It is our timeout, not the network."],
+            ["user", "So what do we do, raise it?"],
+            ["assistant", "Raise the upstream feed timeout to 45 s. That covers the slowest feed we saw (31 s) with headroom, and a truly hung connection still fails within a minute."],
+            ["user", "Ok, make it 45 seconds."],
+            ["assistant", "Changed fetch_feed to Duration::from_secs(45) and reran the nightly import against staging: all 12 feeds imported, the slowest in 29 s."]
+          ],
+          "distilled": {
+            "summary": "Diagnosed nightly feed timeouts and raised the client timeout.",
+            "decisions": [
+              {"id": "A3", "text": "Raise the upstream feed timeout to 45 s: large feeds took 20-30 s and the 15 s limit dropped them"}
+            ],
+            "gotchas": [
+              {"id": "AG1", "text": "reqwest 'operation timed out' on the nightly feed came from the 15 s client timeout, not the network"}
+            ],
+            "supersedes": [{"new": "A3", "old": "A1"}]
+          }
+        },
+        {
+          "id": "ingest-3",
+          "title": "Feed fetch retries",
+          "date": "2026-09-08",
+          "messages": [
+            ["user", "Sometimes the upstream returns a 503 for a few seconds during their deploys. Can the worker cope?"],
+            ["assistant", "Right now a single 503 fails the whole import. I suggest we retry a failed feed fetch 3 times with exponential backoff starting at 2 s, so 2, 4 and 8 seconds."],
+            ["user", "Fine. Should the retries change the timeout?"],
+            ["assistant", "No, keep the 45 second ceiling on each feed download; the retries wrap around it, so a fetch can take a few minutes at worst."],
+            ["user", "Ship it."],
+            ["assistant", "Added the backoff loop around fetch_feed and a test that serves two 503s then the feed: it succeeds on the third attempt."]
+          ],
+          "distilled": {
+            "summary": "Added retries with exponential backoff to feed fetches.",
+            "decisions": [
+              {"id": "A4", "text": "Retry a failed feed fetch 3 times with exponential backoff starting at 2 s"}
+            ],
+            "reaffirms": ["A3"]
+          }
+        }
+      ]
+    },
+    {
+      "path": "/eval/cache-service",
+      "sessions": [
+        {
+          "id": "cache-1",
+          "title": "Cache storage format",
+          "date": "2026-09-02",
+          "messages": [
+            ["user", "We need to persist the computed cache entries to disk between restarts. Which format?"],
+            ["assistant", "For speed and size, serialize cache entries with bincode. Our CacheEntry structs already derive serde, so it is one call each way."],
+            ["user", "Good. Where do the files go?"],
+            ["assistant", "Under ~/.cache/cachesvc/, one file per shard, created on first write."],
+            ["user", "Ok, implement both."],
+            ["assistant", "Implemented: bincode::serialize on write, bincode::deserialize on load, files under ~/.cache/cachesvc/. Loading 50k entries takes 40 ms."]
+          ],
+          "distilled": {
+            "summary": "Picked the on-disk cache format and location.",
+            "decisions": [
+              {"id": "B1", "text": "Serialize cache entries with bincode for speed"},
+              {"id": "B2", "text": "Store the cache files under ~/.cache/cachesvc/"}
+            ]
+          }
+        },
+        {
+          "id": "cache-2",
+          "title": "Cache load crash after refactor",
+          "date": "2026-09-05",
+          "messages": [
+            ["user", "After the refactor the service crashes at startup loading the cache: InvalidTagEncoding(4)."],
+            ["assistant", "That is bincode failing to decode an enum: I reordered the variants of EntryKind, and bincode stores the variant index, so every old cache file now decodes to the wrong variant."],
+            ["user", "How do we recover the machines that are crashing?"],
+            ["assistant", "Delete the old cache files under the cache directory; the service rebuilds them. I added a version byte so a mismatched file is skipped instead of crashing."],
+            ["user", "Also, how long should entries live?"],
+            ["assistant", "Cache entries expire after 24 hours; the loader drops anything older and the hourly sweep removes stale shards."]
+          ],
+          "distilled": {
+            "summary": "Recovered from a bincode decode crash and set entry expiry.",
+            "decisions": [
+              {"id": "B3", "text": "Cache entries expire after 24 hours"}
+            ],
+            "gotchas": [
+              {"id": "BG1", "text": "bincode fails with InvalidTagEncoding after enum variants are reordered: old cache files must be deleted"}
+            ]
+          }
+        },
+        {
+          "id": "cache-3",
+          "title": "Move cache to JSON",
+          "date": "2026-09-09",
+          "messages": [
+            ["user", "The bincode breakage bit us again in staging. Can we pick a format that survives schema changes?"],
+            ["assistant", "Serialize cache entries as JSON with serde_json instead. Field names are stored, so reordering enum variants or adding optional fields no longer breaks old files."],
+            ["user", "What does it cost?"],
+            ["assistant", "Loading 50k entries goes from 40 ms to 110 ms and the files are about 2.5 times larger. For a cache read once at startup that is acceptable."],
+            ["user", "Do it, and drop bincode."],
+            ["assistant", "Switched to serde_json for read and write, removed the bincode dependency, and the loader now ignores old binary files."]
+          ],
+          "distilled": {
+            "summary": "Replaced bincode with JSON for the cache format.",
+            "decisions": [
+              {"id": "B4", "text": "Serialize cache entries as JSON with serde_json: bincode broke when enum variants were reordered"}
+            ],
+            "supersedes": [{"new": "B4", "old": "B1"}]
+          }
+        }
+      ]
+    },
+    {
+      "path": "/eval/web-dashboard",
+      "sessions": [
+        {
+          "id": "dash-1",
+          "title": "Dashboard data layer and hydration bug",
+          "date": "2026-09-03",
+          "messages": [
+            ["user", "How should the dashboard fetch and cache server data?"],
+            ["assistant", "Use TanStack Query for all server state in the dashboard: caching, deduping and background refetch come with it, and we keep no server data in component state."],
+            ["user", "Ok. Separate problem: the page logs a hydration mismatch error on first load."],
+            ["assistant", "The LastUpdated component calls Date.now() during render, so the server and the client render different text. Compute the timestamp in the route loader instead and pass it down."],
+            ["user", "Fixed?"],
+            ["assistant", "Yes, the timestamp now comes from the loader and the hydration warning is gone in dev and in the production build."]
+          ],
+          "distilled": {
+            "summary": "Chose the data layer and fixed a hydration mismatch.",
+            "decisions": [
+              {"id": "C1", "text": "Use TanStack Query for all server state in the dashboard"}
+            ],
+            "gotchas": [
+              {"id": "CG1", "text": "Hydration mismatch came from Date.now() during render: compute timestamps in the route loader instead"}
+            ]
+          }
+        },
+        {
+          "id": "dash-2",
+          "title": "Refetch behaviour",
+          "date": "2026-09-06",
+          "messages": [
+            ["user", "Someone suggested moving to Redux for the dashboard. Thoughts?"],
+            ["assistant", "Server data in the dashboard keeps going through TanStack Query, no Redux: the only client state we have is a few UI toggles."],
+            ["user", "Ok. The charts flicker whenever I switch tabs back to the dashboard."],
+            ["assistant", "That is refetchOnWindowFocus refetching every query. Turn it off by default and enable refetch on window focus only for the alerts panel queries, which must stay fresh."],
+            ["user", "Do that."],
+            ["assistant", "Set refetchOnWindowFocus false in the QueryClient defaults and true on the alerts queries. No more flicker on the charts."]
+          ],
+          "distilled": {
+            "summary": "Kept the data layer and limited focus refetching.",
+            "decisions": [
+              {"id": "C2", "text": "Refetch on window focus only for the alerts panel queries"}
+            ],
+            "reaffirms": ["C1"]
+          }
+        },
+        {
+          "id": "dash-3",
+          "title": "Currency formatting",
+          "date": "2026-09-10",
+          "messages": [
+            ["user", "Revenue figures show as 1234.5 instead of a proper amount."],
+            ["assistant", "Format currency with Intl.NumberFormat in the user's locale, style currency, so it reads $1,234.50 or 1.234,50 EUR depending on the browser."],
+            ["user", "Put it in a shared helper."],
+            ["assistant", "Added formatMoney(amount, currency) in lib/format.ts using Intl.NumberFormat and replaced the six ad hoc toFixed calls."],
+            ["user", "Tests?"],
+            ["assistant", "Added tests for en-US and de-DE output; both pass."]
+          ],
+          "distilled": {
+            "summary": "Added locale-aware currency formatting.",
+            "decisions": [
+              {"id": "C3", "text": "Format currency with Intl.NumberFormat in the user's locale"}
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "path": "/eval/mobile-sync",
+      "sessions": [
+        {
+          "id": "sync-1",
+          "title": "Sync conflict strategy",
+          "date": "2026-09-01",
+          "messages": [
+            ["user", "Two devices can edit the same note offline. How do we resolve conflicts when they sync?"],
+            ["assistant", "Simplest is last-write-wins: every row has updated_at, and on sync the row with the newer updated_at replaces the other."],
+            ["user", "Fine for now."],
+            ["assistant", "Implemented: resolve sync conflicts with last-write-wins on updated_at, in the merge step of the sync engine."],
+            ["user", "Add a test."],
+            ["assistant", "Added a test where two devices edit the same row; the later updated_at wins."]
+          ],
+          "distilled": {
+            "summary": "Picked a first sync conflict strategy.",
+            "decisions": [
+              {"id": "D1", "text": "Resolve sync conflicts with last-write-wins on updated_at"}
+            ]
+          }
+        },
+        {
+          "id": "sync-2",
+          "title": "Background sync locking errors",
+          "date": "2026-09-03",
+          "messages": [
+            ["user", "Background sync fails with SQLITE_BUSY: database is locked, mostly while the user is typing."],
+            ["assistant", "The UI and the sync task each open their own writer connection and collide. Set busy_timeout to 5000 ms and route every write through a single writer connection."],
+            ["user", "And how often does sync run?"],
+            ["assistant", "Sync runs every 15 minutes in the background and whenever the app comes to the foreground."],
+            ["user", "Ok."],
+            ["assistant", "Done; a 30-minute soak test with typing and sync showed no SQLITE_BUSY errors."]
+          ],
+          "distilled": {
+            "summary": "Fixed database locking during background sync.",
+            "decisions": [
+              {"id": "D2", "text": "Sync runs every 15 minutes in the background and on app foreground"}
+            ],
+            "gotchas": [
+              {"id": "DG1", "text": "SQLITE_BUSY during background sync: set busy_timeout to 5000 ms and keep a single writer connection"}
+            ]
+          }
+        },
+        {
+          "id": "sync-3",
+          "title": "Lost offline edits",
+          "date": "2026-09-07",
+          "messages": [
+            ["user", "A tester lost edits: she changed the title on her phone offline and the body on her laptop, and after sync only one change survived."],
+            ["assistant", "That is last-write-wins dropping a whole row. We need a per-field merge: track a vector clock per field and merge field by field, so concurrent edits to different fields both survive."],
+            ["user", "What about two edits to the same field?"],
+            ["assistant", "Then the clocks are concurrent and we keep both versions and flag the field for the user to pick."],
+            ["user", "Go ahead, replace last-write-wins."],
+            ["assistant", "The merge step now merges sync conflicts per field with vector clocks instead of last-write-wins; the tester's scenario keeps both edits."]
+          ],
+          "distilled": {
+            "summary": "Replaced last-write-wins with per-field vector clock merges.",
+            "decisions": [
+              {"id": "D3", "text": "Merge sync conflicts per field with vector clocks instead of last-write-wins: LWW lost offline edits"}
+            ],
+            "supersedes": [{"new": "D3", "old": "D1"}]
+          }
+        },
+        {
+          "id": "sync-4",
+          "title": "Syncing deletions",
+          "date": "2026-09-11",
+          "messages": [
+            ["user", "Deleted notes come back after a device that was offline for a week syncs."],
+            ["assistant", "The offline device still has the row and the server has no record it was deleted. Tombstone deleted rows for 30 days so offline devices can sync deletions."],
+            ["user", "Does this interact with the field merge?"],
+            ["assistant", "A tombstone is just another field with its own clock, so the per-field vector clock merge stays as it is and handles it."],
+            ["user", "Ok, do it."],
+            ["assistant", "Added a deleted_at tombstone, a 30-day purge job, and a test with a week-offline device."]
+          ],
+          "distilled": {
+            "summary": "Added tombstones so deletions sync.",
+            "decisions": [
+              {"id": "D4", "text": "Tombstone deleted rows for 30 days so offline devices can sync deletions"}
+            ],
+            "reaffirms": ["D3"]
+          }
+        }
+      ]
+    },
+    {
+      "path": "/eval/ci-pipeline",
+      "sessions": [
+        {
+          "id": "ci-1",
+          "title": "Speed up CI",
+          "date": "2026-09-02",
+          "messages": [
+            ["user", "CI takes 25 minutes. Make it faster."],
+            ["assistant", "Two changes: cache the cargo registry and target dir with actions/cache keyed on Cargo.lock, and run the test suite on 4 parallel jobs."],
+            ["user", "Try it."],
+            ["assistant", "With the cache warm the build step drops from 14 to 3 minutes, and 4 test jobs bring the whole run to 9 minutes."],
+            ["user", "Nice, keep both."],
+            ["assistant", "Merged the workflow changes."]
+          ],
+          "distilled": {
+            "summary": "Cached cargo artifacts and parallelized tests in CI.",
+            "decisions": [
+              {"id": "E1", "text": "Cache the cargo registry and target dir in CI with actions/cache keyed on Cargo.lock"},
+              {"id": "E2", "text": "Run the test suite on 4 parallel jobs in CI"}
+            ]
+          }
+        },
+        {
+          "id": "ci-2",
+          "title": "macOS runner out of memory",
+          "date": "2026-09-04",
+          "messages": [
+            ["user", "The macOS job dies in the link step: the linker was killed, signal 9."],
+            ["assistant", "That is the linker running out of memory. Debug info for the test binaries is huge; set CARGO_PROFILE_DEV_DEBUG=0 in CI to cut it."],
+            ["user", "It still OOMs sometimes during tests."],
+            ["assistant", "Four parallel test jobs on the 7 GB macOS runner is too many. Run the test suite on 2 parallel jobs in CI: 4 jobs ran the macOS runner out of memory."],
+            ["user", "Fine, 2 jobs."],
+            ["assistant", "Set the parallelism to 2 and disabled dev debug info; ten consecutive runs passed, 11 minutes each."]
+          ],
+          "distilled": {
+            "summary": "Fixed macOS CI memory exhaustion.",
+            "decisions": [
+              {"id": "E3", "text": "Run the test suite on 2 parallel jobs in CI: 4 jobs ran the macOS runner out of memory"}
+            ],
+            "gotchas": [
+              {"id": "EG1", "text": "Linker OOM on the macOS runner: set CARGO_PROFILE_DEV_DEBUG=0 in CI"}
+            ],
+            "supersedes": [{"new": "E3", "old": "E2"}]
+          }
+        },
+        {
+          "id": "ci-3",
+          "title": "Release workflow",
+          "date": "2026-09-09",
+          "messages": [
+            ["user", "How do releases get published?"],
+            ["assistant", "Release tags follow vMAJOR.MINOR.PATCH, for example v1.4.0, and pushing such a tag triggers the publish workflow."],
+            ["user", "What does publish do?"],
+            ["assistant", "It builds the release binaries for the three platforms, uploads them to the GitHub release and publishes the crate."],
+            ["user", "Ok, document it."],
+            ["assistant", "Added a Releasing section to the README."]
+          ],
+          "distilled": {
+            "summary": "Set up the tag-driven release workflow.",
+            "decisions": [
+              {"id": "E4", "text": "Release tags follow vMAJOR.MINOR.PATCH and trigger the publish workflow"}
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "path": "/eval/auth-gateway",
+      "sessions": [
+        {
+          "id": "auth-1",
+          "title": "Token lifetimes",
+          "date": "2026-09-01",
+          "messages": [
+            ["user", "Pick token lifetimes for the gateway."],
+            ["assistant", "Access tokens expire after 15 minutes, which limits the damage of a leaked token. Refresh tokens expire after 30 days."],
+            ["user", "How are refresh tokens stored?"],
+            ["assistant", "Refresh tokens are stored hashed with SHA-256, never in plain text, so a database leak does not hand out sessions."],
+            ["user", "Good."],
+            ["assistant", "Implemented both in the token service with tests for expiry."]
+          ],
+          "distilled": {
+            "summary": "Set token lifetimes and refresh token storage.",
+            "decisions": [
+              {"id": "F1", "text": "Access tokens expire after 15 minutes"},
+              {"id": "F2", "text": "Refresh tokens expire after 30 days and are stored hashed with SHA-256"}
+            ]
+          }
+        },
+        {
+          "id": "auth-2",
+          "title": "Refresh loop",
+          "date": "2026-09-03",
+          "messages": [
+            ["user", "Clients get stuck in a 401 loop when the access token expires."],
+            ["assistant", "The /auth/refresh route sits behind the auth middleware, so it demands the very access token that just expired and answers 401, and the client retries forever."],
+            ["user", "Fix?"],
+            ["assistant", "Exempt /auth/refresh from the auth middleware; it authenticates with the refresh token alone."],
+            ["user", "Verified?"],
+            ["assistant", "Yes, an expired access token now refreshes in one round trip; added an integration test."]
+          ],
+          "distilled": {
+            "summary": "Fixed the token refresh 401 loop.",
+            "gotchas": [
+              {"id": "FG1", "text": "401 loop on token refresh: the /auth/refresh route sat behind the auth middleware; exempt it"}
+            ]
+          }
+        },
+        {
+          "id": "auth-3",
+          "title": "Mobile refresh storms",
+          "date": "2026-09-08",
+          "messages": [
+            ["user", "Mobile clients hammer the refresh endpoint; it is 40% of our traffic."],
+            ["assistant", "With 15-minute access tokens every open app refreshes four times an hour. Access tokens expire after 60 minutes instead: 15 minutes caused refresh storms on mobile."],
+            ["user", "Ok. Also someone is brute forcing logins."],
+            ["assistant", "Rate-limit /auth/login to 10 attempts per minute per IP, with a 429 and Retry-After."],
+            ["user", "Ship both."],
+            ["assistant", "Access token lifetime is now 60 minutes and the login limiter is live; refresh traffic dropped to 9%."]
+          ],
+          "distilled": {
+            "summary": "Lengthened access tokens and rate-limited login.",
+            "decisions": [
+              {"id": "F3", "text": "Access tokens expire after 60 minutes: 15 minutes caused refresh storms on mobile"},
+              {"id": "F4", "text": "Rate-limit /auth/login to 10 attempts per minute per IP"}
+            ],
+            "supersedes": [{"new": "F3", "old": "F1"}]
+          }
+        }
+      ]
+    },
+    {
+      "path": "/eval/search-indexer",
+      "sessions": [
+        {
+          "id": "search-1",
+          "title": "Keyword search engine",
+          "date": "2026-09-02",
+          "messages": [
+            ["user", "We need keyword search over the stored messages."],
+            ["assistant", "Use SQLite FTS5 with the porter tokenizer for message search: it is built into the bundled SQLite, and porter stemming matches 'indexing' to 'index'."],
+            ["user", "Any downside?"],
+            ["assistant", "Porter is English-only, but our messages are almost all English. The FTS table adds about 30% to the database size."],
+            ["user", "Go."],
+            ["assistant", "Created the messages_fts virtual table with tokenize='porter unicode61' and triggers to keep it in sync."]
+          ],
+          "distilled": {
+            "summary": "Built keyword search on FTS5.",
+            "decisions": [
+              {"id": "G1", "text": "Use SQLite FTS5 with the porter tokenizer for message search"}
+            ]
+          }
+        },
+        {
+          "id": "search-2",
+          "title": "Embedding pipeline",
+          "date": "2026-09-05",
+          "messages": [
+            ["user", "Add semantic search. How do we split long messages for embedding?"],
+            ["assistant", "Chunk messages at 512 tokens with 64 tokens of overlap before embedding, so a sentence at a boundary is in both chunks."],
+            ["user", "Startup now fails with: no such module: vec0."],
+            ["assistant", "The vec0 virtual table comes from the sqlite-vec extension, which must be loaded before opening the connection; we opened first and registered later."],
+            ["user", "Fixed?"],
+            ["assistant", "Registered sqlite-vec with sqlite3_auto_extension before the first open; startup works and the vec_messages table is created."]
+          ],
+          "distilled": {
+            "summary": "Built the embedding pipeline and fixed the vec0 load order.",
+            "decisions": [
+              {"id": "G2", "text": "Chunk messages at 512 tokens with 64 tokens of overlap before embedding"}
+            ],
+            "gotchas": [
+              {"id": "GG1", "text": "'no such module: vec0' at startup: load the sqlite-vec extension before opening the connection"}
+            ]
+          }
+        },
+        {
+          "id": "search-3",
+          "title": "Hybrid ranking",
+          "date": "2026-09-09",
+          "messages": [
+            ["user", "Should semantic search replace the keyword engine?"],
+            ["assistant", "No, message search stays on FTS5 with porter stemming; exact identifiers and error strings need keyword matching. We combine the two."],
+            ["user", "How do we combine the two result lists?"],
+            ["assistant", "Fuse keyword and semantic hits with reciprocal rank fusion, k = 60. It needs no score normalization between BM25 and cosine."],
+            ["user", "Ok."],
+            ["assistant", "Implemented fuse_rrf and a test where a hit ranked well in both lists comes first."]
+          ],
+          "distilled": {
+            "summary": "Kept FTS5 and fused it with semantic results.",
+            "decisions": [
+              {"id": "G3", "text": "Fuse keyword and semantic hits with reciprocal rank fusion, k = 60"}
+            ],
+            "reaffirms": ["G1"]
+          }
+        }
+      ]
+    },
+    {
+      "path": "/eval/billing-api",
+      "sessions": [
+        {
+          "id": "billing-1",
+          "title": "Money representation",
+          "date": "2026-09-01",
+          "messages": [
+            ["user", "How should the billing API represent amounts?"],
+            ["assistant", "Store money as integer cents in i64, never as floats: 0.1 + 0.2 is not 0.3 in floating point and invoices must add up exactly."],
+            ["user", "And in the JSON API?"],
+            ["assistant", "The API also sends integer cents plus an ISO 4217 currency code; clients format it."],
+            ["user", "Ok."],
+            ["assistant", "Converted the Amount type to i64 cents and added a migration for the existing rows."]
+          ],
+          "distilled": {
+            "summary": "Settled how money is represented.",
+            "decisions": [
+              {"id": "H1", "text": "Store money as integer cents in i64, never as floats"}
+            ]
+          }
+        },
+        {
+          "id": "billing-2",
+          "title": "Invoice emails",
+          "date": "2026-09-03",
+          "messages": [
+            ["user", "Customers should get an invoice email after checkout."],
+            ["assistant", "Simplest: send invoice emails synchronously inside the checkout request handler, right after the payment succeeds."],
+            ["user", "Fine for the first version."],
+            ["assistant", "Added send_invoice_email to the checkout handler using the SMTP client."],
+            ["user", "Test it."],
+            ["assistant", "The checkout test now asserts one email is sent per successful payment."]
+          ],
+          "distilled": {
+            "summary": "Added invoice emails to checkout.",
+            "decisions": [
+              {"id": "H2", "text": "Send invoice emails synchronously inside the checkout request handler"}
+            ]
+          }
+        },
+        {
+          "id": "billing-3",
+          "title": "Checkout stalls and duplicate charges",
+          "date": "2026-09-07",
+          "messages": [
+            ["user", "Checkout sometimes hangs for 30 seconds, and two customers were charged twice yesterday."],
+            ["assistant", "The hang is the SMTP server stalling inside the request. Send invoice emails from a background job queue, not the request handler: SMTP stalls blocked checkout."],
+            ["user", "And the double charges?"],
+            ["assistant", "Stripe retried the payment webhook after our slow response and we processed it twice. Dedupe webhooks on an idempotency key taken from stripe_event_id."],
+            ["user", "Do both."],
+            ["assistant", "Invoice emails now go through the job queue, and a unique index on stripe_event_id makes a retried webhook a no-op."]
+          ],
+          "distilled": {
+            "summary": "Moved invoice emails to a queue and deduped webhooks.",
+            "decisions": [
+              {"id": "H3", "text": "Send invoice emails from a background job queue, not the request handler: SMTP stalls blocked checkout"}
+            ],
+            "gotchas": [
+              {"id": "HG1", "text": "Duplicate charges from retried Stripe webhooks: dedupe on an idempotency key from stripe_event_id"}
+            ],
+            "supersedes": [{"new": "H3", "old": "H2"}]
+          }
+        }
+      ]
+    }
+  ],
+  "search": [
+    {"slice": "correction", "query": "why did the nightly feed import keep timing out and what timeout fixed it", "expect": ["ingest-2"]},
+    {"slice": "correction", "query": "why was the number of parallel test jobs in CI lowered", "expect": ["ci-2"]},
+    {"slice": "correction", "query": "access token lifetime changed because mobile clients refreshed too often", "expect": ["auth-3"]},
+    {"slice": "error_fix", "query": "reqwest operation timed out on the nightly feed", "expect": ["ingest-2"]},
+    {"slice": "error_fix", "query": "InvalidTagEncoding when loading old cache files", "expect": ["cache-2"]},
+    {"slice": "error_fix", "query": "server and client render different text on first page load", "expect": ["dash-1"]},
+    {"slice": "error_fix", "query": "database is locked errors while the user types during sync", "expect": ["sync-2"]},
+    {"slice": "error_fix", "query": "linker killed with signal 9 on the mac CI runner", "expect": ["ci-2"]},
+    {"slice": "error_fix", "query": "clients stuck retrying forever with 401 when the token expires", "expect": ["auth-2"]},
+    {"slice": "error_fix", "query": "no such module vec0", "expect": ["search-2"]},
+    {"slice": "error_fix", "query": "customers charged twice because the payment webhook was retried", "expect": ["billing-3"]},
+    {"slice": "reversal", "query": "why did we move the cache format from bincode to JSON", "expect": ["cache-3"]},
+    {"slice": "reversal", "query": "replace last write wins so concurrent offline edits both survive", "expect": ["sync-3"]},
+    {"slice": "reversal", "query": "move invoice emails out of the checkout request", "expect": ["billing-3"]},
+    {"slice": "restatement", "query": "are we still using TanStack Query for server data instead of Redux", "expect": ["dash-1", "dash-2"]},
+    {"slice": "restatement", "query": "is message search still FTS5 with porter stemming", "expect": ["search-1", "search-3"]},
+    {"slice": "restatement", "query": "keep the 45 second limit on feed downloads", "expect": ["ingest-2", "ingest-3"]},
+    {"slice": "restatement", "query": "per field merge with vector clocks for sync conflicts", "expect": ["sync-3", "sync-4"]},
+    {"slice": "same_topic", "query": "retry policy when the upstream feed returns 503", "expect": ["ingest-3"]},
+    {"slice": "same_topic", "query": "how long do cache entries live before they expire", "expect": ["cache-2"]},
+    {"slice": "same_topic", "query": "charts flicker when switching browser tabs back to the dashboard", "expect": ["dash-2"]},
+    {"slice": "same_topic", "query": "someone is brute forcing the login endpoint", "expect": ["auth-3"]},
+    {"slice": "same_topic", "query": "how are keyword and vector search results combined", "expect": ["search-3"]},
+    {"slice": "same_topic", "query": "deleted notes reappear after an offline device syncs", "expect": ["sync-4"]},
+    {"slice": "unrelated", "query": "revenue amounts display without currency formatting", "expect": ["dash-3"]},
+    {"slice": "unrelated", "query": "release tag naming and the publish workflow", "expect": ["ci-3"]},
+    {"slice": "unrelated", "query": "how should amounts of money be represented in the billing API", "expect": ["billing-1"]},
+    {"slice": "unrelated", "query": "default log level for the ingest worker", "expect": ["ingest-1"]},
+    {"slice": "unrelated", "query": "where does the cache service keep its files on disk", "expect": ["cache-1"]},
+    {"slice": "unrelated", "query": "chunk size and overlap for embeddings", "expect": ["search-2"]},
+    {"slice": "paraphrase", "query": "how long can someone stay signed in before having to log in again", "expect": ["auth-1", "auth-3"]},
+    {"slice": "paraphrase", "query": "test runner exhausted RAM on the Apple build machine", "expect": ["ci-2"]},
+    {"slice": "paraphrase", "query": "rounding errors with decimal prices", "expect": ["billing-1"]},
+    {"slice": "paraphrase", "query": "library choice for remote data in the frontend", "expect": ["dash-1", "dash-2"]},
+    {"slice": "paraphrase", "query": "two phones editing the same record while disconnected", "expect": ["sync-1", "sync-3"]},
+    {"slice": "paraphrase", "query": "protect against password guessing attacks", "expect": ["auth-3"]}
+  ],
+  "guard": [
+    {"project": "/eval/ingest-worker", "proposal": "Set the feed download timeout to 15 seconds", "expect": [{"fact": "A3", "status": "current"}, {"fact": "A1", "status": "superseded", "replaced_by": "A3"}]},
+    {"project": "/eval/cache-service", "proposal": "Go back to bincode for serializing cache entries", "expect": [{"fact": "B4", "status": "current"}, {"fact": "B1", "status": "superseded", "replaced_by": "B4"}]},
+    {"project": "/eval/mobile-sync", "proposal": "Use last-write-wins on updated_at to resolve sync conflicts", "expect": [{"fact": "D3", "status": "current"}, {"fact": "D1", "status": "superseded", "replaced_by": "D3"}]},
+    {"project": "/eval/ci-pipeline", "proposal": "Run the CI test suite on 4 parallel jobs", "expect": [{"fact": "E3", "status": "current"}, {"fact": "E2", "status": "superseded", "replaced_by": "E3"}]},
+    {"project": "/eval/auth-gateway", "proposal": "Make access tokens expire after 15 minutes", "expect": [{"fact": "F3", "status": "current"}, {"fact": "F1", "status": "superseded", "replaced_by": "F3"}]},
+    {"project": "/eval/billing-api", "proposal": "Send the invoice email synchronously in the checkout handler", "expect": [{"fact": "H3", "status": "current"}, {"fact": "H2", "status": "superseded", "replaced_by": "H3"}]},
+    {"project": "/eval/web-dashboard", "proposal": "Fetch server state in the dashboard with TanStack Query", "expect": [{"fact": "C1", "status": "current"}]},
+    {"project": "/eval/search-indexer", "proposal": "Use FTS5 with porter stemming for message search", "expect": [{"fact": "G1", "status": "current"}]},
+    {"project": "/eval/billing-api", "proposal": "Store prices as floating point dollars", "expect": [{"fact": "H1", "status": "current"}]}
+  ],
+  "pairs": [
+    {"label": "restatement", "fact": "A3", "proposal": "Keep the 45 second ceiling on feed downloads"},
+    {"label": "restatement", "fact": "A1", "proposal": "Use a 15 second timeout on the upstream feed client"},
+    {"label": "restatement", "fact": "B1", "proposal": "Encode the cache entries with bincode because it is fast"},
+    {"label": "restatement", "fact": "B4", "proposal": "Store cache entries as JSON using serde_json"},
+    {"label": "restatement", "fact": "C1", "proposal": "Server data in the dashboard keeps going through TanStack Query, no Redux"},
+    {"label": "restatement", "fact": "C3", "proposal": "Use Intl.NumberFormat with the user's locale to format money in the UI"},
+    {"label": "restatement", "fact": "D1", "proposal": "Sync conflicts are settled by last write wins using updated_at"},
+    {"label": "restatement", "fact": "D3", "proposal": "Keep the per-field vector clock merge for sync conflicts"},
+    {"label": "restatement", "fact": "E1", "proposal": "Use actions/cache keyed on Cargo.lock for the cargo registry and target directory"},
+    {"label": "restatement", "fact": "E3", "proposal": "Limit CI tests to two parallel jobs"},
+    {"label": "restatement", "fact": "F1", "proposal": "Access tokens should be valid for 15 minutes"},
+    {"label": "restatement", "fact": "F4", "proposal": "Allow at most 10 login attempts per minute from one IP"},
+    {"label": "restatement", "fact": "G1", "proposal": "Message search stays on FTS5 with porter stemming"},
+    {"label": "restatement", "fact": "G2", "proposal": "Split messages into 512-token chunks overlapping by 64 before embedding them"},
+    {"label": "restatement", "fact": "H1", "proposal": "Keep monetary amounts as i64 cents rather than floating point"},
+    {"label": "restatement", "fact": "H3", "proposal": "Queue invoice emails in a background job instead of sending them during checkout"},
+    {"label": "same_topic", "fact": "A3", "proposal": "Retry failed feed fetches three times with exponential backoff"},
+    {"label": "same_topic", "fact": "A4", "proposal": "Raise the feed download timeout to 45 seconds"},
+    {"label": "same_topic", "fact": "B4", "proposal": "Expire cache entries after 24 hours"},
+    {"label": "same_topic", "fact": "B3", "proposal": "Serialize cache entries as JSON"},
+    {"label": "same_topic", "fact": "B2", "proposal": "Compress the cache files with zstd"},
+    {"label": "same_topic", "fact": "C1", "proposal": "Refetch the alerts panel queries on window focus"},
+    {"label": "same_topic", "fact": "C2", "proposal": "Use TanStack Query for server state"},
+    {"label": "same_topic", "fact": "D3", "proposal": "Run background sync every 15 minutes"},
+    {"label": "same_topic", "fact": "D4", "proposal": "Resolve sync conflicts per field with vector clocks"},
+    {"label": "same_topic", "fact": "E1", "proposal": "Run the CI test suite on two parallel jobs"},
+    {"label": "same_topic", "fact": "E4", "proposal": "Cache the cargo target directory in CI"},
+    {"label": "same_topic", "fact": "F3", "proposal": "Store refresh tokens hashed with SHA-256"},
+    {"label": "same_topic", "fact": "F2", "proposal": "Rate-limit the login endpoint per IP"},
+    {"label": "same_topic", "fact": "G1", "proposal": "Chunk messages at 512 tokens before embedding"},
+    {"label": "same_topic", "fact": "G3", "proposal": "Use the porter tokenizer for FTS5 search"},
+    {"label": "same_topic", "fact": "H1", "proposal": "Round currency conversions with banker's rounding"},
+    {"label": "unrelated", "fact": "A3", "proposal": "Format currency with Intl.NumberFormat"},
+    {"label": "unrelated", "fact": "B4", "proposal": "Access tokens expire after 60 minutes"},
+    {"label": "unrelated", "fact": "C1", "proposal": "Tombstone deleted rows for 30 days"},
+    {"label": "unrelated", "fact": "D3", "proposal": "Release tags trigger the publish workflow"},
+    {"label": "unrelated", "fact": "E3", "proposal": "Store money as integer cents"},
+    {"label": "unrelated", "fact": "F3", "proposal": "Use SQLite FTS5 for message search"},
+    {"label": "unrelated", "fact": "G1", "proposal": "Log with the tracing crate at info level"},
+    {"label": "unrelated", "fact": "H3", "proposal": "Cache the cargo registry in CI"},
+    {"label": "unrelated", "fact": "A2", "proposal": "Hash refresh tokens with SHA-256"},
+    {"label": "unrelated", "fact": "G3", "proposal": "Retry failed feed fetches with backoff"},
+    {"label": "reversal", "fact": "A3", "proposal": "Set the feed download timeout to 15 seconds"},
+    {"label": "reversal", "fact": "B4", "proposal": "Go back to bincode for serializing cache entries"},
+    {"label": "reversal", "fact": "D3", "proposal": "Use last-write-wins on updated_at to resolve sync conflicts"},
+    {"label": "reversal", "fact": "E3", "proposal": "Run the CI test suite on 4 parallel jobs"},
+    {"label": "reversal", "fact": "F3", "proposal": "Make access tokens expire after 15 minutes"},
+    {"label": "reversal", "fact": "H3", "proposal": "Send the invoice email synchronously in the checkout handler"}
+  ]
+}

@@ -433,16 +433,24 @@ struct Opts {
 /// The output boundary for stored history. Query commands print titles, snippets, facts and
 /// error text straight from the index, which keeps transcripts unredacted, and agents run
 /// them too: the /recall skill falls back to `cal` when MCP isn't wired, and the VS Code
-/// extension reads `--json`. So everything printed goes through these two helpers, redacted
-/// unless the user passed `--raw` for their own terminal. `cat`, `export` and the hooks
-/// redact on their own (packed transcripts, `export::fact_line`) and never honor `--raw`.
+/// extension reads `--json`. So everything printed goes through these two helpers, stripped
+/// of terminal controls (human output only) and redacted unless the user passed `--raw` for
+/// their own terminal. `cat`, `export` and the hooks strip and redact on their own (packed
+/// transcripts, `export::fact_line`) and never honor `--raw`.
 impl Opts {
-    /// Stored text for human output: secrets redacted unless `--raw`.
+    /// Stored text for human output: terminal controls stripped and secrets redacted unless
+    /// `--raw`. A stored ESC or OSC sequence (a window title, an OSC 52 clipboard write, a
+    /// screen clear), a bidi override or a tag character would otherwise reach the user's
+    /// terminal, or an agent running `cal` through its shell. Stripped first, so an escape
+    /// inside a key cannot split it for the redactor. `--json` is not stripped: its payload is
+    /// a contract, and serde escapes every C0 control there.
     fn shown<'a>(&self, text: &'a str) -> Cow<'a, str> {
         if self.raw {
-            Cow::Borrowed(text)
-        } else {
-            context::redact_secrets(text)
+            return Cow::Borrowed(text);
+        }
+        match context::strip_controls(text) {
+            Cow::Borrowed(t) => context::redact_secrets(t),
+            Cow::Owned(t) => Cow::Owned(context::redact_secrets(&t).into_owned()),
         }
     }
 
@@ -982,13 +990,16 @@ fn cmd_distill(args: &[String]) -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("thread {id} not found"))?;
     eprintln!("distilling thread {id} with {provider}/{model}…");
     let rt = tokio::runtime::Runtime::new()?;
-    let distilled = rt.block_on(agent::distill(
+    let (distilled, grounding) = rt.block_on(agent::distill(
         &provider,
         &model,
         key.as_deref(),
         base_url.as_deref(),
         &input,
     ))?;
+    if let Some(line) = grounding.summary_line() {
+        eprintln!("{line}");
+    }
     let now = chrono::Utc::now().timestamp();
     knowledge::store_distilled(&mut conn, id, &distilled, &input.refs, now)?;
     print_knowledge(&knowledge::get_thread_knowledge(&conn, id)?, &o);
@@ -1191,12 +1202,32 @@ fn publish_text(plan: &repo_memory::PublishPlan) -> String {
     if !plan.held.is_empty() {
         let n = plan.held.len();
         out.push_str(&format!(
-            "{n} {} held back until reviewed (flagged stale or wrong) or until {} replacement \
-             is published:\n",
+            "{n} {} held back: out of memory here, so a teammate would read {} as current:\n",
             if n == 1 { "fact" } else { "facts" },
-            if n == 1 { "its" } else { "their" },
+            if n == 1 { "it" } else { "them" },
         ));
-        out.push_str(&changes_text("!", &plan.held));
+        for h in &plan.held {
+            out.push_str(&changes_text("!", std::slice::from_ref(&h.fact)));
+            // Under the fact, like `cal memory`'s "replaced on" line: what to do about it.
+            out.push_str(match h.reason {
+                repo_memory::HeldReason::Flagged => {
+                    "    flagged stale or wrong and not reviewed yet: keep or hide it in the app\n"
+                }
+                // With `--all` every distilled fact is publishable, so the replacement is held
+                // back itself (flagged, say) or a subagent's unpinned fact: `--all` again would
+                // change nothing.
+                repo_memory::HeldReason::ReplacementUnpublished if plan.all => {
+                    "    replaced by a fact this publish leaves out (held back itself, or a \
+                     subagent's unpinned fact): review or pin that fact\n"
+                }
+                // Without it the replacement may be distilled (left out without `--all`) or
+                // held back itself, where `--all` changes nothing, so name both.
+                repo_memory::HeldReason::ReplacementUnpublished => {
+                    "    replaced by a fact this publish leaves out (a distilled one needs \
+                     `--all`; a held one, its own review)\n"
+                }
+            });
+        }
     }
     if plan.changed {
         out.push_str(&format!(
@@ -1378,7 +1409,14 @@ fn cmd_hook(args: &[String]) -> anyhow::Result<()> {
                 return Ok(());
             }
         }
-        println!("{}", hook_stdout(agent, &text));
+        // Each piece is stripped before it is fence-escaped, where it is rendered; this catches
+        // whatever a future piece forgets, since the hook's text lands in the agent's context
+        // and its terminal. Stripping after escaping cannot revive a tag: the escaper reads
+        // through controls (`context::escape_fences`).
+        println!(
+            "{}",
+            hook_stdout(agent, &crate::context::strip_controls(&text))
+        );
         if counts_as_session(source) {
             ledger::append(hook_ledger_kind(&text), &project);
         }
@@ -4674,23 +4712,45 @@ mod tests {
             kind: kind.into(),
             text: text.into(),
         };
+        let held = |kind: &str, text: &str, reason| repo_memory::HeldFact {
+            fact: change(kind, text),
+            reason,
+        };
         let mut plan = repo_memory::PublishPlan::default();
         assert_eq!(
             publish_text(&plan),
             "",
             "silent when there is nothing to say"
         );
-        plan.held = vec![change("decision", "use bincode for the cache")];
+        plan.held = vec![held(
+            "decision",
+            "use bincode for the cache",
+            repo_memory::HeldReason::ReplacementUnpublished,
+        )];
         assert_eq!(
             publish_text(&plan),
-            "1 fact held back until reviewed (flagged stale or wrong) or until its replacement \
-             is published:\n  ! decision: use bincode for the cache\n"
+            "1 fact held back: out of memory here, so a teammate would read it as current:\n  ! \
+             decision: use bincode for the cache\n    replaced by a fact this publish leaves out \
+             (a distilled one needs `--all`; a held one, its own review)\n"
         );
+        // After `--all`, asking for `--all` again would point the user the wrong way.
+        plan.all = true;
+        let out = publish_text(&plan);
+        assert!(!out.contains("`--all`"), "{out}");
+        assert!(
+            out.contains("(held back itself, or a subagent's unpinned fact): review or pin"),
+            "{out}"
+        );
+        plan.all = false;
         plan.changed = true;
         plan.dir = "/r/.callimachus/memory".into();
         plan.decisions = 1;
         plan.added = vec![change("decision", "use JSON for the cache")];
-        plan.held.push(change("gotcha", "the cache is per user"));
+        plan.held.push(held(
+            "gotcha",
+            "the cache is per user",
+            repo_memory::HeldReason::Flagged,
+        ));
         let out = publish_text(&plan);
         assert!(
             out.starts_with(
@@ -4699,8 +4759,14 @@ mod tests {
             ),
             "{out}"
         );
-        assert!(out.contains("their replacement"), "{out}");
-        assert!(out.contains("  ! gotcha: the cache is per user\n"), "{out}");
+        assert!(out.contains("would read them as current"), "{out}");
+        assert!(
+            out.contains(
+                "  ! gotcha: the cache is per user\n    flagged stale or wrong and not reviewed \
+                 yet: keep or hide it in the app\n"
+            ),
+            "{out}"
+        );
         assert!(
             out.ends_with("to share it with everyone who works in this repo.\n"),
             "{out}"
@@ -4757,6 +4823,17 @@ mod tests {
         }];
         let out = memory_text("/p", &mem, &Opts::default());
         assert!(out.contains("\nReplaced (history):\n"), "{out}");
+        // Stored terminal controls never reach the terminal, unless `--raw`.
+        let hostile = "use \u{1B}]0;pwned\u{7}JSON \u{202E}now";
+        let kept = std::mem::replace(&mut mem.decisions, vec![f(9, hostile, OCT_3, "llm")]);
+        let out = memory_text("/p", &mem, &Opts::default());
+        assert!(out.contains("  - use JSON now  ("), "{out:?}");
+        let raw = Opts {
+            raw: true,
+            ..Opts::default()
+        };
+        assert!(memory_text("/p", &mem, &raw).contains(hostile));
+        mem.decisions = kept;
         assert!(
             out.contains(
                 "  - use bincode for the cache  ([superseded] 2026-10-01, codex, thread 12; \

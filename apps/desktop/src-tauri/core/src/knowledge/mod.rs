@@ -6,6 +6,7 @@
 //! do facts recorded by the user or by agents (`record_fact_with_origin`).
 
 pub mod app_config;
+pub mod grounding;
 pub mod harvest;
 pub mod identity;
 pub mod priority;
@@ -1047,9 +1048,22 @@ pub enum GuardMatch {
 }
 
 /// Similarity at which a guard hit counts as `close` (the proposal restates or reverses that
-/// decision) rather than merely `related`. Provisional: picked by eye on synthetic vectors;
-/// calibrate it on real fact embeddings before anything keys hard behavior on it.
+/// decision) rather than merely `related`. Calibrated by `eval::tests::calibrate_guard_close`
+/// on memory_truth_v1 (bge-small-en-v1.5, proposal query-embedded against the stored fact as
+/// check_decision scores it): restatements 0.719-0.935 (median 0.875, n 16), reversals
+/// 0.772-0.875 (n 6), same-topic decisions 0.539-0.715 (median 0.657, n 16), unrelated
+/// 0.448-0.578. 0.75 calls 15/16 restatements, 6/6 reversals and 0/16 same-topic pairs close
+/// (balanced accuracy 0.969). The best separator, 0.717 (1.000), sits in a 0.003 gap set by one
+/// pair on each side, which is sampling noise at n 16; and the eval's own guard run has a
+/// same-topic decision at 0.749 (refresh token lifetime against an access token proposal),
+/// which 0.717 would call close. A false "close" is the costlier error, so it stays 0.75.
 pub const GUARD_CLOSE: f32 = 0.75;
+
+/// Similarity floor for the high-stakes guards (`find_prior_work`, `check_contradiction`): a
+/// false "you already did / decided this" is worse than silence, so it sits above general
+/// recall's. Module-level so `eval::tests::calibrate_guard_close` reports the floor the guard
+/// actually uses.
+pub(crate) const GUARD_FLOOR: f32 = 0.55;
 
 /// Cross-thread semantic recall of distilled facts. `qv` is a PRECOMPUTED query vector
 /// (embed it via `embed::embed_query` BEFORE locking the DB so inference never holds the
@@ -1363,7 +1377,6 @@ pub fn find_prior_work(
     // The guard is high-stakes — an agent acts on "you solved this before", so a false positive
     // is worse than an empty answer. Hold it to a stricter floor than general recall; recall()
     // already dropped the clear noise, this keeps only genuinely-related prior sessions.
-    const GUARD_FLOOR: f32 = 0.55;
     let mut out: Vec<PriorWork> = by_thread
         .into_values()
         .filter(|w| w.similarity >= GUARD_FLOOR)
@@ -1394,7 +1407,6 @@ pub fn check_contradiction(
 ) -> Result<Vec<RecallHit>> {
     // Same high-stakes floor as find_prior_work: recall() already dropped the clear noise; this
     // keeps only decisions genuinely on the proposal's topic.
-    const GUARD_FLOOR: f32 = 0.55;
     let mut hits = recall(conn, qv, "decision", project, (k * 3).max(15), true)?;
     hits.retain(|h| h.similarity >= GUARD_FLOOR);
     for h in &mut hits {
@@ -1441,6 +1453,11 @@ pub struct MemoryFact {
     #[serde(rename = "createdAt")]
     pub created_at: i64,
     pub pinned: bool,
+    /// The user rewrote its text: curated like a pinned fact, so an unresolved flag leaves it
+    /// in memory. With `pinned` it says why a flagged fact is still in memory, which the
+    /// Projects page used to infer from the live lists. Left out of the JSON when false.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub edited: bool,
     /// Who wrote it: `llm`, `heuristic`, `user`, `agent`, or a harvest origin such as
     /// `claude-memory`. The SessionStart hook and the managed AGENTS.md / CLAUDE.md block
     /// drop `claude-memory` facts, which Claude Code already loads from its own auto memory,
@@ -1631,6 +1648,7 @@ fn project_facts(
                 kind: r.get(8)?,
                 source: r.get(10)?,
                 decided_at: r.get(11)?,
+                edited: r.get::<_, i64>(12)? != 0,
                 support: 1,
                 ..Default::default()
             },
@@ -1697,7 +1715,7 @@ fn project_facts_sql(
     // Pinned facts on subagent threads stay: the user curated them (see list_open_todos).
     let mut sql = format!(
         "SELECT f.id, f.thread_id, f.text, t.title, f.created_at, f.pinned, f.extractor, {},
-                f.kind, COALESCE(f.uid, ''), s.kind, {DECIDED_AT_SQL}
+                f.kind, COALESCE(f.uid, ''), s.kind, {DECIDED_AT_SQL}, f.edited
          FROM facts f JOIN threads t ON t.id = f.thread_id
          JOIN sources s ON s.id = t.source_id
          WHERE {kind_sql} AND {scope} AND f.hidden = 0
@@ -2533,6 +2551,61 @@ pub fn rekey_project_keys(conn: &Connection) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A flagged fact carries `edited`, so the Projects page can say whether a pin or an edit
+    /// keeps it in memory (or neither, and it is out) without inferring it from the live lists.
+    #[test]
+    fn memory_facts_say_whether_the_user_edited_them() {
+        use truth::{flag_fact, FlagKind, SignalSource};
+        let conn = temp_db();
+        const P: &str = "/p/edited";
+        let rec = |text: &str| record_fact(&conn, P, "decision", text, None, 1).unwrap();
+        let (plain, pinned, edited) = (rec("plain one"), rec("pinned one"), rec("edited one"));
+        set_fact_pinned(&conn, pinned, true).unwrap();
+        edit_fact(&conn, edited, "edited one, reworded").unwrap();
+        for id in [plain, pinned, edited] {
+            flag_fact(
+                &conn,
+                id,
+                FlagKind::Stale,
+                SignalSource::User,
+                None,
+                None,
+                2,
+            )
+            .unwrap();
+        }
+        let q = MemoryQuery {
+            per_kind: 10,
+            history: true,
+            ..Default::default()
+        };
+        let mem = get_project_memory_with(&conn, P, &q).unwrap();
+        let bits = |l: &[MemoryFact]| -> Vec<(i64, bool, bool)> {
+            let mut v: Vec<_> = l.iter().map(|f| (f.id, f.pinned, f.edited)).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(
+            bits(&mem.flagged),
+            vec![
+                (plain, false, false),
+                (pinned, true, false),
+                (edited, false, true)
+            ]
+        );
+        assert_eq!(
+            bits(&mem.decisions),
+            vec![(pinned, true, false), (edited, false, true)]
+        );
+        // `edited` is left out of the JSON when false, like the other additions.
+        let json = |id: i64| {
+            let f = mem.flagged.iter().find(|f| f.id == id).unwrap();
+            serde_json::to_value(f).unwrap()
+        };
+        assert_eq!(json(edited)["edited"], serde_json::Value::Bool(true));
+        assert!(json(plain).get("edited").is_none());
+    }
 
     /// The live-only memory read (the hook's hot path) checks supersession by an index probe
     /// per fact, never a scan of `fact_links` or `fact_signals`, for every shape of the query.
