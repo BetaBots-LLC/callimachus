@@ -50,6 +50,14 @@ into `tauri.conf.json`, `Cargo.toml`, the root `callimachus` entry in `Cargo.loc
 the updater manifest, the registry entry, the plugin and the git tag never drift. It also
 rewrites the plugin's pinned `npx -y callimachus-mcp@<ver>` in `plugins/claude-code/.mcp.json`
 and the `"ref": "v<ver>"` of the plugin's `git-subdir` source in `.claude-plugin/marketplace.json`.
+For the Cursor plugin it stamps `plugins/cursor/.cursor-plugin/plugin.json`, the
+`npx -y callimachus-mcp@<ver>` pin in `plugins/cursor/mcp.json`, and both versions in
+`.cursor-plugin/marketplace.json` (cursor.directory lists the root manifest's top-level one).
+cursor.directory and team marketplaces read the plugin from a branch (cursor.directory from
+the default one), not a tag, and the Cursor Marketplace lists an update only after Cursor
+reviews it. So after the version PR merges, the pin names an npm version that resolves once
+that release's npm publish lands; the hook scripts ask `cal help` first, so a plugin ahead of
+the user's app stays silent.
 
 **The plugin follows the release, not main.** Claude Code reads the marketplace catalog from
 the default branch but fetches the plugin itself from the `v<ver>` tag the catalog names. Once

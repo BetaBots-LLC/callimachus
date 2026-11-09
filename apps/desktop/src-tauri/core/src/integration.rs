@@ -4379,6 +4379,101 @@ mod tests {
         assert_eq!(entry["source"]["ref"], format!("v{version}"));
     }
 
+    /// The Cursor plugin in plugins/cursor carries the same hooks the app writes to
+    /// `~/.cursor/hooks.json` ([`CURSOR_HOOKS`]): the same events, matchers and timeouts, each a
+    /// plain sh script that runs the linked `cal` with the spec's subcommand, exits quietly
+    /// without it, and asks `cal help` first whether this `cal` speaks Cursor's protocol. Its
+    /// version is the app's, which sync-versions.mjs keeps in step, as it does the MCP pin.
+    #[test]
+    fn cursor_plugin_mirrors_the_app_install() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../../plugins/cursor");
+        let read = |rel: &str| {
+            std::fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"))
+        };
+        let cal = "~/.local/bin/cal";
+        // The released 0.12.0 `cal` has no `--for cursor`; its help ends the `--for` line with
+        // "codex or gemini". The probe greps the line this version's help ends with.
+        let probe = format!("{cal} help 2>/dev/null | grep -q ' or cursor$' || exit 0\n");
+        let for_line = crate::cli_core::USAGE
+            .lines()
+            .skip_while(|l| !l.trim_start().starts_with("--for AGENT"))
+            .take(2)
+            .collect::<Vec<_>>();
+        assert!(
+            for_line.iter().any(|l| l.ends_with(" or cursor")),
+            "`cal help` must end a `--for` line with \" or cursor\" for the plugin's probe: \
+             {for_line:?}"
+        );
+        assert_eq!(
+            crate::cli_core::USAGE
+                .lines()
+                .filter(|l| l.ends_with(" or cursor"))
+                .count(),
+            1,
+            "only the `--for` line may match the probe"
+        );
+
+        let mut expected = Map::new();
+        for spec in CURSOR_HOOKS {
+            let name = spec.subcommand.split(' ').next().unwrap();
+            let script = format!("scripts/{name}.sh");
+            let body = read(&script);
+            assert!(
+                body.starts_with("#!/bin/sh\n"),
+                "{script} is a plain sh script"
+            );
+            assert!(
+                body.contains(&format!("[ -x {cal} ] || exit 0\n")),
+                "{script} exits quietly when cal is not installed"
+            );
+            assert!(body.contains(&probe), "{script} asks `cal help` first");
+            assert!(
+                body.ends_with(&format!("exec {cal} {}\n", spec.subcommand)),
+                "{script} ends by running `cal {}`",
+                spec.subcommand
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(root.join(&script))
+                    .unwrap()
+                    .permissions()
+                    .mode();
+                assert!(
+                    mode & 0o111 != 0,
+                    "{script} is executable (git keeps the mode)"
+                );
+            }
+            // Cursor's flat entry: `command` (plugin hooks run from the plugin's install dir,
+            // cursor.com/docs/hooks "Configuration"), `timeout` in seconds, `matcher` if any.
+            let mut entry = Map::new();
+            entry.insert("command".into(), json!(format!("./{script}")));
+            entry.insert("timeout".into(), json!(spec.timeout_secs));
+            if let Some(m) = spec.matcher {
+                entry.insert("matcher".into(), json!(m));
+            }
+            let entries = expected.entry(spec.event).or_insert_with(|| json!([]));
+            entries.as_array_mut().unwrap().push(Value::Object(entry));
+        }
+        let hooks: Value = serde_json::from_str(&read("hooks/hooks.json")).unwrap();
+        assert_eq!(hooks["hooks"], Value::Object(expected));
+
+        let version = env!("CALLIMACHUS_VERSION");
+        let manifest: Value = serde_json::from_str(&read(".cursor-plugin/plugin.json")).unwrap();
+        assert_eq!(manifest["name"], "callimachus");
+        assert_eq!(manifest["version"], version);
+        let mcp: Value = serde_json::from_str(&read("mcp.json")).unwrap();
+        assert_eq!(
+            mcp["mcpServers"][MCP_NAME],
+            json!({"command": "npx", "args": ["-y", format!("callimachus-mcp@{version}")]})
+        );
+        let skill = read("skills/recall/SKILL.md");
+        assert!(
+            skill.starts_with(SKILL_MD) && skill.contains("\n## With the Cursor plugin\n"),
+            "plugins/cursor/skills/recall/SKILL.md is resources/recall/SKILL.md plus the plugin note"
+        );
+    }
+
     /// The error-playbook hooks are opt-in like proactive recall: Install leaves them out,
     /// a reinstall re-shapes them once opted in (both events, even when only one was there),
     /// a plugin hand-over keeps them, uninstall removes them, and the user's own PostToolUse
