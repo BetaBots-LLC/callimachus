@@ -69,7 +69,7 @@ const TOOLS: { name: string; note: string; write?: boolean }[] = [
   { name: "record_gotcha", note: "Persist a gotcha into a project's memory", write: true },
   {
     name: "flag_fact",
-    note: "Flag a remembered fact as stale or wrong; it leaves memory until you review it",
+    note: "Flag a fact in this repo as stale or wrong; it leaves memory until you review it",
     write: true,
   },
   {
@@ -176,8 +176,8 @@ function McpPage() {
             <code className="font-mono">snapshot_session</code>) that update Callimachus's own
             memory, never your project files. Every remembered fact carries the date its session
             happened, a decision a later session reversed is kept as history and named as replaced,
-            and a flag from an agent hides a fact only until you review it (a fact you pinned stays
-            in).
+            and a flag from an agent hides a fact only until you review it. A fact you pinned or
+            edited stays in, and an agent can flag or replace only facts of the repo it runs in.
           </p>
           <p className="text-sm leading-relaxed text-muted-foreground">
             It also offers <code className="font-mono">recall</code>,{" "}

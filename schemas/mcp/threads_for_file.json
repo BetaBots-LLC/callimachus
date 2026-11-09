@@ -242,6 +242,47 @@
                   "string",
                   "null"
                 ]
+              },
+              "status": {
+                "enum": [
+                  "current",
+                  "disputed",
+                  "flagged",
+                  "superseded",
+                  null
+                ],
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "supersededBy": {
+                "required": [
+                  "id",
+                  "text",
+                  "decidedAt"
+                ],
+                "type": [
+                  "object",
+                  "null"
+                ],
+                "properties": {
+                  "id": {
+                    "type": "integer"
+                  },
+                  "text": {
+                    "type": "string"
+                  },
+                  "decidedAt": {
+                    "type": "integer"
+                  },
+                  "threadId": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  }
+                }
               }
             },
             "required": [

@@ -637,12 +637,19 @@ pub fn enable_memory(conn: &Connection, provider: &str, model: Option<&str>) -> 
 ///
 /// `refs` is the [`RefMap`] of the [`distill_memory_context`] block the model was shown
 /// (`RefMap::default()` when it was shown none). In one transaction:
-/// - the thread's uncurated LLM facts are replaced, an identical text keeping its uid; but a
-///   fact another thread actively supersedes is kept as history (never deleted), and no new
-///   fact is inserted with its text, so a re-distill cannot bring the old decision back as
-///   current; `d<N>` / `g<N>` naming such a text resolves to the kept fact;
-/// - the thread's previous distilled links and unresolved distilled signals are removed
-///   (a re-distill is idempotent; a flag the user resolved stays resolved), then
+/// - the thread's uncurated LLM facts are replaced, an identical text keeping its uid; but some
+///   are kept (never deleted), and no new fact is inserted with their text: a fact another
+///   thread's fact actively supersedes (history, whoever declared it, so a re-distill cannot
+///   bring the old decision back as current), one another source's link names (the user's,
+///   an agent's, a review's, a repo import's, or a link two sessions distilled: deleting
+///   either side would silently void it, and a reworded copy cannot be matched to it), and one
+///   carrying a flag or a resolution that this re-distill does not replace (a user's or an
+///   agent's flag, a retirement from another session, one the user kept). `d<N>` / `g<N>`
+///   naming a kept text resolves to the kept fact; a reworded one is a near-duplicate, which
+///   beats losing the user's link;
+/// - the thread's previous distilled links (except incoming ones: a listed item it said
+///   supersedes its own, which the kept target holds) and unresolved distilled signals are
+///   removed (a re-distill is idempotent; a flag the user resolved stays resolved), then
 ///   `d.links`, `d.reaffirms` and `d.retires` are applied with the per-thread caps and
 ///   validation of [`truth::apply_distilled_truth`].
 pub fn store_distilled(
@@ -654,18 +661,33 @@ pub fn store_distilled(
 ) -> Result<()> {
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let truth = truth::has_truth_tables(&tx);
-    // Facts of this thread that a later session's fact supersedes (a link that is not this
-    // thread's own distilled one, which is about to be replaced): history, so they stay.
+    // Facts of this thread that must outlive the re-distill (see the doc): superseded by
+    // another thread's fact through any active link, including one this thread's own distill
+    // declared (the incoming link the cleanup below keeps, else re-distilling the older
+    // session of a backlog pair without repeating the link would revive its decision); named
+    // by an active link this re-distill does not replace; or carrying a signal it does not
+    // replace, other than a reaffirmation (another session's confirmation is not worth a
+    // duplicate).
     let kept: Vec<(i64, String, String, String)> = if truth {
-        let mut sel = tx.prepare(
+        let mut sel = tx.prepare(&format!(
             "SELECT f.id, f.kind, f.text, f.uid FROM facts f
              WHERE f.thread_id = ?1 AND f.extractor = 'llm'
                AND f.pinned = 0 AND f.edited = 0 AND f.hidden = 0 AND f.uid IS NOT NULL
-               AND EXISTS (SELECT 1 FROM fact_links lk JOIN facts nf ON nf.uid = lk.from_uid
-                    WHERE lk.to_uid = f.uid AND lk.kind = 'supersedes' AND nf.hidden = 0
-                      AND lk.dismissed_at IS NULL AND nf.thread_id != f.thread_id
-                      AND NOT (lk.source = 'distill' AND lk.thread_id IS ?1))",
-        )?;
+               AND (EXISTS (SELECT 1 FROM fact_links lk JOIN facts nf ON nf.uid = lk.from_uid
+                    WHERE lk.to_uid = f.uid AND lk.kind = 'supersedes'
+                      AND {} AND lk.dismissed_at IS NULL AND nf.thread_id != f.thread_id)
+                 OR EXISTS (SELECT 1 FROM fact_links lk
+                    WHERE lk.from_uid = f.uid AND lk.dismissed_at IS NULL
+                      AND NOT (lk.source = 'distill' AND lk.thread_id IS ?1))
+                 OR EXISTS (SELECT 1 FROM fact_links lk
+                    WHERE lk.to_uid = f.uid AND lk.dismissed_at IS NULL
+                      AND NOT (lk.source = 'distill' AND lk.thread_id IS ?1))
+                 OR EXISTS (SELECT 1 FROM fact_signals sg
+                    WHERE sg.fact_uid = f.uid AND sg.kind != 'reaffirmed'
+                      AND NOT (sg.source = 'distill' AND sg.thread_id IS ?1
+                               AND sg.resolved_at IS NULL)))",
+            truth::NEWER_STANDS_NF_SQL
+        ))?;
         let rows = sel
             .query_map([thread_id], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
@@ -706,9 +728,18 @@ pub fn store_distilled(
     };
     if truth {
         // A link the user undid stays: it is what keeps this re-distill from declaring it again.
+        // So does an incoming one (another thread's fact supersedes this thread's own): its
+        // target is kept above as history, and the model leaving the link out this time (an
+        // LLM does not always repeat itself) must not bring the replaced decision back. Run
+        // while this thread's facts still exist, so the own side is recognized.
         tx.execute(
             "DELETE FROM fact_links WHERE thread_id = ?1 AND source = 'distill'
-               AND dismissed_at IS NULL",
+               AND dismissed_at IS NULL
+               AND NOT (kind = 'supersedes'
+                    AND EXISTS (SELECT 1 FROM facts m
+                                WHERE m.uid = fact_links.to_uid AND m.thread_id = ?1)
+                    AND EXISTS (SELECT 1 FROM facts o
+                                WHERE o.uid = fact_links.from_uid AND o.thread_id != ?1))",
             [thread_id],
         )?;
         tx.execute(
@@ -1429,9 +1460,14 @@ pub struct MemoryFact {
     /// imported facts, which live on the project's "Recorded memory" thread).
     pub source: String,
     pub status: FactStatus,
-    /// `decidedAt` of the newest fact it actively supersedes.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub replaces: Option<i64>,
+    /// The ids of the facts it actively supersedes, newest first: the same list of fact ids
+    /// as `replaces` on a recall or check hit, so the key means one thing on every surface.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub replaces: Vec<i64>,
+    /// `decidedAt` of the newest fact it actively supersedes (the `replaces <date>` clause in
+    /// a memory line). A date, never a fact id: the ids are in `replaces`.
+    #[serde(rename = "replacesDecidedAt", skip_serializing_if = "Option::is_none")]
+    pub replaces_decided_at: Option<i64>,
     /// The facts it is disputed with (active `contradicts` links), newest first.
     #[serde(rename = "disputedBy", skip_serializing_if = "Vec::is_empty")]
     pub disputed_by: Vec<LinkedFact>,
@@ -1452,7 +1488,8 @@ impl MemoryFact {
     /// Fill the derived fields from `t`.
     fn apply_truth(&mut self, t: FactTruth) {
         self.status = t.status;
-        self.replaces = t.replaces.first().map(|f| f.decided_at);
+        self.replaces_decided_at = t.replaces.first().map(|f| f.decided_at);
+        self.replaces = t.replaces.iter().map(|f| f.id).collect();
         self.disputed_by = t.disputed_by;
         self.support = t.support;
         self.last_confirmed = t.last_confirmed;
@@ -1529,7 +1566,8 @@ pub fn list_projects(conn: &Connection) -> Result<Vec<ProjectInfo>> {
 /// Which facts [`project_facts`] reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Slice {
-    /// What memory injects: not superseded, and not flagged unless pinned.
+    /// What memory injects: not superseded, and not flagged unless pinned or edited (the
+    /// user curated it; only they settle a flag on it).
     Live,
     /// Superseded (history).
     Superseded,
@@ -1645,7 +1683,7 @@ fn project_facts_sql(
     let filter = match (truth, slice) {
         (false, _) => String::new(),
         (true, Slice::Live) => format!(
-            " AND NOT {} AND (f.pinned = 1 OR NOT {})",
+            " AND NOT {} AND (f.pinned = 1 OR f.edited = 1 OR NOT {})",
             truth::SUPERSEDED_SQL,
             truth::FLAGGED_SQL
         ),

@@ -19,7 +19,7 @@ import type {
   WhyThread,
   WhyTraceAttribution,
 } from "../protocol";
-import { sourceLabel } from "../protocol";
+import { factStatusLabel, sourceLabel } from "../protocol";
 import {
   action,
   closeWhy,
@@ -179,9 +179,20 @@ function WhyCommitBlock({ commit }: { commit: WhyCommit }) {
                       {f.kind}
                     </Badge>
                     <span>
+                      {factStatusLabel(f) ? (
+                        <span className="font-medium text-muted-foreground">
+                          [{factStatusLabel(f)}]{" "}
+                        </span>
+                      ) : null}
                       {f.text}
                       {f.rationale ? (
                         <span className="text-muted-foreground"> Because: {f.rationale}</span>
+                      ) : null}
+                      {f.supersededBy ? (
+                        <span className="text-muted-foreground">
+                          {" "}
+                          Replaced by: {f.supersededBy.text}
+                        </span>
                       ) : null}
                     </span>
                   </li>

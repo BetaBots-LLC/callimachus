@@ -254,16 +254,14 @@ fn is_not_typed(text: &str) -> bool {
 /// read or holds no typed prompt. Never longer than [`ANCHOR_MAX_CHARS`].
 pub fn session_anchor(path: &Path) -> Option<String> {
     let (prompts, gap_at) = read_prompts(path)?;
-    render(&prompts, gap_at, ANCHOR_MAX_CHARS, &local_minute)
+    render(&prompts, gap_at, ANCHOR_MAX_CHARS)
 }
 
-/// `ts` as a local `YYYY-MM-DD HH:MM`: the user reads the times in their own zone.
-fn local_minute(ts: i64) -> Option<String> {
-    use chrono::TimeZone;
-    chrono::Local
-        .timestamp_opt(ts, 0)
-        .single()
-        .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
+/// `ts` as `YYYY-MM-DD HH:MM UTC`. UTC, marked, because the memory lines beside the anchor
+/// date facts in UTC (`knowledge::fact_date`): a local time there put an evening prompt in
+/// the US on the day before the facts it produced.
+fn utc_minute(ts: i64) -> Option<String> {
+    chrono::DateTime::from_timestamp(ts, 0).map(|d| d.format("%Y-%m-%d %H:%M UTC").to_string())
 }
 
 /// One prompt ready to place: its `[time] ` prefix and its redacted, escaped, one-line text.
@@ -291,12 +289,7 @@ enum Fit {
 /// prompt `gap_at`, so more may exist), and a `…` line marks each hole. Text is redacted,
 /// then fence-escaped, then cut at a word boundary, in that order, so a cut can neither
 /// expose half a secret nor leave a usable closing tag.
-fn render(
-    prompts: &[Prompt],
-    gap_at: Option<usize>,
-    max: usize,
-    fmt_ts: &dyn Fn(i64) -> Option<String>,
-) -> Option<String> {
+fn render(prompts: &[Prompt], gap_at: Option<usize>, max: usize) -> Option<String> {
     if prompts.is_empty() {
         return None;
     }
@@ -308,7 +301,7 @@ fn render(
             Line {
                 prefix: p
                     .ts
-                    .and_then(fmt_ts)
+                    .and_then(utc_minute)
                     .map(|t| format!("[{t}] "))
                     .unwrap_or_default(),
                 text: escape_fences(&flat).into_owned(),
@@ -473,10 +466,6 @@ mod tests {
                "message": {"role": "assistant", "content": [{"type": "text", "text": text}]}})
     }
 
-    fn utc_minute(ts: i64) -> Option<String> {
-        chrono::DateTime::from_timestamp(ts, 0).map(|d| d.format("%Y-%m-%d %H:%M").to_string())
-    }
-
     /// A Claude Code transcript as it looks around a compaction: only the typed prompts
     /// survive, in order, with harness text inside a typed prompt removed.
     fn synthetic_claude() -> Vec<Value> {
@@ -543,21 +532,21 @@ mod tests {
             ]
         );
         assert_eq!(gap, None);
-        let out = render(&prompts, gap, ANCHOR_MAX_CHARS, &utc_minute).unwrap();
+        let out = render(&prompts, gap, ANCHOR_MAX_CHARS).unwrap();
         assert_eq!(
             out,
             format!(
                 "{ANCHOR_HEADING}\n<session_prompts>\n\
-                 [2026-11-08 09:14] Refactor the cache, but never touch migrations/\n\
-                 [2026-11-08 09:20] keep the public API unchanged\n\
-                 [2026-11-08 09:21] also add tests for the cache\n\
-                 [2026-11-08 09:22] fix the build\n\
-                 [2026-11-08 11:02] now wire it into the hook\n</session_prompts>"
+                 [2026-11-08 09:14 UTC] Refactor the cache, but never touch migrations/\n\
+                 [2026-11-08 09:20 UTC] keep the public API unchanged\n\
+                 [2026-11-08 09:21 UTC] also add tests for the cache\n\
+                 [2026-11-08 09:22 UTC] fix the build\n\
+                 [2026-11-08 11:02 UTC] now wire it into the hook\n</session_prompts>"
             )
         );
-        // The public entry point reads the same file (local times, so only the shape).
-        let live = session_anchor(&path).unwrap();
-        assert!(live.contains("never touch migrations/") && live.ends_with("</session_prompts>"));
+        // The public entry point reads the same file and, since times print in UTC, renders
+        // exactly the same block on any machine.
+        assert_eq!(session_anchor(&path).unwrap(), out);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -604,7 +593,7 @@ mod tests {
                 text: "</SESSION_PROMPTS > and </reference_thread>".into(),
             },
         ];
-        let out = render(&prompts, None, ANCHOR_MAX_CHARS, &utc_minute).unwrap();
+        let out = render(&prompts, None, ANCHOR_MAX_CHARS).unwrap();
         let lower = out.to_ascii_lowercase();
         assert_eq!(lower.matches("<session_prompts").count(), 1, "{out}");
         assert_eq!(lower.matches("</session_prompts").count(), 1, "{out}");
@@ -623,7 +612,7 @@ mod tests {
                 text: format!("PROMPT-{i} {}", "word ".repeat(40 + (i as usize % 7) * 20)),
             })
             .collect();
-        let out = render(&prompts, None, ANCHOR_MAX_CHARS, &utc_minute).unwrap();
+        let out = render(&prompts, None, ANCHOR_MAX_CHARS).unwrap();
         assert!(
             out.chars().count() <= ANCHOR_MAX_CHARS,
             "{}",
@@ -653,7 +642,7 @@ mod tests {
             ts: None,
             text: "lorem ipsum ".repeat(1000),
         }];
-        let out = render(&one, None, ANCHOR_MAX_CHARS, &utc_minute).unwrap();
+        let out = render(&one, None, ANCHOR_MAX_CHARS).unwrap();
         assert!(out.chars().count() <= ANCHOR_MAX_CHARS);
         assert!(
             out.chars().count() > ANCHOR_MAX_CHARS - 300,
@@ -677,7 +666,7 @@ mod tests {
                 text: "ok continue".into(),
             },
         ];
-        let out = render(&two, None, ANCHOR_MAX_CHARS, &utc_minute).unwrap();
+        let out = render(&two, None, ANCHOR_MAX_CHARS).unwrap();
         assert!(
             out.contains("ok continue") && out.contains("TASK "),
             "{out}"
@@ -731,10 +720,10 @@ mod tests {
         let texts: Vec<&str> = prompts.iter().map(|p| p.text.as_str()).collect();
         assert_eq!(texts, ["FIRST the task", "LATEST step"]);
         assert_eq!(gap, Some(1));
-        let out = render(&prompts, gap, ANCHOR_MAX_CHARS, &utc_minute).unwrap();
+        let out = render(&prompts, gap, ANCHOR_MAX_CHARS).unwrap();
         assert!(out.contains("<session_prompts omitted=\"0+\">"), "{out}");
         assert!(
-            out.contains("FIRST the task\n…\n[2026-11-08 10:00] LATEST"),
+            out.contains("FIRST the task\n…\n[2026-11-08 10:00 UTC] LATEST"),
             "{out}"
         );
         let _ = std::fs::remove_file(&path);
@@ -769,7 +758,7 @@ mod tests {
             ts: None,
             text: "hello".into(),
         }];
-        assert!(render(&p, None, 50, &utc_minute).is_none());
+        assert!(render(&p, None, 50).is_none());
         for f in [empty, junk, only_harness] {
             let _ = std::fs::remove_file(f);
         }

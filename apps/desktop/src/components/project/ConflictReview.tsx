@@ -1,14 +1,24 @@
 import { useState } from "react";
 import type { Conflict } from "../../lib/api";
 import { Button } from "@/components/ui/button";
-import { factDate } from "./FactTruth";
+import { dateTitle, factDate } from "./FactTruth";
 
 /**
  * Review conflicts' results: pairs of decisions the model read as a reversal or a conflict,
  * each side dated. Nothing is stored until the user acts: "Newer replaces older" links the
  * newer decision to the older one (the older leaves memory and shows under Replaced), "Both
  * stand" only drops the pair from this list, and Hide hides one side as before.
+ *
+ * When both sides carry the same date (two decisions from one session share its start), which
+ * one is newer is only the model's guess, which the backend does not trust either. Each side
+ * then gets its own "Keep this one" instead, so the user picks the survivor knowingly.
  */
+
+/** A decision's text cut to fit a button title. */
+function excerpt(text: string, max = 60): string {
+  const t = text.trim().replace(/\s+/g, " ");
+  return t.length > max ? `${t.slice(0, max - 1).trimEnd()}…` : t;
+}
 export function ConflictReview({
   conflicts,
   hiddenIds,
@@ -48,6 +58,12 @@ export function ConflictReview({
         ];
         const newer = sides.find((s) => s.newer) ?? sides[0];
         const older = sides.find((s) => s !== newer) ?? sides[1];
+        // Same timestamp: no date says which came later, so don't offer "Newer replaces older".
+        const sameTime = sides[0].at === sides[1].at;
+        const keep = async (winner: (typeof sides)[number]) => {
+          const loser = winner === sides[0] ? sides[1] : sides[0];
+          if (await onReplace(winner.id, loser.id)) settle(key);
+        };
         return (
           <div key={key} className="space-y-1.5 text-sm">
             <p className="text-muted-foreground">
@@ -61,13 +77,26 @@ export function ConflictReview({
                 key={d.id}
                 className="flex items-start gap-2 rounded-md border px-2 py-1 text-xs"
               >
-                <span className="w-24 shrink-0 tabular-nums text-muted-foreground">
+                <span
+                  className="w-24 shrink-0 tabular-nums text-muted-foreground"
+                  title={dateTitle(d.at)}
+                >
                   {factDate(d.at)}
-                  {d.newer && sides[0].at !== sides[1].at && (
+                  {d.newer && !sameTime && (
                     <span className="block text-[0.65rem] uppercase tracking-wide">Newer</span>
                   )}
                 </span>
                 <span className="flex-1">{d.text}</span>
+                {sameTime && (
+                  <button
+                    type="button"
+                    title={`Keep "${excerpt(d.text)}"; "${excerpt((d === sides[0] ? sides[1] : sides[0]).text)}" moves to Replaced`}
+                    onClick={() => keep(d)}
+                    className="shrink-0 cursor-pointer rounded-sm text-muted-foreground outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/50"
+                  >
+                    Keep this one
+                  </button>
+                )}
                 <button
                   type="button"
                   onClick={() => onHide(d.id)}
@@ -78,16 +107,16 @@ export function ConflictReview({
               </div>
             ))}
             <div className="flex flex-wrap gap-1">
-              <Button
-                size="xs"
-                variant="outline"
-                title={`Keep the ${factDate(newer.at)} decision; the ${factDate(older.at)} one moves to Replaced`}
-                onClick={async () => {
-                  if (await onReplace(newer.id, older.id)) settle(key);
-                }}
-              >
-                Newer replaces older
-              </Button>
+              {!sameTime && (
+                <Button
+                  size="xs"
+                  variant="outline"
+                  title={`Keep "${excerpt(newer.text)}" (${factDate(newer.at)}); "${excerpt(older.text)}" (${factDate(older.at)}) moves to Replaced`}
+                  onClick={() => keep(newer)}
+                >
+                  Newer replaces older
+                </Button>
+              )}
               <Button
                 size="xs"
                 variant="ghost"

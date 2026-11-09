@@ -104,6 +104,14 @@ pub struct WhyFact {
     /// Who wrote it: llm, heuristic, user, agent, or an importer such as claude-memory.
     pub extractor: String,
     pub origin_ref: Option<String>,
+    /// Where it stands now, omitted when current: `superseded` (a later fact replaced it),
+    /// `flagged` (stale or wrong, waiting for review) or `disputed`. Still listed when not
+    /// current: it explains why the line was written, but it is no longer settled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<crate::knowledge::FactStatus>,
+    /// For a superseded fact, the newest one that replaced it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<crate::knowledge::LinkedFact>,
 }
 
 /// A file inside a git checkout, as `git blame` names it.
@@ -466,8 +474,11 @@ pub fn explain_with(
         path_forms(target, &[])
     };
     let origin_ref = crate::knowledge::origin_ref_sql(conn);
+    // `facts.uid` (migration 0034) keys the truth links; a sidecar on an older index has
+    // neither, so every fact reads as current there.
+    let uid = if has_fact_uid(conn) { "f.uid" } else { "NULL" };
     let fact_sql = format!(
-        "SELECT f.id, f.kind, f.text, f.rationale, f.extractor, {origin_ref} FROM facts f
+        "SELECT f.id, f.kind, f.text, f.rationale, f.extractor, {origin_ref}, {uid} FROM facts f
          WHERE f.thread_id = ?1 AND f.hidden = 0 AND f.kind IN ('decision', 'gotcha')
          ORDER BY f.pinned DESC, f.seq, f.id LIMIT ?2"
     );
@@ -500,12 +511,17 @@ pub fn explain_with(
 
     let mut facts = conn.prepare_cached(&fact_sql)?;
     let mut commits = Vec::with_capacity(picked.len());
+    // Fact id -> uid, for one fact_truth pass over every listed fact at the end.
+    let mut uids: HashMap<i64, String> = HashMap::new();
     for (c, mut threads, mut trace) in picked {
         threads.truncate(MAX_THREADS_PER_COMMIT);
         trace.truncate(crate::trace::MAX_ATTRIBUTIONS_PER_COMMIT);
         for t in &mut threads {
             t.facts = facts
                 .query_map(rusqlite::params![t.id, MAX_FACTS_PER_THREAD as i64], |r| {
+                    if let Some(u) = r.get::<_, Option<String>>(6)? {
+                        uids.insert(r.get(0)?, u);
+                    }
                     Ok(WhyFact {
                         id: r.get(0)?,
                         thread_id: t.id,
@@ -514,6 +530,8 @@ pub fn explain_with(
                         rationale: r.get(3)?,
                         extractor: r.get(4)?,
                         origin_ref: r.get(5)?,
+                        status: None,
+                        superseded_by: None,
                     })
                 })?
                 .collect::<rusqlite::Result<_>>()?;
@@ -529,6 +547,7 @@ pub fn explain_with(
             trace,
         });
     }
+    label_facts(conn, &mut commits, &uids)?;
     let unlinked = commits.iter().all(|c| c.threads.is_empty());
     Ok(WhyOutput {
         schema_version: CAL_SCHEMA_VERSION,
@@ -539,6 +558,39 @@ pub fn explain_with(
         unlinked,
         uncommitted,
     })
+}
+
+/// Whether `facts` has its `uid` column (migration 0034).
+fn has_fact_uid(conn: &Connection) -> bool {
+    conn.prepare_cached("SELECT 1 FROM pragma_table_info('facts') WHERE name = 'uid'")
+        .and_then(|mut stmt| stmt.exists([]))
+        .unwrap_or(false)
+}
+
+/// Each listed fact's standing (`knowledge::fact_truth`): a decision a later session reversed
+/// or the user flagged is still why the line was written, so it stays, but labelled, so an
+/// agent reading the line does not take it as settled.
+fn label_facts(
+    conn: &Connection,
+    commits: &mut [WhyCommit],
+    uids: &HashMap<i64, String>,
+) -> Result<()> {
+    let keys: Vec<&str> = uids.values().map(String::as_str).collect();
+    let truth = crate::knowledge::fact_truth(conn, &keys)?;
+    for f in commits
+        .iter_mut()
+        .flat_map(|c| c.threads.iter_mut())
+        .flat_map(|t| t.facts.iter_mut())
+    {
+        let Some(t) = uids.get(&f.id).and_then(|u| truth.get(u)) else {
+            continue;
+        };
+        if t.status != crate::knowledge::FactStatus::Current {
+            f.status = Some(t.status);
+            f.superseded_by = t.superseded_by.clone();
+        }
+    }
+    Ok(())
 }
 
 /// A blamed commit with its linked threads and its trace attributions.
@@ -1220,6 +1272,73 @@ mod tests {
         // Newest first: B (chore: fmt) after A by committer time.
         assert_eq!(out.commits[0].sha, B);
         assert!(out.commits[0].threads.is_empty());
+    }
+
+    /// A decision a later session reversed, or one flagged wrong, still explains the line, so
+    /// it stays listed, labelled with its status; the reversed one names its replacement.
+    #[test]
+    fn reversed_and_flagged_facts_are_labelled() {
+        let mut conn = temp_db();
+        let editor = thread(&mut conn, "e", "rewrote auth", 100);
+        let later = thread(&mut conn, "l", "moved the cache", 200);
+        link(&conn, editor, A, 1);
+        edit(&conn, editor, "src/auth.rs", "edit");
+        fact(&conn, editor, "decision", "use bincode", false, false);
+        fact(
+            &conn,
+            editor,
+            "decision",
+            "rotate on every use",
+            false,
+            false,
+        );
+        fact(
+            &conn,
+            editor,
+            "gotcha",
+            "clock skew breaks expiry",
+            false,
+            false,
+        );
+        fact(&conn, later, "decision", "use JSON", false, false);
+        conn.execute("UPDATE facts SET uid = 'u' || id", [])
+            .unwrap();
+        let id = |text: &str| -> i64 {
+            conn.query_row("SELECT id FROM facts WHERE text = ?1", [text], |r| r.get(0))
+                .unwrap()
+        };
+        conn.execute(
+            "INSERT INTO fact_links (from_uid, to_uid, kind, source, created_at)
+             VALUES ('u' || ?1, 'u' || ?2, 'supersedes', 'user', 1)",
+            [id("use JSON"), id("use bincode")],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO fact_signals (fact_uid, kind, source, created_at)
+             VALUES ('u' || ?1, 'wrong', 'agent', 1)",
+            [id("rotate on every use")],
+        )
+        .unwrap();
+
+        let out = explain(&conn, &target(), Some(1), &parse_blame(&porcelain())).unwrap();
+        let a = out.commits.iter().find(|c| c.sha == A).unwrap();
+        let facts = &a.threads[0].facts;
+        let get = |text: &str| facts.iter().find(|f| f.text == text).unwrap();
+        let old = get("use bincode");
+        assert_eq!(old.status, Some(crate::knowledge::FactStatus::Superseded));
+        let by = old.superseded_by.as_ref().expect("names the replacement");
+        assert_eq!((by.id, by.text.as_str()), (id("use JSON"), "use JSON"));
+        assert_eq!(
+            get("rotate on every use").status,
+            Some(crate::knowledge::FactStatus::Flagged)
+        );
+        let current = get("clock skew breaks expiry");
+        assert_eq!(
+            (current.status, current.superseded_by.is_none()),
+            (None, true)
+        );
+        let json = serde_json::to_value(current).unwrap();
+        assert!(json.get("status").is_none(), "omitted when current: {json}");
     }
 
     #[test]

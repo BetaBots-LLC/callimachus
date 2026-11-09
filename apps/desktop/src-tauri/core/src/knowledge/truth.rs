@@ -12,9 +12,10 @@
 //! - Session time is the clock: [`DECIDED_AT_SQL`] dates a distilled fact by when its session
 //!   started, not when the distiller happened to run (a backlog distills newest first).
 //! - Machine-written links cannot silently remove what the user trusts: a `supersedes` from the
-//!   distiller or an agent whose target is pinned or edited is stored as `contradicts`
-//!   ([`LinkOutcome::Downgraded`]), agent flags never hide a pinned fact, and caps bound what one
-//!   prompt-injected session can write.
+//!   distiller, an agent or a repo import whose target is pinned or edited is stored as
+//!   `contradicts` ([`LinkOutcome::Downgraded`]), an agent flag or a distilled `retires` never
+//!   hides a pinned or edited fact (the flag is stored and shown, the fact stays injected), and
+//!   caps bound what one prompt-injected session can write.
 //!
 //! Readers that run on an index the app has not migrated yet (a newer `cal`, hook or MCP
 //! server opens read-only and never migrates) check [`has_truth_tables`] first and fall back to
@@ -45,13 +46,56 @@ pub fn is_session_extractor(extractor: &str) -> bool {
 pub const DECIDED_AT_SQL: &str = "(CASE WHEN f.extractor IN ('llm', 'claude-compact') \
      AND t.created_at > 0 THEN t.created_at ELSE f.created_at END)";
 
+/// The latest a fact could have been decided, over `facts f JOIN threads t`: its session's
+/// last activity for a session fact (a session that started Monday and ran to Friday can
+/// reverse something decided on Wednesday), the fact's own time otherwise. Only the direction
+/// check of a machine link reads it; ordering stays on [`DECIDED_AT_SQL`], so a long session
+/// does not outrank newer ones for what it decided early.
+const SESSION_END_SQL: &str = "(CASE WHEN f.extractor IN ('llm', 'claude-compact') \
+     AND t.created_at > 0 THEN MAX(t.created_at, COALESCE(t.updated_at, 0)) \
+     ELSE f.created_at END)";
+
+/// Whether the newer side `$a` (a `facts` alias) of a `supersedes` link still stands over
+/// what it replaced: it is visible, or the user hid it after it had itself left memory
+/// (another visible fact supersedes it, or a later session retired it as stale). So in a chain
+/// C supersedes B supersedes A, hiding B keeps A out: C still stands. Hiding a replacement that
+/// was still in force (or one flagged `wrong`) revives what it replaced, as the user rejecting
+/// the replacement. One step deep: chains are a handful long and hiding two links of one is
+/// rare. Off idx_fact_links_to and idx_fact_signals_fact, only for a hidden `$a`.
+macro_rules! newer_stands {
+    ($a:literal) => {
+        concat!(
+            "(",
+            $a,
+            ".hidden = 0
+              OR EXISTS (SELECT 1 FROM fact_links l2 JOIN facts n2 ON n2.uid = l2.from_uid
+                   WHERE l2.to_uid = ",
+            $a,
+            ".uid AND l2.kind = 'supersedes'
+                     AND l2.dismissed_at IS NULL AND n2.hidden = 0)
+              OR EXISTS (SELECT 1 FROM fact_signals s2
+                   WHERE s2.fact_uid = ",
+            $a,
+            ".uid AND s2.kind = 'stale'
+                     AND s2.resolved_at IS NULL))"
+        )
+    };
+}
+
+/// [`newer_stands!`] over the `nf` alias, for callers that build their own link join.
+pub(crate) const NEWER_STANDS_NF_SQL: &str = newer_stands!("nf");
+
 /// `f` (a `facts` alias) has an active `supersedes` link pointing at it: one whose newer side
-/// still exists and is not hidden, and that the user has not undone (`dismissed_at`). Off
-/// idx_fact_links_to, then idx_facts_uid.
-pub(crate) const SUPERSEDED_SQL: &str = "EXISTS (SELECT 1 FROM fact_links lk
+/// still exists and stands ([`NEWER_STANDS_NF_SQL`]), and that the user has not undone
+/// (`dismissed_at`). Off idx_fact_links_to, then idx_facts_uid.
+pub(crate) const SUPERSEDED_SQL: &str = concat!(
+    "EXISTS (SELECT 1 FROM fact_links lk
          JOIN facts nf ON nf.uid = lk.from_uid
          WHERE lk.to_uid = f.uid AND lk.kind = 'supersedes' AND lk.dismissed_at IS NULL
-           AND nf.hidden = 0)";
+           AND ",
+    newer_stands!("nf"),
+    ")"
+);
 
 /// `f` has an unresolved `stale` or `wrong` flag. Off idx_fact_signals_fact.
 pub(crate) const FLAGGED_SQL: &str = "EXISTS (SELECT 1 FROM fact_signals sg
@@ -102,7 +146,8 @@ pub fn fact_date(ts: i64) -> String {
 
 /// Where a fact stands, in priority order: an active `supersedes` link points at it
 /// (`superseded`), an unresolved stale / wrong flag (`flagged`), an active `contradicts` link
-/// on either side (`disputed`), else `current`.
+/// on either side whose other fact is still in play, not hidden or superseded (`disputed`),
+/// else `current`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum FactStatus {
@@ -191,9 +236,11 @@ impl Default for FactTruth {
 /// query). A uid with nothing recorded maps to the default (current, support 1); so does every
 /// uid on an index without 0035's tables.
 ///
-/// A link is active while both facts exist, its newer (`from`) side is not hidden and the user
-/// has not undone it (`dismissed_at`); a `contradicts` link also needs its other side visible
-/// (a fact the user deleted disputes nothing). Links whose uid matches no row are ignored.
+/// A link is active while both facts exist and the user has not undone it (`dismissed_at`).
+/// A `supersedes` also needs its newer (`from`) side to stand (the same rule as
+/// [`SUPERSEDED_SQL`]). A `contradicts` needs its other side visible and not superseded: a fact
+/// the user deleted, or one a later fact replaced, is history and disputes nothing. Links
+/// whose uid matches no row are ignored. A uid listed twice is looked up once.
 pub fn fact_truth(conn: &Connection, uids: &[&str]) -> Result<HashMap<String, FactTruth>> {
     let mut out: HashMap<String, FactTruth> = uids
         .iter()
@@ -202,15 +249,23 @@ pub fn fact_truth(conn: &Connection, uids: &[&str]) -> Result<HashMap<String, Fa
     if uids.is_empty() || !has_truth_tables(conn) {
         return Ok(out);
     }
-    let list = serde_json::to_string(uids)?;
+    // The map's keys, not `uids`: a caller merging lists (a pinned flagged fact is in both the
+    // live and the Flagged list) may pass one uid twice, and json_each would return its links
+    // and flags once per copy.
+    let keys: Vec<&str> = out.keys().map(String::as_str).collect();
+    let list = serde_json::to_string(&keys)?;
     let da = DECIDED_AT_SQL;
+    let sup = SUPERSEDED_SQL;
+    let stands = newer_stands!("f");
     let sql = format!(
         "SELECT j.value, 0, lk.kind, f.id, f.text, {da}, f.thread_id, f.extractor
          FROM json_each(?1) j
          JOIN fact_links lk ON lk.to_uid = j.value
          JOIN facts f ON f.uid = lk.from_uid
          JOIN threads t ON t.id = f.thread_id
-         WHERE f.hidden = 0 AND lk.dismissed_at IS NULL
+         WHERE lk.dismissed_at IS NULL
+           AND CASE WHEN lk.kind = 'supersedes' THEN {stands}
+                    ELSE f.hidden = 0 AND NOT {sup} END
          UNION ALL
          SELECT j.value, 1, lk.kind, f.id, f.text, {da}, f.thread_id, f.extractor
          FROM json_each(?1) j
@@ -219,7 +274,7 @@ pub fn fact_truth(conn: &Connection, uids: &[&str]) -> Result<HashMap<String, Fa
          JOIN facts f ON f.uid = lk.to_uid
          JOIN threads t ON t.id = f.thread_id
          WHERE me.hidden = 0 AND lk.dismissed_at IS NULL
-           AND (lk.kind = 'supersedes' OR f.hidden = 0)"
+           AND (lk.kind = 'supersedes' OR (f.hidden = 0 AND NOT {sup}))"
     );
     let mut stmt = conn.prepare_cached(&sql)?;
     let rows = stmt.query_map([&list], |r| {
@@ -384,7 +439,7 @@ impl LinkSource {
     }
 
     /// Machine sources: their `supersedes` never removes a pinned or edited fact (it is stored
-    /// as `contradicts`), and their direction must match the dates.
+    /// as `contradicts`, as a repo import's is), and their direction must match the dates.
     fn is_machine(self) -> bool {
         matches!(self, LinkSource::Distill | LinkSource::Agent)
     }
@@ -406,7 +461,8 @@ pub enum LinkRejection {
     SelfLink,
     /// The `to` fact already (transitively) supersedes the `from` fact.
     Cycle,
-    /// A machine-declared `supersedes` whose `from` side was decided before its `to` side.
+    /// A machine-declared `supersedes` whose `from` side's session ended before its `to` side
+    /// was decided.
     WrongDirection,
     /// A `contradicts` for a pair a `supersedes` already settles.
     AlreadySettled,
@@ -424,8 +480,8 @@ pub enum LinkOutcome {
         id: i64,
         kind: LinkKind,
     },
-    /// A machine `supersedes` whose target is pinned or user-edited, stored as `contradicts`:
-    /// the pair shows as disputed and the user resolves it.
+    /// A machine or repo `supersedes` whose target is pinned or user-edited, stored as
+    /// `contradicts`: the pair shows as disputed and the user resolves it.
     Downgraded {
         id: i64,
     },
@@ -462,12 +518,14 @@ struct FactRow {
     hidden: bool,
     project: String,
     decided_at: i64,
+    /// See [`SESSION_END_SQL`].
+    session_end: i64,
 }
 
 fn fact_row(conn: &Connection, by_uid: bool, key: &dyn rusqlite::ToSql) -> Result<Option<FactRow>> {
     let sql = format!(
         "SELECT f.uid, f.kind, f.pinned, f.edited, f.hidden,
-                COALESCE(t.project_key, t.project_path, ''), {DECIDED_AT_SQL}
+                COALESCE(t.project_key, t.project_path, ''), {DECIDED_AT_SQL}, {SESSION_END_SQL}
          FROM facts f JOIN threads t ON t.id = f.thread_id WHERE {} = ?1",
         if by_uid { "f.uid" } else { "f.id" }
     );
@@ -482,6 +540,7 @@ fn fact_row(conn: &Connection, by_uid: bool, key: &dyn rusqlite::ToSql) -> Resul
                 hidden: r.get::<_, i64>(4)? != 0,
                 project: r.get(5)?,
                 decided_at: r.get(6)?,
+                session_end: r.get(7)?,
             })
         })
         .optional()?)
@@ -499,9 +558,11 @@ pub(crate) fn uid_of(conn: &Connection, id: i64) -> Result<Option<String>> {
 /// gotchas of the same kind and project, and not the same fact.
 ///
 /// - A `supersedes` from [`LinkSource::Distill`] or [`LinkSource::Agent`] must not point back
-///   in time (`from` decided before `to`: [`LinkRejection::WrongDirection`]), and when its
-///   target is pinned or user-edited it is stored as `contradicts`
-///   ([`LinkOutcome::Downgraded`]). A user, repo or review link is stored as asked.
+///   in time (`from`'s session ended before `to` was decided:
+///   [`LinkRejection::WrongDirection`]). When its target is pinned or user-edited, it and a
+///   [`LinkSource::Repo`] one are stored as `contradicts` ([`LinkOutcome::Downgraded`]): a
+///   line in a checkout (a contributor's branch included) must not silently retire what the
+///   user pinned. A user or review link is stored as asked.
 /// - A `supersedes` that would close a cycle (`to` already supersedes `from`, directly or
 ///   through others) is rejected; storing one removes any `contradicts` between the pair.
 /// - A `contradicts` for a pair a `supersedes` already settles is rejected; one that exists
@@ -658,11 +719,13 @@ fn link_rows_once(
         return reject(LinkRejection::Dismissed);
     }
     let mut stored = kind;
-    if kind == LinkKind::Supersedes && source.is_machine() {
-        if from.decided_at < to.decided_at {
+    if kind == LinkKind::Supersedes {
+        // Against the session's end, not its start: a session can reverse what was decided
+        // while it ran (an agent's record_decision at 10:30 in a session that began at 10:00).
+        if source.is_machine() && from.session_end < to.decided_at {
             return reject(LinkRejection::WrongDirection);
         }
-        if to.pinned || to.edited {
+        if (source.is_machine() || source == LinkSource::Repo) && (to.pinned || to.edited) {
             stored = LinkKind::Contradicts;
         }
     }
@@ -755,6 +818,34 @@ pub(crate) fn pair_dismissed(conn: &Connection, a: &str, b: &str) -> Result<bool
                AND ((from_uid = ?1 AND to_uid = ?2) OR (from_uid = ?2 AND to_uid = ?1)))",
         )?
         .query_row(params![a, b], |r| r.get(0))?)
+}
+
+/// Whether any link relates `a` and `b` (either direction, any kind, undone or not). A repo
+/// import whose line supersedes a pinned or edited fact plans around it: the writer stores
+/// that as `contradicts`, so no `supersedes` row ever shows the line as satisfied.
+pub(crate) fn pair_linked(conn: &Connection, a: &str, b: &str) -> Result<bool> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT EXISTS (SELECT 1 FROM fact_links
+               WHERE (from_uid = ?1 AND to_uid = ?2) OR (from_uid = ?2 AND to_uid = ?1))",
+        )?
+        .query_row(params![a, b], |r| r.get(0))?)
+}
+
+/// The targets of `from_uid`'s active `contradicts` links that a repo import wrote (a line's
+/// `supersedes` onto a pinned or edited fact), sorted.
+pub(crate) fn repo_contradicts_from(conn: &Connection, from_uid: &str) -> Result<Vec<String>> {
+    if !has_truth_tables(conn) {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare_cached(
+        "SELECT to_uid FROM fact_links WHERE from_uid = ?1 AND kind = 'contradicts'
+           AND source = 'repo' AND dismissed_at IS NULL ORDER BY to_uid",
+    )?;
+    let rows = stmt
+        .query_map([from_uid], |r| r.get(0))?
+        .collect::<rusqlite::Result<Vec<String>>>()?;
+    Ok(rows)
 }
 
 fn outcome(asked: LinkKind, stored: LinkKind, id: i64) -> LinkOutcome {
@@ -869,9 +960,9 @@ impl SignalSource {
     }
 }
 
-/// Unresolved agent flags a project may hold at once on facts still in play (visible and not
-/// superseded). A prompt-injected session that flags everything it was shown hides at most
-/// this many facts until the user reviews them.
+/// Unresolved agent flags a project may hold at once on facts the flag keeps out of memory
+/// (visible, not superseded, not pinned or edited). A prompt-injected session that flags
+/// everything it was shown hides at most this many facts until the user reviews them.
 pub const AGENT_FLAG_CAP: i64 = 10;
 
 /// Longest flag reason kept, in chars.
@@ -891,10 +982,11 @@ pub enum FlagOutcome {
     NotFound,
 }
 
-/// Flag fact `fact_id` stale or wrong. An unflagged fact leaves injected memory until the user
-/// keeps it ([`resolve_fact_flags`]) or hides it, except a pinned one: its flag is stored and
-/// reported (status `flagged` in MCP and the app) but the user's trusted fact stays injected.
-/// Agent flags are capped per project ([`AGENT_FLAG_CAP`]). `reason` is redacted and capped.
+/// Flag fact `fact_id` stale or wrong. A flagged fact leaves injected memory until the user
+/// keeps it ([`resolve_fact_flags`]) or hides it, except a pinned or user-edited one: its flag
+/// is stored and reported (status `flagged` in MCP and the app) but the user's trusted fact
+/// stays injected. Agent flags are capped per project ([`AGENT_FLAG_CAP`]). `reason` is
+/// redacted and capped.
 pub fn flag_fact(
     conn: &Connection,
     fact_id: i64,
@@ -937,14 +1029,16 @@ fn flag_row(
         // Only flags that are what keeps their fact out of memory count: one on a fact the
         // user hid (the Flagged group's Hide resolves nothing) or that another fact replaced
         // hides nothing, and counting it would leave flag_fact refused for good after ten
-        // Hides in a project.
+        // Hides in a project; nor does one on a pinned or edited fact, which stays injected
+        // (each fact holds one unresolved flag of a kind, so these cannot pile up either).
         let held: i64 = conn
             .prepare_cached(&format!(
                 "SELECT COUNT(*) FROM fact_signals sg
                  JOIN facts f ON f.uid = sg.fact_uid
                  JOIN threads t ON t.id = f.thread_id
                  WHERE sg.source = 'agent' AND sg.kind IN ('stale', 'wrong')
-                   AND sg.resolved_at IS NULL AND f.hidden = 0 AND NOT {SUPERSEDED_SQL}
+                   AND sg.resolved_at IS NULL AND f.hidden = 0
+                   AND f.pinned = 0 AND f.edited = 0 AND NOT {SUPERSEDED_SQL}
                    AND COALESCE(t.project_key, t.project_path, '') = ?1"
             ))?
             .query_row([&f.project], |r| r.get(0))?;
@@ -1015,6 +1109,7 @@ pub fn agent_supersedes_recent(conn: &Connection, project: &str, now: i64) -> Re
              JOIN facts nf ON nf.uid = lk.from_uid
              JOIN threads t ON t.id = nf.thread_id
              WHERE lk.source = 'agent' AND lk.kind = 'supersedes' AND lk.created_at > ?2
+               AND lk.dismissed_at IS NULL
                AND nf.hidden = 0 AND COALESCE(t.project_key, t.project_path, '') = ?1",
         )?
         .query_row(params![project, now - AGENT_SUPERSEDE_WINDOW_SECS], |r| {
@@ -1042,6 +1137,7 @@ pub fn fact_in_project(conn: &Connection, fact_id: i64, project: &str) -> Result
         hidden: false,
         project: project.to_string(),
         decided_at: 0,
+        session_end: 0,
     };
     Ok(Some(same_repo(conn, &f, &side)))
 }
@@ -1091,6 +1187,9 @@ pub struct RefMap {
     entries: HashMap<String, RefEntry>,
     /// The distilled session's start (epoch seconds), when the thread has one.
     pub session_started_at: Option<i64>,
+    /// Its last activity (`threads.updated_at`), when later than the start. A `retires` of an
+    /// item decided after this is dropped: an older session cannot retire a newer decision.
+    pub session_ended_at: Option<i64>,
 }
 
 impl RefMap {
@@ -1110,6 +1209,19 @@ impl RefMap {
     /// The session's start as `YYYY-MM-DD`, for the block's `session_started` attribute.
     pub fn session_date(&self) -> Option<String> {
         self.session_started_at.map(fact_date)
+    }
+
+    /// The session's last day as `YYYY-MM-DD`, for the block's `session_ended` attribute:
+    /// None when it is the start's day (the attribute would say nothing new).
+    pub fn session_end_date(&self) -> Option<String> {
+        let end = self.session_ended_at.map(fact_date)?;
+        (Some(&end) != self.session_date().as_ref()).then_some(end)
+    }
+
+    /// The latest an item could have been decided and still be one this session saw: its
+    /// last activity, else its start.
+    fn session_end(&self) -> Option<i64> {
+        self.session_ended_at.or(self.session_started_at)
     }
 
     /// Add an entry (tests and callers that build a map by hand).
@@ -1146,35 +1258,42 @@ pub(crate) fn cut_words(s: &str, max: usize) -> String {
 /// empty project (or a thread with no project) gives an empty block. The caller fences it.
 pub fn distill_memory_context(conn: &Connection, thread_id: i64) -> Result<(String, RefMap)> {
     let mut refs = RefMap::default();
-    let thread: Option<(Option<String>, Option<i64>)> = conn
+    let thread: Option<(Option<String>, Option<i64>, Option<i64>)> = conn
         .query_row(
-            "SELECT COALESCE(project_key, project_path), created_at FROM threads WHERE id = ?1",
+            "SELECT COALESCE(project_key, project_path), created_at, updated_at
+             FROM threads WHERE id = ?1",
             [thread_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()?;
-    let Some((project, started)) = thread else {
+    let Some((project, started, updated)) = thread else {
         return Ok((String::new(), refs));
     };
     refs.session_started_at = started.filter(|s| *s > 0);
+    refs.session_ended_at = refs
+        .session_started_at
+        .and_then(|s| updated.filter(|u| *u > s));
     let Some(project) = project.filter(|p| !p.is_empty()) else {
         return Ok((String::new(), refs));
     };
     let truth = has_truth_tables(conn);
-    // Live as memory injects it, except that this thread's own distilled links and flags do
-    // not count: a re-distill replaces them, so the model must see the items it superseded
-    // or retired last time to declare it again (else the item would come back as current).
+    // Live as memory injects it (the same standing and pinned-or-edited rules), except that
+    // this thread's own distilled links and flags do not count: a re-distill replaces them, so
+    // the model must see the items it superseded or retired last time to declare it again
+    // (else the item would come back as current).
     let live = if truth {
-        " AND NOT EXISTS (SELECT 1 FROM fact_links lk JOIN facts nf ON nf.uid = lk.from_uid
-               WHERE lk.to_uid = f.uid AND lk.kind = 'supersedes' AND nf.hidden = 0
+        format!(
+            " AND NOT EXISTS (SELECT 1 FROM fact_links lk JOIN facts nf ON nf.uid = lk.from_uid
+               WHERE lk.to_uid = f.uid AND lk.kind = 'supersedes' AND {NEWER_STANDS_NF_SQL}
                  AND lk.dismissed_at IS NULL
                  AND NOT (lk.source = 'distill' AND lk.thread_id IS ?3))
-           AND (f.pinned = 1 OR NOT EXISTS (SELECT 1 FROM fact_signals sg
+           AND (f.pinned = 1 OR f.edited = 1 OR NOT EXISTS (SELECT 1 FROM fact_signals sg
                WHERE sg.fact_uid = f.uid AND sg.kind IN ('stale', 'wrong')
                  AND sg.resolved_at IS NULL
                  AND NOT (sg.source = 'distill' AND sg.thread_id IS ?3)))"
+        )
     } else {
-        ""
+        String::new()
     };
     let sql = format!(
         "SELECT f.id, f.uid, f.text, f.pinned, f.edited, {DECIDED_AT_SQL}
@@ -1245,8 +1364,9 @@ pub fn distill_memory_context(conn: &Connection, thread_id: i64) -> Result<(Stri
 /// [`super::store_distilled`] just wrote or kept; `refs` resolves the listed items. Caps per
 /// thread ([`DISTILL_MAX_SUPERSEDES`] and the rest) count what was stored; an invalid ref, a
 /// kind mismatch, a self link, a link between two listed items (this session states nothing
-/// about two others), a link within the session, or a supersede that points back in time is
-/// dropped silently. Runs inside `store_distilled`'s transaction, after it removed the
+/// about two others), a link within the session, a link to a listed item the user undid a link
+/// of this session to, a supersede that points back in time, or a retirement of an item decided
+/// after the session ended is dropped silently. Runs inside `store_distilled`'s transaction, after it removed the
 /// thread's previous distilled links and unresolved signals.
 pub(crate) fn apply_distilled_truth(
     conn: &Connection,
@@ -1290,6 +1410,31 @@ pub(crate) fn apply_distilled_truth(
         if from_own == to_own {
             continue;
         }
+        let listed = if from_own { &to } else { &from };
+        // The user undid a link this session declared to this listed item: no re-distill of
+        // the session relates any of its items to it again. Keyed on the listed side, whose
+        // uid is stable: the session's own item gets a new uid when the model rewords it, and
+        // pair_dismissed (exact pair) would then let the reworded item re-link. A dismissed
+        // link two sessions both declared has no thread (NULL) and keeps exact-pair
+        // protection only.
+        let undone: bool = conn
+            .prepare_cached(
+                "SELECT EXISTS (SELECT 1 FROM fact_links WHERE dismissed_at IS NOT NULL
+                   AND source = 'distill' AND thread_id = ?1 AND (from_uid = ?2 OR to_uid = ?2))",
+            )?
+            .query_row(params![thread_id, listed], |r| r.get(0))?;
+        if undone {
+            continue;
+        }
+        // An incoming link this session declared before (a listed item supersedes its own) is
+        // kept across a re-distill (see store_distilled); declaring it again takes no new slot.
+        let held: bool = conn
+            .prepare_cached(
+                "SELECT EXISTS (SELECT 1 FROM fact_links WHERE from_uid = ?1 AND to_uid = ?2
+                   AND kind = ?3 AND source = 'distill' AND thread_id = ?4
+                   AND dismissed_at IS NULL)",
+            )?
+            .query_row(params![from, to, kind.as_str(), thread_id], |r| r.get(0))?;
         let o = link_uids(
             conn,
             &from,
@@ -1300,7 +1445,7 @@ pub(crate) fn apply_distilled_truth(
             now,
             true,
         )?;
-        if o.link_id().is_some() {
+        if o.link_id().is_some() && !held {
             *used += 1;
         }
     }
@@ -1320,6 +1465,11 @@ pub(crate) fn apply_distilled_truth(
             break;
         }
         let Some(e) = refs.get(r) else { continue };
+        // An older session (a backlog distill) cannot retire a decision made after it ended,
+        // the way a supersede may not point back in time.
+        if refs.session_end().is_some_and(|end| e.decided_at > end) {
+            continue;
+        }
         let Some(f) = fact_row(conn, true, &e.uid)? else {
             continue;
         };
@@ -1587,7 +1737,8 @@ mod tests {
         assert_eq!(texts, [JSON, ZSTD], "{texts:?}");
         let b = &mem.decisions[0];
         assert_eq!(b.decided_at, b_start);
-        assert_eq!(b.replaces, Some(a_start));
+        assert_eq!(b.replaces_decided_at, Some(a_start));
+        assert_eq!(b.replaces, [bin]);
         assert_eq!(b.status, FactStatus::Current);
         assert_eq!(b.source, "claude_code");
         assert_eq!(mem.decisions[1].decided_at, a_start);
@@ -1634,8 +1785,9 @@ mod tests {
             (FactStatus::Superseded, a_start)
         );
 
-        // Re-distilling A (same output, then one that no longer mentions bincode) never
-        // brings A's decision back as current, and never duplicates it.
+        // Re-distilling A (same output, then one that leaves the link out, as an LLM may)
+        // never brings A's decision back as current, and never duplicates it, whichever
+        // session declared the link.
         for links in [true, false] {
             distill(
                 &mut conn,
@@ -1659,11 +1811,14 @@ mod tests {
             assert_eq!(status(&conn, id_of(&conn, BINCODE)), FactStatus::Superseded);
             let mem = get_project_memory_facts(&conn, P, 10).unwrap();
             assert!(mem.decisions.iter().all(|f| f.text != BINCODE));
-            if !b_declares {
-                // A's own distill declared it, so the declaration is A's to keep: the
-                // second pass (no link) is checked only where B declared it.
-                break;
-            }
+            let block = crate::export::agent_memory_md_budgeted(
+                P,
+                &mem,
+                None,
+                &crate::export::MemoryBudget::HOOK,
+            );
+            assert!(!block.contains(BINCODE), "{block}");
+            assert_eq!(block.matches(JSON).count(), 1, "{block}");
         }
         if b_declares {
             distill(
@@ -2023,7 +2178,7 @@ mod tests {
     #[test]
     fn agent_flags_are_capped_and_never_hide_a_pinned_fact() {
         let conn = temp_db();
-        let ids: Vec<i64> = (0..12)
+        let ids: Vec<i64> = (0..14)
             .map(|i| {
                 record_fact_with_origin(
                     &conn,
@@ -2063,12 +2218,13 @@ mod tests {
             )
             .unwrap()
         };
-        // The pinned one first: flagged, yet still injected.
+        // The pinned one first: flagged, yet still injected, and not counted (it hides
+        // nothing), so ten more fit under the cap.
         assert!(matches!(
             flag(pinned, SignalSource::Agent),
             FlagOutcome::Flagged { .. }
         ));
-        for id in &ids[..9] {
+        for id in &ids[..10] {
             assert!(matches!(
                 flag(*id, SignalSource::Agent),
                 FlagOutcome::Flagged { .. }
@@ -2089,7 +2245,7 @@ mod tests {
         let live: Vec<i64> = mem.decisions.iter().map(|f| f.id).collect();
         assert_eq!(
             live,
-            [pinned, ids[10], ids[9]],
+            [pinned, ids[13], ids[12], ids[10]],
             "flagged facts leave memory"
         );
         assert_eq!(mem.decisions[0].status, FactStatus::Flagged);
@@ -2107,7 +2263,16 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(hist.flagged.len(), 11, "the agent's ten and the user's one");
+        assert_eq!(
+            hist.flagged.len(),
+            12,
+            "the agent's ten, the pinned one and the user's one"
+        );
+        let pinned_in = |l: &[crate::knowledge::MemoryFact]| l.iter().any(|f| f.id == pinned);
+        assert!(pinned_in(&hist.decisions) && pinned_in(&hist.flagged));
+        // Listed in both groups, its flag is reported once (one status lookup per uid).
+        let f = hist.flagged.iter().find(|f| f.id == pinned).unwrap();
+        assert_eq!(f.flags.len(), 1, "{:?}", f.flags);
 
         // The user keeps one: it is back, and the agent has room for another flag.
         assert_eq!(resolve_fact_flags(&conn, ids[3], 60).unwrap(), 1);
@@ -2118,13 +2283,13 @@ mod tests {
             flag(ids[10], SignalSource::Agent),
             FlagOutcome::Flagged { .. }
         ));
-        assert_eq!(flag(ids[9], SignalSource::Agent), FlagOutcome::CapReached);
+        assert_eq!(flag(ids[12], SignalSource::Agent), FlagOutcome::CapReached);
 
         // The Flagged group's Hide resolves nothing, but a flag on a fact the user hid hides
         // nothing either: it stops counting, so ten Hides cannot lock flag_fact out.
         set_fact_hidden(&conn, ids[0], true).unwrap();
         assert!(matches!(
-            flag(ids[9], SignalSource::Agent),
+            flag(ids[12], SignalSource::Agent),
             FlagOutcome::Flagged { .. }
         ));
         // Same for a flagged fact another fact replaced.
@@ -2374,12 +2539,13 @@ mod tests {
         assert_eq!(status(&conn, json), FactStatus::Superseded);
         assert_eq!(status(&conn, bin), FactStatus::Current);
 
-        // A dispute undone one way is revived by the user from either side.
+        // A dispute undone one way is revived by the user from either side (with the current
+        // `bin`: a superseded fact disputes nothing).
         let z = fact(&conn, tb, "decision", ZSTD);
         let c = link_facts(
             &conn,
             z,
-            json,
+            bin,
             LinkKind::Contradicts,
             LinkSource::User,
             None,
@@ -2392,7 +2558,7 @@ mod tests {
         assert_eq!(status(&conn, z), FactStatus::Current);
         let again = link_facts(
             &conn,
-            json,
+            bin,
             z,
             LinkKind::Contradicts,
             LinkSource::User,
@@ -2655,6 +2821,435 @@ mod tests {
         assert_eq!(mem.decisions.len(), 2);
         let (_, refs) = distill_memory_context(&conn, session(&conn, "n", P, day(10, 1))).unwrap();
         assert_eq!(refs.len(), 2);
+    }
+
+    /// A real session of `project` that started at `started` and was last active at `ended`.
+    fn session_span(conn: &Connection, ext: &str, project: &str, started: i64, ended: i64) -> i64 {
+        let tid = session(conn, ext, project, started);
+        conn.execute(
+            "UPDATE threads SET updated_at = ?2 WHERE id = ?1",
+            params![tid, ended],
+        )
+        .unwrap();
+        tid
+    }
+
+    fn live_ids(conn: &Connection) -> Vec<i64> {
+        let mem = get_project_memory_facts(conn, P, 40).unwrap();
+        mem.decisions
+            .iter()
+            .chain(&mem.gotchas)
+            .map(|f| f.id)
+            .collect()
+    }
+
+    /// The user (or an agent, a review, a repo import) linked a distilled fact of another
+    /// session to an older one: re-distilling that session with the fact reworded keeps the
+    /// fact the link names, so the older decision stays replaced and the link resolves. Same
+    /// for a fact carrying an agent's flag.
+    #[test]
+    fn a_re_distill_keeps_the_facts_other_sources_linked_or_flagged() {
+        let mut conn = temp_db();
+        let ta = session(&conn, "A", P, day(10, 1));
+        let tb = session(&conn, "B", P, day(10, 3));
+        distill(
+            &mut conn,
+            ta,
+            |_| Distilled {
+                decisions: vec![BINCODE.into()],
+                ..Default::default()
+            },
+            day(11, 1),
+        );
+        let b_out = |decision: &str, gotcha: &str| Distilled {
+            decisions: vec![decision.into()],
+            gotchas: vec![gotcha.into()],
+            ..Default::default()
+        };
+        const G: &str = "the cache dir must be created before the first write";
+        distill(&mut conn, tb, |_| b_out(JSON, G), day(11, 2));
+        let (bin, json, g) = (id_of(&conn, BINCODE), id_of(&conn, JSON), id_of(&conn, G));
+        assert!(link_facts(
+            &conn,
+            json,
+            bin,
+            LinkKind::Supersedes,
+            LinkSource::User,
+            None,
+            day(11, 3)
+        )
+        .unwrap()
+        .link_id()
+        .is_some());
+        assert!(matches!(
+            flag_fact(
+                &conn,
+                g,
+                FlagKind::Stale,
+                SignalSource::Agent,
+                None,
+                None,
+                day(11, 3)
+            )
+            .unwrap(),
+            FlagOutcome::Flagged { .. }
+        ));
+
+        // B is distilled again and the model words both items differently.
+        distill(
+            &mut conn,
+            tb,
+            |_| {
+                b_out(
+                    "cache as JSON (bincode broke)",
+                    "create the cache dir first",
+                )
+            },
+            day(11, 4),
+        );
+        assert_eq!(status(&conn, bin), FactStatus::Superseded);
+        assert_eq!(id_of(&conn, JSON), json, "the linked fact is kept");
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM fact_links lk JOIN facts f ON f.uid = lk.from_uid"
+            ),
+            1,
+            "the link still resolves"
+        );
+        assert_eq!(id_of(&conn, G), g);
+        assert_eq!(status(&conn, g), FactStatus::Flagged);
+        assert!(!live_ids(&conn).contains(&bin));
+        // Repeating the kept text maps to the kept fact, never a duplicate.
+        distill(&mut conn, tb, |_| b_out(JSON, G), day(11, 5));
+        assert_eq!(
+            count(
+                &conn,
+                &format!("SELECT COUNT(*) FROM facts WHERE text = '{JSON}'")
+            ),
+            1
+        );
+    }
+
+    /// The user's Undo of a distilled link survives a re-distill that rewords the session's
+    /// own item: the guard is the declaring session and the listed fact, not the exact pair.
+    #[test]
+    fn an_undone_distilled_link_survives_a_reworded_re_distill() {
+        let mut conn = temp_db();
+        let ta = session(&conn, "A", P, day(10, 1));
+        let tb = session(&conn, "B", P, day(10, 3));
+        distill(
+            &mut conn,
+            ta,
+            |_| Distilled {
+                decisions: vec![BINCODE.into()],
+                ..Default::default()
+            },
+            day(11, 1),
+        );
+        let b_out = |text: &str| {
+            let text = text.to_string();
+            move |refs: &HashMap<String, String>| Distilled {
+                decisions: vec![text.clone()],
+                links: vec![link("d1", &refs[BINCODE], "supersedes")],
+                ..Default::default()
+            }
+        };
+        distill(&mut conn, tb, b_out(JSON), day(11, 2));
+        let bin = id_of(&conn, BINCODE);
+        assert_eq!(status(&conn, bin), FactStatus::Superseded);
+        assert_eq!(
+            unlink_facts(
+                &conn,
+                id_of(&conn, JSON),
+                bin,
+                Some(LinkKind::Supersedes),
+                day(11, 3)
+            )
+            .unwrap(),
+            1
+        );
+        distill(
+            &mut conn,
+            tb,
+            b_out("serialize the cache as JSON"),
+            day(11, 4),
+        );
+        assert_eq!(status(&conn, bin), FactStatus::Current);
+        assert!(live_ids(&conn).contains(&bin));
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM fact_links WHERE dismissed_at IS NOT NULL"
+            ),
+            1
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM fact_links WHERE dismissed_at IS NULL"
+            ),
+            0
+        );
+    }
+
+    /// A session can reverse what was decided while it ran: the direction check compares the
+    /// replaced fact with the session's last activity, not its start.
+    #[test]
+    fn a_session_supersedes_a_decision_recorded_while_it_ran() {
+        let mut conn = temp_db();
+        let start = day(10, 1);
+        const R: &str = "store sessions in redis";
+        let r = record_fact_with_origin(
+            &conn,
+            P,
+            "decision",
+            R,
+            None,
+            FactOrigin::Agent,
+            None,
+            start + 1800,
+        )
+        .unwrap()
+        .id;
+        let reverse = |refs: &HashMap<String, String>| Distilled {
+            decisions: vec!["store sessions in postgres, not redis".into()],
+            links: vec![link("d1", &refs[R], "supersedes")],
+            ..Default::default()
+        };
+        // A session that ended before R was recorded cannot replace it.
+        let before = session_span(&conn, "early", P, start - 7200, start - 3600);
+        distill(&mut conn, before, reverse, day(11, 1));
+        assert_eq!(status(&conn, r), FactStatus::Current);
+        // One that began before R and went on after it can.
+        let t = session_span(&conn, "T", P, start, start + 3600);
+        distill(&mut conn, t, reverse, day(11, 2));
+        assert_eq!(status(&conn, r), FactStatus::Superseded);
+        assert!(!live_ids(&conn).contains(&r));
+
+        // The distiller is told a session spans days.
+        let long = session_span(&conn, "long", P, day(10, 2), day(10, 6));
+        let input = crate::agent::DistillInput::load(&conn, long, 10_000)
+            .unwrap()
+            .unwrap();
+        assert!(
+            input.user_prompt().contains(
+                "<existing_memory session_started=\"2026-10-02\" session_ended=\"2026-10-06\">"
+            ),
+            "{}",
+            input.user_prompt()
+        );
+        let one_day = crate::agent::DistillInput::load(&conn, t, 10_000)
+            .unwrap()
+            .unwrap();
+        assert!(!one_day.user_prompt().contains("session_ended"));
+    }
+
+    /// An older session distilled late (a backlog) cannot retire a decision made after it.
+    #[test]
+    fn a_backlog_distill_never_retires_a_newer_decision() {
+        let mut conn = temp_db();
+        let old = session(&conn, "old", P, day(9, 1));
+        let older = fact(&conn, old, "decision", "use tabs in the config files");
+        let ta = session_span(&conn, "A", P, day(10, 1), day(10, 1) + 3600);
+        let tb = session(&conn, "B", P, day(10, 5));
+        const D: &str = "deploy with the blue-green script";
+        distill(
+            &mut conn,
+            tb,
+            |_| Distilled {
+                decisions: vec![D.into()],
+                ..Default::default()
+            },
+            day(11, 1),
+        );
+        distill(
+            &mut conn,
+            ta,
+            |refs| Distilled {
+                decisions: vec!["something else".into()],
+                retires: vec![
+                    refs[D].clone(),
+                    refs["use tabs in the config files"].clone(),
+                ],
+                ..Default::default()
+            },
+            day(11, 2),
+        );
+        let d = id_of(&conn, D);
+        assert_eq!(status(&conn, d), FactStatus::Current);
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM fact_signals WHERE kind = 'stale'"
+            ),
+            1,
+            "only the older item"
+        );
+        assert!(live_ids(&conn).contains(&d));
+        assert_eq!(status(&conn, older), FactStatus::Flagged);
+    }
+
+    /// Hiding the middle of a chain does not revive the start while something later still
+    /// stands over it; hiding a replacement that was still in force does.
+    #[test]
+    fn hiding_a_replaced_or_retired_replacement_keeps_what_it_replaced_out() {
+        let conn = temp_db();
+        let t = session(&conn, "s", P, day(9, 1));
+        let f = |text: &str| fact(&conn, t, "decision", text);
+        let user = |from, to| {
+            link_facts(
+                &conn,
+                from,
+                to,
+                LinkKind::Supersedes,
+                LinkSource::User,
+                None,
+                1,
+            )
+            .unwrap()
+            .link_id()
+            .unwrap()
+        };
+        let (a, b, c) = (f("a"), f("b"), f("c"));
+        user(b, a);
+        user(c, b);
+        set_fact_hidden(&conn, b, true).unwrap();
+        assert_eq!(status(&conn, a), FactStatus::Superseded);
+        assert!(!live_ids(&conn).contains(&a));
+        let other = session(&conn, "o", P, day(10, 1));
+        let (block, _) = distill_memory_context(&conn, other).unwrap();
+        assert!(!block.lines().any(|l| l.ends_with(": a")), "{block}");
+        // C hidden too: nothing stands over A any more.
+        set_fact_hidden(&conn, c, true).unwrap();
+        assert_eq!(status(&conn, a), FactStatus::Current);
+
+        // E replaced D, then a later session retired E as stale; hiding E keeps D out.
+        let (d, e) = (f("d"), f("e"));
+        user(e, d);
+        flag_fact(
+            &conn,
+            e,
+            FlagKind::Stale,
+            SignalSource::Agent,
+            None,
+            None,
+            2,
+        )
+        .unwrap();
+        set_fact_hidden(&conn, e, true).unwrap();
+        assert_eq!(status(&conn, d), FactStatus::Superseded);
+        assert!(!live_ids(&conn).contains(&d));
+        // A replacement flagged wrong and hidden is the user rejecting it: H comes back.
+        let (h, k) = (f("h"), f("k"));
+        user(k, h);
+        flag_fact(
+            &conn,
+            k,
+            FlagKind::Wrong,
+            SignalSource::Agent,
+            None,
+            None,
+            2,
+        )
+        .unwrap();
+        set_fact_hidden(&conn, k, true).unwrap();
+        assert_eq!(status(&conn, h), FactStatus::Current);
+        assert!(live_ids(&conn).contains(&h));
+    }
+
+    #[test]
+    fn a_superseded_counterpart_disputes_nothing() {
+        let conn = temp_db();
+        let t = session(&conn, "s", P, day(9, 1));
+        let (x, y, z) = (
+            fact(&conn, t, "decision", "x"),
+            fact(&conn, t, "decision", "y"),
+            fact(&conn, t, "decision", "z"),
+        );
+        let user = |from, to, kind| {
+            link_facts(&conn, from, to, kind, LinkSource::User, None, 1)
+                .unwrap()
+                .link_id()
+                .unwrap()
+        };
+        user(y, x, LinkKind::Contradicts);
+        assert_eq!(status(&conn, y), FactStatus::Disputed);
+        user(z, x, LinkKind::Supersedes);
+        let uid = uid_of(&conn, y).unwrap().unwrap();
+        let ty = &fact_truth(&conn, &[&uid]).unwrap()[&uid];
+        assert_eq!(ty.status, FactStatus::Current);
+        assert!(ty.disputed_by.is_empty());
+        // Either side: X's dispute with Y is gone too, as X is history now.
+        assert_eq!(status(&conn, x), FactStatus::Superseded);
+        assert_eq!(
+            unlink_facts(&conn, z, x, Some(LinkKind::Supersedes), 2).unwrap(),
+            1
+        );
+        assert_eq!(status(&conn, y), FactStatus::Disputed);
+    }
+
+    /// A fact the user edited is curated like a pinned one: a machine flag (a distilled
+    /// `retires`, an agent's flag_fact) is stored and shown, but the fact stays injected.
+    #[test]
+    fn machine_flags_never_hide_an_edited_fact() {
+        let mut conn = temp_db();
+        let old = session(&conn, "old", P, day(9, 1));
+        let e = fact(&conn, old, "decision", "use the v1 api");
+        const FIXED: &str = "use the v2 api for uploads";
+        crate::knowledge::edit_fact(&conn, e, FIXED).unwrap();
+        let t = session(&conn, "new", P, day(10, 1));
+        distill(
+            &mut conn,
+            t,
+            |refs| Distilled {
+                decisions: vec!["unrelated".into()],
+                retires: vec![refs[FIXED].clone()],
+                ..Default::default()
+            },
+            day(11, 1),
+        );
+        flag_fact(
+            &conn,
+            e,
+            FlagKind::Wrong,
+            SignalSource::Agent,
+            Some("no longer holds"),
+            None,
+            day(11, 2),
+        )
+        .unwrap();
+        let mem = get_project_memory_facts(&conn, P, 40).unwrap();
+        let f = mem.decisions.iter().find(|f| f.id == e).expect("injected");
+        assert_eq!(f.status, FactStatus::Flagged);
+        assert_eq!(f.flags.len(), 2);
+        let block = crate::export::agent_memory_md_budgeted(
+            P,
+            &mem,
+            None,
+            &crate::export::MemoryBudget::AGENTS_FILE,
+        );
+        assert!(block.contains(FIXED), "{block}");
+        // Still listed to the distiller, and the user's Keep clears both flags.
+        let (block, _) = distill_memory_context(&conn, session(&conn, "n", P, day(10, 9))).unwrap();
+        assert!(block.contains(FIXED), "{block}");
+        assert_eq!(resolve_fact_flags(&conn, e, day(11, 3)).unwrap(), 2);
+        assert_eq!(status(&conn, e), FactStatus::Current);
+    }
+
+    #[test]
+    fn a_uid_asked_twice_reports_its_links_and_flags_once() {
+        let conn = temp_db();
+        let t = session(&conn, "s", P, day(9, 1));
+        let (a, b) = (
+            fact(&conn, t, "decision", "a"),
+            fact(&conn, t, "decision", "b"),
+        );
+        link_facts(&conn, b, a, LinkKind::Supersedes, LinkSource::User, None, 1).unwrap();
+        flag_fact(&conn, b, FlagKind::Stale, SignalSource::User, None, None, 1).unwrap();
+        let uid = uid_of(&conn, b).unwrap().unwrap();
+        let t = &fact_truth(&conn, &[&uid, &uid]).unwrap()[&uid];
+        assert_eq!((t.flags.len(), t.replaces.len()), (1, 1));
     }
 
     #[test]

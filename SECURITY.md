@@ -26,7 +26,12 @@ Specifically:
   (1) the **in-app chat**, including the history results and threads its tools
   fetch; (2) **Knowledge distillation** (`agent::distill`) of decisions, gotchas,
   and summaries, including background auto-distill when you turn it on (threads
-  active in the last 30 days, up to the daily limit you set, 50 by default);
+  active in the last 30 days, up to the daily limit you set, 50 by default),
+  which beside the thread also sends the project's current decisions and gotchas
+  (up to 30 and 20, each cut to 200 characters: the ones distilled from other
+  threads, the ones you or an agent recorded and the ones imported from the
+  repo's memory files, never Claude Code auto memory) so the engine can tell
+  what the session changed (`knowledge::distill_memory_context`);
   (3) **Ask your history / RAG** (Chat's Ask mode, `agent::answer`, also reachable
   as `cal ask` and the `ask_history` MCP tool); (4) the Project page's **Synthesize brief**,
   **Write memory file** and **Review conflicts** (`agent::project_brief`,
@@ -175,9 +180,33 @@ browser storage, no cross-site tracking.
   text is redacted, and Claude Code auto memory is never published. The files
   leave the machine only when you commit and push them. Imported repo facts come
   from whoever can push to the repo, so they are never pinned, are marked
-  "From the repo" in the app and `(repo)` in injected memory under a line that
-  names the files, and `cal memory import --review` shows what an import would
-  change without writing it.
+  "From the repo" in the app and `repo` in each injected line's provenance
+  suffix, e.g. `(2026-10-03, repo)`, under a line that names the files, and
+  `cal memory import --review` shows what an import would change without
+  writing it. A committed line's `supersedes` list can take a local fact out of
+  injected memory on import, but only a visible fact of the same kind in the
+  same repo; one you pinned or edited is not replaced but marked disputed for
+  you to settle, and a pair you undid is not linked again.
+- Writes that take a fact out of injected memory are bounded, and each one
+  shows in the Projects tab, where you can undo it. Replaced facts stay as
+  history; nothing is deleted.
+  - `flag_fact` (an agent marks a fact stale or wrong): at most 10 unreviewed
+    agent flags hide facts in a project at a time, a fact you pinned or edited
+    stays in memory (labelled flagged), and the MCP server reaches only facts of
+    the repo it runs in (or another clone of it), whatever project the agent
+    names.
+  - `record_decision` / `record_gotcha` with `replaces`, and
+    `cal remember --replaces`: a target you pinned or edited is not replaced but
+    marked disputed; an agent gets 5 replacements per project in 24 hours, after
+    which further ones are marked disputed too. Over MCP the target must be in
+    the repo the server runs in.
+  - The distiller's links: a session can only point at the existing items it
+    was shown for that project (a closed list of references, never a free id),
+    only for a reversal or disagreement the session plainly states, at most 3
+    replacements, 3 disputes, 3 retirements and 5 confirmations per session. It
+    never replaces or hides a fact you pinned or edited (it is marked disputed
+    or stays in, labelled), and a link you undo is remembered, so re-distilling
+    the session does not bring it back.
 - Agent-recorded and LLM-distilled facts that Callimachus injects into new
   sessions (hooks, `AGENTS.md` / `CLAUDE.md`) are labelled as notes from past
   sessions, not instructions. Review a repo's memory (`cal memory`, or the

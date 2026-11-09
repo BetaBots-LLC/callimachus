@@ -337,11 +337,18 @@
           "$ref": "#/$defs/FactStatus"
         },
         "replaces": {
+          "type": "array",
+          "items": {
+            "type": "integer"
+          },
+          "description": "The ids of the facts it actively supersedes, newest first: the same list of fact ids\nas `replaces` on a recall or check hit, so the key means one thing on every surface."
+        },
+        "replacesDecidedAt": {
           "type": [
             "integer",
             "null"
           ],
-          "description": "`decidedAt` of the newest fact it actively supersedes."
+          "description": "`decidedAt` of the newest fact it actively supersedes (the `replaces <date>` clause in\na memory line). A date, never a fact id: the ids are in `replaces`."
         },
         "disputedBy": {
           "type": "array",
@@ -405,7 +412,7 @@
         "flagged",
         "superseded"
       ],
-      "description": "Where a fact stands, in priority order: an active `supersedes` link points at it\n(`superseded`), an unresolved stale / wrong flag (`flagged`), an active `contradicts` link\non either side (`disputed`), else `current`."
+      "description": "Where a fact stands, in priority order: an active `supersedes` link points at it\n(`superseded`), an unresolved stale / wrong flag (`flagged`), an active `contradicts` link\non either side whose other fact is still in play, not hidden or superseded (`disputed`),\nelse `current`."
     },
     "LinkedFact": {
       "type": "object",

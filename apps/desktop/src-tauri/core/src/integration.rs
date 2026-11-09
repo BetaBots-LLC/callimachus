@@ -1254,7 +1254,7 @@ const SHIPPED_SKILL_HASHES: &[u64] = &[
     0x29e126dbe1770847, // version: 1.2.0 (Batch D: prompts, fallbacks, digest note)
     0x57df09b3095b9add, // version: 1.2.1 (Batch G: recall results under `facts` when structured)
     0xd32ed8411a5ed529, // version: 1.2.2 (Batch H: facts marked (repo), threads_for_file with a line, `cal why`)
-    0x101f0225c6e2ab86, // version: 1.3.0 (memory truth: dated lines, superseded, `replaces`, `flag_fact`)
+    0x88ce74fbfd9784fc, // version: 1.3.0 (memory truth: dated lines, superseded, `replaces`, `flag_fact`)
 ];
 
 /// Stable across builds and platforms, unlike `DefaultHasher`. Only identifies known texts.

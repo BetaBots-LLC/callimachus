@@ -12,7 +12,9 @@
 -- uid matches no fact (the fact was replaced or deleted) is ignored on read.
 -- `dismissed_at`: the user undid the link. The row stays, inactive, so the distiller, an
 -- agent or a repo import asserting the same pair again is a no-op (else a re-distill of the
--- session would bring back what the user just undid); only a later user link clears it.
+-- session would bring back what the user just undid), and so is a re-distill of the declaring
+-- session (`thread_id`) linking a reworded item to the same listed fact; only a later user
+-- link clears it.
 CREATE TABLE fact_links (
     id           INTEGER PRIMARY KEY,
     from_uid     TEXT NOT NULL,

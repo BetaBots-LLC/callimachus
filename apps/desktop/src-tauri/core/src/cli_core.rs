@@ -1142,14 +1142,20 @@ fn memory_checkout(o: &Opts) -> anyhow::Result<std::path::PathBuf> {
 }
 
 fn print_changes(sign: &str, changes: &[repo_memory::FactChange]) {
-    for c in changes {
-        println!("  {sign} {}: {}", c.kind, export::fact_line(&c.text, 120));
-    }
+    print!("{}", changes_text(sign, changes));
+}
+
+fn changes_text(sign: &str, changes: &[repo_memory::FactChange]) -> String {
+    changes
+        .iter()
+        .map(|c| format!("  {sign} {}: {}\n", c.kind, export::fact_line(&c.text, 120)))
+        .collect()
 }
 
 /// `cal memory publish [--all] [path]`: write the repo's decisions and gotchas into its
 /// `.callimachus/memory/` (pinned facts plus recorded ones; `--all` adds distilled ones), and
-/// say what changed. Silent, exit 0, when the files already say it all. Nothing commits.
+/// say what changed and what was held back. Silent, exit 0, when the files already say it all
+/// and nothing is held back. Nothing commits.
 fn cmd_memory_publish(args: &[String]) -> anyhow::Result<()> {
     let (all, rest) = take_flag(args, "--all");
     let o = parse(&rest)?;
@@ -1160,26 +1166,45 @@ fn cmd_memory_publish(args: &[String]) -> anyhow::Result<()> {
     // Read-only: publishing writes files, not the index.
     let conn = open_db()?;
     let plan = repo_memory::publish(&conn, &root, all)?;
-    if !plan.changed {
-        return Ok(());
-    }
-    println!(
-        "Published to {}: {} added, {} updated, {} removed ({} decisions, {} gotchas)",
-        plan.dir,
-        plan.added.len(),
-        plan.updated.len(),
-        plan.removed.len(),
-        plan.decisions,
-        plan.gotchas
-    );
-    print_changes("+", &plan.added);
-    print_changes("~", &plan.updated);
-    print_changes("-", &plan.removed);
-    println!(
-        "Commit {} to share it with everyone who works in this repo.",
-        repo_memory::MEMORY_DIR
-    );
+    print!("{}", publish_text(&plan));
     Ok(())
+}
+
+/// `cal memory publish`'s summary. Held facts are listed even when nothing changed: they
+/// explain why a fact the user sees in the app is missing from the files.
+fn publish_text(plan: &repo_memory::PublishPlan) -> String {
+    let mut out = String::new();
+    if plan.changed {
+        out.push_str(&format!(
+            "Published to {}: {} added, {} updated, {} removed ({} decisions, {} gotchas)\n",
+            plan.dir,
+            plan.added.len(),
+            plan.updated.len(),
+            plan.removed.len(),
+            plan.decisions,
+            plan.gotchas
+        ));
+        out.push_str(&changes_text("+", &plan.added));
+        out.push_str(&changes_text("~", &plan.updated));
+        out.push_str(&changes_text("-", &plan.removed));
+    }
+    if !plan.held.is_empty() {
+        let n = plan.held.len();
+        out.push_str(&format!(
+            "{n} {} held back until reviewed (flagged stale or wrong) or until {} replacement \
+             is published:\n",
+            if n == 1 { "fact" } else { "facts" },
+            if n == 1 { "its" } else { "their" },
+        ));
+        out.push_str(&changes_text("!", &plan.held));
+    }
+    if plan.changed {
+        out.push_str(&format!(
+            "Commit {} to share it with everyone who works in this repo.\n",
+            repo_memory::MEMORY_DIR
+        ));
+    }
+    out
 }
 
 /// `cal memory import [--review] [path]`: bring the index in line with the checkout's
@@ -2401,7 +2426,7 @@ fn cmd_check(args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `cal check`'s listing: each prior decision with its status, date and thread, live ones
+/// `cal check`'s listing: each prior decision with its id, status, date and thread, live ones
 /// first (as `knowledge::check_contradiction` orders them), a replaced one naming what
 /// replaced it. The status matters most here: the closest match to "go back to X" is X.
 fn check_text(hits: &[knowledge::RecallHit], o: &Opts) -> String {
@@ -2413,10 +2438,12 @@ fn check_text(hits: &[knowledge::RecallHit], o: &Opts) -> String {
          before overriding):\n",
     );
     for h in hits {
+        // The fact id is what `cal remember --replaces` takes; the thread id is not one.
         out.push_str(&format!(
-            "\n  • [{}] {}  ({}, thread {}, {:.0}% match)\n",
+            "\n  • [{}] {}  (fact {}, {}, thread {}, {:.0}% match)\n",
             h.status.as_str(),
             o.shown(h.text.trim()),
+            h.id,
             knowledge::fact_date(h.decided_at),
             h.thread_id,
             h.similarity * 100.0
@@ -2430,15 +2457,17 @@ fn check_text(hits: &[knowledge::RecallHit], o: &Opts) -> String {
                 .map(|t| format!(" (thread {t})"))
                 .unwrap_or_default();
             out.push_str(&format!(
-                "    replaced on {}{thread} by: {}\n",
+                "    replaced on {} by fact {}{thread}: {}\n",
                 knowledge::fact_date(by.decided_at),
+                by.id,
                 o.shown(by.text.trim())
             ));
         }
         for d in &h.disputed_by {
             out.push_str(&format!(
-                "    disputed on {} by: {}\n",
+                "    disputed on {} by fact {}: {}\n",
                 knowledge::fact_date(d.decided_at),
+                d.id,
                 o.shown(d.text.trim())
             ));
         }
@@ -2814,7 +2843,23 @@ fn why_text(out: &why::WhyOutput, o: &Opts) -> String {
                     .filter(|r| !r.trim().is_empty())
                     .map(|r| format!(" (because {})", o.shown(r)))
                     .unwrap_or_default();
-                let _ = writeln!(s, "      {}: {}{why}", f.kind, o.shown(&f.text));
+                // A reversed or flagged decision still explains the line, but must not read
+                // as settled: its status leads, and a replaced one names its replacement.
+                let status = match f.status {
+                    Some(knowledge::FactStatus::Flagged) => " [flagged stale or wrong]".into(),
+                    Some(st) => format!(" [{}]", st.as_str()),
+                    None => String::new(),
+                };
+                let _ = writeln!(s, "      {}{status}: {}{why}", f.kind, o.shown(&f.text));
+                if let Some(by) = &f.superseded_by {
+                    let _ = writeln!(
+                        s,
+                        "        replaced on {} by fact {}: {}",
+                        knowledge::fact_date(by.decided_at),
+                        by.id,
+                        o.shown(by.text.trim())
+                    );
+                }
             }
         }
         for a in &c.trace {
@@ -3103,29 +3148,40 @@ fn cmd_recall(args: &[String], kind: &str) -> anyhow::Result<()> {
         eprintln!("nothing recalled — distill some threads first (`cal distill <id>`)");
         return Ok(());
     }
-    for h in &hits {
-        println!("• {}", o.shown(&h.text));
+    print!("{}", recall_text(&hits, &o));
+    Ok(())
+}
+
+/// `cal decisions` / `cal gotchas` text: each hit with its fact id (what `cal remember
+/// --replaces` and flag_fact take; the thread id beside it is not one), status, date and
+/// session, and what replaced it.
+fn recall_text(hits: &[knowledge::RecallHit], o: &Opts) -> String {
+    let mut out = String::new();
+    for h in hits {
+        out.push_str(&format!("• {}\n", o.shown(&h.text)));
         // A non-current status leads, so a replaced or disputed fact never reads as settled.
         let status = match h.status {
             knowledge::FactStatus::Current => String::new(),
             other => format!("{} · ", other.as_str()),
         };
-        println!(
-            "    {status}{} · {} · thread {} · {:.0}% match",
+        out.push_str(&format!(
+            "    {status}fact {} · {} · {} · thread {} · {:.0}% match\n",
+            h.id,
             knowledge::fact_date(h.decided_at),
             o.shown(h.title.as_deref().unwrap_or("untitled")),
             h.thread_id,
             h.similarity * 100.0
-        );
+        ));
         if let Some(by) = &h.superseded_by {
-            println!(
-                "    replaced on {} by: {}",
+            out.push_str(&format!(
+                "    replaced on {} by fact {}: {}\n",
                 knowledge::fact_date(by.decided_at),
+                by.id,
                 o.shown(by.text.trim())
-            );
+            ));
         }
     }
-    Ok(())
+    out
 }
 
 /// `cal similar <task…>` — the "have I done this before?" guard: prior SESSIONS where the
@@ -4564,20 +4620,90 @@ mod tests {
         };
         let out = check_text(&[current, old], &Opts::default());
         let a = out
-            .find("• [current] use JSON for the cache  (2026-10-03, thread 12, 80% match)")
+            .find("• [current] use JSON for the cache  (fact 2, 2026-10-03, thread 12, 80% match)")
             .expect(&out);
         let b = out
-            .find("• [superseded] use bincode for the cache  (2026-10-01, thread 11, 80% match)")
+            .find(
+                "• [superseded] use bincode for the cache  (fact 1, 2026-10-01, thread 11, 80% \
+                 match)",
+            )
             .expect(&out);
         assert!(a < b, "{out}");
         assert!(
-            out.contains("    replaced on 2026-10-03 (thread 12) by: use JSON for the cache"),
+            out.contains(
+                "    replaced on 2026-10-03 by fact 2 (thread 12): use JSON for the cache"
+            ),
             "{out}"
         );
         assert!(out.contains("because: fast"), "{out}");
         assert_eq!(
             check_text(&[], &Opts::default()),
             "No settled decisions conflict with that.\n"
+        );
+
+        // `cal decisions` / `cal gotchas` print the same ids.
+        let current = knowledge::RecallHit {
+            title: Some("cache work".into()),
+            ..hit(2, "use JSON for the cache", OCT_3, 12)
+        };
+        let old = knowledge::RecallHit {
+            status: knowledge::FactStatus::Superseded,
+            superseded_by: Some(linked(2, "use JSON for the cache", OCT_3, 12)),
+            ..hit(1, "use bincode for the cache", OCT_1, 11)
+        };
+        let out = recall_text(&[current, old], &Opts::default());
+        assert!(
+            out.contains("    fact 2 · 2026-10-03 · cache work · thread 12 · 80% match\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("    superseded · fact 1 · 2026-10-01 · untitled · thread 11"),
+            "{out}"
+        );
+        assert!(
+            out.contains("    replaced on 2026-10-03 by fact 2: use JSON for the cache\n"),
+            "{out}"
+        );
+    }
+
+    /// `cal memory publish` lists the facts it held back, also when nothing else changed.
+    #[test]
+    fn publish_text_lists_held_facts() {
+        let change = |kind: &str, text: &str| repo_memory::FactChange {
+            uid: format!("u-{text}"),
+            kind: kind.into(),
+            text: text.into(),
+        };
+        let mut plan = repo_memory::PublishPlan::default();
+        assert_eq!(
+            publish_text(&plan),
+            "",
+            "silent when there is nothing to say"
+        );
+        plan.held = vec![change("decision", "use bincode for the cache")];
+        assert_eq!(
+            publish_text(&plan),
+            "1 fact held back until reviewed (flagged stale or wrong) or until its replacement \
+             is published:\n  ! decision: use bincode for the cache\n"
+        );
+        plan.changed = true;
+        plan.dir = "/r/.callimachus/memory".into();
+        plan.decisions = 1;
+        plan.added = vec![change("decision", "use JSON for the cache")];
+        plan.held.push(change("gotcha", "the cache is per user"));
+        let out = publish_text(&plan);
+        assert!(
+            out.starts_with(
+                "Published to /r/.callimachus/memory: 1 added, 0 updated, 0 removed (1 \
+                 decisions, 0 gotchas)\n  + decision: use JSON for the cache\n2 facts held back"
+            ),
+            "{out}"
+        );
+        assert!(out.contains("their replacement"), "{out}");
+        assert!(out.contains("  ! gotcha: the cache is per user\n"), "{out}");
+        assert!(
+            out.ends_with("to share it with everyone who works in this repo.\n"),
+            "{out}"
         );
     }
 
@@ -4599,7 +4725,8 @@ mod tests {
         let mut mem = knowledge::ProjectMemory {
             project: "/p".into(),
             decisions: vec![knowledge::MemoryFact {
-                replaces: Some(OCT_1),
+                replaces: vec![1],
+                replaces_decided_at: Some(OCT_1),
                 ..f(2, "use JSON for the cache", OCT_3, "llm")
             }],
             gotchas: vec![f(3, "the team note", OCT_1, "repo")],
@@ -5014,6 +5141,23 @@ mod tests {
         let text = why_text(&out, &Opts::default());
         assert!(text.contains("src/auth.rs:3"), "{text}");
         assert!(text.contains("decision: "), "{text}");
+        // A reversed decision is labelled and names its replacement, in the schema too.
+        let mut reversed = out;
+        let f = &mut reversed.commits[0].threads[0].facts[0];
+        f.status = Some(knowledge::FactStatus::Superseded);
+        f.superseded_by = Some(knowledge::LinkedFact {
+            id: 77,
+            text: "rotate refresh tokens daily".into(),
+            decided_at: OCT_3,
+            thread_id: Some(9),
+        });
+        check("why", &json(&reversed));
+        let text = why_text(&reversed, &Opts::default());
+        assert!(text.contains("decision [superseded]: "), "{text}");
+        assert!(
+            text.contains("        replaced on 2026-10-03 by fact 77: rotate refresh tokens daily"),
+            "{text}"
+        );
 
         let knowledge = Some(AuditKnowledge {
             summary: None,

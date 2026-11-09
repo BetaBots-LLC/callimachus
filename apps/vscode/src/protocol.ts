@@ -59,6 +59,25 @@ export interface WhyFact {
   rationale: string | null;
   extractor: string;
   originRef: string | null;
+  /** Where it stands now, omitted when current. Still listed when not: it explains why the
+   *  line was written, but it is no longer settled. */
+  status?: "superseded" | "flagged" | "disputed";
+  /** For a superseded fact, the newest one that replaced it. */
+  supersededBy?: { id: number; text: string; decidedAt: number; threadId?: number };
+}
+
+/** A not-current fact's label (`cal why` prints the same words), or null when current. */
+export function factStatusLabel(f: WhyFact): string | null {
+  switch (f.status) {
+    case "superseded":
+      return "superseded";
+    case "flagged":
+      return "flagged stale or wrong";
+    case "disputed":
+      return "disputed";
+    default:
+      return null;
+  }
 }
 
 /** A session inferred to have produced a blamed commit, with what it did to the file. */

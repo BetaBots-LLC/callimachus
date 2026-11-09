@@ -32,9 +32,12 @@
 //!
 //! - Reversals travel too: a line's `supersedes` lists the uids of the facts it replaces
 //!   (written by publish from the fact's active `supersedes` links), and an import links the
-//!   line's fact to each listed fact it holds in the same repo, with source `repo` (no
-//!   downgrade of a pinned target: a person published the line). The import keeps those
-//!   links in step with the field, so a line that drops it unlinks.
+//!   line's fact to each listed fact it holds in the same repo, with source `repo`. A target
+//!   the user pinned or edited is linked as `contradicts` instead (both stay, disputed, and the
+//!   user settles it): a line in any checked-out branch, a contributor's included, must not
+//!   silently retire what the user trusts. The import keeps those links in step with the
+//!   field, so a line that drops it unlinks. Publish holds back a fact that is out of memory
+//!   here but would read as current to a teammate (see [`PublishPlan::held`]).
 //!
 //! Imported facts are the team's, so the SessionStart hook and the AGENTS.md block include
 //! them, marked `repo` in each line's provenance suffix (`export::provenance`) under a trust
@@ -172,6 +175,11 @@ pub struct PublishPlan {
     pub added: Vec<FactChange>,
     pub updated: Vec<FactChange>,
     pub removed: Vec<FactChange>,
+    /// Facts publish would otherwise write that are out of memory here and would read as
+    /// current to a teammate: flagged stale or wrong and not reviewed yet (and neither pinned
+    /// nor edited), or superseded by a fact that is not published. Held until that changes;
+    /// an earlier line of one is in `removed`.
+    pub held: Vec<FactChange>,
     /// Whether publishing writes anything: false when the files already hold these lines in
     /// this order (line endings and blank lines aside).
     pub changed: bool,
@@ -497,6 +505,80 @@ fn entry_of(
     }
 }
 
+/// The local facts publish would write ([`publishable`]) that it holds back instead, because a
+/// teammate importing the line would take as current what this machine keeps out of memory
+/// (the same rule as the live memory slice):
+/// - an unresolved stale / wrong flag on a fact that is neither pinned nor edited (flags are
+///   local opinions and do not travel, so the line would arrive unflagged);
+/// - a standing `supersedes` onto it none of whose newer sides travels: no newer fact is
+///   published here (a distilled replacement without `all`, say), and no line already in the
+///   files names it in its own `supersedes`. Repeated until nothing changes, since a newer
+///   fact held back carries no link either.
+///
+/// Empty on an index without 0035's tables.
+fn held_uids(
+    conn: &Connection,
+    rows: &[LocalRow],
+    local: &HashMap<&str, &LocalRow>,
+    existing: &HashMap<String, Line>,
+    all: bool,
+) -> Result<HashSet<String>> {
+    let mut held = HashSet::new();
+    if !super::truth::has_truth_tables(conn) {
+        return Ok(held);
+    }
+    let candidates: Vec<&str> = rows
+        .iter()
+        .filter(|r| publishable(r, all))
+        .map(|r| r.uid.as_str())
+        .collect();
+    if candidates.is_empty() {
+        return Ok(held);
+    }
+    let list = serde_json::to_string(&candidates)?;
+    let flagged: Vec<String> = conn
+        .prepare_cached(&format!(
+            "SELECT f.uid FROM json_each(?1) j JOIN facts f ON f.uid = j.value
+             WHERE f.pinned = 0 AND f.edited = 0 AND {}",
+            super::truth::FLAGGED_SQL
+        ))?
+        .query_map([&list], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    held.extend(flagged);
+    // to -> the newer sides of its standing supersedes links.
+    let mut by: HashMap<String, Vec<String>> = HashMap::new();
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT lk.to_uid, lk.from_uid FROM json_each(?1) j
+         JOIN fact_links lk ON lk.to_uid = j.value
+         JOIN facts nf ON nf.uid = lk.from_uid
+         WHERE lk.kind = 'supersedes' AND lk.dismissed_at IS NULL AND {}",
+        super::truth::NEWER_STANDS_NF_SQL
+    ))?;
+    for row in stmt.query_map([&list], |r| Ok((r.get::<_, String>(0)?, r.get(1)?)))? {
+        let (to, from) = row?;
+        by.entry(to).or_default().push(from);
+    }
+    loop {
+        let travels = |from: &str, to: &str| match local.get(from) {
+            Some(r) if r.extractor != EXTRACTOR_REPO => publishable(r, all) && !held.contains(from),
+            // A teammate's line (imported here or not): kept as written, so the link travels
+            // only if the line itself lists the fact.
+            _ => existing
+                .get(from)
+                .is_some_and(|l| l.fact.supersedes.iter().any(|t| t == to)),
+        };
+        let more: Vec<String> = by
+            .iter()
+            .filter(|(to, froms)| !held.contains(*to) && !froms.iter().any(|f| travels(f, to)))
+            .map(|(to, _)| to.clone())
+            .collect();
+        if more.is_empty() {
+            return Ok(held);
+        }
+        held.extend(more);
+    }
+}
+
 /// What publishing `project`'s memory into the checkout at or above `path` would write.
 /// Reads the index and the files; writes nothing ([`apply_publish`] does).
 pub fn plan_publish(conn: &Connection, path: &Path, all: bool) -> Result<PublishPlan> {
@@ -546,6 +628,8 @@ pub(crate) fn plan_publish_with(
     }
     let rows = local_rows(conn, project)?;
     let local: HashMap<&str, &LocalRow> = rows.iter().map(|r| (r.uid.as_str(), r)).collect();
+    let held = held_uids(conn, &rows, &local, &existing, all)?;
+    let publishable = |r: &LocalRow, all: bool| publishable(r, all) && !held.contains(&r.uid);
     // What each published fact supersedes, limited to facts a teammate can know: this
     // project's own and the lines already in the files.
     let links = {
@@ -569,6 +653,12 @@ pub(crate) fn plan_publish_with(
         all,
         ..Default::default()
     };
+    let mut held_rows: Vec<&LocalRow> = rows.iter().filter(|r| held.contains(&r.uid)).collect();
+    held_rows.sort_by(|a, b| a.uid.cmp(&b.uid));
+    plan.held = held_rows
+        .into_iter()
+        .map(|r| FactChange::of(&r.uid, &r.kind, &r.text))
+        .collect();
     let mut existing_sorted: Vec<&Line> = existing.values().collect();
     existing_sorted.sort_by(|a, b| a.fact.uid.cmp(&b.fact.uid));
     for line in existing_sorted {
@@ -741,7 +831,7 @@ pub fn publish(conn: &Connection, path: &Path, all: bool) -> Result<PublishPlan>
 /// The uid lookup an import makes per line, off idx_facts_uid.
 pub(crate) const BY_UID_SQL: &str = "SELECT f.id, f.extractor, f.edited, f.hidden, f.text,
         f.rationale, f.kind, COALESCE(f.origin_ref, ''),
-        COALESCE(t.project_key, t.project_path, '')
+        COALESCE(t.project_key, t.project_path, ''), f.pinned
      FROM facts f JOIN threads t ON t.id = f.thread_id WHERE f.uid = ?1";
 
 /// The visible imported facts of one file under one project key, off idx_facts_origin_ref.
@@ -1026,14 +1116,19 @@ fn plan_import_with(
                                 r.get::<_, String>(6)?,
                                 r.get::<_, String>(8)?,
                                 r.get::<_, i64>(3)? != 0,
+                                r.get::<_, i64>(9)? != 0 || r.get::<_, i64>(2)? != 0,
                             ))
                         })
                         .optional()?;
                     match local {
-                        Some((kind, project, hidden))
+                        Some((kind, project, hidden, trusted))
                             if kind == f.kind && family.contains(&project) =>
                         {
-                            if hidden {
+                            // A pinned or edited target: the link writer stores the line's
+                            // supersedes as `contradicts` (the user settles it). Once any link
+                            // relates the pair (that one, the user's verdict on it, or an
+                            // older one), it is as settled as the import will make it.
+                            if hidden || (trusted && super::truth::pair_linked(conn, &f.uid, t)?) {
                                 blocked.push(t.clone());
                                 false
                             } else {
@@ -1062,11 +1157,18 @@ fn plan_import_with(
             .filter(|t| !links.iter().any(|(to, _)| to == *t))
             .cloned()
             .collect();
-        let remove: Vec<String> = links
+        let mut remove: Vec<String> = links
             .into_iter()
             .filter(|(to, source)| source == "repo" && !want.contains(to) && !blocked.contains(to))
             .map(|(to, _)| to)
             .collect();
+        // A line's supersedes stored as `contradicts` (a pinned or edited target) goes when
+        // the line no longer lists it, as a supersedes would.
+        for to in super::truth::repo_contradicts_from(conn, &f.uid)? {
+            if !want.contains(&to) && !blocked.contains(&to) && !remove.contains(&to) {
+                remove.push(to);
+            }
+        }
         if add.is_empty() && remove.is_empty() {
             continue;
         }
@@ -1219,7 +1321,8 @@ pub fn import_repo(conn: &Connection, root: &Path, now: i64, review: bool) -> Re
                 for to in remove {
                     tx.execute(
                         "DELETE FROM fact_links WHERE from_uid = ?1 AND to_uid = ?2
-                           AND kind = 'supersedes' AND source = 'repo'",
+                           AND kind IN ('supersedes', 'contradicts') AND source = 'repo'
+                           AND dismissed_at IS NULL",
                         params![from, to],
                     )?;
                 }
@@ -1590,7 +1693,7 @@ mod tests {
     }
 
     /// A reversal travels with the files: publish writes the newer line's `supersedes`, an
-    /// import links it (source `repo`, no downgrade), and the preview shows a change of the
+    /// import links it (source `repo`; the target is not pinned or edited), and the preview shows a change of the
     /// field alone, both ways.
     #[test]
     fn supersedes_round_trips_through_repo_memory() {
@@ -1758,6 +1861,179 @@ mod tests {
         unchanged("both stand");
         undone(old_b, new_b, LinkKind::Contradicts);
         unchanged("both stand, other direction");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn line_uids(root: &Path, name: &str) -> Vec<String> {
+        file(root, name)
+            .lines()
+            .map(|l| serde_json::from_str::<RepoFact>(l).unwrap().uid)
+            .collect()
+    }
+
+    /// A fact superseded here by one a default publish leaves out (a distilled replacement)
+    /// would reach teammates as current: it is held back, and its earlier line removed.
+    /// With `all` both go out, the newer line naming the older.
+    #[test]
+    fn publish_holds_a_fact_superseded_by_one_it_leaves_out() {
+        use crate::knowledge::truth::{LinkKind, LinkSource};
+        let (root, key) = checkout("orphan_superseded");
+        let conn = temp_db();
+        let a = record(
+            &conn,
+            &key,
+            "decision",
+            "Cache with bincode",
+            FactOrigin::Agent,
+        );
+        publish_here(&conn, &root, &key, false);
+        assert_eq!(line_uids(&root, "decisions.jsonl"), [uid_of(&conn, a)]);
+        let b = distilled(&conn, &key, &key, "decision", "Cache with JSON");
+        conn.execute(
+            "UPDATE threads SET created_at = 3000, updated_at = 3000
+             WHERE id = (SELECT thread_id FROM facts WHERE id = ?1)",
+            [b],
+        )
+        .unwrap();
+        let o = crate::knowledge::link_facts(
+            &conn,
+            b,
+            a,
+            LinkKind::Supersedes,
+            LinkSource::Distill,
+            None,
+            4_000,
+        )
+        .unwrap();
+        assert!(matches!(
+            o,
+            crate::knowledge::truth::LinkOutcome::Linked {
+                kind: LinkKind::Supersedes,
+                ..
+            }
+        ));
+
+        let plan = publish_here(&conn, &root, &key, false);
+        assert_eq!(plan.removed.len(), 1);
+        assert_eq!(plan.removed[0].uid, uid_of(&conn, a));
+        assert_eq!(plan.held.len(), 1);
+        assert!(line_uids(&root, "decisions.jsonl").is_empty());
+
+        let plan = publish_here(&conn, &root, &key, true);
+        assert!(plan.held.is_empty());
+        let lines: Vec<RepoFact> = file(&root, "decisions.jsonl")
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2);
+        let newer = lines.iter().find(|l| l.uid == uid_of(&conn, b)).unwrap();
+        assert_eq!(newer.supersedes, [uid_of(&conn, a)]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A fact flagged stale or wrong and not reviewed is out of memory here; flags do not
+    /// travel, so publish holds it until the user keeps it. A pinned one stays published, as
+    /// it stays injected.
+    #[test]
+    fn publish_holds_flagged_facts_until_reviewed() {
+        use crate::knowledge::truth::{flag_fact, resolve_fact_flags, FlagKind, SignalSource};
+        let (root, key) = checkout("flagged_held");
+        let conn = temp_db();
+        let f = record(
+            &conn,
+            &key,
+            "decision",
+            "Serialize as JSON",
+            FactOrigin::Agent,
+        );
+        let p = record(&conn, &key, "decision", "Pinned rule", FactOrigin::User);
+        crate::knowledge::set_fact_pinned(&conn, p, true).unwrap();
+        for id in [f, p] {
+            flag_fact(
+                &conn,
+                id,
+                FlagKind::Stale,
+                SignalSource::Agent,
+                None,
+                None,
+                2_000,
+            )
+            .unwrap();
+        }
+        let plan = publish_here(&conn, &root, &key, false);
+        assert_eq!(
+            plan.held.iter().map(|c| c.uid.clone()).collect::<Vec<_>>(),
+            [uid_of(&conn, f)]
+        );
+        assert_eq!(line_uids(&root, "decisions.jsonl"), [uid_of(&conn, p)]);
+        resolve_fact_flags(&conn, f, 3_000).unwrap();
+        let plan = publish_here(&conn, &root, &key, false);
+        assert!(plan.held.is_empty());
+        assert_eq!(plan.added.len(), 1);
+        assert_eq!(line_uids(&root, "decisions.jsonl").len(), 2);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A line that supersedes a fact the user pinned (a contributor's branch naming a published
+    /// uid) is stored as a dispute, not a removal, and settles: the next import plans nothing,
+    /// and a line that drops the field takes the dispute with it.
+    #[test]
+    fn imported_supersedes_of_a_pinned_fact_is_a_dispute() {
+        use crate::knowledge::truth::{fact_truth, FactStatus};
+        let (root, key) = checkout("supersedes_pinned");
+        let conn = temp_db();
+        let mine = record(&conn, &key, "decision", "Keep the API v1", FactOrigin::User);
+        crate::knowledge::set_fact_pinned(&conn, mine, true).unwrap();
+        let mine_uid = uid_of(&conn, mine);
+        std::fs::create_dir_all(memory_dir(&root)).unwrap();
+        let write = |supersedes: Vec<String>| {
+            let line = RepoFact {
+                uid: "11111111-2222-4333-8444-666666666666".into(),
+                kind: "decision".into(),
+                text: "Drop the API v1".into(),
+                rationale: None,
+                pinned: false,
+                by: "user".into(),
+                created_at: 5_000,
+                project: None,
+                subpath: None,
+                supersedes,
+            };
+            std::fs::write(
+                memory_dir(&root).join("decisions.jsonl"),
+                format!("{}\n", serde_json::to_string(&line).unwrap()),
+            )
+            .unwrap();
+        };
+        write(vec![mine_uid.clone()]);
+        let r = import_repo(&conn, &root, 6_000, false).unwrap();
+        assert_eq!(r.added.len(), 1);
+        let kinds = |conn: &Connection| -> Vec<String> {
+            conn.prepare("SELECT kind FROM fact_links ORDER BY kind")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        assert_eq!(kinds(&conn), ["contradicts"]);
+        assert_eq!(
+            fact_truth(&conn, &[&mine_uid]).unwrap()[&mine_uid].status,
+            FactStatus::Disputed
+        );
+        let mem = crate::knowledge::get_project_memory_facts(&conn, &key, 20).unwrap();
+        assert!(mem.decisions.iter().any(|f| f.id == mine));
+        assert!(plan_import(&conn, &root).unwrap().updated.is_empty());
+        assert!(!import_repo(&conn, &root, 7_000, false).unwrap().changed());
+
+        write(Vec::new());
+        let r = import_repo(&conn, &root, 8_000, false).unwrap();
+        assert_eq!(r.updated.len(), 1, "{r:?}");
+        assert!(kinds(&conn).is_empty());
+        assert_eq!(
+            fact_truth(&conn, &[&mine_uid]).unwrap()[&mine_uid].status,
+            FactStatus::Current
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

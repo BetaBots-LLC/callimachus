@@ -13,7 +13,13 @@ import { open } from "node:fs/promises";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { CalSetupError, calHasWhy, config, whyFile } from "./cal";
-import { sourceLabel, type WhyCommit, type WhyResult, type WhyThread } from "./protocol";
+import {
+  factStatusLabel,
+  sourceLabel,
+  type WhyCommit,
+  type WhyResult,
+  type WhyThread,
+} from "./protocol";
 
 /** Settle time after an edit before re-asking. */
 const DEBOUNCE_MS = 500;
@@ -448,10 +454,15 @@ function hoverText(c: WhyCommit, file: string, line: number): vscode.MarkdownStr
     );
     md.appendMarkdown("\n\n");
     for (const f of t.facts.slice(0, HOVER_FACTS)) {
-      md.appendMarkdown(`- *${f.kind}*: `);
+      // A reversed or flagged decision still explains the line, but must not read as settled.
+      const status = factStatusLabel(f);
+      md.appendMarkdown(`- *${f.kind}*${status ? ` **[${status}]**` : ""}: `);
       md.appendText(f.text);
       if (f.rationale) {
         md.appendText(` (because ${f.rationale})`);
+      }
+      if (f.supersededBy) {
+        md.appendText(`; replaced by: ${f.supersededBy.text}`);
       }
       md.appendMarkdown("\n");
     }

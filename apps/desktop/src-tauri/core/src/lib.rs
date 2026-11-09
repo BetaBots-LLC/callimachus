@@ -85,27 +85,31 @@
 //!   `kind` one of `supersedes | contradicts`, `source` one of `distill | user | agent | repo | review`,
 //!   `thread_id` the session that asserted it (`ON DELETE SET NULL`), unique per
 //!   `(from_uid, to_uid, kind)`; indexes `(to_uid, kind)` and partial `(thread_id)`.
-//!   `from_uid` is the NEWER fact of a `supersedes`. A link is active while both facts exist and
-//!   the `from` side is not hidden (a `contradicts` also needs the other side visible) and the
+//!   `from_uid` is the NEWER fact of a `supersedes`. A link is active while both facts exist, the
 //!   user has not undone it (`dismissed_at`, [`knowledge::unlink_link`]: the row stays so a
-//!   machine source asserting the pair again is a no-op); one whose uid matches no fact is
-//!   ignored. Written by [`knowledge::link_facts`] (validation,
-//!   cycle refusal, and the downgrade of a machine `supersedes` on a pinned or edited target to
-//!   `contradicts`), [`knowledge::store_distilled`] (the distiller's `links`, capped per thread)
-//!   and the repo memory import (a line's `supersedes`).
+//!   machine source asserting the pair again is a no-op, and a re-distill of the session that
+//!   declared it relates none of its items to that fact again) and, for a `supersedes`, the
+//!   `from` side stands (visible, or hidden after it had itself been superseded or retired as
+//!   stale); a `contradicts` needs the other side visible and not superseded. One whose uid
+//!   matches no fact is ignored. Written by [`knowledge::link_facts`] (validation, cycle
+//!   refusal, a direction check against the declaring session's last activity, and the
+//!   downgrade to `contradicts` of a machine or repo `supersedes` on a pinned or edited target),
+//!   [`knowledge::store_distilled`] (the distiller's `links`, capped per thread; a re-distill
+//!   keeps the facts other sources' links name, and incoming links) and the repo memory import
+//!   (a line's `supersedes`).
 //! - `fact_signals (id, fact_uid, kind, source, thread_id, reason, created_at, resolved_at)`,
 //!   `kind` one of `reaffirmed | stale | wrong`, `source` one of `distill | agent | user`;
 //!   indexes `(fact_uid, kind)`, partial `(thread_id)`, and a partial unique
 //!   `(fact_uid, thread_id) WHERE kind = 'reaffirmed'` (one reaffirmation per session).
 //!   `resolved_at` set: the user kept the fact ([`knowledge::resolve_fact_flags`]). Written by
 //!   [`knowledge::flag_fact`] (agent flags capped per project) and the distiller (`reaffirms`,
-//!   `retires`).
+//!   `retires`, never of an item decided after the session ended).
 //! - Derived per fact ([`knowledge::fact_truth`], batched): status `superseded` (an active
 //!   `supersedes` points at it) > `flagged` (an unresolved stale / wrong signal) > `disputed`
-//!   (an active `contradicts` on either side) > `current`; `support` (1 + other sessions that
+//!   (an active `contradicts` with a fact still in play) > `current`; `support` (1 + other sessions that
 //!   reaffirmed it) and `last_confirmed`. [`knowledge::DECIDED_AT_SQL`] dates a distilled fact by
 //!   its session's start, not by when it was distilled. Project memory reads exclude superseded
-//!   facts, and flagged ones unless pinned, in SQL; recall drops superseded hits unless asked;
+//!   facts, and flagged ones unless pinned or edited, in SQL; recall drops superseded hits unless asked;
 //!   the contradiction guard keeps them, labelled. Readers on an index without these tables
 //!   (read-only connections never migrate) treat every fact as current
 //!   ([`knowledge::has_truth_tables`]).

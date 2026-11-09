@@ -265,8 +265,11 @@ export interface MemoryFact {
   /** Its thread's source (`in_app` for recorded and imported facts). */
   source: SourceKind;
   status: FactStatus;
-  /** `decidedAt` of the newest fact it replaces. */
-  replaces?: number;
+  /** The ids of the facts it actively supersedes, newest first (absent when none): the same
+   *  key as on a recall or check hit. */
+  replaces?: number[];
+  /** `decidedAt` of the newest of those, the `replaces <date>` in its memory line. */
+  replacesDecidedAt?: number;
   /** The facts it is disputed with, newest first. */
   disputedBy?: LinkedFact[];
   /** 1 + the other sessions that confirmed it. */
@@ -280,8 +283,8 @@ export interface MemoryFact {
 }
 
 /** Durable, aggregated knowledge for one project + distillation coverage. The three lists
- *  hold live facts (a flagged one only when pinned); `superseded` and `flagged` are the
- *  history the Projects page lists apart, absent when empty. */
+ *  hold live facts (a flagged one only when pinned or edited); `superseded` and `flagged`
+ *  are the history the Projects page lists apart, absent when empty. */
 export interface ProjectMemory {
   project: string;
   decisions: MemoryFact[];
@@ -346,6 +349,11 @@ export interface RepoPublishPlan {
   added: RepoFactChange[];
   updated: RepoFactChange[];
   removed: RepoFactChange[];
+  /** Facts publish would otherwise write but holds back, since they are out of memory here
+   *  and would read as current to a teammate: flagged stale or wrong and not reviewed yet
+   *  (and neither pinned nor edited), or replaced by a fact that is not published. An
+   *  earlier line of one is in `removed`. */
+  held: RepoFactChange[];
   /** False when the files already hold exactly this. */
   changed: boolean;
 }

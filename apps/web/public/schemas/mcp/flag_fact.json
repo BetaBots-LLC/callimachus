@@ -30,7 +30,7 @@
             }
           ]
         },
-        "pinned": {
+        "keptInMemory": {
           "type": [
             "boolean",
             "null"

@@ -8,6 +8,7 @@ import {
 } from "../../lib/api";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { fullDate } from "./shared";
 
 /**
  * Where a fact stands and where it came from, as the Memory section shows it: the session
@@ -18,7 +19,8 @@ import { Button } from "@/components/ui/button";
 
 /** A fact's date as the page prints it: the day only, in the viewer's locale but on the UTC
  *  calendar, the day the agents' memory lines (`fact_date`) print, so the two never differ
- *  near midnight. */
+ *  near midnight. The rest of the page is local time, so each date span carries the exact
+ *  local time in its title (`dateTitle`). */
 export function factDate(epochSeconds: number): string {
   if (!epochSeconds) return "";
   return new Date(epochSeconds * 1000).toLocaleDateString([], {
@@ -27,6 +29,12 @@ export function factDate(epochSeconds: number): string {
     day: "numeric",
     timeZone: "UTC",
   });
+}
+
+/** A fact date's hover title: the exact time in the viewer's zone, since `factDate` alone
+ *  can read a day off from the local dates elsewhere on the page. */
+export function dateTitle(epochSeconds: number | null | undefined): string | undefined {
+  return epochSeconds ? `${fullDate(epochSeconds)} (memory lines use the UTC date)` : undefined;
 }
 
 /** Who a fact is from: the session's agent for a distilled fact, else who recorded it. Null
@@ -96,7 +104,9 @@ export function FactMeta({
     <p className="mt-0.5 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-[13px] text-muted-foreground">
       {lead}
       {(date || origin) && (
-        <span className="shrink-0 tabular-nums">{[date, origin].filter(Boolean).join(" · ")}</span>
+        <span className="shrink-0 tabular-nums" title={dateTitle(fact.decidedAt)}>
+          {[date, origin].filter(Boolean).join(" · ")}
+        </span>
       )}
       {fact.title && fact.source !== "in_app" && (
         <span className="line-clamp-1 min-w-0">
@@ -104,13 +114,15 @@ export function FactMeta({
           {fact.title}
         </span>
       )}
-      {fact.replaces != null && (
+      {!!fact.replaces?.length && (
         <Badge
           variant="outline"
           className="shrink-0 text-[0.65rem]"
           title="This replaced an earlier decision, which memory now leaves out"
         >
-          {factDate(fact.replaces) ? `Replaces ${factDate(fact.replaces)}` : "Replaces another"}
+          {fact.replacesDecidedAt
+            ? `Replaces ${factDate(fact.replacesDecidedAt)}`
+            : "Replaces another"}
         </Badge>
       )}
       {disputed.length > 0 && (
@@ -133,13 +145,15 @@ export function FactMeta({
           Disputed
         </Badge>
       )}
+      {/* Only the live lists render this line, and a flagged fact is live only when the user
+          pinned or edited it, so one that is not pinned was edited. */}
       {fact.status === "flagged" && (
         <Badge
           variant="outline"
           className="shrink-0 border-amber-500/50 text-[0.65rem] text-amber-700 dark:text-amber-400"
           title={
             fact.flags?.[0]
-              ? `${flagLine(fact.flags[0])}${fact.flags[0].reason ? `: ${fact.flags[0].reason}` : ""}. Pinned, so it stays in memory until you keep or hide it.`
+              ? `${flagLine(fact.flags[0])}${fact.flags[0].reason ? `: ${fact.flags[0].reason}` : ""}. ${fact.pinned ? "Pinned" : "Edited"}, so it stays in memory until you keep or hide it.`
               : undefined
           }
         >
@@ -161,26 +175,22 @@ export function FactMeta({
   );
 }
 
-/** The other side of each dispute, with the three ways to settle it. Clicks stay here: the
- *  row around it opens the fact's thread. */
+/** The other side of each dispute, with the three ways to settle it. Rendered after the
+ *  fact's row, not inside it, so its buttons stay buttons to assistive tech. Each action names
+ *  the fact to focus afterwards: the settled panel unmounts with the focused button. */
 export function DisputePanel({
   fact,
   onLink,
   onUnlink,
 }: {
   fact: MemoryFact;
-  onLink: (fromId: number, toId: number, kind: LinkKind) => void;
-  onUnlink: (fromId: number, toId: number, kind: LinkKind) => void;
+  onLink: (fromId: number, toId: number, kind: LinkKind, focusId?: number) => void;
+  onUnlink: (fromId: number, toId: number, kind: LinkKind, focusId?: number) => void;
 }) {
   const others = fact.disputedBy ?? [];
   if (!others.length) return null;
   return (
-    // biome-ignore lint/a11y/noStaticElementInteractions: only stops clicks reaching the row
-    <div
-      className="mt-2 space-y-2 rounded-md border border-amber-500/40 bg-amber-500/5 p-2 text-xs"
-      onClick={(e) => e.stopPropagation()}
-      onKeyDown={(e) => e.stopPropagation()}
-    >
+    <div className="space-y-2 rounded-md border border-amber-500/40 bg-amber-500/5 p-2 text-xs">
       {others.map((o) => (
         <div key={o.id} className="space-y-1.5">
           <p className="text-muted-foreground">
@@ -189,17 +199,26 @@ export function DisputePanel({
           </p>
           <p className="text-foreground">{o.text}</p>
           <div className="flex flex-wrap gap-1">
-            <Button size="xs" variant="outline" onClick={() => onLink(fact.id, o.id, "supersedes")}>
+            <Button
+              size="xs"
+              variant="outline"
+              onClick={() => onLink(fact.id, o.id, "supersedes", fact.id)}
+            >
               Keep this one
             </Button>
-            <Button size="xs" variant="outline" onClick={() => onLink(o.id, fact.id, "supersedes")}>
+            {/* This row moves to Replaced, so focus goes to the one kept. */}
+            <Button
+              size="xs"
+              variant="outline"
+              onClick={() => onLink(o.id, fact.id, "supersedes", o.id)}
+            >
               Keep the other
             </Button>
             <Button
               size="xs"
               variant="ghost"
               title="They don't conflict: drop the dispute and keep both"
-              onClick={() => onUnlink(fact.id, o.id, "contradicts")}
+              onClick={() => onUnlink(fact.id, o.id, "contradicts", fact.id)}
             >
               Both stand
             </Button>

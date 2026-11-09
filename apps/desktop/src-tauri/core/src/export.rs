@@ -352,7 +352,7 @@ fn origin_of(f: &crate::knowledge::MemoryFact) -> Origin {
 /// fact is live. Only the newest disputing fact is named, to keep every line short.
 fn link_clauses(f: &crate::knowledge::MemoryFact, p: Provenance) -> Vec<String> {
     let mut out = Vec::new();
-    if let Some(replaced) = f.replaces {
+    if let Some(replaced) = f.replaces_decided_at {
         out.push(format!("replaces {}", fact_date(replaced)));
     }
     if let Some(other) = f.disputed_by.first() {
@@ -1669,7 +1669,8 @@ mod tests {
         // 2026-10-01 and 2026-10-12, 09:00 UTC.
         let (oct_1, oct_12) = (OCT_3 - 2 * 86_400, OCT_3 + 9 * 86_400);
         let linked = MemoryFact {
-            replaces: Some(oct_1),
+            replaces: vec![8],
+            replaces_decided_at: Some(oct_1),
             disputed_by: vec![crate::knowledge::LinkedFact {
                 id: 9,
                 text: "other".into(),
@@ -1748,7 +1749,8 @@ mod tests {
                     let text = format!("{prefix} {i} {}", "word ".repeat(30));
                     let mut f = fact(start + i as i64, text.trim(), false);
                     f.thread_id = 12_345;
-                    f.replaces = Some(OCT_3 - 86_400);
+                    f.replaces = vec![1];
+                    f.replaces_decided_at = Some(OCT_3 - 86_400);
                     f
                 })
                 .collect()

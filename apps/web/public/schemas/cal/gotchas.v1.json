@@ -154,7 +154,7 @@
         "flagged",
         "superseded"
       ],
-      "description": "Where a fact stands, in priority order: an active `supersedes` link points at it\n(`superseded`), an unresolved stale / wrong flag (`flagged`), an active `contradicts` link\non either side (`disputed`), else `current`."
+      "description": "Where a fact stands, in priority order: an active `supersedes` link points at it\n(`superseded`), an unresolved stale / wrong flag (`flagged`), an active `contradicts` link\non either side whose other fact is still in play, not hidden or superseded (`disputed`),\nelse `current`."
     },
     "LinkedFact": {
       "type": "object",
