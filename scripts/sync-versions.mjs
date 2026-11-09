@@ -11,6 +11,9 @@
 //   plugins/claude-code/.claude-plugin/plugin.json  Claude Code plugin "version"
 //   plugins/claude-code/mcp/package.json     the vendored MCP launcher's "version"
 //   .claude-plugin/marketplace.json          plugin source `ref` = the `v<version>` tag
+//   plugins/cursor/.cursor-plugin/plugin.json  Cursor plugin "version"
+//   plugins/cursor/mcp.json                  the `npx -y callimachus-mcp@<version>` pin
+//   .cursor-plugin/marketplace.json          "version" and "metadata.version"
 //
 // Run automatically by the `version-packages` script. Safe to run by hand, and
 // idempotent: running it twice with the same version changes nothing.
@@ -30,6 +33,9 @@ const serverPath = join(root, "server.json");
 const pluginPath = join(root, "plugins", "claude-code", ".claude-plugin", "plugin.json");
 const pluginLauncherPath = join(root, "plugins", "claude-code", "mcp", "package.json");
 const marketPath = join(root, ".claude-plugin", "marketplace.json");
+const cursorPluginPath = join(root, "plugins", "cursor", ".cursor-plugin", "plugin.json");
+const cursorMcpPath = join(root, "plugins", "cursor", "mcp.json");
+const cursorMarketPath = join(root, ".cursor-plugin", "marketplace.json");
 
 function fail(message) {
   console.error(`sync-versions: ${message}`);
@@ -114,6 +120,33 @@ const marketBefore = marketText.match(tagRef)?.[0].slice(9, -1);
 if (marketBefore === undefined) fail('no "ref": "v<version>" in .claude-plugin/marketplace.json');
 writeFileSync(marketPath, marketText.replace(tagRef, `"ref": "v${version}"`));
 
+// The Cursor plugin: its manifest and the root marketplace (whose top-level "version" is
+// what cursor.directory lists, since its parser reads only the root manifest) carry the
+// release, and its MCP server is the npm launcher pinned to it, so the server matches the
+// `cal` the plugin's hooks run. All in place, keeping the files' formatting.
+const cursorPluginText = readFileSync(cursorPluginPath, "utf8");
+const cursorPluginBefore = JSON.parse(cursorPluginText).version;
+if (!topLevelVersion.test(cursorPluginText))
+  fail('no top-level "version" in plugins/cursor/.cursor-plugin/plugin.json');
+writeFileSync(
+  cursorPluginPath,
+  cursorPluginText.replace(topLevelVersion, `  "version": "${version}"`),
+);
+
+const cursorMcpText = readFileSync(cursorMcpPath, "utf8");
+const npxPin = /"callimachus-mcp@[^"]*"/;
+const cursorMcpBefore = cursorMcpText.match(npxPin)?.[0].slice(17, -1);
+if (cursorMcpBefore === undefined)
+  fail('no "callimachus-mcp@<version>" in plugins/cursor/mcp.json');
+writeFileSync(cursorMcpPath, cursorMcpText.replace(npxPin, `"callimachus-mcp@${version}"`));
+
+const cursorMarketText = readFileSync(cursorMarketPath, "utf8");
+const anyVersion = /"version": "[^"]*"/g;
+const cursorMarketBefore = JSON.parse(cursorMarketText).version;
+if ((cursorMarketText.match(anyVersion) ?? []).length !== 2)
+  fail('expected "version" and "metadata.version" in .cursor-plugin/marketplace.json');
+writeFileSync(cursorMarketPath, cursorMarketText.replace(anyVersion, `"version": "${version}"`));
+
 console.log(`sync-versions: ${version}`);
 console.log(`  tauri.conf.json  ${confBefore} -> ${version}`);
 console.log(`  Cargo.toml       ${cargoBefore} -> ${version}`);
@@ -122,6 +155,9 @@ console.log(`  server.json      ${serverBefore} -> ${version}`);
 console.log(`  plugin.json      ${pluginBefore} -> ${version}`);
 console.log(`  mcp/package.json ${launcherBefore} -> ${version}`);
 console.log(`  marketplace.json v${marketBefore} -> v${version}`);
+console.log(`  cursor plugin.json ${cursorPluginBefore} -> ${version}`);
+console.log(`  cursor mcp.json  ${cursorMcpBefore} -> ${version}`);
+console.log(`  cursor marketplace.json ${cursorMarketBefore} -> ${version}`);
 
 /**
  * Sets the version of the local (path) package `name` in a Cargo.lock and

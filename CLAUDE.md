@@ -41,6 +41,9 @@ and PR checks; this file is what an agent needs on top of that.
 - `packages/callimachus-mcp/`: npm launcher; downloads the release binary, checks `SHA256SUMS`.
 - `plugins/claude-code/`: the Claude Code plugin (catalog: `.claude-plugin/marketplace.json`).
   While it is enabled the app installs only `cal` (`integration::claude_plugin_managed`).
+- `plugins/cursor/`: the Cursor plugin (catalog: `.cursor-plugin/marketplace.json`, which
+  cursor.directory's parser also reads). Its hooks and the app's Cursor hooks can both run;
+  `cal hook --for cursor` claims each conversation once (`claim_cursor_injection`).
 
 ## Commands
 
@@ -124,6 +127,10 @@ env -u CLAUDE_CONFIG_DIR -u CODEX_HOME HOME="$S/home" CALLIMACHUS_DB="$S/index.d
 - `integration::claude_plugin_mirrors_the_app_install`: the plugin's skill is a byte copy of
   that file, its `hooks/hooks.json` matches the base `HookSpec`s and the app's version, and
   `plugins/claude-code/mcp/` is a byte copy of `packages/callimachus-mcp`'s `bin/` and `lib/`.
+- `integration::cursor_plugin_mirrors_the_app_install`: plugins/cursor's hooks match the
+  `CURSOR_*` HookSpecs, its scripts probe `cal help` for a line ending ` or cursor` (keep that
+  in `USAGE`), and its version and `npx` pin are the release; `plugins/test/cursor-plugin.test.mjs`
+  also replays cursor.directory's parser over the repo.
 - `command_surface_tests` (lib.rs): `generate_handler!` matches the `invoke` calls in `api.ts`.
 - `telemetry::privacy_policy_names_every_event` (reads `legal.ts`),
   `sidecar_entry_points_never_touch_telemetry`, `every_source_is_on_the_telemetry_allowlist`, and

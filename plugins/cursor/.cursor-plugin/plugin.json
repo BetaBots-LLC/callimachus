@@ -1,0 +1,15 @@
+{
+  "name": "callimachus",
+  "displayName": "Callimachus",
+  "version": "0.12.0",
+  "description": "Recall your past AI coding sessions from a local index: the recall skill, the Callimachus MCP server, and hooks that inject each repo's memory when a Cursor chat starts and queue it for distillation when it ends.",
+  "author": {
+    "name": "Ari Shaller",
+    "url": "https://callimachus.app"
+  },
+  "homepage": "https://callimachus.app",
+  "repository": "https://github.com/BetaBots-LLC/callimachus",
+  "license": "AGPL-3.0-or-later",
+  "keywords": ["memory", "recall", "history", "search", "mcp", "agents"],
+  "logo": "assets/logo.svg"
+}

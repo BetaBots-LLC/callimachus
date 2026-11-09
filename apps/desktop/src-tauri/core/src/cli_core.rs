@@ -1263,6 +1263,15 @@ fn cmd_hook(args: &[String]) -> anyhow::Result<()> {
         max_chars: o.budget,
     };
     if let HookOutcome::Print(text) = hook_outcome(&req, &db::default_index_path())? {
+        // Claimed only once there is something to print, so a run that stays silent never
+        // keeps the other hook source from injecting.
+        if agent == HookAgent::Cursor {
+            let session = payload.as_ref().and_then(cursor_conversation_id);
+            let now = std::time::SystemTime::now();
+            if recall_dir().is_some_and(|dir| !claim_cursor_injection(&dir, session, now)) {
+                return Ok(());
+            }
+        }
         println!("{}", hook_stdout(agent, &text));
         if counts_as_session(source) {
             ledger::append(hook_ledger_kind(&text), &project);
@@ -3375,7 +3384,10 @@ fn is_uuid(s: &str) -> bool {
 /// `--for codex|gemini|copilot|cursor` is the same hook for Codex (SessionEnd: default
 /// timeout 1 s, max 3 s), Gemini CLI (SessionEnd is not awaited), GitHub Copilot (its
 /// camelCase payload names the session `sessionId`) and Cursor (fire and forget), queued as
-/// `<agent>:<session_id>`.
+/// `<agent>:<session_id>`. Cursor's also removes the conversation's injection marker
+/// ([`claim_cursor_injection`]). It needs no claim of its own when both the app's hook and the
+/// Cursor plugin's run: queuing a session again moves the same entry to the front
+/// (`knowledge::enqueue_distill_priority` replaces it), so the second run leaves one entry.
 fn cmd_session_end(args: &[String]) -> anyhow::Result<()> {
     let agent = HookAgent::from_opts(&parse(args)?)?;
     let Some(v) = read_hook_payload() else {
@@ -3388,6 +3400,11 @@ fn cmd_session_end(args: &[String]) -> anyhow::Result<()> {
     // index checks: the file lives outside the index and goes even when there is none.
     if let (Some(dir), Some(session)) = (recall_dir(), payload_session_id(&v)) {
         forget_error_recall(&dir, session);
+    }
+    if agent == HookAgent::Cursor {
+        if let (Some(dir), Some(session)) = (recall_dir(), cursor_conversation_id(&v)) {
+            forget_cursor_injection(&dir, session);
+        }
     }
     if payload_session_id(&v).is_none() || !db::default_index_path().exists() {
         return Ok(());
@@ -3808,7 +3825,7 @@ fn save_error_recall_state(
         return;
     };
     let _ = std::fs::create_dir_all(dir);
-    prune_error_recall_state(dir, now);
+    prune_hook_state(dir, now);
     let mut all = load_error_recall_state(path);
     all.extend(seen.iter().cloned());
     let Ok(json) = serde_json::to_string(&all) else {
@@ -3824,18 +3841,20 @@ fn save_error_recall_state(
     }
 }
 
-/// Remove `recall-error` state files (and temp files a killed run left) last written more
-/// than [`ERROR_RECALL_STATE_TTL`] before `now`.
-fn prune_error_recall_state(dir: &std::path::Path, now: std::time::SystemTime) {
+/// The per-session hook state files [`prune_hook_state`] ages out, by suffix. `recall-now`'s
+/// `<session>.json` is not one of them: its name carries no suffix to tell it from others.
+const PRUNED_HOOK_STATE_SUFFIXES: [&str; 2] = [ERROR_RECALL_SUFFIX, CURSOR_HOOK_SUFFIX];
+
+/// Remove `recall-error` state files (and temp files a killed run left) and Cursor injection
+/// markers last written more than [`ERROR_RECALL_STATE_TTL`] before `now`.
+fn prune_hook_state(dir: &std::path::Path, now: std::time::SystemTime) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for e in entries.flatten() {
-        if !e
-            .file_name()
-            .to_string_lossy()
-            .contains(ERROR_RECALL_SUFFIX)
-        {
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        if !PRUNED_HOOK_STATE_SUFFIXES.iter().any(|s| name.contains(s)) {
             continue;
         }
         let old = e
@@ -3855,6 +3874,62 @@ fn forget_error_recall(dir: &std::path::Path, session: &str) {
     if let Some(p) = error_recall_path(dir, session) {
         let _ = std::fs::remove_file(p);
     }
+}
+
+/// Suffix of the marker `cal hook --for cursor` claims for a conversation, beside the other
+/// per-session hook state.
+const CURSOR_HOOK_SUFFIX: &str = ".cursor-hook";
+
+/// The conversation's injection marker in `dir`. None for an id with no file-safe characters.
+fn cursor_hook_marker(dir: &std::path::Path, session: &str) -> Option<std::path::PathBuf> {
+    let safe = safe_session_name(session);
+    (!safe.is_empty()).then(|| dir.join(format!("{safe}{CURSOR_HOOK_SUFFIX}")))
+}
+
+/// Whether this run may inject memory into Cursor conversation `session`: false only when
+/// another run already claimed it. Cursor runs every matching hook from every source (the
+/// app's `~/.cursor/hooks.json` entry and the Callimachus Cursor plugin's, cursor.com/docs/hooks
+/// "Configuration"), so a user with both would get the memory twice. The claim is an atomic
+/// `create_new` of a marker file, so of two concurrent runs exactly one wins and the other
+/// prints nothing. Without an id there is nothing to key on, and an I/O error other than
+/// "already exists" also lets the run print: one injection too many beats none for the user
+/// who has only one of the two hooks. Old markers go with the 7-day [`prune_hook_state`], and
+/// `cal session-end --for cursor` removes the conversation's own.
+fn claim_cursor_injection(
+    dir: &std::path::Path,
+    session: Option<&str>,
+    now: std::time::SystemTime,
+) -> bool {
+    let Some(marker) = session.and_then(|s| cursor_hook_marker(dir, s)) else {
+        return true;
+    };
+    let _ = std::fs::create_dir_all(dir);
+    prune_hook_state(dir, now);
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker)
+    {
+        Ok(_) => true,
+        Err(e) => e.kind() != std::io::ErrorKind::AlreadyExists,
+    }
+}
+
+/// Drop a finished Cursor conversation's injection marker (`cal session-end --for cursor`).
+fn forget_cursor_injection(dir: &std::path::Path, session: &str) {
+    if let Some(p) = cursor_hook_marker(dir, session) {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+/// The Cursor conversation a hook payload names: `session_id` ("same as `conversation_id`",
+/// cursor.com/docs/hooks, sessionStart), else the common `conversation_id`.
+fn cursor_conversation_id(v: &serde_json::Value) -> Option<&str> {
+    payload_session_id(v).or_else(|| {
+        v.get("conversation_id")
+            .and_then(|x| x.as_str())
+            .filter(|s| !s.is_empty())
+    })
 }
 
 /// `cal issues [project] [-n N] [--json]`: recurring errors across sessions (last 180 days),
@@ -5631,6 +5706,70 @@ mod tests {
             q.contains("\"copilot:cop-1\"") && q.contains("\"cursor:cur-1\""),
             "{q}"
         );
+        // The app's Cursor hook and the Cursor plugin's both run at sessionEnd: the second
+        // run replaces the entry instead of queuing the conversation twice.
+        session_end(
+            &conn,
+            &serde_json::json!({ "session_id": "cur-1", "reason": "user_close" }),
+            105,
+            HookAgent::Cursor,
+        )
+        .unwrap();
+        let q = queue(&conn).unwrap();
+        assert_eq!(q.matches("\"cursor:cur-1\"").count(), 1, "{q}");
+    }
+
+    /// `cal hook --for cursor` injects at most once per conversation when both the app's hook
+    /// and the Cursor plugin's run: the first claim wins (also under a race), a second run in
+    /// that conversation is silent, another conversation and a payload without an id still
+    /// inject, `session-end` frees the claim, and a week-old marker is pruned on a later claim.
+    #[test]
+    fn cursor_hook_injects_once_per_conversation() {
+        let dir = temp_dir("cursor_hook_claim").join(".callimachus/recall");
+        let now = std::time::SystemTime::now();
+        assert!(claim_cursor_injection(&dir, Some("conv-1"), now));
+        assert!(!claim_cursor_injection(&dir, Some("conv-1"), now));
+        assert!(claim_cursor_injection(&dir, Some("conv-2"), now));
+        assert!(claim_cursor_injection(&dir, None, now));
+        assert!(claim_cursor_injection(&dir, None, now));
+        // An id with no file-safe characters has no marker to claim.
+        assert!(claim_cursor_injection(&dir, Some("///"), now));
+        assert!(claim_cursor_injection(&dir, Some("///"), now));
+        assert!(dir.join("conv-1.cursor-hook").is_file());
+
+        let race = |id: &'static str| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let dir = dir.clone();
+                    std::thread::spawn(move || claim_cursor_injection(&dir, Some(id), now))
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .filter(|won| *won)
+                .count()
+        };
+        assert_eq!(race("conv-race"), 1, "exactly one concurrent run injects");
+
+        // Cursor names the conversation `session_id` at sessionStart; `conversation_id` too.
+        let payload = serde_json::json!({ "conversation_id": "conv-3", "cursor_version": "2" });
+        assert_eq!(cursor_conversation_id(&payload), Some("conv-3"));
+        let payload = serde_json::json!({ "session_id": "s", "conversation_id": "c" });
+        assert_eq!(cursor_conversation_id(&payload), Some("s"));
+
+        forget_cursor_injection(&dir, "conv-1");
+        assert!(!dir.join("conv-1.cursor-hook").exists());
+        assert!(claim_cursor_injection(&dir, Some("conv-1"), now));
+
+        let later = now + ERROR_RECALL_STATE_TTL + std::time::Duration::from_secs(60);
+        assert!(claim_cursor_injection(&dir, Some("conv-4"), later));
+        assert!(
+            !dir.join("conv-2.cursor-hook").exists(),
+            "a week-old marker is pruned"
+        );
+        assert!(dir.join("conv-4.cursor-hook").is_file());
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap().parent().unwrap());
     }
 
     /// `--for` picks the protocol; an unknown agent is an error (a hook swallows it, so

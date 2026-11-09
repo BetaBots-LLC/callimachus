@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "sessionStart": [
+      {
+        "command": "./scripts/hook.sh",
+        "timeout": 10
+      }
+    ],
+    "sessionEnd": [
+      {
+        "command": "./scripts/session-end.sh",
+        "timeout": 5
+      }
+    ]
+  }
+}
