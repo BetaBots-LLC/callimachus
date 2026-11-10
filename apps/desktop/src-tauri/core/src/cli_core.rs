@@ -2451,30 +2451,67 @@ fn cmd_check(args: &[String]) -> anyhow::Result<()> {
     }
     let proposal = o.positional.join(" ");
     let embedder = cli_embedder();
-    let Some(qv) = embed::embed_query(&embedder, &proposal)? else {
-        return Ok(());
-    };
-    let conn = open_db()?;
-    let hits = knowledge::check_contradiction(&conn, &qv, o.project.as_deref(), 8)?;
-    if o.json {
-        println!("{}", o.json(&hits)?);
+    let qv = embed::embed_query(&embedder, &proposal)?;
+    if o.json && qv.is_none() {
+        // Bare `--json` without a vector has always printed nothing, before even opening
+        // the index; the fallback leads are for people.
         return Ok(());
     }
-    print!("{}", check_text(&hits, &o));
+    let conn = open_db()?;
+    let outcome =
+        knowledge::check_or_fallback(&conn, &proposal, qv.as_deref(), o.project.as_deref(), 8)?;
+    print!("{}", check_output(outcome, qv.is_some(), &o)?);
     Ok(())
+}
+
+/// What `cal check` prints for `outcome`; `vector` says whether the proposal was embedded.
+/// `--json` stays what it always was: nothing without a vector, whatever the fallback found
+/// (a thin scope's leads must not turn "model missing" into `[]`, which reads as "no
+/// conflict"), else the hits, `[]` for none. Text gets the leads.
+fn check_output(
+    outcome: knowledge::RecallOutcome,
+    vector: bool,
+    o: &Opts,
+) -> anyhow::Result<String> {
+    use knowledge::RecallOutcome::{Hits, NoModel, Thin};
+    if o.json {
+        if !vector {
+            return Ok(String::new());
+        }
+        let hits = match outcome {
+            Hits { hits } => hits,
+            NoModel { .. } | Thin { .. } => Vec::new(),
+        };
+        return Ok(format!("{}\n", o.json(&hits)?));
+    }
+    Ok(match outcome {
+        Hits { hits } => check_text(&hits, o),
+        NoModel { sessions } => no_model_text(&sessions, o),
+        Thin {
+            coverage, sessions, ..
+        } => thin_text(knowledge::NO_DECISION_YET, coverage, &sessions, o),
+    })
 }
 
 /// `cal check`'s listing: each prior decision with its id, status, date and thread, live ones
 /// first (as `knowledge::check_contradiction` orders them), a replaced one naming what
 /// replaced it. The status matters most here: the closest match to "go back to X" is X.
 fn check_text(hits: &[knowledge::RecallHit], o: &Opts) -> String {
+    use knowledge::NO_DECISION_YET;
     if hits.is_empty() {
-        return "No settled decisions conflict with that.\n".into();
+        return format!("{NO_DECISION_YET} No settled decision conflicts with that.\n");
     }
-    let mut out = String::from(
-        "Prior decisions on this topic (the newer wins; replaced ones are history; reconcile \
-         before overriding):\n",
-    );
+    let mut out = if knowledge::guard_no_decision(hits) {
+        format!(
+            "{NO_DECISION_YET} Related decisions, for context only (none restates or reverses \
+             it):\n"
+        )
+    } else {
+        String::from(
+            "Prior decisions on this topic (the newer wins; replaced ones are history; \
+             reconcile before overriding):\n",
+        )
+    };
     for h in hits {
         // The fact id is what `cal remember --replaces` takes; the thread id is not one.
         out.push_str(&format!(
@@ -3160,34 +3197,108 @@ fn cmd_recall(args: &[String], kind: &str) -> anyhow::Result<()> {
     }
     let conn = open_db()?;
     let embedder = cli_embedder();
-    let Some(qv) = embed::embed_query(&embedder, &query)? else {
-        // No vector (the model isn't on this machine; cli_embedder said so on stderr). The
-        // versioned listing says so in `notice`, so a script can tell it from no match; bare
-        // `--json` prints nothing here, as it always has.
-        if o.json_version.is_some() {
-            println!("{}", o.json(&recall_without_model())?);
-        }
-        return Ok(());
-    };
+    let qv = embed::embed_query(&embedder, &query)?;
     let limit = o.limit.unwrap_or(20) as usize;
-    let hits = knowledge::recall(
+    let outcome = knowledge::recall_or_fallback(
         &conn,
-        &qv,
+        &query,
+        qv.as_deref(),
         kind,
         o.project.as_deref(),
         limit,
         o.include_superseded,
     )?;
-    if o.json {
-        println!("{}", o.json_list(&hits)?);
-        return Ok(());
-    }
-    if hits.is_empty() {
+    let out = recall_output(outcome, qv.is_some(), &o)?;
+    if out.is_empty() && !o.json {
         eprintln!("nothing recalled — distill some threads first (`cal distill <id>`)");
         return Ok(());
     }
-    print!("{}", recall_text(&hits, &o));
+    print!("{out}");
     Ok(())
+}
+
+/// What `cal decisions` / `gotchas` print for `outcome` (empty: nothing recalled); `vector`
+/// says whether the query was embedded. JSON stays what it always was. Without a vector
+/// (the model isn't on this machine) bare `--json` prints nothing and the versioned listing
+/// says why in `notice`, so a script can tell it from no match, whatever the fallback found:
+/// a thin scope's leads must not turn that into an empty list. With one, the hits (a thin
+/// scope's none included). Text gets the leads: the closest sessions by keyword without the
+/// model, an undistilled scope's coverage.
+fn recall_output(
+    outcome: knowledge::RecallOutcome,
+    vector: bool,
+    o: &Opts,
+) -> anyhow::Result<String> {
+    use knowledge::RecallOutcome::{Hits, NoModel, Thin};
+    if o.json {
+        if !vector {
+            return Ok(match o.json_version {
+                Some(_) => format!("{}\n", o.json(&recall_without_model())?),
+                None => String::new(),
+            });
+        }
+        let hits = match outcome {
+            Hits { hits } => hits,
+            NoModel { .. } | Thin { .. } => Vec::new(),
+        };
+        return Ok(format!("{}\n", o.json_list(&hits)?));
+    }
+    Ok(match outcome {
+        Hits { hits } => recall_text(&hits, o),
+        NoModel { sessions } => no_model_text(&sessions, o),
+        Thin {
+            coverage, sessions, ..
+        } => thin_text("Nothing recalled:", coverage, &sessions, o),
+    })
+}
+
+/// `cal decisions` / `gotchas` / `check` without the embedding model: the closest sessions by
+/// keyword under a one-line note, so the answer is leads rather than nothing.
+fn no_model_text(sessions: &[knowledge::ClosestSession], o: &Opts) -> String {
+    if sessions.is_empty() {
+        return "No embedding model on this machine to recall by meaning, and no session \
+                matches by keyword.\n"
+            .into();
+    }
+    let mut out = String::from(
+        "No embedding model on this machine (run `cal embed`), so these are the closest past \
+         sessions by keyword:\n",
+    );
+    out.push_str(&sessions_text(sessions, o));
+    out
+}
+
+/// No fact in a scope that was never distilled: `lead`, its coverage and the closest sessions.
+fn thin_text(
+    lead: &str,
+    coverage: knowledge::DistillCoverage,
+    sessions: &[knowledge::ClosestSession],
+    o: &Opts,
+) -> String {
+    let mut out = format!(
+        "{lead} {} of {} threads in scope are distilled, and none holds a decision or gotcha yet \
+         (`cal distill <id>`).\n",
+        coverage.distilled_threads, coverage.threads
+    );
+    if !sessions.is_empty() {
+        out.push_str("Closest past sessions:\n");
+        out.push_str(&sessions_text(sessions, o));
+    }
+    out
+}
+
+/// Fallback sessions as `cal` lists them: title and thread id, then the best message.
+fn sessions_text(sessions: &[knowledge::ClosestSession], o: &Opts) -> String {
+    let mut out = String::new();
+    for s in sessions {
+        out.push_str(&format!(
+            "• {} · thread {}\n    {}\n",
+            o.shown(s.title.as_deref().unwrap_or("untitled")),
+            s.id,
+            o.shown(&s.snippet)
+        ));
+    }
+    out
 }
 
 /// `cal decisions` / `cal gotchas` text: each hit with its fact id (what `cal remember
@@ -3777,9 +3888,13 @@ fn external_id_under(transcript_path: &str, base: &std::path::Path) -> Option<St
     Some(crate::indexer::claude::external_id_for(base, path))
 }
 
-/// Cosine floor for an UNPROMPTED "you may have solved this before" note. bge-small scores
-/// cluster high, so this sits well above the on-demand guard's 0.55.
-const PROACTIVE_FLOOR: f32 = 0.68;
+/// Cosine floor for an UNPROMPTED "you may have solved this before" note: a close match only
+/// (`knowledge::GUARD_CLOSE`), where the on-demand guard also shows related sessions from
+/// `knowledge::GUARD_RELATED`. Measured by `eval::tests::real_guard_calibration` on the
+/// author's index: of 60 real first prompts submitted in another project (past the keyword
+/// gate), the old 0.68 floor injected a note for 22; this one for 1 (0.72 would for 4). In
+/// their own project with their own session left out, 28 of 68 got one before, 4 now.
+pub(crate) const PROACTIVE_FLOOR: f32 = knowledge::GUARD_CLOSE;
 
 /// Most notes per prompt, and most prompts per session that get one.
 const PROACTIVE_MAX_HITS: usize = 2;
@@ -3872,7 +3987,7 @@ fn recall_line(h: &knowledge::PriorWork) -> String {
 
 /// Whether a submitted prompt is worth a recall lookup: not a slash command, and long
 /// enough (5+ words) to say what the task is.
-fn prompt_worth_recalling(prompt: &str) -> bool {
+pub(crate) fn prompt_worth_recalling(prompt: &str) -> bool {
     !prompt.starts_with('/')
         && prompt.chars().count() >= 12
         && prompt.split_whitespace().count() >= 5
@@ -3882,7 +3997,7 @@ fn prompt_worth_recalling(prompt: &str) -> bool {
 /// the BEST match was already shown this session, show nothing rather than falling through
 /// to weaker matches (repeating a prompt used to surface progressively less related
 /// threads). Otherwise keep unseen hits above the floor, at most PROACTIVE_MAX_HITS.
-fn select_recall_hits(
+pub(crate) fn select_recall_hits(
     hits: Vec<knowledge::PriorWork>,
     seen: &std::collections::HashSet<i64>,
 ) -> Vec<knowledge::PriorWork> {
@@ -4630,6 +4745,105 @@ mod tests {
         }
     }
 
+    /// `cal decisions` / `gotchas` / `check` without the model print the keyword sessions
+    /// under one line saying why (they printed nothing), and an undistilled scope its
+    /// coverage; stored text is redacted like every other listing.
+    #[test]
+    fn fallback_text_lists_sessions_under_one_line() {
+        let s = |id, title: &str, snippet: &str| knowledge::ClosestSession {
+            id,
+            title: Some(title.into()),
+            snippet: snippet.into(),
+        };
+        let o = Opts::default();
+        let out = no_model_text(
+            &[
+                s(4, "postgres plan", "user: move to postgres"),
+                s(9, "wal", "assistant: tune the checkpoint"),
+            ],
+            &o,
+        );
+        assert_eq!(
+            out,
+            "No embedding model on this machine (run `cal embed`), so these are the closest past \
+             sessions by keyword:\n\
+             • postgres plan · thread 4\n    user: move to postgres\n\
+             • wal · thread 9\n    assistant: tune the checkpoint\n"
+        );
+        assert!(no_model_text(&[], &o).contains("no session matches by keyword"));
+        let cov = knowledge::DistillCoverage {
+            distilled_threads: 1,
+            threads: 5,
+        };
+        let out = thin_text(
+            knowledge::NO_DECISION_YET,
+            cov,
+            &[s(4, "postgres plan", "user: move to postgres")],
+            &o,
+        );
+        assert!(
+            out.starts_with(
+                "No decision on this yet. 1 of 5 threads in scope are distilled, and none holds \
+                 a decision or gotcha yet (`cal distill <id>`).\nClosest past sessions:\n• \
+                 postgres plan · thread 4\n"
+            ),
+            "{out}"
+        );
+    }
+
+    /// The fallback leads are for people: `--json` prints what it always printed. Without a
+    /// vector that is nothing for bare `--json` (and the no-model notice under
+    /// `--json-version 1` for recall) even when the scope is thin, the fresh-install state
+    /// where the fallback returns `Thin` rather than `NoModel`; it used to become `[]`, which
+    /// reads as "no match" or "no conflict".
+    #[test]
+    fn fallback_leads_leave_json_as_it_was() {
+        let o = |args: &[&str]| parse_with(&argv(args), None).unwrap();
+        let thin = || knowledge::RecallOutcome::Thin {
+            coverage: knowledge::DistillCoverage {
+                distilled_threads: 0,
+                threads: 3,
+            },
+            sessions: vec![knowledge::ClosestSession {
+                id: 4,
+                title: Some("postgres plan".into()),
+                snippet: "user: move to postgres".into(),
+            }],
+            distill_on: false,
+        };
+        let no_model = || knowledge::RecallOutcome::NoModel {
+            sessions: Vec::new(),
+        };
+        let none = || knowledge::RecallOutcome::Hits { hits: Vec::new() };
+        let (json, v1, text) = (o(&["--json"]), o(&["--json-version", "1"]), o(&[]));
+        let notice = format!("{}\n", v1.json(&recall_without_model()).unwrap());
+        assert!(notice.contains("\"notice\""), "{notice}");
+        let empty_v1 = format!("{}\n", v1.json_list::<knowledge::RecallHit>(&[]).unwrap());
+
+        // Without a vector, whichever fallback ran.
+        for outcome in [thin, no_model] {
+            assert_eq!(recall_output(outcome(), false, &json).unwrap(), "");
+            assert_eq!(recall_output(outcome(), false, &v1).unwrap(), notice);
+            assert_eq!(check_output(outcome(), false, &json).unwrap(), "");
+        }
+        // With one, a thin scope is the empty answer it was.
+        assert_eq!(recall_output(thin(), true, &json).unwrap(), "[]\n");
+        assert_eq!(recall_output(thin(), true, &v1).unwrap(), empty_v1);
+        assert_eq!(check_output(thin(), true, &json).unwrap(), "[]\n");
+        assert_eq!(check_output(none(), true, &json).unwrap(), "[]\n");
+        assert_eq!(recall_output(none(), true, &json).unwrap(), "[]\n");
+
+        // People get the leads, and an empty recall stays empty (`cal` says why on stderr).
+        let out = recall_output(thin(), false, &text).unwrap();
+        assert!(out.starts_with("Nothing recalled: 0 of 3 threads"), "{out}");
+        assert!(out.contains("postgres plan · thread 4"), "{out}");
+        let out = check_output(thin(), false, &text).unwrap();
+        assert!(out.starts_with(knowledge::NO_DECISION_YET), "{out}");
+        let out = check_output(no_model(), false, &text).unwrap();
+        assert!(out.contains("no session matches by keyword"), "{out}");
+        assert_eq!(recall_output(none(), true, &text).unwrap(), "");
+    }
+
     /// `cal check`: each hit with its status, date and thread; a replaced one names what
     /// replaced it, after the live one.
     #[test]
@@ -4644,6 +4858,7 @@ mod tests {
             extractor: "llm".into(),
             decided_at: at,
             support: 1,
+            match_strength: Some(knowledge::GuardMatch::Close),
             ..Default::default()
         };
         let current = knowledge::RecallHit {
@@ -4674,9 +4889,25 @@ mod tests {
             "{out}"
         );
         assert!(out.contains("because: fast"), "{out}");
+        assert!(out.starts_with("Prior decisions on this topic"), "{out}");
         assert_eq!(
             check_text(&[], &Opts::default()),
-            "No settled decisions conflict with that.\n"
+            "No decision on this yet. No settled decision conflicts with that.\n"
+        );
+        // Only a related hit: nothing was decided on it, and the answer says so first.
+        let related = knowledge::RecallHit {
+            similarity: 0.72,
+            match_strength: Some(knowledge::GuardMatch::Related),
+            ..hit(3, "refresh tokens live for 30 days", OCT_1, 13)
+        };
+        let out = check_text(&[related], &Opts::default());
+        assert!(
+            out.starts_with("No decision on this yet. Related decisions, for context only"),
+            "{out}"
+        );
+        assert!(
+            out.contains("• [current] refresh tokens live for 30 days  (fact 3, 2026-10-01, thread 13, 72% match)"),
+            "{out}"
         );
 
         // `cal decisions` / `cal gotchas` print the same ids.
@@ -6260,6 +6491,9 @@ mod tests {
         );
         let weak = select_recall_hits(vec![prior(1, 0.66), prior(2, 0.6)], &none);
         assert!(weak.is_empty(), "below the proactive floor");
+        // A related session (the on-demand guard would list it) is no reason to interrupt.
+        let related = (knowledge::GUARD_RELATED + knowledge::GUARD_CLOSE) / 2.0;
+        assert!(select_recall_hits(vec![prior(1, related)], &none).is_empty());
         // The best match was already shown: stay quiet instead of offering weaker ones.
         let seen: std::collections::HashSet<i64> = [1].into_iter().collect();
         assert!(select_recall_hits(vec![prior(1, 0.9), prior(2, 0.85)], &seen).is_empty());

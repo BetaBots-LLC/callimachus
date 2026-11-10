@@ -31,11 +31,11 @@ pub struct SearchFilters {
 }
 
 /// How a project filter matches a thread's canonical project
-/// (`COALESCE(project_key, project_path)`).
+/// (`COALESCE(project_key, project_path)`); see [`crate::scope::ProjectScope`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ProjectMatch {
-    /// A case-sensitive substring: `cal -p app` and MCP's `project` take a repo name or a
-    /// path fragment.
+    /// A substring, as `LIKE` matches (ASCII case-insensitive; `_` and `%` literal): `cal -p
+    /// app` and MCP's `project` take a repo name or a path fragment.
     #[default]
     Substring,
     /// Exactly this key. The app's chips and Project page hold the key `list_projects`
@@ -56,26 +56,19 @@ pub(crate) fn project_condition(
     project_condition_at(t, mode, args.len())
 }
 
-/// The bind value for [`project_condition_at`]: the key itself, or `%key%` for a substring.
+/// The bind value for [`project_condition_at`]: the key itself, or the escaped `%key%` for a
+/// substring ([`crate::scope::ProjectScope::value`]).
 pub(crate) fn project_value(project: &str, mode: ProjectMatch) -> Box<dyn ToSql> {
-    match mode {
-        ProjectMatch::Substring => Box::new(format!("%{project}%")),
-        ProjectMatch::Exact => Box::new(project.to_string()),
-    }
+    let scope = crate::scope::ProjectScope::with_match(project, mode);
+    Box::new(scope.value().unwrap_or_default())
 }
 
-/// The project condition on `{t}` with its value bound at `?{ph}`. Exact is spelled as an
-/// OR on the columns, not `COALESCE(..) =`, so idx_threads_project_key / idx_threads_project
-/// stay usable when a plan wants them; the two forms select the same rows.
+/// The project condition on `{t}` with its value bound at `?{ph}`
+/// ([`crate::scope::ProjectScope::condition_at`]).
 pub(crate) fn project_condition_at(t: &str, mode: ProjectMatch, ph: usize) -> String {
-    match mode {
-        ProjectMatch::Substring => {
-            format!("COALESCE({t}.project_key, {t}.project_path) LIKE ?{ph}")
-        }
-        ProjectMatch::Exact => format!(
-            "({t}.project_key = ?{ph} OR ({t}.project_key IS NULL AND {t}.project_path = ?{ph}))"
-        ),
-    }
+    crate::scope::ProjectScope::with_match("", mode)
+        .condition_at(t, ph)
+        .unwrap_or_default()
 }
 
 /// One message-level search hit.
@@ -2155,6 +2148,11 @@ mod tests {
         let (recent, found) = run("/r/app", ProjectMatch::Substring);
         assert_eq!(recent, ["app", "web"]);
         assert_eq!(found, ["app", "web"]);
+        // A substring's `_` is literal too: it used to match `/r/app` and `/r/apX`.
+        assert_eq!(
+            run("/r/ap_", ProjectMatch::Substring).0,
+            Vec::<String>::new()
+        );
     }
 
     /// Heatmap days are local calendar days, each with the unix range Search opens for it.

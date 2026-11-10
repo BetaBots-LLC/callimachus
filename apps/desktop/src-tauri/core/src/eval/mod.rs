@@ -8,8 +8,11 @@
 //! decision restated in different words, a same-topic but different decision, and an unrelated
 //! one. Each session carries a hand-written distill output with its links, stored through
 //! `knowledge::store_distilled`: the eval measures retrieval and rendering, not the LLM.
+//! `memory_truth_v2.json` extends it with a cross-project slice: proposals decided in one
+//! project, checked in another that never decided them, where check_decision must answer
+//! "no decision" (`knowledge::guard_no_decision`).
 //!
-//! Three tests:
+//! Four tests:
 //! - `corpus_builds_with_the_planted_links` (default CI, no model): the corpus parses, every
 //!   reference resolves, every planted supersede and reaffirm is stored, and the HOOK block
 //!   leaves the superseded facts out.
@@ -19,6 +22,9 @@
 //! - `calibrate_guard_close` (`#[ignore]`): the cosine distributions of the labelled
 //!   proposal/fact pairs and the threshold that best separates a restatement from a
 //!   same-topic decision, for `knowledge::GUARD_CLOSE`.
+//! - `real_guard_calibration` (`#[ignore]`, needs `CALLIMACHUS_GROUNDING_DB`, a clone of a
+//!   real index): cross-project negatives and `fact_links` positives for
+//!   `knowledge::GUARD_RELATED`, and what `recall-now` would inject on unrelated prompts.
 //!
 //! The model is read from the usual cache roots (`FASTEMBED_CACHE_DIR` first); without it the
 //! ignored tests print why and pass. They download it only with `CALLIMACHUS_EVAL_DOWNLOAD=1`.
@@ -37,9 +43,11 @@ use crate::knowledge::truth::{distill_memory_context, FactStatus};
 use crate::knowledge::{self, store_distilled, RecallHit};
 use crate::search::{self, SearchFilters};
 
-/// The corpus. Bump to a new file (v2) rather than editing this one, so numbers quoted in
-/// comments (GUARD_CLOSE, the floors below) stay tied to the text they were measured on.
+/// The corpus. Bump to a new file (v3) rather than editing these, so numbers quoted in
+/// comments (GUARD_CLOSE, GUARD_RELATED, the floors below) stay tied to the text they were
+/// measured on. v2 adds a slice to v1 and changes nothing in it, so v1's numbers still hold.
 const CORPUS_V1: &str = include_str!("fixtures/memory_truth_v1.json");
+const CORPUS_V2: &str = include_str!("fixtures/memory_truth_v2.json");
 
 #[derive(Debug, Deserialize)]
 struct Corpus {
@@ -48,6 +56,26 @@ struct Corpus {
     search: Vec<SearchCase>,
     guard: Vec<GuardCase>,
     pairs: Vec<Pair>,
+    /// v2: proposals checked in a project that never decided them.
+    #[serde(default)]
+    cross_project: Vec<CrossProject>,
+}
+
+/// v2's file: the slices it adds to the version it extends.
+#[derive(Debug, Deserialize)]
+struct CorpusExtension {
+    version: String,
+    extends: String,
+    cross_project: Vec<CrossProject>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CrossProject {
+    /// Where the proposal is checked: no decision there restates or reverses it.
+    project: String,
+    proposal: String,
+    /// The project that did decide it (documentation, and a check that it differs).
+    decided_in: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -123,7 +151,12 @@ struct Pair {
 }
 
 fn corpus() -> Corpus {
-    serde_json::from_str(CORPUS_V1).expect("the eval corpus parses")
+    let mut c: Corpus = serde_json::from_str(CORPUS_V1).expect("the eval corpus parses");
+    let ext: CorpusExtension = serde_json::from_str(CORPUS_V2).expect("the v2 extension parses");
+    assert_eq!(ext.extends, c.version, "v2 extends v1");
+    c.version = ext.version;
+    c.cross_project = ext.cross_project;
+    c
 }
 
 /// Unix seconds of 09:00 UTC on `date` (`YYYY-MM-DD`).
@@ -539,6 +572,10 @@ struct Report {
     current_first: f64,
     superseded_labelled: f64,
     hook_leaks: usize,
+    /// In-project guard cases answered "no decision" (each expects one).
+    guard_no_decision: usize,
+    /// Cross-project cases answered "no decision", as a rate.
+    cross_no_decision: f64,
 }
 
 fn run_eval(embedder: &Embedder) -> Report {
@@ -649,7 +686,14 @@ fn run_eval(embedder: &Embedder) -> Report {
     // check_decision: the MCP tool's path (embed the proposal, then the guard).
     let mut guard_lat: Vec<Duration> = Vec::new();
     let (mut cf, mut top1, mut sup_ok, mut sup_n) = (0usize, 0usize, 0usize, 0usize);
+    let mut guard_no_decision = 0usize;
     let mut lines: Vec<String> = Vec::new();
+    let fact_id = |id: i64| {
+        b.facts
+            .iter()
+            .find(|(_, v)| **v == id)
+            .map_or("?", |(k, _)| k.as_str())
+    };
     for g in &c.guard {
         let key = &b.project_keys[&g.project];
         let t = Instant::now();
@@ -657,6 +701,7 @@ fn run_eval(embedder: &Embedder) -> Report {
         // CHECK_DECISION_K in mcp_server.rs.
         let hits = knowledge::check_contradiction(&conn, &qv, Some(key), 8).unwrap();
         guard_lat.push(t.elapsed());
+        guard_no_decision += usize::from(knowledge::guard_no_decision(&hits));
         let o = grade_guard(g, &b, &hits);
         cf += usize::from(o.current_first);
         top1 += usize::from(o.top1_current);
@@ -665,11 +710,7 @@ fn run_eval(embedder: &Embedder) -> Report {
         let returned: Vec<String> = hits
             .iter()
             .map(|h| {
-                let id = b
-                    .facts
-                    .iter()
-                    .find(|(_, v)| **v == h.id)
-                    .map_or("?", |(k, _)| k.as_str());
+                let id = fact_id(h.id);
                 let close = match h.match_strength {
                     Some(knowledge::GuardMatch::Close) => "close",
                     _ => "related",
@@ -694,8 +735,47 @@ fn run_eval(embedder: &Embedder) -> Report {
     md.push_str(&format!(
         "\n### check_decision\n\n- current-first rate: {cf}/{n_guard} ({current_first:.2})\n\
          - top hit is the expected current decision: {top1}/{n_guard}\n\
-         - superseded hits labelled with the right replacement: {sup_ok}/{sup_n}\n\nPer proposal (fact, status, similarity, match):\n{}\n",
+         - superseded hits labelled with the right replacement: {sup_ok}/{sup_n}\n\
+         - answered \"no decision\" although one was made: {guard_no_decision}/{n_guard}\n\nPer proposal (fact, status, similarity, match):\n{}\n",
         lines.join("\n")
+    ));
+
+    // The cross-project slice: decided elsewhere, so check_decision here must say "no
+    // decision"; a related hit may stay as context, a close one would be a false "decided".
+    let (mut cross_ok, mut cross_related) = (0usize, 0usize);
+    let mut cross_lines: Vec<String> = Vec::new();
+    for x in &c.cross_project {
+        let key = &b.project_keys[&x.project];
+        let qv = embed::embed_query(embedder, &x.proposal).unwrap().unwrap();
+        let candidates = knowledge::guard_candidates(&conn, &qv, Some(key), 8).unwrap();
+        let hits = knowledge::check_contradiction(&conn, &qv, Some(key), 8).unwrap();
+        let no_decision = knowledge::guard_no_decision(&hits);
+        cross_ok += usize::from(no_decision);
+        cross_related += hits.len();
+        let shown: Vec<String> = hits
+            .iter()
+            .map(|h| format!("{} {:.3}", fact_id(h.id), h.similarity))
+            .collect();
+        cross_lines.push(format!(
+            "- \"{}\" in {} (decided in {}): {}; best candidate {}, {} at or over the old 0.55 floor; shown [{}]",
+            x.proposal,
+            x.project,
+            x.decided_in,
+            if no_decision { "no decision" } else { "CLOSE HIT" },
+            candidates
+                .first()
+                .map_or("none".into(), |h| format!("{} {:.3}", fact_id(h.id), h.similarity)),
+            candidates.iter().filter(|h| h.similarity >= 0.55).count(),
+            shown.join(", ")
+        ));
+    }
+    let n_cross = c.cross_project.len();
+    let cross_no_decision = cross_ok as f64 / n_cross.max(1) as f64;
+    md.push_str(&format!(
+        "\n### check_decision, cross-project (decided in another project)\n\n\
+         - answered \"no decision\": {cross_ok}/{n_cross}\n\
+         - related hits shown: {cross_related} over {n_cross} proposals\n\n{}\n",
+        cross_lines.join("\n")
     ));
 
     // HOOK block: no superseded fact, every planted current decision of the project.
@@ -744,6 +824,8 @@ fn run_eval(embedder: &Embedder) -> Report {
         current_first,
         superseded_labelled,
         hook_leaks,
+        guard_no_decision,
+        cross_no_decision,
     }
 }
 
@@ -871,6 +953,17 @@ mod tests {
         }
         for label in ["restatement", "same_topic", "unrelated"] {
             assert!(c.pairs.iter().any(|p| p.label == label), "no {label} pairs");
+        }
+        assert_eq!(c.version, "memory_truth_v2");
+        assert!(!c.cross_project.is_empty());
+        for x in &c.cross_project {
+            assert!(b.project_keys.contains_key(&x.project), "{}", x.project);
+            assert!(
+                b.project_keys.contains_key(&x.decided_in),
+                "{}",
+                x.decided_in
+            );
+            assert_ne!(x.project, x.decided_in, "{}", x.proposal);
         }
 
         // Every planted supersede holds, naming its replacement; every reaffirm counts.
@@ -1012,6 +1105,13 @@ mod tests {
         assert_eq!(r.current_first, 1.0, "current-first rate");
         assert_eq!(r.superseded_labelled, 1.0, "superseded labelling");
         assert_eq!(r.hook_leaks, 0, "superseded facts in the HOOK block");
+        // memory_truth_v2: every in-project proposal has a close hit, and no cross-project one
+        // does (the guard's two error kinds, a missed decision and a false one).
+        assert_eq!(
+            r.guard_no_decision, 0,
+            "in-project proposals answered no decision"
+        );
+        assert_eq!(r.cross_no_decision, 1.0, "cross-project no-decision rate");
     }
 
     /// Calibrates `knowledge::GUARD_CLOSE`. Run on demand:
@@ -1072,13 +1172,13 @@ mod tests {
                 v.len()
             ));
         }
-        // check_contradiction's floor: a same-topic decision under it is never shown.
-        const GUARD_FLOOR: f32 = knowledge::GUARD_FLOOR;
+        // check_contradiction's related floor: a same-topic decision under it is never shown.
+        const GUARD_RELATED: f32 = knowledge::GUARD_RELATED;
         for label in ["restatement", "same_topic", "reversal", "unrelated"] {
             let v = of(label);
-            let through = v.iter().filter(|s| **s >= GUARD_FLOOR).count();
+            let through = v.iter().filter(|s| **s >= GUARD_RELATED).count();
             md.push_str(&format!(
-                "- GUARD_FLOOR {GUARD_FLOOR} lets {through}/{} {label} pairs through\n",
+                "- GUARD_RELATED {GUARD_RELATED} lets {through}/{} {label} pairs through\n",
                 v.len()
             ));
         }
@@ -1091,6 +1191,353 @@ mod tests {
                 s.sim, s.label, s.fact, s.proposal
             ));
         }
+        println!("{md}");
+    }
+
+    /// A stored vector (`vec0` returns the float32 blob).
+    fn blob_vec(b: &[u8]) -> Vec<f32> {
+        b.chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    }
+
+    /// `n` items of `v` spread evenly over it (deterministic, unlike a sample).
+    fn spread<T: Clone>(v: &[T], n: usize) -> Vec<T> {
+        if v.len() <= n {
+            return v.to_vec();
+        }
+        (0..n).map(|i| v[i * v.len() / n].clone()).collect()
+    }
+
+    fn share(v: &[f32], t: f32) -> f64 {
+        v.iter().filter(|s| **s >= t).count() as f64 / v.len().max(1) as f64
+    }
+
+    fn dist_line(label: &str, v: &mut [f32]) -> String {
+        if v.is_empty() {
+            return format!("| {label} | 0 | | | | | | |\n");
+        }
+        v.sort_by(f32::total_cmp);
+        format!(
+            "| {label} | {} | {:.3} | {:.3} | {:.3} | {:.3} | {:.3} | {:.3} |\n",
+            v.len(),
+            percentile(v, 50),
+            percentile(v, 75),
+            percentile(v, 90),
+            percentile(v, 95),
+            percentile(v, 99),
+            v[v.len() - 1]
+        )
+    }
+
+    /// Calibrates `knowledge::GUARD_RELATED` (and checks `recall-now`'s floor) on a clone of a
+    /// real index, read-only, never migrated (an index one schema older reads as it is):
+    ///
+    /// - negatives: decisions of one project checked in each of the largest OTHER projects,
+    ///   where nothing decided them. The exact best cosine against every decision there, and
+    ///   what `check_contradiction` shows through its real KNN, under the old 0.55 floor and
+    ///   the current rule.
+    /// - positives: `fact_links` supersedes, the newer decision as the proposal against the
+    ///   one it replaced (none on an index that predates 0035).
+    /// - `recall-now`: real first prompts of one project submitted in another, through the
+    ///   hook's own gates (`has_keyword_candidates`, `find_prior_work`, `select_recall_hits`);
+    ///   and in their own project with their own session left out, for how often it still
+    ///   speaks at all.
+    ///
+    /// CALLIMACHUS_GROUNDING_DB=<an APFS clone of index.db> FASTEMBED_CACHE_DIR=<models dir> \
+    ///   cargo test -p callimachus-core real_guard_calibration -- --ignored --nocapture
+    #[test]
+    #[ignore = "needs a real index clone and the embedding model; run on demand"]
+    fn real_guard_calibration() {
+        const MIN_DECISIONS: usize = 15;
+        const PROPOSALS_PER_PROJECT: usize = 30;
+        const PROMPTS_PER_PROJECT: usize = 20;
+        const TARGETS: usize = 3;
+        const OLD_FLOOR: f32 = 0.55;
+        let Ok(path) = std::env::var("CALLIMACHUS_GROUNDING_DB") else {
+            eprintln!("set CALLIMACHUS_GROUNDING_DB to an index clone");
+            return;
+        };
+        let Some(embedder) = eval_embedder() else {
+            return;
+        };
+        let conn = crate::db::open_readonly(std::path::Path::new(&path)).unwrap();
+        let t0 = Instant::now();
+
+        // Visible, embedded decisions with their project key and stored vector.
+        let mut vectors: HashMap<i64, Vec<f32>> = HashMap::new();
+        {
+            let mut stmt = conn
+                .prepare("SELECT fact_id, embedding FROM vec_facts")
+                .unwrap();
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?)))
+                .unwrap();
+            for row in rows {
+                let (id, blob) = row.unwrap();
+                vectors.insert(id, blob_vec(&blob));
+            }
+        }
+        let mut by_project: HashMap<String, Vec<(i64, String)>> = HashMap::new();
+        {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT f.id, f.text, COALESCE(t.project_key, t.project_path)
+                     FROM facts f JOIN threads t ON t.id = f.thread_id
+                     WHERE f.kind = 'decision' AND f.hidden = 0 AND f.embedded = 1
+                       AND COALESCE(t.project_key, t.project_path, '') != ''
+                     ORDER BY f.id",
+                )
+                .unwrap();
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get(2)?))
+                })
+                .unwrap();
+            for row in rows {
+                let (id, text, key): (i64, String, String) = row.unwrap();
+                if vectors.contains_key(&id) {
+                    by_project.entry(key).or_default().push((id, text));
+                }
+            }
+        }
+        let mut projects: Vec<(&String, &Vec<(i64, String)>)> = by_project
+            .iter()
+            .filter(|(_, v)| v.len() >= MIN_DECISIONS)
+            .collect();
+        projects.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then(a.0.cmp(b.0)));
+        // A key that contains another (a monorepo subdir) would scope into it: skip the pair.
+        let nested = |a: &str, b: &str| a.contains(b) || b.contains(a);
+        let largest: Vec<&String> = projects.iter().map(|(k, _)| *k).take(TARGETS + 1).collect();
+
+        // Negatives.
+        let (mut exact_max, mut knn_max): (Vec<f32>, Vec<f32>) = (Vec::new(), Vec::new());
+        let (mut old_any, mut old_hits, mut new_related, mut new_close) =
+            (0usize, 0usize, 0usize, 0usize);
+        let mut new_related_hits = 0usize;
+        let mut negatives = 0usize;
+        let (mut duplicates, mut distinct_max) = (0usize, Vec::<f32>::new());
+        let mut worst: Vec<(f32, String, String)> = Vec::new();
+        for (key, decisions) in &projects {
+            for (_, text) in spread(decisions, PROPOSALS_PER_PROJECT) {
+                let qv = embed::embed_query(&embedder, &text).unwrap().unwrap();
+                for target in largest.iter().filter(|t| !nested(t, key)).take(TARGETS) {
+                    negatives += 1;
+                    let (best, best_text) = by_project[*target]
+                        .iter()
+                        .map(|(id, t)| (cosine(&qv, &vectors[id]), t))
+                        .max_by(|a, b| a.0.total_cmp(&b.0))
+                        .unwrap();
+                    exact_max.push(best);
+                    // The same text recorded in both projects (a shared memory file, a fact
+                    // copied between sibling repos) is a decision there too, not a negative.
+                    if best_text.trim() == text.trim() {
+                        duplicates += 1;
+                    } else {
+                        distinct_max.push(best);
+                    }
+                    worst.push((best, text.clone(), best_text.clone()));
+                    let candidates =
+                        knowledge::guard_candidates(&conn, &qv, Some(target), 8).unwrap();
+                    let sims: Vec<f32> = candidates.iter().map(|h| h.similarity).collect();
+                    knn_max.push(sims.first().copied().unwrap_or(0.0));
+                    let old = sims.iter().filter(|s| **s >= OLD_FLOOR).take(8).count();
+                    old_hits += old;
+                    old_any += usize::from(old > 0);
+                    let kept = knowledge::guard_keep(&sims);
+                    let close = sims
+                        .iter()
+                        .zip(&kept)
+                        .filter(|(s, k)| **k && **s >= knowledge::GUARD_CLOSE)
+                        .count();
+                    let related = kept.iter().filter(|k| **k).count() - close;
+                    new_close += usize::from(close > 0);
+                    new_related += usize::from(related > 0);
+                    new_related_hits += related;
+                }
+            }
+        }
+        let n = negatives.max(1) as f64;
+        let mut md = format!(
+            "## Guard calibration on a real index ({} projects with {MIN_DECISIONS}+ decisions, \
+             {negatives} cross-project proposals)\n\n\
+             | best cosine | n | p50 | p75 | p90 | p95 | p99 | max |\n|---|---|---|---|---|---|---|---|\n",
+            projects.len()
+        );
+        md.push_str(&dist_line(
+            "exact, every decision in the target",
+            &mut exact_max,
+        ));
+        md.push_str(&dist_line(
+            &format!("exact, {duplicates} identical texts left out"),
+            &mut distinct_max,
+        ));
+        md.push_str(&dist_line("through the guard's KNN", &mut knn_max));
+        md.push_str("\nShare of cross-project proposals whose best decision there scores at least t (exact; identical texts left out):\n\n| t | share | without identical |\n|---|---|---|\n");
+        for t in [
+            0.55, 0.60, 0.65, 0.68, 0.70, 0.71, 0.72, 0.73, 0.74, 0.75, 0.78, 0.80, 0.85, 0.90,
+        ] {
+            md.push_str(&format!(
+                "| {t:.2} | {:.3} | {:.3} |\n",
+                share(&exact_max, t),
+                share(&distinct_max, t)
+            ));
+        }
+        md.push_str(&format!(
+            "\ncheck_decision on them: old floor {OLD_FLOOR} showed something for {:.3} (mean {:.2} hits); \
+             now (GUARD_RELATED {}, band {}, max {}) {:.3} get a related hit (mean {:.2}), \
+             {:.3} a close one (a false \"decided\").\n",
+            old_any as f64 / n,
+            old_hits as f64 / n,
+            knowledge::GUARD_RELATED,
+            knowledge::GUARD_RELATED_BAND,
+            knowledge::GUARD_RELATED_MAX,
+            new_related as f64 / n,
+            new_related_hits as f64 / n,
+            new_close as f64 / n,
+        ));
+        worst.sort_by(|a, b| b.0.total_cmp(&a.0));
+        md.push_str("\nHighest cross-project pairs (proposal || best decision in the target):\n");
+        for (sim, p, d) in worst.iter().take(8) {
+            md.push_str(&format!(
+                "- {sim:.3} {} || {}\n",
+                crate::export::fact_line(p, 90),
+                crate::export::fact_line(d, 90)
+            ));
+        }
+
+        // Positives: what a later session replaced.
+        let mut pos: Vec<f32> = Vec::new();
+        if crate::db::has_table(&conn, "fact_links") {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT n.text, o.id FROM fact_links l
+                     JOIN facts n ON n.uid = l.from_uid JOIN facts o ON o.uid = l.to_uid
+                     WHERE l.kind = 'supersedes' AND l.dismissed_at IS NULL
+                       AND n.kind = 'decision' AND o.kind = 'decision'",
+                )
+                .unwrap();
+            let rows: Vec<(String, i64)> = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            for (text, old) in rows {
+                if let Some(v) = vectors.get(&old) {
+                    let qv = embed::embed_query(&embedder, &text).unwrap().unwrap();
+                    pos.push(cosine(&qv, v));
+                }
+            }
+        }
+        md.push_str(&format!(
+            "\nPositives (fact_links supersedes, newer proposal vs the replaced decision): n {}{}\n",
+            pos.len(),
+            if pos.is_empty() {
+                " (this index has no supersede links yet)".to_string()
+            } else {
+                pos.sort_by(f32::total_cmp);
+                format!(
+                    ", p10 {:.3}, p50 {:.3}, min {:.3}; >= GUARD_CLOSE {:.3}, >= GUARD_RELATED {:.3}",
+                    percentile(&pos, 10),
+                    percentile(&pos, 50),
+                    pos[0],
+                    share(&pos, knowledge::GUARD_CLOSE),
+                    share(&pos, knowledge::GUARD_RELATED)
+                )
+            }
+        ));
+
+        // recall-now: first prompts of real sessions.
+        let (mut cross_prompts, mut cross_gated, mut cross_old, mut cross_new) = (0, 0, 0, 0);
+        let (mut own_prompts, mut own_old, mut own_new) = (0, 0, 0);
+        // The best session find_prior_work keeps per prompt, for a sweep of the note's floor.
+        let (mut cross_kept, mut own_kept): (Vec<f32>, Vec<f32>) = (Vec::new(), Vec::new());
+        let best_kept = |c: &[knowledge::PriorWork]| -> f32 {
+            let sims: Vec<f32> = c.iter().map(|w| w.similarity).collect();
+            sims.iter()
+                .zip(knowledge::guard_keep(&sims))
+                .find(|(_, k)| *k)
+                .map_or(0.0, |(s, _)| *s)
+        };
+        let mut prompt_best: Vec<f32> = Vec::new();
+        let none = std::collections::HashSet::new();
+        for (key, _) in &projects {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT t.id, (SELECT m.text FROM messages m WHERE m.thread_id = t.id
+                                    AND m.role = 'user' ORDER BY m.seq LIMIT 1)
+                     FROM threads t
+                     WHERE COALESCE(t.project_key, t.project_path) = ?1 AND t.is_subagent = 0
+                       AND t.message_count >= 4
+                     ORDER BY t.id",
+                )
+                .unwrap();
+            let prompts: Vec<(i64, String)> = stmt
+                .query_map([key.as_str()], |r| {
+                    Ok((r.get(0)?, r.get::<_, Option<String>>(1)?))
+                })
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .filter_map(|(id, t)| t.map(|t| (id, t.trim().to_string())))
+                .filter(|(_, t)| crate::cli_core::prompt_worth_recalling(t) && !t.starts_with('<'))
+                .collect();
+            for (tid, prompt) in spread(&prompts, PROMPTS_PER_PROJECT) {
+                let query: String = prompt.chars().take(1500).collect();
+                let terms = knowledge::prompt_terms(&prompt, 8);
+                let qv = embed::embed_query(&embedder, &query).unwrap().unwrap();
+                // Old: find_prior_work's 0.55 floor, then PROACTIVE_FLOOR 0.68, at most 2.
+                let old_rule = |c: &[knowledge::PriorWork]| {
+                    c.first()
+                        .is_some_and(|b| b.similarity >= OLD_FLOOR.max(0.68))
+                };
+                let new_rule = |c: Vec<knowledge::PriorWork>| {
+                    let sims: Vec<f32> = c.iter().map(|w| w.similarity).collect();
+                    let mut keep = knowledge::guard_keep(&sims).into_iter();
+                    let mut kept = c;
+                    kept.retain(|_| keep.next().unwrap_or(false));
+                    kept.truncate(5);
+                    !crate::cli_core::select_recall_hits(kept, &none).is_empty()
+                };
+                for target in largest.iter().filter(|t| !nested(t, key)).take(1) {
+                    cross_prompts += 1;
+                    if !knowledge::has_keyword_candidates(&conn, &terms, Some(target)).unwrap() {
+                        continue;
+                    }
+                    cross_gated += 1;
+                    let c = knowledge::prior_work_candidates(&conn, &qv, Some(target), 5).unwrap();
+                    prompt_best.push(c.first().map_or(0.0, |w| w.similarity));
+                    cross_kept.push(best_kept(&c));
+                    cross_old += usize::from(old_rule(&c));
+                    cross_new += usize::from(new_rule(c));
+                }
+                own_prompts += 1;
+                if knowledge::has_keyword_candidates(&conn, &terms, Some(key)).unwrap() {
+                    let mut c = knowledge::prior_work_candidates(&conn, &qv, Some(key), 5).unwrap();
+                    c.retain(|w| w.thread_id != tid);
+                    own_kept.push(best_kept(&c));
+                    own_old += usize::from(old_rule(&c));
+                    own_new += usize::from(new_rule(c));
+                }
+            }
+        }
+        md.push_str(&format!(
+            "\n### recall-now (PROACTIVE_FLOOR {})\n\n\
+             - a project's first prompts submitted in another project: {cross_prompts}, {cross_gated} past the keyword gate; \
+             a note before {cross_old}, now {cross_new}\n\
+             - in their own project, own session left out: {own_prompts}; a note before {own_old}, now {own_new}\n",
+            crate::cli_core::PROACTIVE_FLOOR
+        ));
+        md.push_str("\n| best prior session, cross-project prompts | n | p50 | p75 | p90 | p95 | p99 | max |\n|---|---|---|---|---|---|---|---|\n");
+        md.push_str(&dist_line("past the keyword gate", &mut prompt_best));
+        md.push_str("\nNotes by the note's own floor (over find_prior_work's rule):\n\n| floor | cross-project | own project |\n|---|---|---|\n");
+        for f in [0.72, 0.73, 0.74, 0.75, 0.76, 0.78] {
+            md.push_str(&format!(
+                "| {f:.2} | {} | {} |\n",
+                cross_kept.iter().filter(|s| **s >= f).count(),
+                own_kept.iter().filter(|s| **s >= f).count()
+            ));
+        }
+        md.push_str(&format!("\n({:.1} s)\n", t0.elapsed().as_secs_f64()));
         println!("{md}");
     }
 }

@@ -1350,17 +1350,7 @@ pub(crate) mod digest_test_support {
     pub const KEY: &str = "sk-ant-api03-AbCdEfGhIjKlMnOpQrStUv0123456789";
 
     pub fn temp_db(tag: &str) -> Connection {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static N: AtomicU64 = AtomicU64::new(0);
-        let p = std::env::temp_dir().join(format!(
-            "calli_digest_{tag}_{}_{}.db",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ));
-        for ext in ["db", "db-wal", "db-shm"] {
-            let _ = std::fs::remove_file(p.with_extension(ext));
-        }
-        crate::db::open(&p).unwrap()
+        crate::db::test_support::TestIndex::new(&format!("digest_{tag}")).into_connection()
     }
 
     /// A Claude Code session in `project` updated `age_secs` ago, with user prompts (oldest

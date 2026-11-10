@@ -1255,6 +1255,7 @@ const SHIPPED_SKILL_HASHES: &[u64] = &[
     0x57df09b3095b9add, // version: 1.2.1 (Batch G: recall results under `facts` when structured)
     0xd32ed8411a5ed529, // version: 1.2.2 (Batch H: facts marked (repo), threads_for_file with a line, `cal why`)
     0x88ce74fbfd9784fc, // version: 1.3.0 (memory truth: dated lines, superseded, `replaces`, `flag_fact`)
+    0x6c564b76cfd7a3fc, // version: 1.3.1 (Batch J: check_decision's `noDecision`)
 ];
 
 /// Stable across builds and platforms, unlike `DefaultHasher`. Only identifies known texts.
@@ -4680,9 +4681,10 @@ mod tests {
         let tmp = TempDir::new("refresh_tuning");
         let exe = tmp.path().join("callimachus");
         std::fs::write(&exe, "").unwrap();
-        let tool = tmp.path().join("tool");
-        std::fs::write(&tool, "").unwrap();
-        let user_cmd = format!("\"{}\" hook", tool.display());
+        // The user's tool sits outside the temp dir: under a TMPDIR whose path mentions
+        // "callimachus" (a scratch dir named for this repo) it would read as one of ours, and
+        // this test then failed for a reason that has nothing to do with the code.
+        let user_cmd = "\"/opt/tool\" hook".to_string();
         // The user's own `"<path>" hook` comes first; ours (old unguarded form) was tuned: a
         // wider matcher, a longer timeout, plus an extra group with our command for `resume`.
         let mut root = json!({"hooks": {"SessionStart": [

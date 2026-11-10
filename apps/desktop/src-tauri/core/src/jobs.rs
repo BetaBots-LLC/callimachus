@@ -141,6 +141,13 @@ pub struct EmbedJob {
     /// Background top-ups stay off until then after one stopped because the model would
     /// not load (a corrupt cache): retrying every quiet minute would only repeat it.
     pub auto_paused_until: Mutex<Option<std::time::Instant>>,
+    /// The watcher's vector rebuild ([`cleanup::rebuild_vec_chunks`]) stays off until then
+    /// after one failed (too little free disk): each quiet minute would only repeat it.
+    pub rebuild_paused_until: Mutex<Option<std::time::Instant>>,
+    /// The [`JobGuard`] token of this process's build while it holds `embed.lock`, 0 when
+    /// none does. A whole-file rewrite asks this process's build to yield; only another
+    /// process's lock (a terminal `cal embed`) makes it refuse.
+    lock_token: AtomicU64,
 }
 
 /// How long background top-ups pause after the model failed to load in one.
@@ -149,6 +156,15 @@ const AUTO_EMBED_FAILURE_PAUSE: Duration = Duration::from_secs(60 * 60);
 impl EmbedJob {
     pub fn is_running(&self) -> bool {
         self.running.is_set()
+    }
+
+    /// Whether the build holding `embed.lock` is this process's running one. The token is
+    /// stored after the lock is taken and stops matching once the guard releases `running`,
+    /// before the lock itself drops, so a stale answer only ever reads as "another process"
+    /// (a rewrite refuses for a moment) and never hides a terminal `cal embed`.
+    fn holds_process_lock(&self) -> bool {
+        let token = self.lock_token.load(Ordering::SeqCst);
+        token != 0 && self.running.0.load(Ordering::SeqCst) == token
     }
 }
 
@@ -213,6 +229,9 @@ static NEXT_JOB_TOKEN: AtomicU64 = AtomicU64::new(1);
 pub struct JobGuard {
     flag: Arc<JobFlag>,
     token: u64,
+    /// The cross-process lock that goes with this claim (`rewrite.lock` for a rewrite,
+    /// `embed.lock` for a build), dropped with it, after the flag is released.
+    process_lock: Option<locks::ProcessLock>,
 }
 
 impl JobGuard {
@@ -225,7 +244,14 @@ impl JobGuard {
         Some(Self {
             flag: Arc::clone(flag),
             token,
+            process_lock: None,
         })
+    }
+
+    /// Hold `lock` for as long as this claim: other processes see the job through it.
+    fn holding(mut self, lock: locks::ProcessLock) -> Self {
+        self.process_lock = Some(lock);
+        self
     }
 
     /// Whether this guard still owns its flag: false once a cancel freed it, even if
@@ -524,17 +550,37 @@ impl Drop for ReleaseThenKick<'_> {
 /// the write lock for the whole rewrite, so a reindex or semantic build running alongside
 /// stalls on it, and a second rewrite fails with "database is locked". A background
 /// top-up is asked to stop and waited for (at most [`EMBED_YIELD_WAIT`]), since the watcher
-/// starts one after most quiet minutes of agent activity.
+/// starts one after most quiet minutes of agent activity. The claim also holds
+/// `rewrite.lock` until [`release_rewrite`], so the `cal` writers refuse to start meanwhile.
 pub async fn claim_rewrite(flags: &JobFlags) -> anyhow::Result<JobGuard> {
+    claim_rewrite_at(flags, &db::default_index_path()).await
+}
+
+/// [`claim_rewrite`] for the index at `index`.
+async fn claim_rewrite_at(flags: &JobFlags, index: &std::path::Path) -> anyhow::Result<JobGuard> {
+    const ALREADY: &str = "The index is already being rewritten. Try again when that finishes.";
     // Claim first, then check: a job that starts after this sees CompactJob and waits.
     let Some(job) = JobGuard::try_acquire(&flags.compact.0) else {
-        anyhow::bail!("The index is already being rewritten. Try again when that finishes.");
+        anyhow::bail!("{ALREADY}");
+    };
+    // Then rewrite.lock, before looking at the `cal` locks: each `cal` writer takes its own
+    // lock and then checks this one, so the two sides can both refuse but never both run.
+    // A lock file that cannot be opened (another user's) leaves the rewrite as it was
+    // before the lock existed rather than refusing it for good.
+    let job = match locks::acquire(index, locks::REWRITE_LOCK) {
+        Ok(locks::Acquire::Acquired(lock)) => job.holding(lock),
+        Ok(locks::Acquire::Held(_)) => anyhow::bail!("{ALREADY}"),
+        Err(e) => {
+            app_log!("[cleanup] rewrite lock: {e}");
+            job
+        }
     };
     const EMBED_BUSY: &str = "The semantic index is being built";
-    // The flags are per process: `cal watch` or `cal index` indexing, or `cal distill
-    // --auto` storing facts, in another process would make the VACUUM fail with "database is locked" after
-    // the busy timeout (or lose that process's write), so refuse up front.
-    if let Some(why) = cal_writer_running(&db::default_index_path()) {
+    // The flags are per process: `cal watch` or `cal index` indexing, `cal embed` building,
+    // or `cal distill --auto` storing facts, in another process would make the VACUUM fail
+    // with "database is locked" after the busy timeout (or lose that process's write), so
+    // refuse up front. This process's own build is asked to yield below instead.
+    if let Some(why) = cal_writer_running(index, flags.embed.holds_process_lock()) {
         anyhow::bail!("{why}");
     }
     let busy = if flags.index.0.is_set() {
@@ -562,8 +608,9 @@ pub async fn claim_rewrite(flags: &JobFlags) -> anyhow::Result<JobGuard> {
 }
 
 /// Which `cal` process writing to `index` makes a whole-file rewrite refuse, as the
-/// message for the user, or None when none is.
-fn cal_writer_running(index: &std::path::Path) -> Option<&'static str> {
+/// message for the user, or None when none is. `own_embed`: `embed.lock` is this process's
+/// build's (see [`EmbedJob::holds_process_lock`]), which yields instead.
+fn cal_writer_running(index: &std::path::Path, own_embed: bool) -> Option<&'static str> {
     if locks::holder(index, locks::WATCH_LOCK).is_some() {
         return Some("cal watch is writing; stop it first.");
     }
@@ -576,6 +623,11 @@ fn cal_writer_running(index: &std::path::Path) -> Option<&'static str> {
         return Some(
             "cal index is updating the index (the Claude Code plugin starts one at session start); try again when it finishes.",
         );
+    }
+    // After watch.lock: `cal watch`'s own top-ups hold embed.lock too, and its line says
+    // more. What is left is a terminal `cal embed`, which can run for an hour.
+    if !own_embed && locks::holder(index, locks::EMBED_LOCK).is_some() {
+        return Some("cal embed is building the semantic index; try again when it finishes.");
     }
     None
 }
@@ -776,9 +828,50 @@ pub fn start_embed_build(host: &Host, trigger: EmbedTrigger) -> bool {
     let Some(running) = claim_embed_build(host.flags(), trigger) else {
         return false;
     };
+    let Some(running) = take_embed_lock(host.flags(), &db::default_index_path(), running, trigger)
+    else {
+        return false;
+    };
     let host = Arc::clone(host);
     std::thread::spawn(move || run_embed_build(&host, running, trigger));
     true
+}
+
+/// Attach `embed.lock` to a build this process claimed, or give the claim back (None) while
+/// another process's build holds it: a terminal `cal embed` embedding the same backlog
+/// alongside would only double the CPU and the write-lock turns. Quiet, like a build already
+/// running here: a background top-up retries on a later tick, and a Build click's build is
+/// the one `cal embed` is already running. Holding it makes `cal embed` refuse meanwhile.
+fn take_embed_lock(
+    flags: &JobFlags,
+    index: &std::path::Path,
+    running: JobGuard,
+    trigger: EmbedTrigger,
+) -> Option<JobGuard> {
+    match locks::acquire(index, locks::EMBED_LOCK) {
+        Ok(locks::Acquire::Acquired(lock)) => {
+            flags
+                .embed
+                .lock_token
+                .store(running.token, Ordering::SeqCst);
+            Some(running.holding(lock))
+        }
+        Ok(locks::Acquire::Held(pid)) => {
+            if trigger == EmbedTrigger::User {
+                app_log!(
+                    "[embed] another process is building the semantic index{}; it covers this request",
+                    locks::pid_note(pid)
+                );
+            }
+            flags.embed.user_requested.store(false, Ordering::SeqCst);
+            None // `running` drops: released
+        }
+        // An unwritable lock file (another user's): build as before the lock existed.
+        Err(e) => {
+            app_log!("[embed] embed lock: {e}");
+            Some(running)
+        }
+    }
 }
 
 /// Claim [`EmbedJob`] for a build, or None when it should not start (a build is already
@@ -816,12 +909,22 @@ pub fn claim_embed_build(flags: &JobFlags, trigger: EmbedTrigger) -> Option<JobG
 pub fn run_embed_build(host: &Host, running: JobGuard, trigger: EmbedTrigger) {
     let job = &host.flags().embed;
     let mut background = trigger == EmbedTrigger::Background;
+    // An index from before 0036 gets its subagent partition first, so this build's vectors
+    // go straight into it instead of being rewritten at the end (and a first build on a new
+    // index, whose table is empty, pays nothing). Holding `running`, like the compaction
+    // after the build: reindex, the catch-up and distill keep yielding to it.
+    if !job.cancel.load(Ordering::SeqCst) && vec_partition_pending(&**host) {
+        maintain_vectors(&**host);
+    }
     loop {
         let clock = jobclock::JobClock::start();
         // The build's own model (see `Embedder::bulk_build`), dropped below with its
         // thread pool and the working memory its padded sub-batches grew. Queries keep
-        // the shared 4-thread model, which the watcher's reaper unloads once idle.
-        let bulk = host.embedder().bulk_build(background);
+        // the shared 4-thread model, which the watcher's reaper unloads once idle. A
+        // top-up's thread count follows its size.
+        let bulk = host
+            .embedder()
+            .bulk_build(background.then(|| top_up_size(&**host)));
         let stats = run_embed_job(&**host, &bulk, background);
         if background && stats.model_failed {
             if let Ok(mut until) = job.auto_paused_until.lock() {
@@ -851,7 +954,7 @@ pub fn run_embed_build(host: &Host, running: JobGuard, trigger: EmbedTrigger) {
         drop(bulk);
         let secs = clock.wall().as_secs_f64().max(0.001);
         app_log!(
-            "[embed] {} build{}: {} messages, {} chunks in {} ({:.0} chunks/s)",
+            "[embed] {} build{}: {} messages, {} chunks ({} reused) in {} ({:.0} chunks/s)",
             if background { "background" } else { "user" },
             if cancelled {
                 " (stopped for a reindex or rewrite)"
@@ -860,6 +963,7 @@ pub fn run_embed_build(host: &Host, running: JobGuard, trigger: EmbedTrigger) {
             },
             stats.messages,
             stats.chunks,
+            stats.reused,
             clock.process_summary(),
             stats.chunks as f64 / secs
         );
@@ -870,17 +974,7 @@ pub fn run_embed_build(host: &Host, running: JobGuard, trigger: EmbedTrigger) {
         // writer mutex meanwhile. Skipped when a reindex or rewrite is waiting for the
         // writer: the next build does it.
         if !job.cancel.load(Ordering::SeqCst) {
-            let maintenance = jobclock::JobClock::start();
-            match db::open(&db::default_index_path()) {
-                Ok(mut conn) => finish_embed_build(&mut conn),
-                Err(e) => app_log!("[embed] post-build maintenance: {e:#}"),
-            }
-            if maintenance.wall() >= Duration::from_secs(1) {
-                app_log!(
-                    "[embed] post-build maintenance: {}",
-                    maintenance.thread_summary()
-                );
-            }
+            maintain_vectors(&**host);
         }
         // A Build click in the tail above (facts, compaction) found `running` held and
         // only set the flag, after the batch loop had stopped reading it: run the full
@@ -942,23 +1036,20 @@ fn messages_pending_embed_sql() -> String {
 /// hybrid, related and Ask see them without a manual Build. Only for users who already
 /// built a semantic index and have the model on disk (never starts the 128 MB download),
 /// and only when something is pending.
+///
+/// The same kick partitions the vectors of an index from before 0036 (see
+/// [`cleanup::rebuild_vec_chunks`]) when nothing is waiting to embed: a top-up does that
+/// itself before its first batch. So it runs once, after the launch catch-up, on the app's
+/// and `cal watch`'s watcher only (never a hook or the MCP server), and it needs no model.
 pub fn embed_kick(host: &Host) -> EmbedKick {
-    let paused = host
-        .flags()
-        .embed
-        .auto_paused_until
-        .lock()
-        .is_ok_and(|until| until.is_some_and(|t| std::time::Instant::now() < t));
-    if paused || !embed::model_is_cached() {
-        return EmbedKick::NotNeeded;
-    }
+    let job = &host.flags().embed;
     let Some(pool) = host.readers() else {
         return EmbedKick::NotNeeded;
     };
     // Runs on the watcher thread: r2d2's default `get` waits up to 30 s when UI reads hold
     // every reader, and file events, catch-up retries and the reaper tick would wait too.
     // Busy re-arms the timer instead.
-    let (has_vectors, pending) = match pool.0.get_timeout(Duration::from_millis(100)) {
+    let (has_vectors, pending, partitioned) = match pool.0.get_timeout(Duration::from_millis(100)) {
         Ok(conn) => {
             let exists = |sql: &str| {
                 conn.query_row(sql, [], |r| r.get::<_, bool>(0))
@@ -967,18 +1058,167 @@ pub fn embed_kick(host: &Host) -> EmbedKick {
             (
                 exists("SELECT EXISTS(SELECT 1 FROM vec_chunk_owner)"),
                 exists(&messages_pending_embed_sql()),
+                embed::vec_partitioned(&conn),
             )
         }
         Err(_) => return EmbedKick::Busy,
     };
-    if !(has_vectors && pending) {
-        EmbedKick::NotNeeded
-    } else if start_embed_build(host, EmbedTrigger::Background) {
+    let top_up =
+        has_vectors && pending && !paused_now(&job.auto_paused_until) && embed::model_is_cached();
+    let started = match kick_plan(
+        has_vectors,
+        top_up,
+        partitioned,
+        paused_now(&job.rebuild_paused_until),
+    ) {
+        KickPlan::Nothing => return EmbedKick::NotNeeded,
+        KickPlan::TopUp => start_embed_build(host, EmbedTrigger::Background),
+        KickPlan::Rebuild => start_vec_rebuild(host),
+    };
+    if started {
         EmbedKick::Started
     } else {
         EmbedKick::Busy
     }
 }
+
+/// What [`embed_kick`] starts.
+#[derive(Debug, PartialEq, Eq)]
+enum KickPlan {
+    /// A background top-up, which partitions an old-shape table before its first batch.
+    TopUp,
+    /// Only the 0036 partition ([`start_vec_rebuild`]).
+    Rebuild,
+    Nothing,
+}
+
+/// [`embed_kick`]'s decision, from what it read: whether the index has vectors, whether a
+/// top-up can run (something pending, the model on disk, top-ups not paused), whether the
+/// table is already partitioned and whether rebuilds are paused after a failure. The
+/// partition must not wait for something to embed: an index with nothing pending would
+/// otherwise keep its old shape (and its crowded default searches) indefinitely.
+fn kick_plan(has_vectors: bool, top_up: bool, partitioned: bool, rebuild_paused: bool) -> KickPlan {
+    if !has_vectors {
+        KickPlan::Nothing
+    } else if top_up {
+        KickPlan::TopUp
+    } else if partitioned || rebuild_paused {
+        KickPlan::Nothing
+    } else {
+        KickPlan::Rebuild
+    }
+}
+
+/// Whether a pause set until `until` is still on.
+fn paused_now(until: &Mutex<Option<std::time::Instant>>) -> bool {
+    until
+        .lock()
+        .is_ok_and(|until| until.is_some_and(|t| std::time::Instant::now() < t))
+}
+
+/// Partition the vectors on a thread of its own, holding [`EmbedJob`] as a build does (so
+/// reindex, the catch-up, distill and the rewrites keep out of its write lock), then send
+/// `embed:done` so a status poll that saw it running settles. A Build click that landed
+/// meanwhile only set `user_requested`: it gets its full build now.
+///
+/// It holds `embed.lock` like a build ([`take_embed_lock`]): a terminal `cal embed` then
+/// refuses instead of queueing behind the rebuild's write lock, and the build a Build click
+/// hands over to below is one other processes can see. Held by another process means that
+/// process's build partitions the table before its first batch, so this one steps aside.
+fn start_vec_rebuild(host: &Host) -> bool {
+    let Some(running) = claim_embed_build(host.flags(), EmbedTrigger::Background) else {
+        return false;
+    };
+    let Some(running) = take_embed_lock(
+        host.flags(),
+        &db::default_index_path(),
+        running,
+        EmbedTrigger::Background,
+    ) else {
+        return false;
+    };
+    let host = Arc::clone(host);
+    std::thread::spawn(move || {
+        maintain_vectors(&*host);
+        if host.flags().embed.user_requested.load(Ordering::SeqCst) {
+            run_embed_build(&host, running, EmbedTrigger::User);
+            return;
+        }
+        drop(running);
+        emit(&*host, "embed:done", &());
+        auto_distill_kick(&host);
+    });
+    true
+}
+
+/// About how many messages a background top-up will embed: those waiting, up to its cap
+/// ([`AUTO_EMBED_MAX_MESSAGES`]). A bounded walk of 0026's covering index (as
+/// `messages_pending_embed_sql`), so it never counts a whole backlog.
+fn top_up_size(host: &dyn JobHost) -> i64 {
+    let sql = top_up_size_sql();
+    host.writer()
+        .and_then(|db| db.0.lock().ok())
+        .and_then(|conn| {
+            conn.query_row(&sql, [AUTO_EMBED_MAX_MESSAGES], |r| r.get(0))
+                .ok()
+        })
+        .unwrap_or(AUTO_EMBED_MAX_MESSAGES)
+}
+
+fn top_up_size_sql() -> String {
+    format!(
+        "SELECT COUNT(*) FROM (SELECT 1 FROM messages m WHERE m.embedded = 0 AND {} LIMIT ?1)",
+        embed::EMBEDDABLE_SQL
+    )
+}
+
+/// Whether the vector table still has its pre-0036 shape. Through the shared writer (a
+/// cached schema lookup, no vector read).
+fn vec_partition_pending(host: &dyn JobHost) -> bool {
+    host.writer()
+        .and_then(|db| db.0.lock().ok())
+        .is_some_and(|conn| !embed::vec_partitioned(&conn))
+}
+
+/// Vector upkeep on a dedicated connection, as `vacuum_db` does, so UI commands don't queue
+/// behind the shared writer mutex meanwhile: owner rows for any vectors written without one,
+/// then [`cleanup::rebuild_vec_chunks`] (the 0036 partition once, a compaction when deletes
+/// left the table mostly holes). The caller holds [`EmbedJob`]. After a rebuild failed
+/// (too little free disk), the next ones wait out [`VEC_REBUILD_FAILURE_PAUSE`]: every
+/// top-up would only repeat the failure and its log line.
+fn maintain_vectors(host: &dyn JobHost) {
+    maintain_vectors_at(
+        &db::default_index_path(),
+        &host.flags().embed.rebuild_paused_until,
+    );
+}
+
+/// [`maintain_vectors`] on the index at `path`, pausing rebuilds through `paused_until`.
+fn maintain_vectors_at(path: &std::path::Path, paused_until: &Mutex<Option<std::time::Instant>>) {
+    let maintenance = jobclock::JobClock::start();
+    let rebuild = !paused_now(paused_until);
+    match db::open(path) {
+        Ok(mut conn) => {
+            if !finish_embed_build(&mut conn, rebuild) {
+                if let Ok(mut until) = paused_until.lock() {
+                    *until = Some(std::time::Instant::now() + VEC_REBUILD_FAILURE_PAUSE);
+                }
+            }
+        }
+        Err(e) => app_log!("[embed] vector maintenance: {e:#}"),
+    }
+    if maintenance.wall() >= Duration::from_secs(1) {
+        app_log!(
+            "[embed] vector maintenance: {}",
+            maintenance.thread_summary()
+        );
+    }
+}
+
+/// How long the watcher's vector rebuild waits after one failed (most likely too little
+/// free disk: it needs about three times the vector table, see
+/// `cleanup::REBUILD_SPACE_FACTOR`).
+const VEC_REBUILD_FAILURE_PAUSE: Duration = Duration::from_secs(60 * 60);
 
 /// What `embed_kick` did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -990,26 +1230,85 @@ pub enum EmbedKick {
     Busy,
 }
 
-/// Index maintenance after a semantic build, on its own connection.
-fn finish_embed_build(conn: &mut rusqlite::Connection) {
+/// Vector maintenance on its own connection (see [`maintain_vectors`]), with the rebuild
+/// when `rebuild`. Returns false when the rebuild failed.
+fn finish_embed_build(conn: &mut rusqlite::Connection, rebuild: bool) -> bool {
     // Safety net for #27: owner rows for any vectors written without one.
     if let Err(e) = cleanup::reconcile_vec_owners(conn) {
         app_log!("[embed] owner reconcile: {e}");
     }
-    // Rebuild vec_chunks once deletes (0029's tool-vector purge) have left it mostly
-    // holes: ~35% faster KNN. Two small COUNTs and a no-op when it is dense.
-    match cleanup::compact_vec_chunks(conn) {
-        Ok(Some(c)) => app_log!(
-            "[embed] compacted {} vectors into {} chunks (was {})",
-            c.vectors,
-            c.chunks_after,
-            c.chunks_before
-        ),
-        Ok(None) => {}
-        Err(e) => app_log!("[embed] vector compaction: {e}"),
-    }
+    // The 0036 partition once (default searches stop losing main-thread hits behind
+    // subagent vectors), then a compaction whenever deletes (0029's tool-vector purge)
+    // have left the table mostly holes: ~35% faster KNN. A schema lookup and two small
+    // COUNTs, a no-op, when neither is due.
+    let mut rebuilt = false;
+    let ok = match rebuild.then(|| cleanup::rebuild_vec_chunks(conn)) {
+        None => true,
+        Some(Ok(Some(c))) => {
+            rebuilt = true;
+            let held = Duration::from_millis(c.held_ms);
+            app_log!(
+                "[embed] {} {} vectors into {} chunks (was {}), write lock held {:.1} s{}",
+                if c.partitioned {
+                    "partitioned"
+                } else {
+                    "compacted"
+                },
+                c.vectors,
+                c.chunks_after,
+                c.chunks_before,
+                held.as_secs_f64(),
+                if held >= db::BUSY_TIMEOUT {
+                    ", past the busy timeout: a write on another app connection meanwhile \
+                     may have failed with \"database is locked\""
+                } else {
+                    ""
+                }
+            );
+            true
+        }
+        Some(Ok(None)) => true,
+        Some(Err(e)) => {
+            app_log!("[embed] vector rebuild: {e:#}");
+            false
+        }
+    };
     // Fold the WAL back after the build's many small writes (PASSIVE never blocks).
     let _ = conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);");
+    if rebuilt || wal_bytes(conn) > WAL_TRUNCATE_OVER {
+        truncate_wal(conn);
+    }
+    ok
+}
+
+/// A WAL file over this size is truncated after a build ([`truncate_wal`]). A checkpoint
+/// copies the WAL back into the index but leaves the file at its peak size, and normal
+/// writes keep it near 4 MB (SQLite checkpoints every 1,000 pages).
+const WAL_TRUNCATE_OVER: u64 = 64 << 20;
+
+/// How long [`truncate_wal`] waits for readers. A TRUNCATE checkpoint holds off new
+/// writers while it waits, so not the connection's usual 15 s.
+const WAL_TRUNCATE_WAIT: Duration = Duration::from_secs(1);
+
+/// The size of the index's WAL file, 0 when there is none (or no file at all).
+fn wal_bytes(conn: &rusqlite::Connection) -> u64 {
+    conn.path()
+        .filter(|p| !p.is_empty())
+        .and_then(|p| std::fs::metadata(format!("{p}-wal")).ok())
+        .map_or(0, |m| m.len())
+}
+
+/// Give a large WAL's disk back. The vector rebuild writes its scratch copy and the new
+/// table through the WAL: 1,128 MiB on a 324k-vector index, which a PASSIVE checkpoint
+/// never shrinks, so it stayed on disk until the app quit. Best effort: a reader on an
+/// older snapshot stops it, and a later build (the file is still large) tries again.
+fn truncate_wal(conn: &rusqlite::Connection) {
+    let _ = conn.busy_timeout(WAL_TRUNCATE_WAIT);
+    let done = cleanup::checkpoint_truncate(conn).unwrap_or(false);
+    let _ = conn.busy_timeout(db::BUSY_TIMEOUT);
+    if !done {
+        app_log!("[embed] WAL truncate held back by a reader; a later build retries");
+    }
 }
 
 /// How one build pass ended.
@@ -1034,6 +1333,8 @@ enum EmbedEnd {
 struct EmbedRunStats {
     messages: i64,
     chunks: usize,
+    /// Chunks whose vector was copied, not inferred (a repeated text).
+    reused: usize,
     end: EmbedEnd,
     /// The build stopped because the model could not load or went away.
     model_failed: bool,
@@ -1150,6 +1451,9 @@ fn run_embed_job(
     // Consecutive multi-message batches where EVERY message failed inference on its own:
     // systemic, not one bad input, so stop instead of marking the corpus.
     let mut all_failed_streak = 0u32;
+    // Chunk texts this pass stored: a repeat copies the stored vector instead of running
+    // the model (embed::ChunkMemo).
+    let mut memo = embed::ChunkMemo::default();
     loop {
         if let Some(end) = interrupted() {
             stats.end = end;
@@ -1176,10 +1480,21 @@ fn run_embed_job(
             stats.end = EmbedEnd::Drained;
             break;
         }
-        // 2. UNLOCKED: inference. embed_rows retries a failing batch one message at a
-        //    time, so only inputs that fail on their own land in `failed`; store_batch
-        //    below marks them embedded without vectors (FTS still finds them).
-        let batch = match embed::embed_rows(embedder, &rows) {
+        // 2. UNLOCKED: inference, except for chunk texts this pass already stored, whose
+        //    vectors are read back first (point lookups, briefly locked). embed_rows retries
+        //    a failing batch one message at a time, so only inputs that fail on their own
+        //    land in `failed`; store_batch below marks them embedded without vectors (FTS
+        //    still finds them).
+        let hits = memo.reusable(&rows);
+        let known = if hits.is_empty() {
+            std::collections::HashMap::new()
+        } else {
+            match db.0.lock() {
+                Ok(conn) => memo.read_vectors(&conn, &hits),
+                Err(_) => std::collections::HashMap::new(),
+            }
+        };
+        let batch = match embed::embed_rows_with(embedder, &rows, &known) {
             Ok(b) => b,
             Err(e) => {
                 // The model itself became unavailable: stop and leave this batch pending.
@@ -1220,7 +1535,8 @@ fn run_embed_job(
                 embed::store_batch(&mut conn, &ids, &batch.owners, &batch.vecs)
             };
             match res {
-                Ok(()) => {
+                Ok(rowids) => {
+                    memo.remember(&batch.keys, &rowids);
                     stored = true;
                     break;
                 }
@@ -1252,6 +1568,7 @@ fn run_embed_job(
         progress(done);
         stats.messages += rows.len() as i64;
         stats.chunks += batch.owners.len();
+        stats.reused += batch.reused;
         if limit.is_some_and(|l| stats.messages >= l) {
             stats.end = EmbedEnd::Capped;
             break;
@@ -2067,7 +2384,9 @@ pub async fn auto_distill_drain(host: &Host) -> DistillOutcome {
 
 #[cfg(test)]
 mod tests {
-    use super::{messages_pending_embed_sql, owes_full_build, EmbedEnd, JobFlag, JobGuard};
+    use super::{
+        messages_pending_embed_sql, owes_full_build, top_up_size_sql, EmbedEnd, JobFlag, JobGuard,
+    };
     use std::sync::Arc;
 
     /// Shrink index and Reclaim space refuse while any `cal` writer holds its lock: a VACUUM
@@ -2081,18 +2400,130 @@ mod tests {
             (locks::WATCH_LOCK, "cal watch"),
             (locks::DISTILL_LOCK, "cal distill --auto"),
             (locks::INDEX_LOCK, "cal index"),
+            (locks::EMBED_LOCK, "cal embed"),
         ] {
-            let dir = std::env::temp_dir()
-                .join(format!("calli_jobs_writers_{name}_{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&dir);
-            let index = dir.join("index.db");
-            assert_eq!(super::cal_writer_running(&index), None, "{name}");
+            let index = lock_dir(name);
+            assert_eq!(super::cal_writer_running(&index, false), None, "{name}");
             let locks::Acquire::Acquired(_lock) = locks::acquire(&index, name).unwrap() else {
                 panic!("{name} is free");
             };
-            let why = super::cal_writer_running(&index).expect(name);
+            let why = super::cal_writer_running(&index, false).expect(name);
             assert!(why.starts_with(says), "{name}: {why}");
         }
+        // embed.lock held by this process's own build: that one yields instead.
+        let index = lock_dir("own_embed");
+        let locks::Acquire::Acquired(_lock) = locks::acquire(&index, locks::EMBED_LOCK).unwrap()
+        else {
+            panic!("embed.lock is free");
+        };
+        assert_eq!(super::cal_writer_running(&index, true), None);
+    }
+
+    /// `index.db` in a fresh temp dir of its own, for one lock case, removed on drop.
+    fn lock_dir(tag: &str) -> crate::db::test_support::TestDir {
+        crate::db::test_support::TestDir::new(&format!("jobs_writers_{tag}"))
+    }
+
+    /// Generous, as in the locks tests: a child another test thread is spawning holds a
+    /// dropped lock until its exec.
+    const FREED: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// The app's builds (a Build click, the watcher's top-ups) and a terminal `cal embed` never
+    /// embed side by side: the app's build gives its claim back while another process holds
+    /// embed.lock, and holds it itself otherwise, which a rewrite reads as this process's
+    /// build (asked to yield) rather than `cal embed`.
+    #[test]
+    fn an_app_build_skips_while_cal_embed_runs_and_holds_embed_lock_itself() {
+        use super::{cal_writer_running, claim_embed_build, take_embed_lock, EmbedTrigger};
+        use crate::locks;
+        use std::sync::atomic::Ordering;
+        let index = lock_dir("app_build");
+        let flags = super::JobFlags::default();
+
+        let locks::Acquire::Acquired(cal_embed) =
+            locks::acquire(&index, locks::EMBED_LOCK).unwrap()
+        else {
+            panic!("embed.lock is free");
+        };
+        let running = claim_embed_build(&flags, EmbedTrigger::User).expect("nothing runs here");
+        assert!(take_embed_lock(&flags, &index, running, EmbedTrigger::User).is_none());
+        assert!(!flags.embed.is_running(), "the claim is given back");
+        assert!(!flags.embed.user_requested.load(Ordering::SeqCst));
+        assert!(cal_writer_running(&index, flags.embed.holds_process_lock())
+            .is_some_and(|why| why.starts_with("cal embed")));
+        drop(cal_embed);
+        assert!(locks::wait_until_free(&index, locks::EMBED_LOCK, FREED));
+
+        let running = claim_embed_build(&flags, EmbedTrigger::Background).unwrap();
+        let running = take_embed_lock(&flags, &index, running, EmbedTrigger::Background)
+            .expect("embed.lock is free");
+        assert!(
+            locks::holder(&index, locks::EMBED_LOCK).is_some(),
+            "cal embed sees it"
+        );
+        assert!(flags.embed.holds_process_lock());
+        assert_eq!(
+            cal_writer_running(&index, flags.embed.holds_process_lock()),
+            None
+        );
+        drop(running);
+        assert!(!flags.embed.holds_process_lock(), "released with the claim");
+        assert!(locks::wait_until_free(&index, locks::EMBED_LOCK, FREED));
+    }
+
+    /// Shrink index / Reclaim space hold rewrite.lock for the whole rewrite (the `cal`
+    /// writers refuse under it), refuse beside a terminal `cal embed` giving both claims
+    /// back, and ask this process's own background top-up to yield instead.
+    #[test]
+    fn a_rewrite_holds_rewrite_lock_and_refuses_beside_cal_embed() {
+        use super::{claim_embed_build, claim_rewrite_at, take_embed_lock, EmbedTrigger};
+        use crate::locks;
+        use std::sync::atomic::Ordering;
+        let index = lock_dir("rewrite");
+        let flags = super::JobFlags::default();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        let job = rt.block_on(claim_rewrite_at(&flags, &index)).unwrap();
+        assert!(locks::holder(&index, locks::REWRITE_LOCK).is_some());
+        drop(job);
+        assert!(!flags.compact.0.is_set());
+        assert!(locks::wait_until_free(&index, locks::REWRITE_LOCK, FREED));
+
+        let locks::Acquire::Acquired(cal_embed) =
+            locks::acquire(&index, locks::EMBED_LOCK).unwrap()
+        else {
+            panic!("embed.lock is free");
+        };
+        let why = rt
+            .block_on(claim_rewrite_at(&flags, &index))
+            .err()
+            .expect("cal embed is building")
+            .to_string();
+        assert!(why.starts_with("cal embed"), "{why}");
+        assert!(!flags.compact.0.is_set());
+        assert!(locks::wait_until_free(&index, locks::REWRITE_LOCK, FREED));
+        drop(cal_embed);
+        assert!(locks::wait_until_free(&index, locks::EMBED_LOCK, FREED));
+
+        // This process's top-up holds embed.lock and stops when asked.
+        let running = claim_embed_build(&flags, EmbedTrigger::Background).unwrap();
+        let running = take_embed_lock(&flags, &index, running, EmbedTrigger::Background).unwrap();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                while !flags.embed.cancel.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                drop(running);
+            });
+            let job = rt
+                .block_on(claim_rewrite_at(&flags, &index))
+                .expect("the top-up yields");
+            assert!(!flags.embed.is_running());
+            drop(job);
+        });
     }
 
     /// A thread in `cwd` with one Edit call, written through the indexer.
@@ -2545,13 +2976,34 @@ mod tests {
             "{plan:?}"
         );
         assert!(!plan.iter().any(|d| d.starts_with("SCAN m")), "{plan:?}");
+        // So must the top-up's size, which picks its thread count.
+        let size_sql = top_up_size_sql();
+        let plan: Vec<String> = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {size_sql}"))
+            .unwrap()
+            .query_map([2_000], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|d| d.starts_with("SEARCH m USING COVERING INDEX")),
+            "{plan:?}"
+        );
+        assert!(!plan.iter().any(|d| d.starts_with("SCAN m")), "{plan:?}");
         let pending =
             |c: &rusqlite::Connection| c.query_row(&sql, [], |r| r.get::<_, bool>(0)).unwrap();
+        let size = |c: &rusqlite::Connection, cap: i64| -> i64 {
+            c.query_row(&size_sql, [cap], |r| r.get(0)).unwrap()
+        };
         assert!(!pending(&conn));
+        assert_eq!(size(&conn, 2_000), 0);
         let mut conn = conn;
         let sid = crate::indexer::source_id(&conn, "codex").unwrap();
         crate::indexer::upsert_thread(&mut conn, sid, &thread("a", 2)).unwrap();
         assert!(pending(&conn));
+        assert_eq!(size(&conn, 2_000), 2);
+        assert_eq!(size(&conn, 1), 1, "capped");
     }
 
     #[test]
@@ -2661,6 +3113,105 @@ mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst),
             "the kick ran, after the release"
         );
+    }
+
+    /// The watcher's kick partitions an old-shape table even when nothing waits to embed (a
+    /// top-up would do it first), and leaves it alone once done or while paused.
+    #[test]
+    fn the_kick_partitions_an_index_with_nothing_to_embed() {
+        use super::{kick_plan, KickPlan};
+        // (has vectors, a top-up can run, partitioned, rebuild paused)
+        assert_eq!(kick_plan(true, false, false, false), KickPlan::Rebuild);
+        assert_eq!(
+            kick_plan(true, true, false, false),
+            KickPlan::TopUp,
+            "the top-up partitions before its first batch"
+        );
+        assert_eq!(kick_plan(true, true, true, true), KickPlan::TopUp);
+        assert_eq!(
+            kick_plan(true, false, true, false),
+            KickPlan::Nothing,
+            "done"
+        );
+        assert_eq!(
+            kick_plan(true, false, false, true),
+            KickPlan::Nothing,
+            "paused after a failure"
+        );
+        assert_eq!(
+            kick_plan(false, false, false, false),
+            KickPlan::Nothing,
+            "no semantic index"
+        );
+    }
+
+    /// The job path's vector upkeep: a rebuild that fails rolls back and pauses the next
+    /// ones (each quiet minute would only repeat it); after the pause the table gets its
+    /// partition, keeps every vector, and the WAL the rebuild wrote is truncated.
+    #[test]
+    fn vector_upkeep_pauses_after_a_failure_then_partitions_and_truncates_the_wal() {
+        let path = temp_db("upkeep");
+        let conn = crate::db::open(&path).unwrap();
+        conn.execute(
+            "INSERT INTO threads (source_id, external_id, title) VALUES (1, 'upkeep', 't')",
+            [],
+        )
+        .unwrap();
+        let tid = conn.last_insert_rowid();
+        for i in 0..50_usize {
+            conn.execute(
+                "INSERT INTO messages (thread_id, seq, role, text, embedded)
+                 VALUES (?1, ?2, 'user', 'v', 1)",
+                rusqlite::params![tid, i as i64],
+            )
+            .unwrap();
+            let mid = conn.last_insert_rowid();
+            let mut v = vec![0.0_f32; crate::embed::DIM];
+            v[i] = 1.0;
+            conn.execute(
+                "INSERT INTO vec_chunks (message_id, embedding) VALUES (?1, ?2)",
+                rusqlite::params![mid, crate::embed::vec_to_bytes(&v)],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO vec_chunk_owner (chunk_rowid, message_id) VALUES (?1, ?2)",
+                [conn.last_insert_rowid(), mid],
+            )
+            .unwrap();
+        }
+        let vectors = |c: &rusqlite::Connection| -> i64 {
+            c.query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
+                .unwrap()
+        };
+        // A view named like the rebuild's scratch table makes its transaction fail.
+        conn.execute_batch("CREATE VIEW vec_compact_scratch AS SELECT 1 AS x;")
+            .unwrap();
+        let paused = std::sync::Mutex::new(None);
+        super::maintain_vectors_at(&path, &paused);
+        assert!(
+            paused.lock().unwrap().is_some(),
+            "a failure pauses rebuilds"
+        );
+        assert!(!crate::embed::vec_partitioned(&conn), "rolled back");
+        assert_eq!(vectors(&conn), 50);
+
+        conn.execute_batch("DROP VIEW vec_compact_scratch;")
+            .unwrap();
+        super::maintain_vectors_at(&path, &paused);
+        assert!(!crate::embed::vec_partitioned(&conn), "still paused");
+
+        *paused.lock().unwrap() = None;
+        super::maintain_vectors_at(&path, &paused);
+        assert!(crate::embed::vec_partitioned(&conn));
+        assert!(paused.lock().unwrap().is_none());
+        assert_eq!(vectors(&conn), 50);
+        let wal = std::fs::metadata(format!("{}-wal", path.display())).map_or(0, |m| m.len());
+        assert_eq!(wal, 0, "the rebuild's WAL is given back");
+
+        drop(conn);
+        for ext in ["db", "db-wal", "db-shm"] {
+            let _ = std::fs::remove_file(path.with_extension(ext));
+        }
     }
 
     /// The tail-window sequence: a capped top-up exits its batch loop, a Build click then

@@ -14,6 +14,7 @@ import {
   isSearchResultsKey,
   takeUserStarted,
 } from "./lib/queries";
+import { invalidateDomain, memoryWritePending } from "./lib/keys";
 import { AGGREGATE_KEYS, invalidateIndexDerived, queryClient } from "./lib/queryClient";
 import { isSafeExternalHref } from "./lib/safeLinks";
 import { track } from "./lib/telemetry";
@@ -61,8 +62,8 @@ void listen("embed:done", () => {
 // The one-time TODO backfill finished (at launch on an upgraded index, or after enabling
 // distillation). Projects shows those TODOs too, so a user sitting there sees them now.
 void listen("knowledge:todos-ready", () => {
-  for (const key of ["open_todos", "project_memory", "projects"])
-    void queryClient.invalidateQueries({ queryKey: [key] });
+  invalidateDomain("memory");
+  invalidateDomain("projects");
 });
 // Per-source reindex progress → drives the progress bar (JobProgress). A reindex emits
 // after each of the first 50 threads and then every 10, about 2,100 events for 21k
@@ -170,6 +171,15 @@ void listen<IndexReport | null>("index:done", (e) => {
  *  - a typed search is only marked stale, and ResultsList offers "Refresh results"
  *    instead. Re-running it every 4 s cost 0.6-0.7 s of search per run on a 21k-thread
  *    index (about 15% of the time spent fetching) and reordered rows under the cursor;
+ *  - an open Project page's memory and TODO lists refetch too: a decision or TODO an agent
+ *    records (MCP, `cal remember`) lands while its session writes, and showed up only after
+ *    the next navigation. Not while one of the user's own optimistic writes to them is
+ *    pending (`memoryWritePending`): the refetch would read the index before that write
+ *    commits and put the row back. They are marked stale instead and the write's own
+ *    refresh picks up both;
+ *  - Today is not among them. Its command also links commits (a `git log` per checkout and
+ *    a write, up to 2 s), which the watcher already does once a minute, so it stays one of
+ *    the aggregates: marked stale, reloaded on the next visit;
  *  - open threads and the heavy aggregates are only marked stale (no refetch now), so
  *    they reload the next time a view mounts them. Refetching a multi-MB open thread
  *    every few seconds while an agent writes to it would cost more than it shows;
@@ -179,14 +189,28 @@ void listen<IndexReport | null>("index:done", (e) => {
  */
 const LIVE_UPDATE_THROTTLE_MS = 4_000;
 // project_recent is the Project page's Recent sessions: a cheap ordered read of 10 threads,
-// and the list an agent working in that repo changes.
+// and the list an agent working in that repo changes. project_memory and open_todos are the
+// memory domain (lib/keys.ts) minus today (see above) and agent_view, which renders the
+// whole hook preview.
 const LIVE_KEYS = [
   "results",
   "db_stats",
   "index_stats",
   "thread_commits",
   "project_recent",
+  "project_memory",
+  "open_todos",
 ] as const;
+/** The live keys a pending optimistic write holds back (`memoryWritePending`). */
+const MEMORY_LIVE_KEYS = new Set<string>(["project_memory", "open_todos"]);
+/** Refetch the mounted queries of a live key, or only mark them stale while one of the
+ *  user's own writes to that list is pending. */
+function refreshLiveKey(key: (typeof LIVE_KEYS)[number], memoryBusy: boolean) {
+  void queryClient.invalidateQueries({
+    queryKey: [key],
+    refetchType: memoryBusy && MEMORY_LIVE_KEYS.has(key) ? "none" : "active",
+  });
+}
 let liveTimer: ReturnType<typeof setTimeout> | null = null;
 let liveLastRun = 0;
 let missedWhileHidden = false;
@@ -221,8 +245,10 @@ function refreshAfterWatcherUpdate() {
   ) {
     useUi.getState().noteSearchActivity();
   }
-  for (const key of ["db_stats", "index_stats", "thread_commits", "project_recent"]) {
-    void queryClient.invalidateQueries({ queryKey: [key], refetchType: "active" });
+  const memoryBusy = memoryWritePending();
+  for (const key of LIVE_KEYS) {
+    if (key === "results") continue; // handled above: a typed search is only marked stale
+    refreshLiveKey(key, memoryBusy);
   }
 }
 // Back from hidden after the watcher reported writes: one refresh of what is on screen,
@@ -237,9 +263,8 @@ document.addEventListener("visibilitychange", () => {
     liveTimer = null;
   }
   liveLastRun = Date.now();
-  for (const key of LIVE_KEYS) {
-    void queryClient.invalidateQueries({ queryKey: [key], refetchType: "active" });
-  }
+  const memoryBusy = memoryWritePending();
+  for (const key of LIVE_KEYS) refreshLiveKey(key, memoryBusy);
 });
 void listen<string | null>("index:updated", (e) => {
   // No source kind: startup housekeeping rewrote rows (re-keyed projects), or the

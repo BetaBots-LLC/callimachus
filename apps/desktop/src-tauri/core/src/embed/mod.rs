@@ -22,7 +22,7 @@ use fastembed::{
     EmbeddingModel as FeModel, InitOptionsUserDefined, TextEmbedding, TextInitOptions,
     TokenizerFiles, UserDefinedEmbeddingModel,
 };
-use rusqlite::{params, Connection, ToSql};
+use rusqlite::{params, Connection, OptionalExtension, ToSql};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError, TryLockError};
@@ -79,14 +79,51 @@ const QUERY_PREFIX: &str = "Represent this sentence for searching relevant passa
 /// Written against the `messages` table aliased as `m` (`FROM messages m`). Reuse this
 /// exact text (don't retype it): SQLite only uses a partial index when the index's WHERE
 /// terms appear in the query, so a hand-written variant can silently lose the index.
-/// Mirrors `is_embeddable`, minus its blank-text check: that one is applied by
-/// `chunk_messages` so the progress COUNTs never have to read message bodies.
+/// Mirrors `is_embeddable`, minus its blank-text and boilerplate checks: those are applied
+/// by `chunk_messages` so the progress COUNTs never have to read message bodies.
 pub const EMBEDDABLE_SQL: &str = "m.role IN ('user','assistant') AND m.tool_name IS NULL";
 
+/// `messages.embedded` of a message the embedder is done with that got no vector: blank
+/// text, harness boilerplate ([`is_boilerplate`]) or an input that failed inference. 0 is
+/// pending and 1 has vectors, each with its owner row. Not 1: 0025's fallback trigger
+/// (`messages_vec_ad_unmapped`) reads "embedded = 1, user/assistant prose, no owner row" as
+/// vectors stored without the owner map and deletes them with a full vec0 scan under the
+/// write lock (about 0.2 s per message at 200k vectors), so every deleted boilerplate
+/// message (4,459 on a measured index) would pay one. Both of 0025's triggers skip this
+/// value, and the progress counts take every non-zero value as done.
+pub const EMBEDDED_NO_VECTOR: i64 = 2;
+
 /// Rust-side twin of `EMBEDDABLE_SQL`: true for user/assistant prose that is worth a
-/// vector. Blank text is excluded too (it would only produce a meaningless vector).
+/// vector. Blank text and harness boilerplate ([`is_boilerplate`]) are excluded too (they
+/// would only produce meaningless vectors).
 pub fn is_embeddable(role: &str, tool_name: Option<&str>, text: &str) -> bool {
-    matches!(role, "user" | "assistant") && tool_name.is_none() && !text.trim().is_empty()
+    matches!(role, "user" | "assistant") && tool_name.is_none() && worth_a_vector(text)
+}
+
+/// Not blank and not [`is_boilerplate`]: the body half of [`is_embeddable`].
+fn worth_a_vector(text: &str) -> bool {
+    !text.trim().is_empty() && !is_boilerplate(text)
+}
+
+/// A message the agent harness wrote whole, which says nothing a search could want: the
+/// local-command caveat, the interrupt markers, the session or weekly limit notice and a
+/// slash command with no arguments. Among the 20 most repeated chunk texts of a 324k-vector index
+/// (19% of its vectors repeated another chunk), with 1,054 + 357 + 2,028 + 1,020 messages.
+/// FTS still finds them. Whole short messages only, so a typed message that merely starts
+/// the same way still gets its vector. Subagent prompt templates (the other top repeats)
+/// stay: they say what the subagent was asked to do, and [`ChunkMemo`] already runs each
+/// one through the model once per build.
+fn is_boilerplate(text: &str) -> bool {
+    let t = text.trim();
+    // The longest of each shape measured: 245, 42, 73 and 156 chars.
+    (t.len() <= 400
+        && t.starts_with("<local-command-caveat>")
+        && t.ends_with("</local-command-caveat>"))
+        || (t.len() <= 64 && t.starts_with("[Request interrupted by user") && t.ends_with(']'))
+        || (t.len() <= 120 && t.starts_with("You've hit your ") && t.contains(" limit · resets"))
+        || (t.len() <= 400
+            && t.starts_with("<command-name>")
+            && t.ends_with("<command-args></command-args>"))
 }
 
 /// Turn-aware chunking: ~400 tokens per chunk with overlap (chars ≈ 4×tokens).
@@ -328,10 +365,20 @@ const MAX_BULK_YIELD: Duration = Duration::from_secs(2);
 const QUERY_INTRA_THREADS: usize = 4;
 
 /// ONNX intra-op threads for a background top-up build (the watcher's auto-embed after
-/// agent activity). Measured 63 chunks/s at 8 threads against 88 at 22 on a 24-core
-/// machine: a top-up of a few hundred messages takes seconds either way, and 8 keeps the
-/// fans quiet while the user works.
-const BACKGROUND_INTRA_THREADS: usize = 8;
+/// agent activity), by its size ([`background_intra_threads`]). Measured on a 24-core M2
+/// Ultra over real chunk texts (`background_threads_bench`), chunks per CPU-second barely
+/// move with the thread count (100 chunks: 7.0 / 7.2 / 7.2 / 6.7 at 1 / 2 / 4 / 8 threads;
+/// 2,000 chunks: 5.1 / 5.0 / 5.1 / 4.8), while 8 threads kept 7.3 cores busy for every
+/// 16-100 chunk top-up the app logged (and spin between batches on top). A background
+/// build is not waited on, so it takes the cheap end: 2 threads for a top-up of one claimed
+/// batch (100 chunks in 7 s instead of 2 s), 4 for a longer backlog (2,000 chunks in 104 s
+/// instead of 59 s). A Build click keeps `bulk_intra_threads`.
+const BACKGROUND_INTRA_THREADS: usize = 4;
+
+/// A top-up of up to this many messages (the job's claimed batch) runs on
+/// [`BACKGROUND_SMALL_INTRA_THREADS`].
+const BACKGROUND_SMALL_MESSAGES: i64 = 128;
+const BACKGROUND_SMALL_INTRA_THREADS: usize = 2;
 
 /// How long the app's shared (query) model stays loaded with nothing using it. Reloading
 /// from the cache costs about 150 ms on the next query, while a loaded model holds about
@@ -454,14 +501,14 @@ impl Embedder {
 
     /// A separate embedder for one semantic-index build, dropped when the build ends so the
     /// bulk session's thread pool and the working memory its padded sub-batches grew go
-    /// with it. `background` (the watcher's auto top-up) uses fewer threads. It downloads
+    /// with it. `background`: the watcher's auto top-up, with about how many messages it
+    /// will embed, which picks fewer threads ([`background_intra_threads`]). It downloads
     /// only if this one may, and shares this one's interactive counter so the build keeps
     /// yielding to queries. Never idle-unloaded: the build owns it.
-    pub fn bulk_build(&self, background: bool) -> Self {
-        let threads = if background {
-            bulk_intra_threads().min(BACKGROUND_INTRA_THREADS)
-        } else {
-            bulk_intra_threads()
+    pub fn bulk_build(&self, background: Option<i64>) -> Self {
+        let threads = match background {
+            Some(pending) => background_intra_threads(pending),
+            None => bulk_intra_threads(),
         };
         let mut e = Self::new(self.allow_download, self.cache_root.clone(), threads);
         e.interactive = std::sync::Arc::clone(&self.interactive);
@@ -743,6 +790,17 @@ fn bulk_intra_threads() -> usize {
     available_cores().saturating_sub(2).max(1)
 }
 
+/// ONNX intra-op threads for a background top-up of about `pending` messages (see
+/// [`BACKGROUND_INTRA_THREADS`]), never more than a Build click would use.
+fn background_intra_threads(pending: i64) -> usize {
+    let threads = if pending <= BACKGROUND_SMALL_MESSAGES {
+        BACKGROUND_SMALL_INTRA_THREADS
+    } else {
+        BACKGROUND_INTRA_THREADS
+    };
+    bulk_intra_threads().min(threads)
+}
+
 /// ONNX intra-op threads for a query-only embedder (see `QUERY_INTRA_THREADS`).
 fn query_intra_threads() -> usize {
     available_cores().min(QUERY_INTRA_THREADS)
@@ -897,12 +955,13 @@ pub fn pending_batch(conn: &Connection, batch: usize) -> Result<Vec<(i64, String
 
 /// Flatten a batch of messages into chunks, tracking each chunk's owning message id.
 /// Pure (no DB / no model) — run between the locked SELECT and the locked write.
-/// Blank messages produce no chunk; `store_batch` still marks them done.
+/// Blank and boilerplate messages ([`is_boilerplate`]) produce no chunk; `store_batch`
+/// still marks them done.
 pub fn chunk_messages(rows: &[(i64, String)]) -> (Vec<i64>, Vec<String>) {
     let mut owners = Vec::new();
     let mut texts = Vec::new();
     for (id, text) in rows {
-        if text.trim().is_empty() {
+        if !worth_a_vector(text) {
             continue;
         }
         for c in chunk_text(text) {
@@ -920,15 +979,169 @@ pub struct EmbeddedBatch {
     pub owners: Vec<i64>,
     /// One vector per chunk.
     pub vecs: Vec<Vec<f32>>,
+    /// The text key of each vector, parallel to `vecs`, for [`ChunkMemo::remember`].
+    pub keys: Vec<ChunkKey>,
     /// Messages whose inference failed even when retried on their own. They have no
     /// vectors; `store_batch` still marks them embedded so the job moves past them (FTS
     /// still finds them).
     pub failed: Vec<i64>,
+    /// Vectors that did not go through the model: a repeat of a text earlier in the batch,
+    /// or one the build had already stored ([`ChunkMemo`]).
+    pub reused: usize,
+}
+
+/// A chunk text's identity for [`ChunkMemo`]: a 64-bit hash of the text with its length.
+/// Two different texts would have to collide on both to share a vector; with the memo's
+/// 200k entries the chance is about 1e-9 per build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ChunkKey {
+    hash: u64,
+    len: usize,
+}
+
+impl ChunkKey {
+    pub fn of(text: &str) -> Self {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        text.hash(&mut h);
+        Self {
+            hash: h.finish(),
+            len: text.len(),
+        }
+    }
+}
+
+/// Most chunk texts one build remembers: about 10 MB of map at 200k entries.
+const CHUNK_MEMO_CAP: usize = 200_000;
+
+/// The chunk texts one build already stored, by key, with the rowid of their vector, so a
+/// repeat copies that vector instead of running the model. 19% of the 324k vectors on a
+/// measured index were exact repeats of another chunk, mostly the prompts a workflow sends
+/// to many subagents (one text 1,277 times) and harness notices ([`is_boilerplate`], now
+/// skipped outright). The model gives a text the
+/// same vector every time (thread count and batch padding move it by under 1e-5 in cosine),
+/// so a copy is what inference would have stored. Per build, not persisted: no migration,
+/// and a stale entry (its message deleted since) only costs a re-embed. Keeps its first
+/// [`CHUNK_MEMO_CAP`] entries; the repeats worth catching show up early and often.
+#[derive(Default)]
+pub struct ChunkMemo {
+    stored: std::collections::HashMap<ChunkKey, i64>,
+}
+
+impl ChunkMemo {
+    /// The chunks of `rows` this build has stored before, as (key, rowid). Pure: run it
+    /// without the DB lock, then [`read_vectors`](Self::read_vectors) under it.
+    pub fn reusable(&self, rows: &[(i64, String)]) -> Vec<(ChunkKey, i64)> {
+        if self.stored.is_empty() {
+            return Vec::new();
+        }
+        let (_, texts) = chunk_messages(rows);
+        let mut out: Vec<(ChunkKey, i64)> = Vec::new();
+        for t in &texts {
+            let key = ChunkKey::of(t);
+            if let Some(&rowid) = self.stored.get(&key) {
+                if !out.iter().any(|(k, _)| *k == key) {
+                    out.push((key, rowid));
+                }
+            }
+        }
+        out
+    }
+
+    /// Read the stored vectors of `hits` back (vec0 point lookups by rowid, a few
+    /// microseconds each). A vector that is gone (its message was deleted or re-indexed
+    /// since) is forgotten, and its text is embedded again.
+    pub fn read_vectors(
+        &mut self,
+        conn: &Connection,
+        hits: &[(ChunkKey, i64)],
+    ) -> std::collections::HashMap<ChunkKey, Vec<f32>> {
+        let mut out = std::collections::HashMap::new();
+        let Ok(mut stmt) = conn.prepare_cached("SELECT embedding FROM vec_chunks WHERE rowid = ?1")
+        else {
+            return out;
+        };
+        for (key, rowid) in hits {
+            match stmt
+                .query_row([rowid], |r| r.get::<_, Vec<u8>>(0))
+                .optional()
+            {
+                Ok(Some(blob)) if blob.len() == DIM * 4 => {
+                    out.insert(*key, bytes_to_vec(&blob));
+                }
+                _ => {
+                    self.stored.remove(key);
+                }
+            }
+        }
+        out
+    }
+
+    /// Remember the vectors `store_batch` just wrote: `keys` and `rowids` are parallel to
+    /// the batch's vectors (a None rowid was not stored).
+    pub fn remember(&mut self, keys: &[ChunkKey], rowids: &[Option<i64>]) {
+        for (key, rowid) in keys.iter().zip(rowids) {
+            if self.stored.len() >= CHUNK_MEMO_CAP {
+                return;
+            }
+            if let Some(rowid) = rowid {
+                self.stored.entry(*key).or_insert(*rowid);
+            }
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.stored.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.stored.is_empty()
+    }
+}
+
+/// Vectors for `texts` (keyed by `keys`, parallel), running the model once per distinct
+/// text that `known` does not already hold. Returns them parallel to `texts`, with how many
+/// skipped the model.
+fn embed_unique(
+    embedder: &Embedder,
+    texts: &[String],
+    keys: &[ChunkKey],
+    known: &std::collections::HashMap<ChunkKey, Vec<f32>>,
+) -> Result<(Vec<Vec<f32>>, usize), EmbedError> {
+    embed_unique_with(texts, keys, known, |todo| embedder.embed_typed(todo))
+}
+
+/// [`embed_unique`] with the inference step passed in (tests count what reaches it).
+fn embed_unique_with(
+    texts: &[String],
+    keys: &[ChunkKey],
+    known: &std::collections::HashMap<ChunkKey, Vec<f32>>,
+    infer: impl FnOnce(&[String]) -> Result<Vec<Vec<f32>>, EmbedError>,
+) -> Result<(Vec<Vec<f32>>, usize), EmbedError> {
+    let mut slot: std::collections::HashMap<ChunkKey, usize> = std::collections::HashMap::new();
+    let mut todo: Vec<String> = Vec::new();
+    for (text, key) in texts.iter().zip(keys) {
+        if known.contains_key(key) || slot.contains_key(key) {
+            continue;
+        }
+        slot.insert(*key, todo.len());
+        todo.push(text.clone());
+    }
+    let fresh = infer(&todo)?;
+    let vecs = keys
+        .iter()
+        .map(|key| match known.get(key) {
+            Some(v) => v.clone(),
+            None => fresh[slot[key]].clone(),
+        })
+        .collect();
+    Ok((vecs, texts.len() - todo.len()))
 }
 
 /// Chunk and embed a claimed batch (the unlocked middle phase of the job), isolating bad
 /// inputs: if the batch fails inference, each message is retried alone and only the ones
-/// that still fail land in `failed`.
+/// that still fail land in `failed`. A text repeated within the batch runs through the
+/// model once.
 ///
 /// Returns `Err` only when the MODEL is unavailable (`EmbedError::is_model_unavailable`).
 /// The caller must then stop the job and leave the rows pending (do NOT mark them
@@ -937,13 +1150,26 @@ pub fn embed_rows(
     embedder: &Embedder,
     rows: &[(i64, String)],
 ) -> Result<EmbeddedBatch, EmbedError> {
+    embed_rows_with(embedder, rows, &std::collections::HashMap::new())
+}
+
+/// [`embed_rows`] given the vectors a build already has for some chunk texts
+/// ([`ChunkMemo::read_vectors`]): those are copied instead of embedded.
+pub fn embed_rows_with(
+    embedder: &Embedder,
+    rows: &[(i64, String)],
+    known: &std::collections::HashMap<ChunkKey, Vec<f32>>,
+) -> Result<EmbeddedBatch, EmbedError> {
     let (owners, texts) = chunk_messages(rows);
-    match embedder.embed_typed(&texts) {
-        Ok(vecs) => {
+    let keys: Vec<ChunkKey> = texts.iter().map(|t| ChunkKey::of(t)).collect();
+    match embed_unique(embedder, &texts, &keys, known) {
+        Ok((vecs, reused)) => {
             return Ok(EmbeddedBatch {
                 owners,
                 vecs,
+                keys,
                 failed: Vec::new(),
+                reused,
             })
         }
         Err(e) if e.is_model_unavailable() => return Err(e),
@@ -952,16 +1178,76 @@ pub fn embed_rows(
     let mut batch = EmbeddedBatch::default();
     for row in rows {
         let (owners, texts) = chunk_messages(std::slice::from_ref(row));
-        match embedder.embed_typed(&texts) {
-            Ok(vecs) => {
+        let keys: Vec<ChunkKey> = texts.iter().map(|t| ChunkKey::of(t)).collect();
+        match embed_unique(embedder, &texts, &keys, known) {
+            Ok((vecs, reused)) => {
                 batch.owners.extend(owners);
                 batch.vecs.extend(vecs);
+                batch.keys.extend(keys);
+                batch.reused += reused;
             }
             Err(e) if e.is_model_unavailable() => return Err(e),
             Err(_) => batch.failed.push(row.0),
         }
     }
     Ok(batch)
+}
+
+/// `vec_chunks` as `cleanup::rebuild_vec_chunks` recreates it: 0004's table plus a
+/// `subagent` partition key (0 for main threads, 1 for subagent ones, from
+/// `threads.is_subagent`). vec0 keeps each partition in its own chunks and a KNN constrained
+/// to `subagent = 0` reads only the main partition's. Before this, a default search ran a
+/// global KNN and dropped subagent hits afterwards: on a 324k-vector index where 58% of the
+/// vectors are subagent ones, 1 of 5 sampled queries (2 of 5 real ones in an earlier
+/// survey) kept 0 main-thread hits out of the over-fetch; partitioned, all five got their
+/// 60 (`real_index_default_knn`).
+///
+/// `gen` ([`VEC_GEN`]) is there to be mandatory. vec0 takes an insert that leaves the
+/// partition key out: the vector lands in a NULL partition that no default KNN reads, in a
+/// 1024-slot chunk of its own (about 1.5 MB per vector). 0036's version bump keeps an older
+/// binary from opening the index, but one that already had it open when the table is rebuilt
+/// (an app left running, a `cal watch`, a `cal embed` mid-run) never looks at the version
+/// again and goes on inserting `(message_id, embedding)`. vec0 refuses a NULL in an INTEGER
+/// metadata column, so that insert now fails ("Expected integer for INTEGER metadata column
+/// gen"), its batch rolls back, and nothing is marked embedded until that process is
+/// restarted. Older readers are not affected: their KNN names no new column.
+pub(crate) const PARTITIONED_VEC_CHUNKS_SQL: &str = "CREATE VIRTUAL TABLE vec_chunks USING vec0(
+    message_id integer,
+    subagent integer partition key,
+    gen integer,
+    embedding float[384] distance_metric=cosine
+)";
+
+/// The `gen` every vector is stored with: the generation of the writer and model that made
+/// it. Its job today is to exist (see [`PARTITIONED_VEC_CHUNKS_SQL`]); a later change of the
+/// embedding model or of the stored format can bump it to tell old vectors from new ones.
+pub const VEC_GEN: i64 = 1;
+
+/// Whether `vec_chunks` has its current shape ([`PARTITIONED_VEC_CHUNKS_SQL`], the `subagent`
+/// partition and `gen`), read from its stored CREATE statement. Migration 0036 leaves the
+/// old shape in place and a background job rebuilds it later, so readers and writers meet
+/// both: a pooled reader that outlives the rebuild, a sidecar on an index whose app has not
+/// rebuilt yet. Any other statement reads as not partitioned, and the rebuild is then due. A
+/// cached lookup on the schema table, per call, so it follows a rebuild that lands under a
+/// long-lived connection.
+pub fn vec_partitioned(conn: &Connection) -> bool {
+    conn.prepare_cached(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'vec_chunks'",
+    )
+    .and_then(|mut stmt| stmt.query_row([], |r| r.get::<_, String>(0)))
+    .is_ok_and(|sql| is_partitioned_ddl(&sql))
+}
+
+/// Whether a stored CREATE statement is [`PARTITIONED_VEC_CHUNKS_SQL`], whitespace and case
+/// aside (SQLite keeps the statement's text from the table name on).
+fn is_partitioned_ddl(sql: &str) -> bool {
+    let norm = |s: &str| {
+        s.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_lowercase()
+    };
+    norm(sql) == norm(PARTITIONED_VEC_CHUNKS_SQL)
 }
 
 /// Persist chunk vectors and mark the messages embedded, in one transaction. Fast —
@@ -973,45 +1259,90 @@ pub fn embed_rows(
 /// vectors, so none are orphaned. Never `DELETE FROM vec_chunks` directly: delete through
 /// `vec_chunk_owner`, whose trigger removes the vector, or a stale owner row could later
 /// point at a reused rowid.
+///
+/// On a partitioned table each vector goes into its thread's partition, with [`VEC_GEN`].
+/// Never insert one without its partition: a NULL partition value is a partition no KNN
+/// reads, and vec0 starts a new 1024-slot chunk for every such insert (its latest-chunk
+/// lookup never matches NULL). The old statement cannot do that by accident (a failed shape
+/// probe here, an older process): it omits `gen`, which vec0 refuses.
+///
+/// Returns the stored rowid of each vector, parallel to `owners` (None where the message
+/// went away), so a build can reuse them for repeated chunk texts ([`ChunkMemo`]).
+///
+/// A selected message that got no vector (no chunk, or failed inference) is marked
+/// [`EMBEDDED_NO_VECTOR`], not 1, so deleting it never runs 0025's full-scan fallback.
 pub fn store_batch(
     conn: &mut Connection,
     message_ids: &[i64],
     owners: &[i64],
     vecs: &[Vec<f32>],
-) -> Result<()> {
+) -> Result<Vec<Option<i64>>> {
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let mut rowids = Vec::with_capacity(owners.len());
     {
-        let mut live = tx.prepare("SELECT 1 FROM messages WHERE id = ?1 AND embedded = 0")?;
-        let mut ins =
-            tx.prepare("INSERT INTO vec_chunks (message_id, embedding) VALUES (?1, ?2)")?;
+        let partitioned = vec_partitioned(&tx);
+        // The thread's subagent flag, or nothing when the message is gone or already
+        // embedded (re-upserted mid-batch).
+        let mut live = tx.prepare(
+            "SELECT t.is_subagent FROM messages m JOIN threads t ON t.id = m.thread_id
+             WHERE m.id = ?1 AND m.embedded = 0",
+        )?;
+        let mut ins = tx.prepare(if partitioned {
+            "INSERT INTO vec_chunks (message_id, subagent, gen, embedding)
+             VALUES (?1, ?2, ?3, ?4)"
+        } else {
+            "INSERT INTO vec_chunks (message_id, embedding) VALUES (?1, ?2)"
+        })?;
         let mut own = tx.prepare(
             "INSERT OR REPLACE INTO vec_chunk_owner (chunk_rowid, message_id) VALUES (?1, ?2)",
         )?;
-        let mut alive: std::collections::HashMap<i64, bool> = std::collections::HashMap::new();
+        let mut alive: std::collections::HashMap<i64, Option<i64>> =
+            std::collections::HashMap::new();
+        // Messages this transaction stored at least one vector for.
+        let mut vectored: std::collections::HashSet<i64> = std::collections::HashSet::new();
         for (mid, v) in owners.iter().zip(vecs.iter()) {
-            let ok = match alive.get(mid) {
-                Some(b) => *b,
+            let subagent = match alive.get(mid) {
+                Some(s) => *s,
                 None => {
-                    let b = live.exists([mid])?;
-                    alive.insert(*mid, b);
-                    b
+                    let s = live
+                        .query_row([mid], |r| r.get::<_, i64>(0))
+                        .optional()?
+                        .map(|s| i64::from(s != 0));
+                    alive.insert(*mid, s);
+                    s
                 }
             };
-            if !ok {
+            let Some(subagent) = subagent else {
+                rowids.push(None);
                 continue; // deleted / re-upserted mid-batch: no orphan vectors
+            };
+            if partitioned {
+                ins.execute(params![mid, subagent, VEC_GEN, vec_to_bytes(v)])?;
+            } else {
+                ins.execute(params![mid, vec_to_bytes(v)])?;
             }
-            ins.execute(params![mid, vec_to_bytes(v)])?;
-            own.execute(params![tx.last_insert_rowid(), mid])?;
+            let rowid = tx.last_insert_rowid();
+            own.execute(params![rowid, mid])?;
+            rowids.push(Some(rowid));
+            vectored.insert(*mid);
         }
         // Mark every selected message done (even any that produced no chunk) so it is
-        // never reselected. Re-upserting a thread resets this via fresh rows.
-        let mut done = tx.prepare("UPDATE messages SET embedded = 1 WHERE id = ?1")?;
+        // never reselected. Re-upserting a thread resets this via fresh rows. Only rows
+        // still pending: one another build already finished keeps its state (a 1 turned
+        // into EMBEDDED_NO_VECTOR would leave its vectors to the orphan sweep on delete).
+        let mut done =
+            tx.prepare("UPDATE messages SET embedded = ?2 WHERE id = ?1 AND embedded = 0")?;
         for id in message_ids {
-            done.execute([id])?;
+            let state = if vectored.contains(id) {
+                1
+            } else {
+                EMBEDDED_NO_VECTOR
+            };
+            done.execute(params![id, state])?;
         }
     }
     tx.commit()?;
-    Ok(())
+    Ok(rowids)
 }
 
 /// Mark messages embedded WITHOUT storing vectors, so the job advances past inputs that
@@ -1019,6 +1350,7 @@ pub fn store_batch(
 ///
 /// Never call this for a model-load failure (`is_model_unavailable`): that would flag the
 /// whole corpus embedded with no vectors. Stop the job and leave the batch pending.
+/// Marks them [`EMBEDDED_NO_VECTOR`], as `store_batch` does a message without a vector.
 pub fn mark_embedded(conn: &Connection, ids: &[i64]) -> Result<()> {
     if ids.is_empty() {
         return Ok(());
@@ -1026,7 +1358,10 @@ pub fn mark_embedded(conn: &Connection, ids: &[i64]) -> Result<()> {
     let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
     let params: Vec<&dyn rusqlite::ToSql> = ids.iter().map(|i| i as &dyn rusqlite::ToSql).collect();
     conn.execute(
-        &format!("UPDATE messages SET embedded = 1 WHERE id IN ({placeholders})"),
+        &format!(
+            "UPDATE messages SET embedded = {EMBEDDED_NO_VECTOR}
+             WHERE id IN ({placeholders}) AND embedded = 0"
+        ),
         params.as_slice(),
     )?;
     Ok(())
@@ -1329,7 +1664,7 @@ pub fn semantic_search_scoped(
     k: usize,
 ) -> Result<Vec<(i64, f32)>> {
     let prefilter = scope.is_filtered() && owner_prefilter_usable(conn);
-    let (sql, args) = semantic_knn_sql(qv, scope, k, prefilter);
+    let (sql, args) = semantic_knn_sql(qv, scope, k, prefilter, vec_partitioned(conn));
     let arg_refs: Vec<&dyn ToSql> = args.iter().map(|b| b.as_ref()).collect();
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(arg_refs.as_slice(), |r| {
@@ -1360,11 +1695,14 @@ fn owner_prefilter_usable(conn: &Connection) -> bool {
 /// The statement and bind values behind `semantic_search_vec`, split out so tests can
 /// check its query plan. `owner_prefilter` pushes the thread/message filters into the KNN
 /// (see [`owner_prefilter_usable`]); without it they only post-filter an over-fetch.
+/// `partitioned`: the table has the subagent partition ([`vec_partitioned`]), so a scope
+/// without subagents reads only the main partition.
 fn semantic_knn_sql(
     qv: &[f32],
     scope: &KnnScope<'_>,
     k: usize,
     owner_prefilter: bool,
+    partitioned: bool,
 ) -> (String, Vec<Box<dyn ToSql>>) {
     let project = scope.project();
     let sources = scope.sources;
@@ -1445,6 +1783,16 @@ fn semantic_knn_sql(
     } else {
         String::new()
     };
+    // The main partition only, inside the KNN, so subagent vectors never take a slot of the
+    // top-k (vec0 skips the other partition's chunks: 276 ms to 115 ms warm for k = 60 on
+    // the measured index). It combines with the `rowid IN` list above. The outer
+    // `t.is_subagent = 0` stays as a safety net for a vector whose thread changed its flag
+    // after it was stored. On the old, unpartitioned shape the outer filter does it alone.
+    let partition = if partitioned && !scope.include_subagents {
+        " AND subagent = 0"
+    } else {
+        ""
+    };
 
     // Over-fetch chunks so dedup (several chunks per message) and the remaining
     // post-filters (subagents, legacy tool-call vectors) still leave k messages. A filter
@@ -1466,7 +1814,7 @@ fn semantic_knn_sql(
     let mut sql = format!(
         "WITH knn AS MATERIALIZED (
             SELECT message_id, distance FROM vec_chunks
-            WHERE embedding MATCH ?1 AND k = {knn_k}{prefilter} ORDER BY distance
+            WHERE embedding MATCH ?1 AND k = {knn_k}{partition}{prefilter} ORDER BY distance
          )
          SELECT knn.message_id, MIN(knn.distance) AS d
          FROM knn
@@ -1502,17 +1850,19 @@ fn semantic_knn_sql(
 /// `EMBEDDABLE_SQL`, the same predicate as `pending_batch`, so the bar reaches 100% when
 /// the queue is empty instead of counting tool-call rows that are never embedded.
 pub fn embed_progress(conn: &Connection) -> Result<(i64, i64)> {
-    let done: i64 = conn.query_row(
-        &format!("SELECT COUNT(*) FROM messages m WHERE m.embedded = 1 AND {EMBEDDABLE_SQL}"),
-        [],
-        |r| r.get(0),
-    )?;
+    let done: i64 = conn.query_row(&embedded_count_sql(), [], |r| r.get(0))?;
     let total: i64 = conn.query_row(
         &format!("SELECT COUNT(*) FROM messages m WHERE {EMBEDDABLE_SQL}"),
         [],
         |r| r.get(0),
     )?;
     Ok((done, total))
+}
+
+/// The done half of [`embed_progress`]: with or without a vector ([`EMBEDDED_NO_VECTOR`]).
+/// A range on the last column of 0026's covering (role, tool_name, embedded) index.
+fn embedded_count_sql() -> String {
+    format!("SELECT COUNT(*) FROM messages m WHERE m.embedded > 0 AND {EMBEDDABLE_SQL}")
 }
 
 /// Encode an f32 vector as the little-endian byte BLOB sqlite-vec expects.
@@ -1522,6 +1872,13 @@ pub fn vec_to_bytes(v: &[f32]) -> Vec<u8> {
         out.extend_from_slice(&f.to_le_bytes());
     }
     out
+}
+
+/// Decode a vec0 float32 BLOB ([`vec_to_bytes`]'s inverse).
+pub fn bytes_to_vec(b: &[u8]) -> Vec<f32> {
+    b.chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
 }
 
 #[cfg(test)]
@@ -1560,6 +1917,37 @@ mod tests {
         let (owners, texts) = chunk_messages(&rows);
         assert_eq!(owners, vec![1]);
         assert_eq!(texts, vec!["real prose".to_string()]);
+    }
+
+    /// The harness's own whole messages get no vector; typed text that only starts like
+    /// one, or a slash command with arguments, still does.
+    #[test]
+    fn chunk_messages_skips_harness_boilerplate() {
+        let rows: Vec<(i64, String)> = [
+            "<local-command-caveat>Caveat: The messages below were generated by the user \
+             while running local commands. DO NOT respond to these messages or otherwise \
+             consider them in your response unless the user explicitly asks you to.\
+             </local-command-caveat>",
+            "[Request interrupted by user]",
+            "[Request interrupted by user for tool use]",
+            "You've hit your session limit · resets 4:20pm (America/Los_Angeles)",
+            "<command-name>/model</command-name>\n<command-message>model</command-message>\n\
+             <command-args></command-args>",
+            // Kept:
+            "<command-name>/plan</command-name>\n<command-message>plan</command-message>\n\
+             <command-args>split the vec table by subagent</command-args>",
+            "[Request interrupted by user] then: actually, keep the old index for a release",
+            "You've hit your limit on retries, so the deploy script should back off",
+            "why did the rebuild hold the write lock for 40 s?",
+        ]
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (i as i64, t.to_string()))
+        .collect();
+        let (owners, _) = chunk_messages(&rows);
+        assert_eq!(owners, vec![5, 6, 7, 8]);
+        assert!(!is_embeddable("user", None, &rows[1].1));
+        assert!(is_embeddable("user", None, &rows[8].1));
     }
 
     #[test]
@@ -1709,7 +2097,8 @@ mod tests {
         dot / (norm(a) * norm(b))
     }
 
-    /// Needs a downloaded model. The sidecar's small thread pool must not change vectors.
+    /// Needs a downloaded model. The sidecar's and the background top-ups' small thread
+    /// pools must not change vectors.
     #[test]
     #[ignore]
     fn thread_count_does_not_change_vectors() {
@@ -1718,16 +2107,23 @@ mod tests {
             "how do I activate a python virtualenv",
             "sqlite busy timeout",
         ];
-        let few = load_snapshot(&snapshot, QUERY_INTRA_THREADS)
-            .unwrap()
-            .embed(texts, None)
-            .unwrap();
         let many = load_snapshot(&snapshot, bulk_intra_threads())
             .unwrap()
             .embed(texts, None)
             .unwrap();
-        for (a, b) in few.iter().zip(&many) {
-            assert!(cosine(a, b) > 0.99999, "cosine {}", cosine(a, b));
+        for threads in [
+            1,
+            BACKGROUND_SMALL_INTRA_THREADS,
+            QUERY_INTRA_THREADS,
+            BACKGROUND_INTRA_THREADS,
+        ] {
+            let few = load_snapshot(&snapshot, threads)
+                .unwrap()
+                .embed(texts, None)
+                .unwrap();
+            for (a, b) in few.iter().zip(&many) {
+                assert!(cosine(a, b) > 0.99999, "{threads}: cosine {}", cosine(a, b));
+            }
         }
     }
 
@@ -1968,9 +2364,22 @@ mod tests {
         // The app's shared embedder serves queries too; only its build embedder is bulk.
         let app = Embedder::default();
         assert_eq!(app.intra_threads, query_intra_threads());
-        assert_eq!(app.bulk_build(false).intra_threads, bulk_intra_threads());
-        let background = app.bulk_build(true).intra_threads;
-        assert!((1..=BACKGROUND_INTRA_THREADS).contains(&background));
+        assert_eq!(app.bulk_build(None).intra_threads, bulk_intra_threads());
+        // A background top-up picks by size: a small one on fewer threads than a backlog,
+        // both under the bulk pool on a machine with cores to spare.
+        let small = app.bulk_build(Some(40)).intra_threads;
+        let backlog = app.bulk_build(Some(2_000)).intra_threads;
+        assert_eq!(
+            small,
+            bulk_intra_threads().min(BACKGROUND_SMALL_INTRA_THREADS)
+        );
+        assert_eq!(backlog, bulk_intra_threads().min(BACKGROUND_INTRA_THREADS));
+        assert!(small <= backlog && backlog <= bulk_intra_threads());
+        assert_eq!(
+            app.bulk_build(Some(BACKGROUND_SMALL_MESSAGES))
+                .intra_threads,
+            small
+        );
     }
 
     #[test]
@@ -1981,7 +2390,7 @@ mod tests {
             Some(SIDECAR_IDLE_UNLOAD)
         );
         let app = Embedder::default();
-        let build = app.bulk_build(false);
+        let build = app.bulk_build(None);
         // The build owns its model; nothing reaps it mid-build.
         assert_eq!(build.idle_unload, None);
         assert!(!build.unload_if_idle());
@@ -2127,6 +2536,94 @@ mod tests {
             (3, 3),
             "no phantom work left"
         );
+        let state = |id: i64| -> i64 {
+            conn.query_row("SELECT embedded FROM messages WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        };
+        assert_eq!((state(user), state(asst)), (1, 1));
+        assert_eq!(state(blank), EMBEDDED_NO_VECTOR, "done, without a vector");
+    }
+
+    /// The done count reads 0026's covering index (a range on `embedded`), never the rows.
+    #[test]
+    fn embedded_count_reads_the_covering_index() {
+        let db = temp_db("donecount");
+        let plan: Vec<String> = db
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {}", embedded_count_sql()))
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|l| l.contains("COVERING INDEX idx_messages_embed_counts")
+                    && l.contains("embedded>?")),
+            "{plan:?}"
+        );
+    }
+
+    /// A boilerplate (or blank, or failed) message has no vector and no owner row. Marked
+    /// embedded = 1 it met 0025's fallback trigger, whose `DELETE FROM vec_chunks WHERE
+    /// message_id = ...` scans every vector: so its delete must cost the same VM steps
+    /// however many vectors the table holds, while a message with vectors still loses them.
+    #[test]
+    fn deleting_a_vectorless_message_never_scans_the_vectors() {
+        use rusqlite::StatementStatus;
+        let mut db = temp_db("vectorless");
+        let embed_all = |db: &mut TempDb| {
+            let rows = pending_batch(&db.conn, 10_000).unwrap();
+            let (owners, texts) = chunk_messages(&rows);
+            let vecs: Vec<Vec<f32>> = (0..texts.len())
+                .map(|i| {
+                    let mut v = vec![0.0_f32; DIM];
+                    v[i % DIM] = 1.0;
+                    v
+                })
+                .collect();
+            let ids: Vec<i64> = rows.iter().map(|(id, _)| *id).collect();
+            store_batch(&mut db.conn, &ids, &owners, &vecs).unwrap();
+        };
+        let boilerplate = |db: &TempDb, seq: i64| {
+            insert_msg(&db.conn, seq, "user", "[Request interrupted by user]", None)
+        };
+        let first = boilerplate(&db, 0);
+        let prose = insert_msg(&db.conn, 1, "assistant", "rebuild the vec table", None);
+        embed_all(&mut db);
+        let delete_steps = |db: &TempDb, id: i64| -> i32 {
+            let mut st = db
+                .conn
+                .prepare("DELETE FROM messages WHERE id = ?1")
+                .unwrap();
+            st.execute([id]).unwrap();
+            st.get_status(StatementStatus::VmStep)
+        };
+        let before = delete_steps(&db, first);
+        // Two thousand more vectors, and another boilerplate message.
+        for seq in 2..2_002 {
+            insert_msg(
+                &db.conn,
+                seq,
+                "user",
+                &format!("message number {seq}"),
+                None,
+            );
+        }
+        let second = boilerplate(&db, 5_000);
+        embed_all(&mut db);
+        let vectors = |db: &TempDb| -> i64 {
+            db.conn
+                .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(vectors(&db), 2_001);
+        assert_eq!(delete_steps(&db, second), before, "no vector scan");
+        assert_eq!(vectors(&db), 2_001);
+        delete_steps(&db, prose);
+        assert_eq!(vectors(&db), 2_000, "a message's own vectors still go");
     }
 
     #[test]
@@ -2147,7 +2644,14 @@ mod tests {
         .unwrap();
         let conn = &db.conn;
         // What the old job did when the model failed to load.
-        mark_embedded(conn, &[lost, tool]).unwrap();
+        conn.execute(
+            "UPDATE messages SET embedded = 1 WHERE id IN (?1, ?2)",
+            [lost, tool],
+        )
+        .unwrap();
+        // An input that failed inference today: done on purpose, never re-queued.
+        let failed = insert_msg(conn, 4, "user", "failed inference", None);
+        mark_embedded(conn, &[failed]).unwrap();
 
         assert_eq!(
             requeue_unvectored(conn).unwrap(),
@@ -2281,6 +2785,7 @@ mod tests {
         sources: &[String],
         project: Option<&str>,
         owner_prefilter: bool,
+        partitioned: bool,
     ) -> Vec<String> {
         let scope = KnnScope {
             include_subagents,
@@ -2288,7 +2793,8 @@ mod tests {
             project,
             ..KnnScope::default()
         };
-        let (sql, args) = semantic_knn_sql(&direction(0.0), &scope, 10, owner_prefilter);
+        let (sql, args) =
+            semantic_knn_sql(&direction(0.0), &scope, 10, owner_prefilter, partitioned);
         let refs: Vec<&dyn ToSql> = args.iter().map(|b| b.as_ref()).collect();
         let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
         stmt.query_map(refs.as_slice(), |r| r.get::<_, String>(3))
@@ -2307,7 +2813,8 @@ mod tests {
                 (&vec![], Some("cal")),
                 (&codex, Some("cal")),
             ] {
-                let plan = semantic_plan(&db.conn, include_subagents, sources, project, true);
+                let plan =
+                    semantic_plan(&db.conn, include_subagents, sources, project, true, false);
                 // vec0 marks a consumed `rowid IN` with '[' in its index string. Without
                 // it the list would be checked after a global top-k: starvation again.
                 assert!(
@@ -2318,7 +2825,8 @@ mod tests {
                 // Building the list must never walk the whole messages table.
                 assert!(!plan.iter().any(|l| l.starts_with("SCAN m")), "{plan:#?}");
                 // The fallback never touches the owner map.
-                let plan = semantic_plan(&db.conn, include_subagents, sources, project, false);
+                let plan =
+                    semantic_plan(&db.conn, include_subagents, sources, project, false, false);
                 assert!(!plan.iter().any(|l| l.contains('[')), "{plan:#?}");
                 assert!(
                     !plan.iter().any(|l| l.contains("vec_chunk_owner")),
@@ -2328,7 +2836,7 @@ mod tests {
         }
         // An unfiltered search has no list to build.
         for include_subagents in [false, true] {
-            let plan = semantic_plan(&db.conn, include_subagents, &[], None, true);
+            let plan = semantic_plan(&db.conn, include_subagents, &[], None, true, false);
             assert!(!plan.iter().any(|l| l.contains('[')), "{plan:#?}");
         }
     }
@@ -2361,7 +2869,7 @@ mod tests {
             },
         ];
         for scope in &scopes {
-            let (sql, args) = semantic_knn_sql(&direction(0.0), scope, 10, true);
+            let (sql, args) = semantic_knn_sql(&direction(0.0), scope, 10, true, false);
             let refs: Vec<&dyn ToSql> = args.iter().map(|b| b.as_ref()).collect();
             let plan: Vec<String> = db
                 .conn
@@ -2392,7 +2900,7 @@ mod tests {
                 sources,
                 ..KnnScope::default()
             };
-            let (sql, _) = semantic_knn_sql(&q, &scope, k, prefilter);
+            let (sql, _) = semantic_knn_sql(&q, &scope, k, prefilter, false);
             let tail = &sql[sql.find("AND k = ").unwrap() + "AND k = ".len()..];
             tail.split(|c: char| !c.is_ascii_digit())
                 .next()
@@ -2474,6 +2982,469 @@ mod tests {
         assert_eq!(search(&db.conn, &["codex"], Some("beta")), vec![beta]);
         assert_eq!(search(&db.conn, &["codex"], None), vec![beta]);
         assert!(search(&db.conn, &["cursor"], Some("alpha")).is_empty());
+    }
+
+    // ---- subagent partition (0036) ----------------------------------------------------
+
+    /// Thread ids of the default-scope hits.
+    fn hit_threads(conn: &Connection, hits: &[(i64, f32)]) -> Vec<i64> {
+        hits.iter()
+            .map(|(mid, _)| {
+                conn.query_row("SELECT thread_id FROM messages WHERE id = ?1", [mid], |r| {
+                    r.get(0)
+                })
+                .unwrap()
+            })
+            .collect()
+    }
+
+    /// 1,000 subagent chunks nearer the query than any of 50 main-thread chunks: the
+    /// default scope must still return min(k, 50) main hits. On the old shape the global
+    /// top-k (200 for k <= 40) is all subagent and the post-filter leaves nothing, which is
+    /// what a default search on a subagent-heavy index did before the partition.
+    #[test]
+    fn subagent_vectors_never_crowd_out_main_hits() {
+        let mut db = temp_db("crowding");
+        insert_thread(&db.conn, "sub", "/w/p", 1, true);
+        let sub: Vec<i64> = (0..1000)
+            .map(|i| insert_msg(&db.conn, i, "assistant", "subagent echo", None))
+            .collect();
+        insert_thread(&db.conn, "main", "/w/p", 1, false);
+        let main_tid: i64 = db
+            .conn
+            .query_row("SELECT MAX(id) FROM threads", [], |r| r.get(0))
+            .unwrap();
+        let main: Vec<i64> = (0..50)
+            .map(|i| insert_msg(&db.conn, i, "user", "main prose", None))
+            .collect();
+        // Subagent vectors at cosine 0.995..0.99, main ones at 0.98..0.83: all above the
+        // floor, every subagent one nearer.
+        let mut ids = sub.clone();
+        let mut vecs: Vec<Vec<f32>> = (0..sub.len())
+            .map(|i| direction(0.1 + i as f32 * 0.00004))
+            .collect();
+        ids.extend(&main);
+        vecs.extend((0..main.len()).map(|i| direction(0.2 + i as f32 * 0.012)));
+        store_batch(&mut db.conn, &ids, &ids, &vecs).unwrap();
+
+        let q = direction(0.0);
+        let default = |conn: &Connection, k: usize| {
+            semantic_search_vec(conn, &q, false, &[], None, k).unwrap()
+        };
+        assert!(!vec_partitioned(&db.conn));
+        assert!(
+            default(&db.conn, 10).is_empty(),
+            "the old shape: crowded out"
+        );
+
+        let report = crate::cleanup::rebuild_vec_chunks(&mut db.conn)
+            .unwrap()
+            .expect("the old shape is rebuilt");
+        assert!(report.partitioned);
+        assert_eq!(report.vectors, 1050);
+        assert!(vec_partitioned(&db.conn));
+        for (k, want) in [(10, 10), (50, 50), (60, 50)] {
+            let hits = default(&db.conn, k);
+            assert_eq!(hits.len(), want, "k = {k}");
+            assert!(hit_threads(&db.conn, &hits).iter().all(|t| *t == main_tid));
+            // Nearest first, as before.
+            let got: Vec<i64> = hits.iter().map(|(id, _)| *id).collect();
+            assert_eq!(got, main[..want].to_vec());
+        }
+        // include_subagents reads both partitions: the subagent vectors win, as they did.
+        let all = semantic_search_vec(&db.conn, &q, true, &[], None, 10).unwrap();
+        assert_eq!(all.len(), 10);
+        assert!(all.iter().all(|(id, _)| sub.contains(id)), "{all:?}");
+        // A scoped search combines the partition with the `rowid IN` pre-filter.
+        let scoped = semantic_search_vec(&db.conn, &q, false, &[], Some("/w/p"), 5).unwrap();
+        let got: Vec<i64> = scoped.iter().map(|(id, _)| *id).collect();
+        assert_eq!(got, main[..5].to_vec());
+
+        // New vectors land in their thread's partition.
+        insert_thread(&db.conn, "main2", "/w/q", 1, false);
+        let late = insert_msg(&db.conn, 0, "user", "late main prose", None);
+        insert_thread(&db.conn, "sub2", "/w/q", 1, true);
+        let late_sub = insert_msg(&db.conn, 0, "user", "late subagent", None);
+        store_batch(
+            &mut db.conn,
+            &[late, late_sub],
+            &[late, late_sub],
+            &[direction(0.0), direction(0.0)],
+        )
+        .unwrap();
+        let partition = |mid: i64| -> i64 {
+            db.conn
+                .query_row(
+                    "SELECT subagent FROM vec_chunks WHERE rowid =
+                         (SELECT chunk_rowid FROM vec_chunk_owner WHERE message_id = ?1)",
+                    [mid],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!((partition(late), partition(late_sub)), (0, 1));
+        assert_eq!(default(&db.conn, 1)[0].0, late);
+        // No NULL partition ever: each would be a chunk of its own that no KNN reads.
+        let null_chunks: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM vec_chunks_chunks WHERE partition00 IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(null_chunks, 0);
+    }
+
+    /// Both shapes give the same answers wherever the old one was not crowded out: a pooled
+    /// reader or a sidecar may meet either while the rebuild is pending.
+    #[test]
+    fn old_and_partitioned_shapes_answer_alike() {
+        let mut db = temp_db("shapes");
+        let mut ids = Vec::new();
+        let mut vecs = Vec::new();
+        for (t, (project, source, subagent)) in [
+            ("/w/a", 1, false),
+            ("/w/a", 1, true),
+            ("/w/b", 2, false),
+            ("/w/b", 1, true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            insert_thread(&db.conn, &format!("t{t}"), project, source, subagent);
+            for i in 0..5 {
+                ids.push(insert_msg(&db.conn, i, "user", "x", None));
+                vecs.push(direction(0.05 * (1 + t * 5 + i as usize) as f32));
+            }
+        }
+        store_batch(&mut db.conn, &ids, &ids, &vecs).unwrap();
+        let q = direction(0.0);
+        let codex = ["codex".to_string()];
+        let answers = |conn: &Connection| {
+            let mut out = Vec::new();
+            for subagents in [false, true] {
+                for (sources, project) in [
+                    (&[][..], None),
+                    (&[][..], Some("/w/a")),
+                    (&codex[..], None),
+                    (&[][..], Some("/w/b")),
+                ] {
+                    out.push(
+                        semantic_search_vec(conn, &q, subagents, sources, project, 7)
+                            .unwrap()
+                            .into_iter()
+                            .map(|(id, _)| id)
+                            .collect::<Vec<i64>>(),
+                    );
+                }
+            }
+            out
+        };
+        let before = answers(&db.conn);
+        assert!(before.iter().all(|a| !a.is_empty()), "{before:?}");
+        crate::cleanup::rebuild_vec_chunks(&mut db.conn).unwrap();
+        assert!(vec_partitioned(&db.conn));
+        assert_eq!(answers(&db.conn), before);
+    }
+
+    /// The default scope pushes `subagent = 0` into vec0 (']Aa' in its index string: a
+    /// partition constraint, EQ, on partition column A), alone and next to the `rowid IN`
+    /// pre-filter; include_subagents and the old shape never add it.
+    #[test]
+    fn partitioned_plan_reads_the_main_partition_only() {
+        let mut db = temp_db("partplan");
+        crate::cleanup::rebuild_vec_chunks(&mut db.conn).unwrap();
+        assert!(
+            vec_partitioned(&db.conn),
+            "an empty table is partitioned at once"
+        );
+        let codex = vec!["codex".to_string()];
+        for (sources, project) in [(&vec![], None), (&codex, None), (&vec![], Some("cal"))] {
+            let plan = semantic_plan(&db.conn, false, sources, project, true, true);
+            assert!(plan.iter().any(|l| l.contains("]Aa")), "{plan:#?}");
+            let filtered = !sources.is_empty() || project.is_some();
+            assert_eq!(
+                plan.iter()
+                    .any(|l| l.contains("VIRTUAL TABLE INDEX") && l.contains('[')),
+                filtered,
+                "{plan:#?}"
+            );
+            let plan = semantic_plan(&db.conn, true, sources, project, true, true);
+            assert!(!plan.iter().any(|l| l.contains("]A")), "{plan:#?}");
+        }
+        let fresh = temp_db("partplan-old");
+        let plan = semantic_plan(&fresh.conn, false, &[], None, true, false);
+        assert!(!plan.iter().any(|l| l.contains("]A")), "{plan:#?}");
+    }
+
+    /// Default-scope KNN latency and main-thread hits on a real index, before and after its
+    /// 0036 partition. Read-only on an APFS clone (never the live index); no model: the five
+    /// query vectors are stored chunks picked by a fixed hash of their rowid, which the
+    /// rebuild keeps, so a run before and one after compare the same queries.
+    /// `CALLIMACHUS_DB=<clone>/index.db cargo test --release -p callimachus-core --lib --
+    /// --ignored real_index_default_knn --nocapture`
+    #[test]
+    #[ignore]
+    fn real_index_default_knn() {
+        let db = std::env::var_os("CALLIMACHUS_DB").expect("CALLIMACHUS_DB = a cloned index");
+        let conn = crate::db::open_readonly(Path::new(&db)).unwrap();
+        let picks: Vec<(i64, i64)> = conn
+            .prepare(
+                "SELECT o.chunk_rowid, t.is_subagent FROM vec_chunk_owner o
+                 JOIN messages m ON m.id = o.message_id JOIN threads t ON t.id = m.thread_id
+                 ORDER BY (o.chunk_rowid * 2654435761) % 4294967296 LIMIT 5",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        println!(
+            "partitioned: {}, vectors: {}",
+            vec_partitioned(&conn),
+            conn.query_row("SELECT COUNT(*) FROM vec_chunks_rowids", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap()
+        );
+        for (rowid, subagent) in picks {
+            let blob: Vec<u8> = conn
+                .query_row(
+                    "SELECT embedding FROM vec_chunks WHERE rowid = ?1",
+                    [rowid],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let qv = bytes_to_vec(&blob);
+            // Hybrid's semantic arm asks for SEM_ARM_MAX (60) under the default scope.
+            let scope = KnnScope::default();
+            let t = Instant::now();
+            let hits = semantic_search_scoped(&conn, &qv, &scope, 60).unwrap();
+            let first = t.elapsed();
+            let mut warm: Vec<Duration> = (0..5)
+                .map(|_| {
+                    let t = Instant::now();
+                    semantic_search_scoped(&conn, &qv, &scope, 60).unwrap();
+                    t.elapsed()
+                })
+                .collect();
+            warm.sort();
+            println!(
+                "query chunk {rowid} (subagent {subagent}): {} main hits, first {:.1} ms, warm median {:.1} ms",
+                hits.len(),
+                first.as_secs_f64() * 1000.0,
+                warm[2].as_secs_f64() * 1000.0
+            );
+        }
+    }
+
+    /// The most repeated chunk texts of a real index's embedded messages, with how much of
+    /// the vector table is repeats. Read-only on an APFS clone; no model.
+    /// `CALLIMACHUS_DB=<clone>/index.db cargo test --release -p callimachus-core --lib --
+    /// --ignored real_index_repeated_chunks --nocapture`
+    #[test]
+    #[ignore]
+    fn real_index_repeated_chunks() {
+        let db = std::env::var_os("CALLIMACHUS_DB").expect("CALLIMACHUS_DB = a cloned index");
+        let conn = crate::db::open_readonly(Path::new(&db)).unwrap();
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT m.id, m.text, t.is_subagent FROM messages m
+                 JOIN threads t ON t.id = m.thread_id
+                 WHERE m.embedded = 1 AND {EMBEDDABLE_SQL}"
+            ))
+            .unwrap();
+        // key -> (chunks, of them in subagent threads, the text's first 80 chars)
+        let mut seen: std::collections::HashMap<ChunkKey, (u32, u32, String)> =
+            std::collections::HashMap::new();
+        let mut total = 0usize;
+        let mut rows = stmt.query([]).unwrap();
+        while let Some(r) = rows.next().unwrap() {
+            let row = (r.get::<_, i64>(0).unwrap(), r.get::<_, String>(1).unwrap());
+            let sub = r.get::<_, i64>(2).unwrap() != 0;
+            for text in chunk_messages(std::slice::from_ref(&row)).1 {
+                total += 1;
+                let e = seen
+                    .entry(ChunkKey::of(&text))
+                    .or_insert_with(|| (0, 0, text.chars().take(80).collect()));
+                e.0 += 1;
+                e.1 += u32::from(sub);
+            }
+        }
+        let repeats: usize = seen.values().map(|e| e.0 as usize - 1).sum();
+        println!(
+            "{total} chunks, {} distinct, {repeats} repeats ({:.1}%)",
+            seen.len(),
+            100.0 * repeats as f64 / total.max(1) as f64
+        );
+        let mut top: Vec<_> = seen.into_values().filter(|e| e.0 > 1).collect();
+        top.sort_by_key(|e| std::cmp::Reverse(e.0));
+        for (n, sub, head) in top.iter().take(20) {
+            let head = crate::context::redact_secrets(head).replace(['\n', '\r'], " ");
+            println!("{n:>6} ({sub:>6} subagent)  {head}");
+        }
+    }
+
+    /// Chunks per CPU-second of a background build at 1, 2, 4 and 8 ONNX threads, on a
+    /// small top-up and on a large batch of real chunk texts, through the bulk path a
+    /// build uses (128-message batches, 16-chunk length-sorted sub-batches). Needs the
+    /// cached model (never downloads) and an APFS clone, read-only:
+    /// `CALLIMACHUS_DB=<clone>/index.db FASTEMBED_CACHE_DIR=<dir> cargo test --release -p
+    /// callimachus-core --lib -- --ignored background_threads_bench --nocapture
+    /// --test-threads 1`
+    #[test]
+    #[ignore]
+    fn background_threads_bench() {
+        let db = std::env::var_os("CALLIMACHUS_DB").expect("CALLIMACHUS_DB = a cloned index");
+        let root = env_path(CACHE_DIR_ENV).expect("FASTEMBED_CACHE_DIR = a model dir");
+        let conn = crate::db::open_readonly(Path::new(&db)).unwrap();
+        // A fixed pseudo-random spread of embedded prose, in 128-message batches as
+        // run_embed_job claims them.
+        let rows: Vec<(i64, String)> = conn
+            .prepare(&format!(
+                "SELECT m.id, m.text FROM messages m WHERE m.embedded = 1 AND {EMBEDDABLE_SQL}
+                 ORDER BY (m.id * 2654435761) % 4294967296 LIMIT 3000"
+            ))
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let batches = |want: usize| -> Vec<Vec<String>> {
+            let mut out = Vec::new();
+            let mut n = 0;
+            for b in rows.chunks(128) {
+                let mut texts = chunk_messages(b).1;
+                texts.truncate(want - n);
+                n += texts.len();
+                out.push(texts);
+                if n >= want {
+                    break;
+                }
+            }
+            out
+        };
+        let mut reference: Option<Vec<Vec<f32>>> = None;
+        for want in [100, 2000] {
+            let work = batches(want);
+            for threads in [1, 2, 4, 8] {
+                let e = Embedder::new(false, Some(root.clone()), threads);
+                let load = crate::jobclock::JobClock::start();
+                e.ensure_loaded().unwrap();
+                let load_cpu = load.process_cpu().unwrap_or_default();
+                let clock = crate::jobclock::JobClock::start();
+                let mut vecs = Vec::new();
+                for texts in &work {
+                    vecs.extend(e.embed(texts.clone()).unwrap());
+                }
+                let (wall, cpu) = (clock.wall(), clock.process_cpu().unwrap_or_default());
+                let n = vecs.len() as f64;
+                println!(
+                    "{want:>5} chunks, {threads} threads: {:.0} chunks/s, {:.1} chunks per cpu-s \
+                     ({:.2} s wall, {:.2} s cpu; load {:.2} s cpu)",
+                    n / wall.as_secs_f64(),
+                    n / cpu.as_secs_f64().max(1e-6),
+                    wall.as_secs_f64(),
+                    cpu.as_secs_f64(),
+                    load_cpu.as_secs_f64(),
+                );
+                // Thread count must not move the vectors.
+                if want == 100 {
+                    match &reference {
+                        None => reference = Some(vecs),
+                        Some(r) => {
+                            for (a, b) in r.iter().zip(&vecs) {
+                                assert!(cosine(a, b) > 0.99999, "cosine {}", cosine(a, b));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- repeated chunk texts -------------------------------------------------------
+
+    /// A text repeated within a batch reaches the model once, and one the build already
+    /// stored never does; the vectors still come back parallel to the input.
+    #[test]
+    fn repeated_texts_run_through_the_model_once() {
+        let texts: Vec<String> = ["a", "b", "a", "c", "b", "a"]
+            .iter()
+            .map(|t| t.to_string())
+            .collect();
+        let keys: Vec<ChunkKey> = texts.iter().map(|t| ChunkKey::of(t)).collect();
+        let mut known = std::collections::HashMap::new();
+        known.insert(ChunkKey::of("c"), vec![3.0_f32]);
+        let mut seen: Vec<String> = Vec::new();
+        let (vecs, reused) = embed_unique_with(&texts, &keys, &known, |todo| {
+            seen = todo.to_vec();
+            Ok(todo
+                .iter()
+                .map(|t| vec![if t == "a" { 1.0 } else { 2.0 }])
+                .collect())
+        })
+        .unwrap();
+        assert_eq!(seen, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(reused, 4);
+        let flat: Vec<f32> = vecs.iter().map(|v| v[0]).collect();
+        assert_eq!(flat, vec![1.0, 2.0, 1.0, 3.0, 2.0, 1.0]);
+        // Everything known: no model call at all (an embedder without a model succeeds).
+        let all: std::collections::HashMap<ChunkKey, Vec<f32>> =
+            keys.iter().map(|k| (*k, vec![0.5])).collect();
+        let e = Embedder::new(false, Some(temp_dir("memo-nomodel")), 1);
+        let rows: Vec<(i64, String)> = vec![(1, "a".into()), (2, "b".into())];
+        let batch = embed_rows_with(&e, &rows, &all).unwrap();
+        assert_eq!(batch.owners, vec![1, 2]);
+        assert_eq!(batch.reused, 2);
+        assert!(!e.is_loaded());
+        // Same text, different length (or any other text): a different key.
+        assert_ne!(ChunkKey::of("a"), ChunkKey::of("a "));
+    }
+
+    /// The memo hands back the vector the build stored for a text, and forgets one whose
+    /// message (and so its vector) went away.
+    #[test]
+    fn chunk_memo_reuses_stored_vectors_until_they_go() {
+        let mut db = temp_db("memo");
+        // A subagent prompt a workflow sent to many subagents.
+        let prompt = "Review the billing module for untested error paths";
+        let first = insert_msg(&db.conn, 0, "user", prompt, None);
+        let other = insert_msg(&db.conn, 1, "user", "something else", None);
+        let rows = pending_batch(&db.conn, 10).unwrap();
+        let (owners, texts) = chunk_messages(&rows);
+        let keys: Vec<ChunkKey> = texts.iter().map(|t| ChunkKey::of(t)).collect();
+        let vecs: Vec<Vec<f32>> = owners.iter().map(|o| direction(*o as f32 / 10.0)).collect();
+        let ids: Vec<i64> = rows.iter().map(|(id, _)| *id).collect();
+        let rowids = store_batch(&mut db.conn, &ids, &owners, &vecs).unwrap();
+        assert!(rowids.iter().all(Option::is_some));
+        let mut memo = ChunkMemo::default();
+        memo.remember(&keys, &rowids);
+        assert_eq!(memo.len(), 2);
+
+        // A later message repeating the first text.
+        let again = insert_msg(&db.conn, 2, "user", prompt, None);
+        let rows = pending_batch(&db.conn, 10).unwrap();
+        assert_eq!(rows.iter().map(|r| r.0).collect::<Vec<_>>(), vec![again]);
+        let hits = memo.reusable(&rows);
+        assert_eq!(hits.len(), 1);
+        let known = memo.read_vectors(&db.conn, &hits);
+        let want = &vecs[owners.iter().position(|o| *o == first).unwrap()];
+        assert_eq!(known.get(&hits[0].0), Some(want));
+
+        // Its vector goes with its message; the memo drops the entry instead of copying it.
+        db.conn
+            .execute("DELETE FROM messages WHERE id = ?1", [first])
+            .unwrap();
+        assert!(memo.read_vectors(&db.conn, &hits).is_empty());
+        assert!(memo.reusable(&rows).is_empty());
+        assert_eq!(memo.len(), 1);
+        let _ = other;
+
+        // Unstored vectors (a message gone mid-batch) are not remembered.
+        let mut memo = ChunkMemo::default();
+        memo.remember(&[ChunkKey::of("x")], &[None]);
+        assert!(memo.is_empty());
     }
 
     /// A query issued while a big bulk batch runs must wait at most about one sub-batch,

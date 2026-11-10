@@ -203,7 +203,8 @@ pub fn purge_legacy_auto_snapshots(conn: &Connection) -> Result<usize> {
     )?)
 }
 
-/// List snapshots newest-first, optionally scoped to a project-path substring.
+/// List snapshots newest-first, optionally scoped to a project-path substring (`_` and `%`
+/// literal, as in every project scope: `crate::scope`).
 pub fn list(conn: &Connection, project: Option<&str>, limit: usize) -> Result<Vec<Snapshot>> {
     let mut sql = String::from(
         "SELECT id, thread_id, project_path, source_kind, label, token_estimate, created_at
@@ -211,8 +212,11 @@ pub fn list(conn: &Connection, project: Option<&str>, limit: usize) -> Result<Ve
     );
     let mut args: Vec<Box<dyn ToSql>> = Vec::new();
     if let Some(p) = project.filter(|p| !p.is_empty()) {
-        args.push(Box::new(format!("%{p}%")));
-        sql.push_str(&format!(" WHERE project_path LIKE ?{}", args.len()));
+        args.push(Box::new(crate::scope::like_contains(p)));
+        sql.push_str(&format!(
+            " WHERE project_path LIKE ?{} ESCAPE '\\'",
+            args.len()
+        ));
     }
     args.push(Box::new(limit as i64));
     sql.push_str(&format!(" ORDER BY created_at DESC LIMIT ?{}", args.len()));
@@ -481,6 +485,10 @@ mod tests {
         assert_eq!(listed[0].id, snap.id);
         // A non-matching project filter returns nothing.
         assert!(list(&conn, Some("/other"), 10).unwrap().is_empty());
+        // `_` and `%` in the fragment are literal: as wildcards they matched "/proj/app".
+        assert!(list(&conn, Some("proj_app"), 10).unwrap().is_empty());
+        assert!(list(&conn, Some("pr%pp"), 10).unwrap().is_empty());
+        assert_eq!(list(&conn, Some("PROJ/APP"), 10).unwrap().len(), 1);
     }
 
     #[test]

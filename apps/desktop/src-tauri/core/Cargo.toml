@@ -73,6 +73,11 @@ dirs = "7"
 # memory files. Already in the lock graph through tauri; `v4` pulls getrandom, also there.
 uuid = { version = "1", features = ["v4"] }
 
+# `trace` (sqlite3_trace_v2) lets `bench::real_index_bench` list the statements each case runs.
+# Tests only: the shipped binaries keep their feature set (resolver 2 does not unify it in).
+[dev-dependencies]
+rusqlite = { version = "0.40", features = ["trace"] }
+
 # Free-space probe before Reclaim space / Shrink index rewrites the file (cleanup.rs
 # `volume_space`). Already in the lock graph through keyring; this only turns on the
 # FileSystem bindings (GetDiskFreeSpaceExW, GetVolumePathNameW).

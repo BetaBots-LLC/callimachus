@@ -6,6 +6,8 @@
 //! do facts recorded by the user or by agents (`record_fact_with_origin`).
 
 pub mod app_config;
+// Recall and check_decision without an answer: no model, or an undistilled scope.
+pub mod fallback;
 pub mod grounding;
 pub mod harvest;
 pub mod identity;
@@ -13,6 +15,9 @@ pub mod priority;
 pub mod repo_memory;
 pub mod truth;
 
+pub use fallback::{
+    check_or_fallback, recall_or_fallback, ClosestSession, DistillCoverage, RecallOutcome,
+};
 pub use identity::{
     local_keys_for_portable, new_fact_uid, portable_project_id, rebind_fact_sources,
     refresh_portable_project_id, IMPORT_FACT_SQL,
@@ -479,8 +484,12 @@ pub fn list_open_todos(
         sql.push_str(&format!(" AND (f.text LIKE ?{a} OR t.title LIKE ?{b})"));
     }
     if let Some(p) = project.filter(|p| !p.is_empty()) {
-        args.push(Box::new(format!("%{p}%")));
-        sql.push_str(&format!(" AND t.project_path LIKE ?{}", args.len()));
+        // A project fragment's `_` and `%` are literal, as in every project scope.
+        args.push(Box::new(crate::scope::like_contains(p)));
+        sql.push_str(&format!(
+            " AND t.project_path LIKE ?{} ESCAPE '\\'",
+            args.len()
+        ));
     }
     if let Some(src) = source.filter(|s| !s.is_empty()) {
         args.push(Box::new(src.to_string()));
@@ -1059,11 +1068,66 @@ pub enum GuardMatch {
 /// which 0.717 would call close. A false "close" is the costlier error, so it stays 0.75.
 pub const GUARD_CLOSE: f32 = 0.75;
 
-/// Similarity floor for the high-stakes guards (`find_prior_work`, `check_contradiction`): a
-/// false "you already did / decided this" is worse than silence, so it sits above general
-/// recall's. Module-level so `eval::tests::calibrate_guard_close` reports the floor the guard
-/// actually uses.
-pub(crate) const GUARD_FLOOR: f32 = 0.55;
+/// Similarity a guard hit below [`GUARD_CLOSE`] needs to be shown at all, as `related`
+/// (`find_prior_work`, `check_contradiction`). The old floor, 0.55, let nearly every proposal
+/// through. Calibrated by `eval::tests::real_guard_calibration` on a clone of the author's
+/// index (bge-small-en-v1.5, 2026-11-09): 891 decisions of one project checked in another
+/// (12 projects with 15+ decisions, each against the 3 largest others), where nothing decided
+/// them. Their best cosine there had a median of 0.662, p90 0.714, p95 0.729 and max 0.795
+/// (28 pairs whose texts were identical in both projects left out); 99.7% cleared 0.55, and
+/// check_decision answered 96.2% of them with a list (6.46 hits on average), so agents learned
+/// to ignore it. 0.72 sits at that p90: 6.5% now get a related hit (0.08 on average). On the
+/// eval pairs it passes 15/16 restatements, 6/6 reversals, 0/16 same-topic and 0/10 unrelated
+/// (same-topic max 0.715): a related hit is a near-restatement, not a topic match. No
+/// `fact_links` supersedes existed on that index to measure positives against.
+pub const GUARD_RELATED: f32 = 0.72;
+
+/// A `related` hit more than this below the best hit is dropped. Without a close hit every
+/// related one is within it (they all sit in [0.72, 0.75)); next to a close one it keeps only
+/// near-ties. memory_truth's "access tokens expire after 15 minutes" has its restatement at
+/// 0.948 and a refresh-token decision at 0.749: context the close answer does not need.
+pub const GUARD_RELATED_BAND: f32 = 0.05;
+
+/// Most `related` hits one guard answer keeps; every close hit stays.
+pub const GUARD_RELATED_MAX: usize = 2;
+
+/// The guard's rule over candidates sorted best first: keep every close hit (at or above
+/// [`GUARD_CLOSE`]); keep a related one only at or above `related` and within `band` of the
+/// best, at most `max` of them. Parameterized so the calibration can sweep it; the guards
+/// call [`guard_keep`].
+pub(crate) fn guard_keep_with(sims: &[f32], related: f32, band: f32, max: usize) -> Vec<bool> {
+    let best = sims.iter().copied().fold(f32::MIN, f32::max);
+    let mut related_kept = 0;
+    sims.iter()
+        .map(|&s| {
+            if s >= GUARD_CLOSE {
+                return true;
+            }
+            let keep = s >= related && s >= best - band && related_kept < max;
+            related_kept += usize::from(keep);
+            keep
+        })
+        .collect()
+}
+
+/// [`guard_keep_with`] at the calibrated [`GUARD_RELATED`], [`GUARD_RELATED_BAND`] and
+/// [`GUARD_RELATED_MAX`]. `sims` must be sorted best first.
+pub(crate) fn guard_keep(sims: &[f32]) -> Vec<bool> {
+    guard_keep_with(sims, GUARD_RELATED, GUARD_RELATED_BAND, GUARD_RELATED_MAX)
+}
+
+/// What check_decision and `cal check` say first when no hit restates or reverses the
+/// proposal ([`guard_no_decision`]), before any related one.
+pub const NO_DECISION_YET: &str = "No decision on this yet.";
+
+/// Whether a guard answer holds no decision on the proposal: no close hit (a restatement or a
+/// reversal of it), only related ones or nothing. check_decision and `cal check` then lead
+/// with "No decision on this yet." so a related hit is never read as a settled answer.
+pub fn guard_no_decision(hits: &[RecallHit]) -> bool {
+    !hits
+        .iter()
+        .any(|h| h.match_strength == Some(GuardMatch::Close))
+}
 
 /// Cross-thread semantic recall of distilled facts. `qv` is a PRECOMPUTED query vector
 /// (embed it via `embed::embed_query` BEFORE locking the DB so inference never holds the
@@ -1104,15 +1168,11 @@ pub fn recall(
         Box::new(crate::embed::vec_to_bytes(qv)),
         Box::new(kind.to_string()),
     ];
-    if let Some(p) = project.filter(|p| !p.is_empty()) {
-        args.push(Box::new(format!("%{p}%")));
-        // Match how facts are WRITTEN + aggregated (record_fact / project_memory both scope by
-        // COALESCE(project_key, project_path)); filtering project_path alone silently drops the
-        // canonical-key threads the backfill exists to fix.
-        sql.push_str(&format!(
-            " AND COALESCE(t.project_key, t.project_path) LIKE ?{}",
-            args.len()
-        ));
+    // Match how facts are WRITTEN + aggregated (record_fact / project_memory both scope by
+    // COALESCE(project_key, project_path)); filtering project_path alone silently drops the
+    // canonical-key threads the backfill exists to fix.
+    if let Some(cond) = crate::scope::ProjectScope::fragment(project).sql("t", &mut args) {
+        sql.push_str(&format!(" AND {cond}"));
     }
     // Similarity floor: a cosine KNN always returns its k-nearest, so a query with no real match
     // still yields confident-but-wrong hits. Drop neighbors below MIN_SIMILARITY (distance =
@@ -1207,20 +1267,6 @@ fn fact_hit_row(r: &rusqlite::Row) -> rusqlite::Result<FactHit> {
     })
 }
 
-/// `s` as a LIKE pattern matching it anywhere, with `%`, `_` and the escape char escaped.
-fn like_contains(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('%');
-    for c in s.chars() {
-        if matches!(c, '%' | '_' | '\\') {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out.push('%');
-    out
-}
-
 /// Visible decisions and gotchas whose text holds every term of `query` (case-insensitive;
 /// phrases, stopwords and punctuation as the search box parses them, see
 /// `search::like_terms`), pinned first then newest, optionally in one project (its canonical
@@ -1305,7 +1351,7 @@ fn fact_search_sql(
     );
     let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
     for w in words {
-        args.push(Box::new(like_contains(w)));
+        args.push(Box::new(crate::scope::like_contains(w)));
         sql.push_str(&format!(" AND f.text LIKE ?{} ESCAPE '\\'", args.len()));
     }
     if let Some(p) = project {
@@ -1349,6 +1395,26 @@ pub fn find_prior_work(
     project: Option<&str>,
     k: usize,
 ) -> Result<Vec<PriorWork>> {
+    // The guard is high-stakes: an agent acts on "you solved this before", so a false positive
+    // is worse than an empty answer. Every close session stays; merely related ones only as
+    // the guard rule allows (`guard_keep`).
+    let mut out = prior_work_candidates(conn, qv, project, k)?;
+    let sims: Vec<f32> = out.iter().map(|w| w.similarity).collect();
+    let mut keep = guard_keep(&sims).into_iter();
+    out.retain(|_| keep.next().unwrap_or(false));
+    out.truncate(k);
+    Ok(out)
+}
+
+/// Every thread [`find_prior_work`] weighs, best first, before the guard rule: one entry per
+/// thread with its best-matching decision or gotcha. Separate so the calibration can measure
+/// the rule against the candidates it sees.
+pub(crate) fn prior_work_candidates(
+    conn: &Connection,
+    qv: &[f32],
+    project: Option<&str>,
+    k: usize,
+) -> Result<Vec<PriorWork>> {
     let over = (k * 3).max(15);
     // A superseded fact is no reason to revisit its session: the newer one is.
     let mut hits = recall(conn, qv, "decision", project, over, false)?;
@@ -1374,27 +1440,22 @@ pub fn find_prior_work(
         }
     }
 
-    // The guard is high-stakes — an agent acts on "you solved this before", so a false positive
-    // is worse than an empty answer. Hold it to a stricter floor than general recall; recall()
-    // already dropped the clear noise, this keeps only genuinely-related prior sessions.
-    let mut out: Vec<PriorWork> = by_thread
-        .into_values()
-        .filter(|w| w.similarity >= GUARD_FLOOR)
-        .collect();
+    let mut out: Vec<PriorWork> = by_thread.into_values().collect();
     out.sort_by(|a, b| {
         b.similarity
-            .partial_cmp(&a.similarity)
-            .unwrap_or(std::cmp::Ordering::Equal)
+            .total_cmp(&a.similarity)
+            .then(a.thread_id.cmp(&b.thread_id))
     });
-    out.truncate(k);
     Ok(out)
 }
 
 /// The active contradiction guard: prior DECISIONS semantically close to `qv` (an embedded
-/// proposal an agent is about to act on), held to a stricter floor than general recall — a
-/// false "you already decided X" is worse than silence. Surface these before the agent
-/// re-litigates a settled choice. Returns decision facts (each with its rationale, when
-/// recorded, its date and status, and `match`). `project` optionally scopes to one repo.
+/// proposal an agent is about to act on). A false "you already decided X" is worse than
+/// silence, so every `close` hit (a restatement or reversal) stays and at most
+/// [`GUARD_RELATED_MAX`] `related` ones do ([`guard_keep`]); no close hit means no decision on
+/// it yet ([`guard_no_decision`]). Surface these before the agent re-litigates a settled
+/// choice. Returns decision facts (each with its rationale, when recorded, its date and
+/// status, and `match`). `project` optionally scopes to one repo.
 ///
 /// Superseded decisions are always included, each naming what replaced it: they are the most
 /// useful answer to "should we go back to X?". Order: live hits (`current`, `disputed`) first,
@@ -1405,10 +1466,10 @@ pub fn check_contradiction(
     project: Option<&str>,
     k: usize,
 ) -> Result<Vec<RecallHit>> {
-    // Same high-stakes floor as find_prior_work: recall() already dropped the clear noise; this
-    // keeps only decisions genuinely on the proposal's topic.
-    let mut hits = recall(conn, qv, "decision", project, (k * 3).max(15), true)?;
-    hits.retain(|h| h.similarity >= GUARD_FLOOR);
+    let mut hits = guard_candidates(conn, qv, project, k)?;
+    let sims: Vec<f32> = hits.iter().map(|h| h.similarity).collect();
+    let mut keep = guard_keep(&sims).into_iter();
+    hits.retain(|_| keep.next().unwrap_or(false));
     for h in &mut hits {
         h.match_strength = Some(if h.similarity >= GUARD_CLOSE {
             GuardMatch::Close
@@ -1430,6 +1491,18 @@ pub fn check_contradiction(
     });
     hits.truncate(k);
     Ok(hits)
+}
+
+/// Every decision [`check_contradiction`] weighs, best first, before the guard rule
+/// (superseded ones included). Separate so the calibration can measure the rule against the
+/// candidates it sees.
+pub(crate) fn guard_candidates(
+    conn: &Connection,
+    qv: &[f32],
+    project: Option<&str>,
+    k: usize,
+) -> Result<Vec<RecallHit>> {
+    recall(conn, qv, "decision", project, (k * 3).max(15), true)
 }
 
 // ---------------------------------------------------------------------------
@@ -2461,12 +2534,8 @@ pub fn has_keyword_candidates(
     let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
     let mut likes = Vec::new();
     for t in terms {
-        // Escape LIKE wildcards in the term itself.
-        let escaped = t
-            .replace('\\', "\\\\")
-            .replace('%', "\\%")
-            .replace('_', "\\_");
-        args.push(Box::new(format!("%{escaped}%")));
+        // LIKE wildcards in the term itself are literal.
+        args.push(Box::new(crate::scope::like_contains(t)));
         likes.push(format!("f.text LIKE ?{} ESCAPE '\\'", args.len()));
     }
     let mut sql = format!(
@@ -2475,12 +2544,8 @@ pub fn has_keyword_candidates(
            AND ({})",
         likes.join(" OR ")
     );
-    if let Some(p) = project.filter(|p| !p.is_empty()) {
-        args.push(Box::new(format!("%{p}%")));
-        sql.push_str(&format!(
-            " AND COALESCE(t.project_key, t.project_path) LIKE ?{}",
-            args.len()
-        ));
+    if let Some(cond) = crate::scope::ProjectScope::fragment(project).sql("t", &mut args) {
+        sql.push_str(&format!(" AND {cond}"));
     }
     sql.push(')');
     let arg_refs: Vec<&dyn rusqlite::ToSql> = args.iter().map(|b| b.as_ref()).collect();
@@ -2858,17 +2923,7 @@ mod tests {
     }
 
     fn temp_db() -> Connection {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static N: AtomicU64 = AtomicU64::new(0);
-        let p = std::env::temp_dir().join(format!(
-            "calli_know_{}_{}.db",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ));
-        for ext in ["db", "db-wal", "db-shm"] {
-            let _ = std::fs::remove_file(p.with_extension(ext));
-        }
-        crate::db::open(&p).unwrap()
+        crate::db::test_support::TestIndex::new("know").into_connection()
     }
 
     #[test]
@@ -3359,6 +3414,27 @@ mod tests {
         assert!(recall(&conn, &v, "gotcha", None, 5, false)
             .unwrap()
             .is_empty());
+    }
+
+    /// Every close hit stays; a related one only from GUARD_RELATED, within the band of the
+    /// best hit, two at most; nothing below the floor.
+    #[test]
+    fn guard_keeps_close_hits_and_few_near_related_ones() {
+        let (c, r) = (GUARD_CLOSE, GUARD_RELATED);
+        assert_eq!(guard_keep(&[0.95, 0.9, 0.8, c]), vec![true; 4]);
+        // Next to a strong close hit, a related one outside the band is noise.
+        assert_eq!(guard_keep(&[0.95, c - 0.01]), vec![true, false]);
+        assert_eq!(
+            guard_keep(&[c + 0.01, c - 0.01]),
+            vec![true, true],
+            "a near tie stays"
+        );
+        assert_eq!(
+            guard_keep(&[r + 0.02, r + 0.01, r + 0.005, r - 0.01]),
+            vec![true, true, false, false]
+        );
+        assert!(guard_keep(&[r - 0.001, 0.6]).iter().all(|k| !k));
+        assert!(guard_keep(&[]).is_empty());
     }
 
     #[test]

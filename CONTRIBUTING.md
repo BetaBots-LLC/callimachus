@@ -114,19 +114,52 @@ writes and then deletes a test entry in your OS credential store, and live calls
 through your logged-in `claude` CLI. To run one, name it, e.g.
 `cargo test -p callimachus-core -- --ignored real_claude_index`.
 
+Test indexes go in the temp dir as `calli_<tag>_<pid>_<n>.db`. Use
+`db::test_support::TestIndex` (or `TestPath`, or `TestDir` for a folder) for new ones: it
+removes the files when it drops, and on macOS and Linux the first one a test run makes
+deletes the `calli_<tag>_<pid>_<n>` index files that earlier, finished runs left behind
+(never the files of a test process still running, and not folders or other name shapes).
+
+### Measuring on a real index
+
+`bench::real_index_bench` times the reads the app, `cal`, the hooks and the MCP server
+lean on (keyword search, the semantic KNN with and without a project or source filter,
+the SessionStart hook for your five biggest projects, the session digest, issue mining,
+Today and the embed progress counts), cold and warm, wall and CPU time, then prints every
+statement each one ran with its `EXPLAIN QUERY PLAN`. It opens the index read-only and
+only from `CALLIMACHUS_DB`, and refuses a file in the app's data folder, so measure a
+copy:
+
+```bash
+D="$HOME/Library/Application Support/dev.shaller.callimachus"; B=/tmp/cal-bench
+mkdir -p "$B" && cp -c "$D"/index.db* "$B"/   # APFS clone: instant, no extra disk
+cd apps/desktop/src-tauri
+CALLIMACHUS_DB="$B/index.db" cargo test -p callimachus-core --release real_index_bench -- --ignored --nocapture
+```
+
+Use `--release`: a debug build compiles SQLite without optimizations. "cold" is each
+case's first run in the process (SQLite's cache is empty; the OS cache is only cold on a
+copy nothing has read yet), "warm" the best of three more. The output labels projects by
+rank, not by path, so it can go into an issue or a PR. It needs no model: the KNN query
+vectors are read from the index's own stored chunks.
+
 ### Memory recall eval
 
 `core/src/eval/` holds a small synthetic corpus (`fixtures/memory_truth_v1.json`: eight
-projects with planted corrections, fixes, reversals and restatements) and two ignored
-tests that run it through the real search, `check_decision` and hook-memory paths with
-hand-written distill output, so no LLM is involved. Run them after changing search,
-recall, fact links or the memory renderer:
+projects with planted corrections, fixes, reversals and restatements; `memory_truth_v2.json`
+adds proposals checked in a project that never decided them) and ignored tests that run it
+through the real search, `check_decision` and hook-memory paths with hand-written distill
+output, so no LLM is involved. Run them after changing search, recall, fact links, the
+guard or the memory renderer:
 
 ```bash
 cd apps/desktop/src-tauri
 export FASTEMBED_CACHE_DIR="$HOME/Library/Application Support/dev.shaller.callimachus/models"
 cargo test -p callimachus-core eval_memory_truth -- --ignored --nocapture      # report + floors
 cargo test -p callimachus-core calibrate_guard_close -- --ignored --nocapture  # GUARD_CLOSE
+# GUARD_RELATED and recall-now's floor, on an APFS clone of your index (read-only):
+CALLIMACHUS_GROUNDING_DB=/path/to/clone/index.db \
+  cargo test -p callimachus-core real_guard_calibration -- --ignored --nocapture
 ```
 
 They only read the model files (never the index next to them) and skip with a message

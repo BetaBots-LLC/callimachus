@@ -1013,9 +1013,15 @@ where
 /// messages batch-by-batch (`jobs::start_embed_build`). Emits `embed:progress`,
 /// `embed:error` (model unavailable / systemic failure) and `embed:done`.
 #[tauri::command]
-fn build_embeddings(app: AppHandle) -> AppResult<()> {
-    jobs::start_embed_build(&host(&app), jobs::EmbedTrigger::User);
-    Ok(())
+async fn build_embeddings(app: AppHandle) -> AppResult<()> {
+    // Off the main thread: the start takes embed.lock (file I/O, and up to 2 x 50 ms of
+    // retries while a terminal `cal embed` holds it), which would freeze the window.
+    let host = host(&app);
+    blocking(move || {
+        jobs::start_embed_build(&host, jobs::EmbedTrigger::User);
+        Ok(())
+    })
+    .await
 }
 
 /// The app's search filters: its project chip and pages hold an exact key from
@@ -1943,7 +1949,7 @@ async fn recall_decisions(
     query: String,
     project: Option<String>,
     limit: Option<u32>,
-) -> AppResult<Vec<knowledge::RecallHit>> {
+) -> AppResult<knowledge::RecallOutcome> {
     recall_facts(app, "decision", query, project, limit).await
 }
 
@@ -1954,7 +1960,7 @@ async fn recall_gotchas(
     query: String,
     project: Option<String>,
     limit: Option<u32>,
-) -> AppResult<Vec<knowledge::RecallHit>> {
+) -> AppResult<knowledge::RecallOutcome> {
     recall_facts(app, "gotcha", query, project, limit).await
 }
 
@@ -1981,24 +1987,25 @@ async fn find_prior_work(
 }
 
 /// Shared recall path: embed the query OUTSIDE the DB (cached-only), then run the SQL KNN
-/// on the pool.
+/// on the pool. Without the model (or in an undistilled scope) the outcome carries the
+/// closest sessions instead of an empty list, as `cal` and the MCP server answer
+/// (`knowledge::recall_or_fallback`).
 async fn recall_facts(
     app: AppHandle,
     kind: &'static str,
     query: String,
     project: Option<String>,
     limit: Option<u32>,
-) -> AppResult<Vec<knowledge::RecallHit>> {
+) -> AppResult<knowledge::RecallOutcome> {
     blocking(move || {
         let embedder = app.state::<embed::Embedder>();
-        let Some(qv) = embed::embed_query_cached_only(&embedder, &query)? else {
-            return Ok(Vec::new());
-        };
+        let qv = embed::embed_query_cached_only(&embedder, &query)?;
         let pool = app.state::<db::ReadPool>();
         let conn = read(&pool).map_err(error::AppError::into_inner)?;
-        knowledge::recall(
+        knowledge::recall_or_fallback(
             &conn,
-            &qv,
+            &query,
+            qv.as_deref(),
             kind,
             project.as_deref(),
             limit.unwrap_or(20) as usize,

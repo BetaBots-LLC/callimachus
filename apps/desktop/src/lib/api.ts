@@ -411,6 +411,28 @@ export interface RecallHit {
   originRef?: string | null;
 }
 
+/** A past session offered when recall has no fact to return: by keyword without the
+ *  embedding model, or the closest by meaning in a scope that was never distilled. */
+export interface ClosestSession {
+  id: number;
+  title: string | null;
+  /** The best-matching message, `role: text`, redacted and clipped. */
+  snippet: string;
+}
+
+/** `recall_decisions` / `recall_gotchas`: the hits, or why there are none and what to open
+ *  instead (`knowledge::RecallOutcome`). `noModel`: show the sessions with a hint to
+ *  download the model (Settings, semantic search). */
+export type RecallOutcome =
+  | { kind: "hits"; hits: RecallHit[] }
+  | {
+      kind: "thin";
+      coverage: { distilledThreads: number; threads: number };
+      sessions: ClosestSession[];
+      distillOn: boolean;
+    }
+  | { kind: "noModel"; sessions: ClosestSession[] };
+
 /** Distilled knowledge for one thread. */
 export interface ThreadKnowledge {
   summary: string | null;
@@ -1113,11 +1135,12 @@ export const api = {
     invoke<AutoDistillBudget>("set_auto_distill_daily_cap", { cap }),
   threadKnowledge: (threadId: number) => invoke<ThreadKnowledge>("thread_knowledge", { threadId }),
   distillThread: (threadId: number) => invoke<ThreadKnowledge>("distill_thread", { threadId }),
-  // Cross-thread semantic recall of distilled facts.
+  // Cross-thread semantic recall of distilled facts, or the closest sessions when there is
+  // no model or no distilled memory in scope.
   recallDecisions: (query: string, project?: string) =>
-    invoke<RecallHit[]>("recall_decisions", { query, project: project ?? null }),
+    invoke<RecallOutcome>("recall_decisions", { query, project: project ?? null }),
   recallGotchas: (query: string, project?: string) =>
-    invoke<RecallHit[]>("recall_gotchas", { query, project: project ?? null }),
+    invoke<RecallOutcome>("recall_gotchas", { query, project: project ?? null }),
   // Ask-your-history (RAG): synthesized answer + cited source threads. Saves nothing: the
   // chat store saves the turn with saveChat once the answer is shown.
   askHistory: (question: string) => invoke<AskAnswer>("ask_history", { question }),

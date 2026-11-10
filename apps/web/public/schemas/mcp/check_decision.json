@@ -218,6 +218,9 @@
             "string",
             "null"
           ]
+        },
+        "noDecision": {
+          "type": "boolean"
         }
       },
       "required": [

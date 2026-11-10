@@ -80,11 +80,16 @@ pub fn default_index_path() -> PathBuf {
     if let Ok(p) = std::env::var("CALLIMACHUS_DB") {
         return PathBuf::from(p);
     }
+    app_data_dir().join("index.db")
+}
+
+/// The folder of the app's own index (and the dev build's `index.dev.db`), whatever
+/// `CALLIMACHUS_DB` says.
+pub(crate) fn app_data_dir() -> PathBuf {
     dirs::data_local_dir()
         .or_else(dirs::home_dir)
         .unwrap_or_else(std::env::temp_dir)
         .join("dev.shaller.callimachus")
-        .join("index.db")
 }
 
 /// Open (or create) the database at `path`, apply pragmas, and migrate to latest. For the
@@ -597,6 +602,256 @@ pub fn shrink_memory(conn: &Connection) {
     crate::memtrim::release_freed_memory();
 }
 
+/// Test indexes that clean up after themselves. Test helpers used to name a fresh index
+/// `calli_<tag>_<pid>_<n>.db` in the temp dir and never delete it: one machine's temp dir held
+/// 42,883 of them (about 19 GiB). A [`TestIndex`](test_support::TestIndex) or
+/// [`TestPath`](test_support::TestPath) removes its files on drop, and the first one a test
+/// process makes sweeps what earlier test processes left behind.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+
+    /// The extensions of `calli_<tag>_<pid>_<n>.db` and the files made next to it: SQLite's
+    /// WAL, shared memory and rollback journal, and the MCP server's ledger
+    /// (`ledger::path_for`).
+    const EXTENSIONS: [&str; 5] = ["db", "db-wal", "db-shm", "db-journal", "ledger.jsonl"];
+
+    /// A fresh temp index path, `calli_<tag>_<pid>_<n>.db`, whose files (WAL and shared
+    /// memory included) are removed on drop. For tests that open their own connections.
+    pub struct TestPath(PathBuf);
+
+    impl TestPath {
+        pub fn new(tag: &str) -> Self {
+            static SEQ: AtomicU64 = AtomicU64::new(0);
+            sweep_once();
+            let n = SEQ.fetch_add(1, Ordering::Relaxed);
+            let path =
+                std::env::temp_dir().join(format!("calli_{tag}_{}_{n}.db", std::process::id()));
+            remove_index_files(&path);
+            Self(path)
+        }
+    }
+
+    impl std::ops::Deref for TestPath {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl AsRef<Path> for TestPath {
+        fn as_ref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestPath {
+        fn drop(&mut self) {
+            remove_index_files(&self.0);
+        }
+    }
+
+    /// A migrated index ([`open`]) at a [`TestPath`]. Derefs to its connection; on drop the
+    /// connection closes, then the files go.
+    pub struct TestIndex {
+        // Before `path`: fields drop in order, and Windows cannot remove an open file.
+        conn: Connection,
+        path: TestPath,
+    }
+
+    thread_local! {
+        /// The files of test indexes whose connection was handed out
+        /// ([`TestIndex::into_connection`]), removed when this thread ends.
+        static HANDED_OUT: std::cell::RefCell<Vec<TestPath>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    impl TestIndex {
+        pub fn new(tag: &str) -> Self {
+            let path = TestPath::new(tag);
+            let conn = open(&path).expect("open + migrate");
+            Self { conn, path }
+        }
+
+        /// `conn`, which the caller opened at `path` (a raw open at an old schema version,
+        /// say), removed with it.
+        pub fn adopt(conn: Connection, path: TestPath) -> Self {
+            Self { conn, path }
+        }
+
+        /// The bare connection, for a helper whose callers move it (into a `Db`, the MCP
+        /// server). Its files go when the calling thread ends: libtest runs each test on a
+        /// thread of its own, so that is when the test is done and its locals are dropped.
+        pub fn into_connection(self) -> Connection {
+            let Self { conn, path } = self;
+            HANDED_OUT.with(|files| files.borrow_mut().push(path));
+            conn
+        }
+    }
+
+    impl std::ops::Deref for TestIndex {
+        type Target = Connection;
+        fn deref(&self) -> &Connection {
+            &self.conn
+        }
+    }
+
+    impl std::ops::DerefMut for TestIndex {
+        fn deref_mut(&mut self) -> &mut Connection {
+            &mut self.conn
+        }
+    }
+
+    /// A fresh temp folder, `calli_<tag>_<pid>_<n>`, removed with all it holds on drop. Derefs
+    /// to the (not yet created) `index.db` path inside it, for tests whose index needs a
+    /// folder of its own: lock files and logs land next to the index. The sweep leaves
+    /// folders alone, so without this each run of such a test left one behind.
+    pub struct TestDir {
+        dir: PathBuf,
+        index: PathBuf,
+    }
+
+    impl TestDir {
+        pub fn new(tag: &str) -> Self {
+            static SEQ: AtomicU64 = AtomicU64::new(0);
+            sweep_once();
+            let n = SEQ.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!("calli_{tag}_{}_{n}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("create the test folder");
+            let index = dir.join("index.db");
+            Self { dir, index }
+        }
+    }
+
+    impl std::ops::Deref for TestDir {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.index
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn remove_index_files(path: &Path) {
+        for ext in EXTENSIONS {
+            let _ = std::fs::remove_file(path.with_extension(ext));
+        }
+    }
+
+    /// Sweep the temp dir once per test process, before its first test index.
+    fn sweep_once() {
+        static SWEPT: OnceLock<usize> = OnceLock::new();
+        SWEPT.get_or_init(|| sweep_dead_test_files(&std::env::temp_dir()));
+    }
+
+    /// The pid in a test index file's name, `calli_<tag>_<pid>_<n>.db` (or a companion in
+    /// [`EXTENSIONS`]), or None for any other name. Tags may hold underscores.
+    pub fn test_file_pid(name: &str) -> Option<u32> {
+        let stem = name.strip_prefix("calli_")?;
+        let stem = EXTENSIONS
+            .iter()
+            .find_map(|ext| stem.strip_suffix(ext)?.strip_suffix('.'))?;
+        let mut parts = stem.rsplitn(3, '_');
+        let n = parts.next()?;
+        let pid = parts.next()?;
+        let tag = parts.next()?;
+        let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+        if !(digits(n) && digits(pid) && !tag.is_empty()) {
+            return None;
+        }
+        pid.parse().ok()
+    }
+
+    /// Remove the test index files in `dir` whose process is gone, returning how many.
+    /// Parallel test processes (cargo runs one per crate, CI runs jobs side by side) share
+    /// the temp dir, so a live pid's files are never touched, and nothing is when liveness
+    /// cannot be read. Unix only: Windows has no cheap pid probe without a new dependency.
+    pub fn sweep_dead_test_files(dir: &Path) -> usize {
+        sweep_dead_test_files_before(dir, std::time::SystemTime::now())
+    }
+
+    /// [`sweep_dead_test_files`], removing only files last written before `started` (when
+    /// the sweep began). Liveness is read once, and deleting a large backlog takes seconds
+    /// (31,507 such files sat in one machine's temp dir): a new test process handed a dead
+    /// pid meanwhile recreates the very names on the list (its counter starts at 0), and its
+    /// files, written after the sweep began, must survive.
+    pub fn sweep_dead_test_files_before(dir: &Path, started: std::time::SystemTime) -> usize {
+        if !cfg!(unix) {
+            return 0;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return 0;
+        };
+        let me = std::process::id();
+        let files: Vec<(PathBuf, u32)> = entries
+            .flatten()
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+            .filter_map(|e| {
+                let pid = test_file_pid(e.file_name().to_str()?)?;
+                (pid != me).then(|| (e.path(), pid))
+            })
+            .collect();
+        let pids: Vec<u32> = files
+            .iter()
+            .map(|(_, pid)| *pid)
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        let Some(live) = live_pids(&pids) else {
+            return 0;
+        };
+        let stale = |path: &Path| {
+            std::fs::metadata(path)
+                .and_then(|m| m.modified())
+                .is_ok_and(|written| written < started)
+        };
+        files
+            .into_iter()
+            .filter(|(path, pid)| {
+                !live.contains(pid) && stale(path) && std::fs::remove_file(path).is_ok()
+            })
+            .count()
+    }
+
+    /// Which of `pids` are running, from one `ps` per 500 pids (core has no libc; cleanup
+    /// reads free space through `df` too). `ps` exits 1 when a pid is gone, so the answer is
+    /// read from its output, and trusted only when it names this process: a `ps` that
+    /// printed nothing would otherwise read as "every pid is dead".
+    fn live_pids(pids: &[u32]) -> Option<HashSet<u32>> {
+        let me = std::process::id();
+        let mut live = HashSet::new();
+        for chunk in pids.chunks(500) {
+            let list = chunk
+                .iter()
+                .chain([&me])
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            let out = std::process::Command::new("ps")
+                .args(["-p", &list, "-o", "pid="])
+                .output()
+                .ok()?;
+            let seen: HashSet<u32> = String::from_utf8_lossy(&out.stdout)
+                .split_whitespace()
+                .filter_map(|s| s.parse().ok())
+                .collect();
+            if !seen.contains(&me) {
+                return None;
+            }
+            live.extend(seen);
+        }
+        Some(live)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -617,27 +872,136 @@ mod tests {
         assert_eq!(default_index_path(), expected);
     }
 
-    fn temp_db() -> Connection {
-        // Unique temp path per test run; an in-memory DB would also work but a file
-        // exercises the real open() path including WAL pragmas. A process-wide
-        // counter avoids collisions when tests run on the same nanosecond.
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        let path =
-            std::env::temp_dir().join(format!("callimachus_test_{}_{n}.db", std::process::id()));
-        open(&path).expect("open + migrate")
+    use super::test_support::{
+        sweep_dead_test_files_before, test_file_pid, TestDir, TestIndex, TestPath,
+    };
+
+    // A file rather than an in-memory DB: it exercises the real open() path including the
+    // WAL pragmas.
+    fn temp_db() -> TestIndex {
+        TestIndex::new("db")
+    }
+
+    /// A test index's files go when it drops, WAL and shared memory included.
+    #[test]
+    fn a_test_index_removes_its_files_on_drop() {
+        let index = TestIndex::new("drop");
+        index
+            .execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES (1);")
+            .unwrap();
+        let path = PathBuf::from(index.path().unwrap());
+        let wal = path.with_extension("db-wal");
+        assert!(path.exists() && wal.exists(), "WAL mode leaves a -wal file");
+        drop(index);
+        assert!(!path.exists() && !wal.exists());
+        assert!(!path.with_extension("db-shm").exists());
+
+        // A handed-out connection's files go when its thread ends.
+        let path = std::thread::spawn(|| {
+            let conn = TestIndex::new("handed_out").into_connection();
+            let path = PathBuf::from(conn.path().unwrap());
+            drop(conn);
+            assert!(path.exists(), "kept while the thread runs");
+            path
+        })
+        .join()
+        .unwrap();
+        assert!(!path.exists());
+    }
+
+    /// A test folder goes with everything in it (an index, its WAL, lock files) on drop.
+    #[test]
+    fn a_test_dir_removes_itself_on_drop() {
+        let index = TestDir::new("dir");
+        let conn = open(&index).unwrap();
+        conn.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES (1);")
+            .unwrap();
+        std::fs::write(index.with_file_name("index.db.embed.lock"), b"1").unwrap();
+        let dir = index.parent().unwrap().to_path_buf();
+        assert!(dir.join("index.db-wal").exists());
+        drop(conn);
+        drop(index);
+        assert!(!dir.exists());
+    }
+
+    /// Only `calli_<tag>_<pid>_<n>.db` and its companions name a pid; tags may hold
+    /// underscores, and any other shape is left alone.
+    #[test]
+    fn test_file_names_give_their_pid() {
+        assert_eq!(test_file_pid("calli_mcp_123_4.db"), Some(123));
+        assert_eq!(test_file_pid("calli_mcp_skew_123_4.db-wal"), Some(123));
+        assert_eq!(test_file_pid("calli_digest_hook_9_0.db-shm"), Some(9));
+        assert_eq!(test_file_pid("calli_x_7_1.db-journal"), Some(7));
+        assert_eq!(test_file_pid("calli_mcp_8_2.ledger.jsonl"), Some(8));
+        for other in [
+            "calli_cost_123.db",
+            "calli_mcp_123_4.jsonl",
+            "calli_mcp_123_4",
+            "calli__123_4.db",
+            "calli_mcp_12a_4.db",
+            "calli_mcp_123_.db",
+            "callimachus_test_123_4.db",
+            "other_mcp_123_4.db",
+        ] {
+            assert_eq!(test_file_pid(other), None, "{other}");
+        }
+    }
+
+    /// The sweep removes the files of test processes that are gone and never a live
+    /// process's (this one's, or pid 1's), nor anything that is not a test index file.
+    #[cfg(unix)]
+    #[test]
+    fn the_sweep_removes_only_dead_processes_test_files() {
+        let dir = std::env::temp_dir().join(format!("calli_sweep_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A pid that was alive a moment ago and is not now.
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let dead = child.id();
+        child.wait().unwrap();
+        let me = std::process::id();
+        let gone = [
+            format!("calli_mcp_{dead}_0.db"),
+            format!("calli_mcp_{dead}_0.db-wal"),
+            format!("calli_mcp_skew_{dead}_3.db-shm"),
+            format!("calli_mcp_{dead}_0.ledger.jsonl"),
+        ];
+        let kept = [
+            format!("calli_mcp_{me}_0.db"),
+            "calli_mcp_1_0.db".to_string(),
+            format!("calli_cost_{dead}.db"),
+            format!("calli_mcp_{dead}_0.jsonl"),
+            format!("other_{dead}_0.db"),
+        ];
+        for name in gone.iter().chain(&kept) {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+        // A directory with a test file's name is not a file.
+        std::fs::create_dir(dir.join(format!("calli_dir_{dead}_1.db"))).unwrap();
+        // Nothing written after the sweep began goes, whatever its pid: a new test process
+        // handed a dead pid recreates these very names while a long sweep is deleting.
+        assert_eq!(
+            sweep_dead_test_files_before(&dir, std::time::SystemTime::UNIX_EPOCH),
+            0
+        );
+        for name in &gone {
+            assert!(dir.join(name).exists(), "{name} is newer than the sweep");
+        }
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(1);
+        assert_eq!(sweep_dead_test_files_before(&dir, later), gone.len());
+        for name in &gone {
+            assert!(!dir.join(name).exists(), "{name} removed");
+        }
+        for name in &kept {
+            assert!(dir.join(name).exists(), "{name} kept");
+        }
+        assert!(dir.join(format!("calli_dir_{dead}_1.db")).is_dir());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn read_pool_opens_queries_and_has_vec0() {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static SEQ: AtomicU64 = AtomicU64::new(9000);
-        let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("calli_pool_{}_{n}.db", std::process::id()));
-        for ext in ["db", "db-wal", "db-shm"] {
-            let _ = std::fs::remove_file(path.with_extension(ext));
-        }
+        let path = TestPath::new("pool");
         let _writer = open(&path).unwrap(); // create + migrate first (readers can't)
         let pool = read_pool(&path, 3).unwrap();
         let conn = pool.0.get().unwrap();
@@ -661,15 +1025,8 @@ mod tests {
         shrink_memory(&c2);
     }
 
-    fn fresh_path(tag: &str) -> PathBuf {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        let p = std::env::temp_dir().join(format!("calli_{tag}_{}_{n}.db", std::process::id()));
-        for ext in ["db", "db-wal", "db-shm"] {
-            let _ = std::fs::remove_file(p.with_extension(ext));
-        }
-        p
+    fn fresh_path(tag: &str) -> TestPath {
+        TestPath::new(tag)
     }
 
     /// A process that finds the schema out of date while another one is upgrading it waits
@@ -691,7 +1048,7 @@ mod tests {
         other.execute_batch("BEGIN IMMEDIATE").unwrap();
         other.pragma_update(None, "user_version", version).unwrap();
 
-        let path = p.clone();
+        let path = p.to_path_buf();
         let opener = std::thread::spawn(move || {
             open_with(&path, Duration::from_millis(50), Duration::from_secs(10))
         });
