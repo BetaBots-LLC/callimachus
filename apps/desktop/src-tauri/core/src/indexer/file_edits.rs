@@ -799,12 +799,12 @@ pub fn backfill_file_edits_once(
     db: &crate::db::Db,
     pause: &dyn Fn() -> bool,
 ) -> anyhow::Result<Option<BackfillReport>> {
-    let lock = || db.0.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"));
-    if !crate::knowledge::app_config::get_flag(&*lock()?, BACKFILL_PENDING)? {
+    let lock = || crate::db::lock_conn(&db.0);
+    if !crate::knowledge::app_config::get_flag(&lock(), BACKFILL_PENDING)? {
         return Ok(None);
     }
     let report = backfill_file_edits(db, pause)?;
-    crate::knowledge::app_config::delete(&*lock()?, BACKFILL_PENDING)?;
+    crate::knowledge::app_config::delete(&lock(), BACKFILL_PENDING)?;
     Ok(Some(report))
 }
 
@@ -823,10 +823,10 @@ pub fn backfill_file_edits(
     db: &crate::db::Db,
     pause: &dyn Fn() -> bool,
 ) -> anyhow::Result<BackfillReport> {
-    let lock = || db.0.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"));
+    let lock = || crate::db::lock_conn(&db.0);
     let started = std::time::Instant::now();
     let (thread_ids, rollouts) = {
-        let conn = lock()?;
+        let conn = lock();
         let mut stmt = conn.prepare(
             "SELECT t.id FROM threads t
              WHERE NOT EXISTS (SELECT 1 FROM file_edits f WHERE f.thread_id = t.id)
@@ -864,7 +864,7 @@ pub fn backfill_file_edits(
             }
         }
         if !batch.is_empty() {
-            let mut conn = lock()?;
+            let mut conn = lock();
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             for p in &batch {
                 let free: bool = tx.query_row(
@@ -910,7 +910,7 @@ fn plan_stored_thread(
 ) -> anyhow::Result<Vec<EditRow>> {
     type Stored = (Option<i64>, String, String, Option<i64>);
     let (project_path, codex_id, stored): (Option<String>, Option<String>, Vec<Stored>) = {
-        let conn = db.0.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+        let conn = crate::db::lock_conn(&db.0);
         let Some((project_path, kind, external_id)) = conn
             .query_row(
                 "SELECT t.project_path, s.kind, t.external_id

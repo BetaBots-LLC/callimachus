@@ -8,7 +8,7 @@
 //!
 //! Schema verified against block/goose `session_manager.rs`.
 
-use super::common::truncate_title;
+use super::common::{begin_file, count_file, count_line, count_skipped, truncate_title};
 use super::{
     file_change_state, set_file_state, source_id, upsert_thread, IndexReport, ParsedMessage,
     ParsedThread,
@@ -64,6 +64,7 @@ fn scan_path(conn: &mut Connection, db: &Path, tick: &mut dyn FnMut()) -> Result
 
     for s in sessions {
         tick();
+        let file = begin_file();
         let mut messages: Vec<ParsedMessage> = Vec::new();
         let mut first_user: Option<String> = None;
         let mut min_ts: Option<i64> = None;
@@ -79,9 +80,16 @@ fn scan_path(conn: &mut Connection, db: &Path, tick: &mut dyn FnMut()) -> Result
 
         for row in rows {
             let (role, content_json, raw_ts) = row?;
+            count_line();
             let role = match role.as_deref() {
                 Some("assistant") => "assistant",
-                _ => "user",
+                Some("user") => "user",
+                // Read as the user's, as before; counted so a renamed role shows up
+                // (`parse_health`) instead of quietly relabelling every message.
+                other => {
+                    count_skipped("role:", other, &[]);
+                    "user"
+                }
             };
             let text = content_json
                 .as_deref()
@@ -107,6 +115,7 @@ fn scan_path(conn: &mut Connection, db: &Path, tick: &mut dyn FnMut()) -> Result
             });
         }
 
+        count_file(file, messages.len());
         if messages.is_empty() {
             report.threads_skipped += 1;
             continue;
@@ -227,6 +236,40 @@ mod tests {
     }
 
     /// Build a Goose-shaped sessions.db and verify extraction.
+    /// The parse canary: a message of an invented role is counted (and still indexed as the
+    /// user's), and each session is one file.
+    #[test]
+    fn parse_counts_name_unknown_roles() {
+        let dir = crate::db::test_support::TestDir::new("goose_canary");
+        let src = dir.with_file_name("sessions.db");
+        {
+            let c = Connection::open(&src).unwrap();
+            c.execute_batch(
+                "CREATE TABLE sessions (id TEXT PRIMARY KEY, name TEXT, description TEXT, working_dir TEXT);
+                 CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, role TEXT, content_json TEXT, created_timestamp INTEGER);
+                 INSERT INTO sessions VALUES ('s1', 'x', '', '/p'), ('s2', 'empty', '', '/p'),
+                   ('s3', 'textless', '', '/p');
+                 INSERT INTO messages (session_id, role, content_json, created_timestamp) VALUES
+                   ('s1', 'user', json('{\"text\":\"hi\"}'), 1780000000),
+                   ('s1', 'narrator', json('{\"text\":\"once upon a time\"}'), 1780000001),
+                   ('s3', 'assistant', json('[]'), 1780000002);",
+            )
+            .unwrap();
+        }
+        let mut conn = crate::db::open(&dir).unwrap();
+        let (report, stats) = crate::indexer::common::collect_parse_stats(|| {
+            scan_path(&mut conn, &src, &mut || {}).unwrap()
+        });
+        assert_eq!(report.messages_indexed, 2);
+        assert_eq!(stats.lines, 3);
+        assert_eq!(
+            stats.unknown_kinds,
+            std::collections::BTreeMap::from([("role:narrator".to_string(), 1)])
+        );
+        // s2 holds no message row (an empty file); s3 holds one that yields no text.
+        assert_eq!((stats.files, stats.files_with_zero_messages), (3, 1));
+    }
+
     #[test]
     fn extracts_from_goose_shaped_db() {
         let src = temp("goose_src.db");

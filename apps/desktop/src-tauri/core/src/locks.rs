@@ -81,14 +81,19 @@ pub fn lock_path(index: &Path, name: &str) -> PathBuf {
 }
 
 /// Take the lock `name` next to `index` for the life of this process and write our pid
-/// into it. Creates the index directory if needed.
+/// into it. Creates the index directory if needed (owner-only, like `db::open` does; the
+/// lock file itself keeps the default mode, see below).
 pub fn acquire(index: &Path, name: &str) -> std::io::Result<Acquire> {
     let path = lock_path(index, name);
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        crate::db::create_private_dir(dir)?;
     }
     // Not `truncate(true)`: the file may be a live holder's, whose pid must survive this
     // open. It is truncated below, once the lock is ours.
+    // Not owner-only, unlike the index next to it: [`holder`] probes a lock by opening the file
+    // read-only, also one another user left behind (`sudo cal watch`, a root container on a
+    // mounted folder), and a file it cannot open reads as held for good. The file holds a pid
+    // and nothing else, and the app's own data folder is 0700 anyway.
     let mut file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -301,6 +306,33 @@ mod tests {
         }
         stop.store(true, Ordering::Relaxed);
         spawner.join().unwrap();
+    }
+
+    /// The index folder a lock creates is owner-only; the lock file itself is not narrowed
+    /// (a probe by another user must still be able to open it: the next test shows what an
+    /// unreadable one costs), and an existing one keeps its mode.
+    #[cfg(unix)]
+    #[test]
+    fn a_new_index_folder_is_owner_only_and_lock_files_stay_probeable() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let base = index_in("owner_only");
+        let index = base.with_file_name("sub").join("index.db");
+        let Acquire::Acquired(lock) = acquire(&index, WATCH_LOCK).unwrap() else {
+            panic!("a free lock is acquired");
+        };
+        assert_eq!(mode(index.parent().unwrap()), 0o700);
+        // Whatever the process umask allows; with the usual 022 that is 0644.
+        std::fs::set_permissions(lock.path(), std::fs::Permissions::from_mode(0o644)).unwrap();
+        let path = lock.path().to_path_buf();
+        drop(lock);
+        assert!(wait_until_free(&index, WATCH_LOCK, FREED));
+        let Acquire::Acquired(again) = acquire(&index, WATCH_LOCK).unwrap() else {
+            panic!("a free lock is acquired");
+        };
+        assert_eq!(mode(&path), 0o644, "taking a lock never narrows its file");
+        drop(again);
+        let _ = std::fs::remove_dir_all(base.parent().unwrap());
     }
 
     /// A lock file that exists but cannot be opened reads as held (pid unknown), never as

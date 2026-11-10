@@ -1654,8 +1654,11 @@ fn user_prompt(text: String) -> Vec<PromptMessage> {
 }
 
 impl Callimachus {
+    /// Never an error: a panic under an earlier guard is recovered from
+    /// ([`crate::db::lock_conn`]), so one bad call cannot fail every later one until the
+    /// agent restarts the server. The `Result` keeps the tools' `?`.
     fn lock(&self) -> Result<MutexGuard<'_, Connection>, ErrorData> {
-        self.conn.lock().map_err(internal)
+        Ok(crate::db::lock_conn(&self.conn))
     }
 
     /// The guidance every tool answers with instead of results ([`Self::index_notice`]), as a
@@ -1729,10 +1732,8 @@ impl Callimachus {
         let Ok(fresh) = crate::db::open_sidecar_current_long_lived(path) else {
             return;
         };
-        if let Ok(mut conn) = self.conn.lock() {
-            *conn = fresh;
-            *reopen = None;
-        }
+        *crate::db::lock_conn(&self.conn) = fresh;
+        *reopen = None;
     }
 
     /// Keyword or hybrid search under the connection lock.
@@ -3033,6 +3034,16 @@ impl ServerHandler for Callimachus {
 /// [`serve_stdio`] calls it, after opening the index and building the runtime. `reopen` is
 /// [`open_index`]'s stand-in path, if any.
 async fn serve(conn: Connection, reopen: Option<PathBuf>) -> anyhow::Result<()> {
+    serve_on(conn, reopen, (tokio::io::stdin(), tokio::io::stdout())).await
+}
+
+/// [`serve`] over any pair of byte streams; tests drive the real protocol through an
+/// in-memory pipe ([`assert_every_tool_answers_with_the_schema_notice`]).
+async fn serve_on<R, W>(conn: Connection, reopen: Option<PathBuf>, io: (R, W)) -> anyhow::Result<()>
+where
+    R: tokio::io::AsyncRead + Send + Unpin + 'static,
+    W: tokio::io::AsyncWrite + Send + Unpin + 'static,
+{
     let server = Callimachus::new(conn);
     *server.reopen.lock().map_err(|e| anyhow::anyhow!("{e}"))? = reopen;
     // Drop the model a minute after the last semantic call instead of holding about 390 MB
@@ -3051,7 +3062,7 @@ async fn serve(conn: Connection, reopen: Option<PathBuf>) -> anyhow::Result<()> 
                     // The semantic calls that loaded the model also filled the page cache
                     // (a KNN reads vector pages); hand both back together.
                     if e.unload_if_idle() {
-                        if let Ok(conn) = conn.try_lock() {
+                        if let Some(conn) = crate::db::try_lock_conn(&conn) {
                             crate::db::shrink_memory(&conn);
                         }
                     }
@@ -3060,11 +3071,137 @@ async fn serve(conn: Connection, reopen: Option<PathBuf>) -> anyhow::Result<()> 
             }
         }
     });
-    let service = server
-        .serve((tokio::io::stdin(), tokio::io::stdout()))
-        .await?;
+    let service = server.serve(io).await?;
     service.waiting().await?;
     Ok(())
+}
+
+/// Drive the server over an in-memory pipe as an agent would (initialize, `tools/list`, then
+/// `tools/call` on every listed tool with arguments it accepts) against `index`, an existing
+/// index at another schema than this binary's. Asserts that every call is answered with the
+/// schema notice, not a protocol error or a tool error, and returns how many tools answered.
+/// A tool with no entry in the argument table fails it, so a new tool joins the
+/// older-schema matrix (`cli_core::tests::every_reader_runs_on_older_schemas`).
+#[cfg(test)]
+pub(crate) async fn assert_every_tool_answers_with_the_schema_notice(index: &Path) -> usize {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    struct Client<R, W> {
+        lines: tokio::io::Lines<BufReader<R>>,
+        write: W,
+        id: u64,
+    }
+    impl<R: tokio::io::AsyncRead + Unpin, W: tokio::io::AsyncWrite + Unpin> Client<R, W> {
+        async fn send(&mut self, message: serde_json::Value) {
+            let line = format!("{message}\n");
+            self.write.write_all(line.as_bytes()).await.unwrap();
+            self.write.flush().await.unwrap();
+        }
+        async fn request(&mut self, method: &str, params: serde_json::Value) -> serde_json::Value {
+            self.id += 1;
+            let id = self.id;
+            self.send(json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }))
+                .await;
+            loop {
+                let line = tokio::time::timeout(
+                    std::time::Duration::from_secs(60),
+                    self.lines.next_line(),
+                )
+                .await
+                .unwrap_or_else(|_| panic!("no answer to {method} in 60 s"))
+                .unwrap()
+                .unwrap_or_else(|| panic!("the server closed the pipe during {method}"));
+                let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+                if v.get("id") == Some(&json!(id)) {
+                    return v;
+                }
+            }
+        }
+    }
+    fn tool_args(name: &str) -> serde_json::Value {
+        match name {
+            "search_threads"
+            | "search_current_project"
+            | "recall_decisions"
+            | "recall_gotchas"
+            | "find_prior_work" => json!({ "query": "refresh token" }),
+            "get_thread" | "snapshot_session" | "linked_commits" | "get_thread_knowledge" => {
+                json!({ "thread_id": 1 })
+            }
+            "list_snapshots" | "recurring_issues" | "recent_threads" | "list_tags"
+            | "list_open_todos" | "project_memory" => json!({}),
+            "load_snapshot" | "complete_todo" => json!({ "id": 1 }),
+            "check_decision" => json!({ "proposal": "use WAL" }),
+            "threads_for_file" => json!({ "path": "src/auth.rs" }),
+            "ask_history" => json!({ "question": "why rotate?" }),
+            "flag_fact" => json!({ "id": 1, "verdict": "stale" }),
+            "record_decision" | "record_gotcha" => json!({ "text": "x", "project": "/repo" }),
+            other => panic!("no arguments for the MCP tool `{other}`: add them to tool_args"),
+        }
+    }
+
+    let notice = {
+        let conn = crate::db::open_readonly(index).unwrap();
+        match crate::db::schema_pending(&conn).unwrap() {
+            0 => panic!("{} is at this binary's schema", index.display()),
+            p if p > 0 => index_behind_notice(),
+            _ => index_ahead_notice(newer_app_version(&conn).as_deref()),
+        }
+    };
+    let (conn, reopen) = open_index("test", index).expect("open the index");
+    let (client, server_end) = tokio::io::duplex(1 << 20);
+    let server = tokio::spawn(serve_on(conn, reopen, tokio::io::split(server_end)));
+    let (read, write) = tokio::io::split(client);
+    let mut client = Client {
+        lines: BufReader::new(read).lines(),
+        write,
+        id: 0,
+    };
+    let init = client
+        .request(
+            "initialize",
+            json!({
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": { "name": "older-schema-matrix", "version": "0" },
+            }),
+        )
+        .await;
+    assert!(init.get("result").is_some(), "initialize: {init}");
+    client
+        .send(json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }))
+        .await;
+    let listed = client.request("tools/list", json!({})).await;
+    let names: Vec<String> = listed["result"]["tools"]
+        .as_array()
+        .unwrap_or_else(|| panic!("tools/list: {listed}"))
+        .iter()
+        .map(|t| t["name"].as_str().unwrap().to_string())
+        .collect();
+    for name in &names {
+        let answer = client
+            .request(
+                "tools/call",
+                json!({ "name": name, "arguments": tool_args(name) }),
+            )
+            .await;
+        let result = answer
+            .get("result")
+            .unwrap_or_else(|| panic!("{name} answered with a protocol error: {answer}"));
+        assert_ne!(result["isError"], json!(true), "{name}: {answer}");
+        assert_eq!(
+            result["content"][0]["text"].as_str(),
+            Some(notice.as_str()),
+            "{name}: {answer}"
+        );
+    }
+    drop(client);
+    tokio::time::timeout(std::time::Duration::from_secs(30), server)
+        .await
+        .expect("the server stops when the client hangs up")
+        .unwrap()
+        .unwrap();
+    names.len()
 }
 
 /// How often the server checks whether its model has been idle past `SIDECAR_IDLE_UNLOAD`,
@@ -5326,6 +5463,40 @@ mod tests {
     /// A tool's arguments from JSON, the way a client sends them.
     fn args<T: serde::de::DeserializeOwned>(v: serde_json::Value) -> Parameters<T> {
         Parameters(serde_json::from_value(v).unwrap())
+    }
+
+    /// A panic under the connection's guard (a handler bug; tokio isolates the task by
+    /// unwinding) poisons the mutex. The next tool call still answers, and a write still
+    /// lands, instead of every call failing until the agent restarts the server.
+    #[tokio::test]
+    async fn a_panic_under_the_lock_does_not_break_later_tool_calls() {
+        let srv = seeded_server().in_session("/proj/app");
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let conn = srv.lock().unwrap();
+            conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+            panic!("a handler bug under the guard");
+        }));
+        assert!(panicked.is_err());
+        assert!(srv.conn.is_poisoned());
+
+        let res = srv.recent_threads(args(json!({}))).await.unwrap();
+        assert_ne!(res.is_error, Some(true));
+        assert!(
+            text_of(&res).contains("auth token refresh"),
+            "{}",
+            text_of(&res)
+        );
+        let res = srv
+            .record_decision(args(
+                json!({ "text": "rotate tokens", "project": "/proj/app" }),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            text_of(&res).starts_with("Recorded decision"),
+            "{}",
+            text_of(&res)
+        );
     }
 
     /// Check one answer's structuredContent against the tool's declared output schema. Tool

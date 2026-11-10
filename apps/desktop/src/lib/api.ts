@@ -62,6 +62,30 @@ export interface VacuumReport {
   pending?: boolean;
 }
 
+/** One snapshot of the index (`backup::Snapshot`): a copy kept in the snapshots folder next to
+ *  it. `privateBytes` is what it costs on disk now (an APFS clone starts at 0 and grows as
+ *  the index changes); null where the system does not report it. `otherIndex`: an automatic
+ *  snapshot of an earlier index (before a fresh start), never removed automatically. */
+export interface IndexSnapshot {
+  name: string;
+  takenAt: number; // unix seconds
+  reason: "pre-migration" | "weekly" | "manual";
+  bytes: number;
+  privateBytes: number | null;
+  otherIndex: boolean;
+}
+
+/** The index's snapshots for Settings (`backup::Status`). `automatic`: they are taken on their
+ *  own here (macOS, with the index on a disk that clones); elsewhere only `cal backup` makes
+ *  one. `lastCheck.at` is 0 for a failed check carried across Shrink index / Reclaim space. */
+export interface SnapshotStatus {
+  automatic: boolean;
+  folder: string;
+  snapshots: IndexSnapshot[];
+  bytesOnDisk: number | null;
+  lastCheck: { at: number; ok: boolean; ms: number } | null;
+}
+
 export interface IndexReport {
   threadsIndexed: number;
   threadsSkipped: number;
@@ -816,6 +840,40 @@ export interface LedgerCounts {
   playbook: number;
 }
 
+/** What Settings > General's Copy diagnostics copies (`diagnostics`): `cal doctor`'s report
+ *  as text, plus the structure (`schemas/cal/doctor.v1.json` without `schema_version`). Paths
+ *  show the home folder as `~`; no project text. */
+export interface Diagnostics {
+  text: string;
+  report: {
+    version: string;
+    platform: string;
+    /** What looks wrong, in plain words. */
+    problems: string[];
+    [key: string]: unknown;
+  };
+}
+
+/** A source whose last indexing pass read like a transcript format change (`parse_drifts`,
+ *  `indexer::parse_health`). Counts and type names only. */
+export interface ParseDrift {
+  source: SourceKind;
+  /** When the pass ran (unix seconds). */
+  at: number;
+  /** Unknown plus malformed records in that pass, 0 to 1. */
+  share: number;
+  /** The same share over the source's earlier passes. */
+  baseline: number;
+  malformed: number;
+  /** Its unknown record types, most frequent first. */
+  kinds: string[];
+  files: number;
+  zeroFiles: number;
+  byShare: boolean;
+  byZeroFiles: boolean;
+  dismissed: boolean;
+}
+
 /** What Callimachus did for the user's agents, and what it kept (`value_ledger`). */
 export interface ValueLedger {
   /** The last 7 local days, today included. */
@@ -993,6 +1051,8 @@ export const api = {
     }),
   deleteThreads: (ids: number[]) => invoke<number>("delete_threads", { ids }),
   vacuumDb: () => invoke<VacuumReport>("vacuum_db"),
+  // The index's snapshots (before upgrades, weekly, `cal backup`) and what they cost on disk.
+  indexSnapshots: () => invoke<SnapshotStatus>("index_snapshots"),
   // "Shrink index": trim tool output indexed before the per-row cap existed, then VACUUM
   // when enough is free (the same rule as Reclaim space).
   // onProgress receives running totals while it works (the `compact:progress` event).
@@ -1124,6 +1184,11 @@ export const api = {
   valueLedger: () => invoke<ValueLedger>("value_ledger"),
   // Claude Code's transcript retention in days; null removes the key (its 30-day default).
   setClaudeCleanupDays: (days: number | null) => invoke<void>("set_claude_cleanup_days", { days }),
+  // `cal doctor`'s report for Settings > General's Copy diagnostics.
+  diagnostics: () => invoke<Diagnostics>("diagnostics"),
+  // Sources whose transcripts may have changed format (Settings > Index), and dismissing one.
+  parseDrifts: () => invoke<ParseDrift[]>("parse_drifts"),
+  dismissParseDrift: (source: string) => invoke<void>("dismiss_parse_drift", { source }),
   // Harvest Claude Code's own auto-memory files into project memory.
   harvestSettings: () => invoke<HarvestSettings>("harvest_settings"),
   setHarvestClaudeMemory: (on: boolean) => invoke<void>("set_harvest_claude_memory", { on }),

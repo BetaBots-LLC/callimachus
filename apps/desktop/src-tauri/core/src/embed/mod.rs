@@ -237,14 +237,29 @@ pub fn model_cache_dir() -> PathBuf {
 /// environment: the Dock-launched app sees no shell variables, while the hooks and MCP
 /// server an agent spawns inherit them. Only absolute paths, so a lookup never resolves
 /// against the agent's CWD.
+///
+/// Not [`configured_cache_dir`]: it creates the first usable candidate, and it is always
+/// one of these roots anyway (the override, or a candidate). A lookup creates nothing:
+/// `cal doctor` promises to change nothing, and hooks never create a file, yet with it a
+/// doctor run on a machine without the app left `<app data>/dev.shaller.callimachus/models`
+/// behind.
 fn lookup_roots() -> Vec<PathBuf> {
+    lookup_roots_from(
+        [env_path(HF_HOME_ENV), env_path(CACHE_DIR_ENV)]
+            .into_iter()
+            .flatten(),
+        cache_dir_candidates(),
+    )
+}
+
+/// [`lookup_roots`] from its parts: the environment's roots, then this build's candidates,
+/// deduplicated, absolute only. Names directories and creates none.
+fn lookup_roots_from(
+    env: impl IntoIterator<Item = PathBuf>,
+    candidates: Vec<PathBuf>,
+) -> Vec<PathBuf> {
     let mut roots: Vec<PathBuf> = Vec::new();
-    let candidates = [env_path(HF_HOME_ENV), env_path(CACHE_DIR_ENV)]
-        .into_iter()
-        .flatten()
-        .chain(std::iter::once(configured_cache_dir().to_path_buf()))
-        .chain(cache_dir_candidates());
-    for root in candidates {
+    for root in env.into_iter().chain(candidates) {
         if root.is_absolute() && !roots.contains(&root) {
             roots.push(root);
         }
@@ -1414,7 +1429,7 @@ pub fn embed_pending_facts(db: &crate::db::Db, embedder: &Embedder) -> Result<()
     loop {
         // 1. Locked, fast: claim a batch of un-embedded recall facts.
         let rows: Vec<(i64, String)> = {
-            let conn = db.0.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+            let conn = crate::db::lock_conn(&db.0);
             let mut stmt = conn.prepare(
                 "SELECT id, text FROM facts
                  WHERE embedded = 0 AND kind IN ('decision', 'gotcha') LIMIT ?1",
@@ -1435,7 +1450,7 @@ pub fn embed_pending_facts(db: &crate::db::Db, embedder: &Embedder) -> Result<()
         };
         // 3. Locked, fast: persist vectors + mark embedded.
         {
-            let mut conn = db.0.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+            let mut conn = crate::db::lock_conn(&db.0);
             store_facts(&mut conn, &rows, &vecs)?;
         }
     }
@@ -2275,6 +2290,28 @@ mod tests {
         assert!(roots.iter().all(|r| r.is_absolute()), "{roots:?}");
         // The app's own download location is checked whatever HF_HOME says.
         assert!(roots.contains(&cache_dir_candidates()[0]), "{roots:?}");
+    }
+
+    /// A model lookup names directories and creates none (`cal doctor` and the hooks run it
+    /// on machines without the app), and still covers wherever a download would have gone.
+    #[test]
+    fn a_model_lookup_creates_nothing_and_covers_the_download_dir() {
+        let dir = crate::db::test_support::TestDir::new("model_lookup");
+        let base = dir.parent().unwrap();
+        let env = base.join("env");
+        let app = base.join("app").join("models");
+        let beside = base.join("beside").join("models");
+        let candidates = vec![app.clone(), beside.clone(), PathBuf::from("relative")];
+        let roots = lookup_roots_from([env.clone()], candidates.clone());
+        assert_eq!(roots, vec![env.clone(), app.clone(), beside.clone()]);
+        assert!(find_snapshot(&roots).is_none());
+        assert!(roots.iter().all(|r| !r.exists()), "nothing created");
+        // Wherever `configured_cache_dir` would pick (the override, or the first usable
+        // candidate), the lookup already looks.
+        for (over, usable) in [(Some(env.clone()), app.clone()), (None, beside.clone())] {
+            let picked = pick_cache_dir(over, &candidates, |p| p == usable.as_path());
+            assert!(roots.contains(&picked), "{picked:?}");
+        }
     }
 
     // ---- loading policy -------------------------------------------------------------

@@ -59,11 +59,16 @@ fn ingest_line(thread: &mut ParsedThread, obj: &Value, state: &mut ChatState) {
         thread.updated_at = Some(thread.updated_at.map_or(ts, |u| u.max(ts)));
     }
 
-    let role = match obj.get("type").and_then(Value::as_str) {
+    let kind = obj.get("type").and_then(Value::as_str);
+    let role = match kind {
         Some("user") => "user",
         Some("assistant") => "assistant",
         Some("tool_result") => "tool",
-        _ => return, // system / unknown — skipped
+        _ => {
+            // `system` (compression and other markers) on purpose; anything else is new.
+            super::common::count_skipped("", kind, &["system"]);
+            return;
+        }
     };
     // Content lives in the nested Gemini `message` object: { role, parts: [...] }.
     let parts = obj.get("message").and_then(|m| m.get("parts"));
@@ -107,6 +112,27 @@ mod tests {
 {"uuid":"u3","parentUuid":"u2","sessionId":"sess-q","type":"system","subtype":"chat_compression","timestamp":"2026-06-01T10:00:05.500Z"}
 {"uuid":"u4","parentUuid":"u3","sessionId":"sess-q","type":"tool_result","timestamp":"2026-06-01T10:00:06.000Z","message":{"role":"user","parts":[{"functionResponse":{"name":"run_shell","response":{"output":"Finished dev profile"}}}]}}
 "#;
+
+    /// The parse canary: an invented record type is counted, `system` records are not.
+    #[test]
+    fn parse_counts_name_unknown_types() {
+        let path = temp_path("qwen_canary.jsonl");
+        let text = format!(
+            "{SAMPLE}{}\n",
+            r#"{"uuid":"u5","type":"hologram","message":{"parts":[{"text":"x"}]}}"#
+        );
+        std::fs::write(&path, text).unwrap();
+        let (thread, stats) = crate::indexer::common::collect_parse_stats(|| {
+            parse_file(&path, "x/chats/s.jsonl").unwrap().unwrap()
+        });
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(thread.messages.len(), 4);
+        assert_eq!((stats.lines, stats.malformed_lines), (5, 0));
+        assert_eq!(
+            stats.unknown_kinds,
+            std::collections::BTreeMap::from([("hologram".to_string(), 1)])
+        );
+    }
 
     fn write_sample(name: &str) -> PathBuf {
         let path = temp_path(name);

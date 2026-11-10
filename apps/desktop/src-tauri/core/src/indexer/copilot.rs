@@ -12,10 +12,12 @@
 //! that switches models mid-conversation keeps each turn's model. Project path comes
 //! from the workspace's `workspace.json` folder URI.
 
-use super::common::{read_json, truncate_title};
+use super::common::{
+    begin_file, count_file, count_line, count_malformed, count_skipped, read_json, truncate_title,
+};
 use super::{
-    file_change_state, set_file_state, source_id, upsert_thread, IndexReport, MsgUsage,
-    ParsedMessage, ParsedThread,
+    file_change_state, file_state, set_file_state, source_id, unreadable_key, upsert_thread,
+    IndexReport, MsgUsage, ParsedMessage, ParsedThread,
 };
 use anyhow::Result;
 use rusqlite::Connection;
@@ -121,6 +123,18 @@ fn index_session(
     let key = path.to_string_lossy().to_string();
 
     let Some(root) = read_json(path) else {
+        // Not one JSON document. Newer VS Code builds write some sessions as JSONL (a
+        // snapshot line, then edits): 10 of 41 files on the author's machine, which this
+        // indexer does not read yet. Counted, so `cal doctor` shows them, as a file that
+        // held a record and yielded no message, so the files rule sees new sessions turn
+        // unreadable. Once per change of the file: counted on every pass, the source's share
+        // followed how many old unreadable files exist rather than what the pass read.
+        if path.exists() && file_state(conn, &unreadable_key(&key))? != Some((mtime, size)) {
+            set_file_state(conn, &unreadable_key(&key), KIND, mtime, size)?;
+            let file = begin_file();
+            count_malformed();
+            count_file(file, 0);
+        }
         return Ok(None);
     };
     // The session lives under `v` (the `{kind, v}` wrapper); tolerate a bare root too.
@@ -145,13 +159,23 @@ fn index_session(
         return Ok(None);
     }
 
+    let file = begin_file();
     let mut messages: Vec<ParsedMessage> = Vec::new();
     let mut usage: Vec<(usize, MsgUsage)> = Vec::new();
     let mut first_user: Option<String> = None;
     let mut max_ts: Option<i64> = None;
 
-    if let Some(requests) = v.get("requests").and_then(Value::as_array) {
+    let requests = v.get("requests");
+    if requests.is_none_or(|r| !r.is_array()) {
+        // Every session VS Code writes has `requests`, `[]` when empty. Without it the
+        // session is one record of a shape this parser does not know (a renamed or nested
+        // list), counted so the canary sees the file stop yielding messages.
+        count_line();
+        count_skipped("requests:", Some(super::claude::json_kind(requests)), &[]);
+    }
+    if let Some(requests) = requests.and_then(Value::as_array) {
         for req in requests {
+            count_line();
             let ts = req
                 .get("timestamp")
                 .and_then(Value::as_i64)
@@ -217,6 +241,7 @@ fn index_session(
         }
     }
 
+    count_file(file, messages.len());
     if messages.is_empty() {
         // No upsert that could fail — safe to record the fingerprint now.
         set_file_state(conn, &key, KIND, mtime, size)?;
@@ -243,23 +268,65 @@ fn index_session(
     Ok(Some(n))
 }
 
+/// Response parts that carry no answer text and are skipped on purpose (the parse canary,
+/// `parse_health`): reasoning, tool calls and their progress, edits, file links, prompts for
+/// confirmation, MCP start-up notices. VS Code writes its markdown as a bare `{value}` part
+/// (no `kind`) and the other kinds it is known to write are here, so a part outside this
+/// list without a `value` (markdown moved under another key, say) counts as unknown instead
+/// of emptying the assistant's turns unseen. The 31 readable sessions on the author's
+/// machine held only `thinking`, `mcpServersStarting` and `progressTaskSerialized` parts
+/// besides markdown (2026-11-09).
+const NON_TEXT_PARTS: &[&str] = &[
+    "thinking",
+    "toolInvocation",
+    "toolInvocationSerialized",
+    "prepareToolInvocation",
+    "progressMessage",
+    "progressTask",
+    "progressTaskSerialized",
+    "textEditGroup",
+    "notebookEditGroup",
+    "undoStop",
+    "inlineReference",
+    "codeblockUri",
+    "codeCitation",
+    "confirmation",
+    "elicitation",
+    "warning",
+    "command",
+    "extensions",
+    "mcpServersStarting",
+    "multiDiffData",
+    "pullRequest",
+];
+
 /// Concatenate the assistant's rendered markdown from a request's `response[]`,
 /// skipping thinking / tool / progress parts (only top-level string `value`s are
 /// the answer text).
 fn response_text(response: Option<&Value>) -> String {
-    let Some(arr) = response.and_then(Value::as_array) else {
-        return String::new();
+    let arr = match response {
+        Some(Value::Array(arr)) => arr,
+        // A request still running, or cancelled before any answer.
+        None | Some(Value::Null) => return String::new(),
+        other => {
+            count_skipped("response:", Some(super::claude::json_kind(other)), &[]);
+            return String::new();
+        }
     };
     let mut out = Vec::new();
     for part in arr {
-        if part.get("kind").and_then(Value::as_str) == Some("thinking") {
+        let kind = part.get("kind").and_then(Value::as_str);
+        if kind == Some("thinking") {
             continue;
         }
-        if let Some(s) = part.get("value").and_then(Value::as_str) {
-            let s = s.trim();
-            if !s.is_empty() {
-                out.push(s.to_string());
+        match part.get("value").and_then(Value::as_str) {
+            Some(s) => {
+                let s = s.trim();
+                if !s.is_empty() {
+                    out.push(s.to_string());
+                }
             }
+            None => count_skipped("part:", kind, NON_TEXT_PARTS),
         }
     }
     out.join("\n")
@@ -309,6 +376,134 @@ fn pct_decode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The parse canary: each request is a record, and a session file that is not one JSON
+    /// document (the JSONL form newer VS Code builds write, which this indexer does not read
+    /// yet) is a malformed record instead of nothing at all.
+    #[test]
+    fn parse_counts_requests_and_unreadable_sessions() {
+        let dir = crate::db::test_support::TestDir::new("copilot_canary");
+        let good = dir.with_file_name("a.json");
+        std::fs::write(
+            &good,
+            r#"{"kind":0,"v":{"sessionId":"a","requests":[
+                {"message":{"text":"hi"},"response":[{"value":"ok"}]},
+                {"message":{"text":""},"response":[{"kind":"thinking","value":"x"}]}]}}"#,
+        )
+        .unwrap();
+        let jsonl = dir.with_file_name("b.jsonl");
+        std::fs::write(
+            &jsonl,
+            "{\"kind\":0,\"v\":{\"sessionId\":\"b\",\"requests\":[]}}\n{\"kind\":1,\"k\":[\"x\"],\"v\":1}\n",
+        )
+        .unwrap();
+        let mut conn = crate::db::open(&dir).unwrap();
+        let sid = source_id(&conn, KIND).unwrap();
+        let ((), stats) = crate::indexer::common::collect_parse_stats(|| {
+            index_session(&mut conn, sid, &good, None).unwrap();
+            assert_eq!(index_session(&mut conn, sid, &jsonl, None).unwrap(), None);
+        });
+        assert_eq!((stats.lines, stats.malformed_lines), (3, 1));
+        assert_eq!(
+            (stats.files, stats.files_with_zero_messages),
+            (2, 1),
+            "the unreadable session is a file that yielded no message"
+        );
+    }
+
+    /// An unreadable session is counted once per change of the file, not on every pass: the
+    /// source's share would otherwise reflect how many old unreadable files exist rather than
+    /// what a pass read. The file is still read on every pass, and no state row under its own
+    /// path says it was indexed, so a later reader of the form picks it up.
+    #[test]
+    fn an_unreadable_session_is_counted_once_per_change() {
+        let dir = crate::db::test_support::TestDir::new("copilot_unreadable");
+        let jsonl = dir.with_file_name("b.jsonl");
+        std::fs::write(
+            &jsonl,
+            "{\"kind\":0,\"v\":{}}\n{\"kind\":1,\"k\":[\"x\"],\"v\":1}\n",
+        )
+        .unwrap();
+        let mut conn = crate::db::open(&dir).unwrap();
+        let sid = source_id(&conn, KIND).unwrap();
+        let pass = |conn: &mut Connection| {
+            let ((), stats) = crate::indexer::common::collect_parse_stats(|| {
+                assert_eq!(index_session(conn, sid, &jsonl, None).unwrap(), None);
+            });
+            stats
+        };
+        let first = pass(&mut conn);
+        assert_eq!((first.lines, first.malformed_lines), (1, 1));
+        assert_eq!((first.files, first.files_with_zero_messages), (1, 1));
+        assert!(pass(&mut conn).is_empty(), "the same file: counted once");
+        assert_eq!(
+            file_state(&conn, &jsonl.to_string_lossy()).unwrap(),
+            None,
+            "never recorded as indexed"
+        );
+        // VS Code appends to the session: a change, counted again.
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&jsonl)
+            .unwrap();
+        std::io::Write::write_all(&mut f, b"{\"kind\":1,\"k\":[\"y\"],\"v\":2}\n").unwrap();
+        drop(f);
+        assert_eq!(pass(&mut conn).files_with_zero_messages, 1);
+        assert!(pass(&mut conn).is_empty());
+    }
+
+    /// The parse canary over response parts and the session's shape: a part of an invented
+    /// kind with no `value` (markdown moved under another key) is counted, tool and progress
+    /// parts are not; a session whose `requests` list was renamed is one unknown record in a
+    /// file that lost its messages; an empty session is an empty file.
+    #[test]
+    fn parse_counts_invented_parts_and_a_renamed_request_list() {
+        let dir = crate::db::test_support::TestDir::new("copilot_canary_parts");
+        let parts = dir.with_file_name("a.json");
+        std::fs::write(
+            &parts,
+            r#"{"kind":0,"v":{"sessionId":"a","requests":[
+                {"message":{"text":"hi"},"response":[
+                    {"kind":"toolInvocationSerialized","toolId":"x"},
+                    {"kind":"markdownContent","content":{"value":"the answer"}},
+                    {"kind":"inlineReference","inlineReference":{}},
+                    {"value":"ok"}]}]}}"#,
+        )
+        .unwrap();
+        let renamed = dir.with_file_name("b.json");
+        std::fs::write(
+            &renamed,
+            r#"{"kind":0,"v":{"sessionId":"b","turns":[{"message":{"text":"hi"}}]}}"#,
+        )
+        .unwrap();
+        let empty = dir.with_file_name("c.json");
+        std::fs::write(&empty, r#"{"kind":0,"v":{"sessionId":"c","requests":[]}}"#).unwrap();
+        let mut conn = crate::db::open(&dir).unwrap();
+        let sid = source_id(&conn, KIND).unwrap();
+        let ((), stats) = crate::indexer::common::collect_parse_stats(|| {
+            assert_eq!(
+                index_session(&mut conn, sid, &parts, None).unwrap(),
+                Some(2)
+            );
+            assert_eq!(
+                index_session(&mut conn, sid, &renamed, None).unwrap(),
+                Some(0)
+            );
+            assert_eq!(
+                index_session(&mut conn, sid, &empty, None).unwrap(),
+                Some(0)
+            );
+        });
+        assert_eq!(stats.lines, 2, "one request, one renamed list");
+        assert_eq!(
+            stats.unknown_kinds,
+            std::collections::BTreeMap::from([
+                ("part:markdownContent".to_string(), 1),
+                ("requests:null".to_string(), 1),
+            ])
+        );
+        assert_eq!((stats.files, stats.files_with_zero_messages), (3, 1));
+    }
 
     #[test]
     fn indexes_chat_with_per_message_model() {

@@ -12,7 +12,10 @@
 //!
 //! Schema verified against google-gemini/gemini-cli `chatRecordingService.ts`.
 
-use super::common::{parse_rfc3339, push_message, truncate_title};
+use super::common::{
+    begin_file, count_file, count_line, count_malformed, count_skipped, parse_rfc3339,
+    push_message, truncate_title,
+};
 use super::{
     file_change_state, set_file_state, source_id, upsert_thread, IndexReport, MsgUsage,
     ParsedMessage, ParsedThread,
@@ -212,6 +215,7 @@ pub(super) fn parse_chat_jsonl(
     ingest: IngestLine,
 ) -> Result<Option<ParsedThread>> {
     let content = fs::read_to_string(path)?;
+    let file = begin_file();
     let mut thread = ParsedThread {
         external_id: external_id.to_string(),
         ..Default::default()
@@ -222,10 +226,13 @@ pub(super) fn parse_chat_jsonl(
             continue;
         }
         let Ok(obj) = serde_json::from_str::<Value>(line) else {
+            count_malformed();
             continue; // tolerate the occasional malformed line
         };
+        count_line();
         ingest(&mut thread, &obj, &mut state);
     }
+    count_file(file, thread.messages.len());
     if thread.messages.is_empty() {
         return Ok(None);
     }
@@ -279,12 +286,22 @@ fn extract_parts(out: &mut Vec<ParsedMessage>, role: &str, parts: Option<&Value>
                     // embedded or distilled, and dominated the index size).
                     let text = super::claude::cap_tool_text(text.trim());
                     push_message(out, "tool", &text, None, ts);
+                } else {
+                    // Named by its first key (`inlineData`, `executableCode`, ...).
+                    let kind = part.as_object().and_then(|o| o.keys().next());
+                    count_skipped("part:", kind.map(String::as_str), SKIPPED_PARTS);
                 }
             }
         }
-        _ => {}
+        // No content: a record that only carries tokens or tool calls.
+        None | Some(Value::Null) => {}
+        other => count_skipped("content:", Some(super::claude::json_kind(other)), &[]),
     }
 }
+
+/// Gemini parts skipped on purpose (the parse canary, `parse_health`): attached images and
+/// files, and the signature a thinking model attaches to a call.
+const SKIPPED_PARTS: &[&str] = &["inlineData", "fileData", "thoughtSignature"];
 
 // ---------------------------------------------------------------------------------------
 // Gemini's record shape
@@ -322,10 +339,19 @@ fn ingest_line(thread: &mut ParsedThread, obj: &Value, state: &mut ChatState) {
         .get("timestamp")
         .and_then(Value::as_str)
         .and_then(parse_rfc3339);
-    let role = match obj.get("type").and_then(Value::as_str) {
+    let kind = obj.get("type").and_then(Value::as_str);
+    let role = match kind {
         Some("user") => "user",
         Some("gemini") => "assistant",
-        _ => return, // info / error / warning / tool records — skipped for now
+        _ => {
+            // info / error / warning records, and the session header (no `type`).
+            count_skipped(
+                "",
+                kind,
+                &["info", "error", "warning", super::common::NO_KIND],
+            );
+            return;
+        }
     };
     state.begin_record(thread, obj.get("id").and_then(Value::as_str));
     let before = thread.messages.len();
@@ -376,6 +402,34 @@ mod tests {
 {"id":"m3","type":"info","timestamp":"2026-06-01T10:00:05.500Z","content":"context compressed"}
 {"id":"m4","type":"user","timestamp":"2026-06-01T10:00:06.000Z","content":[{"functionResponse":{"name":"run_shell_command","response":{"output":"Finished dev profile"}}}]}
 "#;
+
+    /// The parse canary: an invented record type, an invented part and a broken line are
+    /// counted; the session header and `info` records are skipped on purpose.
+    #[test]
+    fn parse_counts_name_unknown_types_and_broken_lines() {
+        let path = temp_path("gemini_canary.jsonl");
+        let text = format!(
+            "{SAMPLE}{}\n{}\n{}\n",
+            r#"{"id":"m5","type":"hologram","content":"x"}"#,
+            r#"{"id":"m6","type":"gemini","content":[{"telepathy":{"x":1}},{"text":"ok"}]}"#,
+            r#"{"id":"m7","type":"user","content":"#,
+        );
+        std::fs::write(&path, text).unwrap();
+        let (thread, stats) = crate::indexer::common::collect_parse_stats(|| {
+            parse_file(&path, "x/chats/s.jsonl").unwrap().unwrap()
+        });
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(thread.messages.len(), 5);
+        assert_eq!((stats.lines, stats.malformed_lines), (8, 1));
+        assert_eq!(
+            stats.unknown_kinds,
+            std::collections::BTreeMap::from([
+                ("hologram".to_string(), 1),
+                ("part:telepathy".to_string(), 1),
+            ])
+        );
+        assert_eq!((stats.files, stats.files_with_zero_messages), (1, 0));
+    }
 
     fn write_sample(name: &str) -> PathBuf {
         let path = temp_path(name);

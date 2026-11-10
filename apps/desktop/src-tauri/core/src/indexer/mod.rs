@@ -16,6 +16,7 @@ pub mod gemini;
 pub mod goose;
 pub mod kilo;
 pub mod opencode;
+pub mod parse_health;
 pub mod qwen;
 pub mod roo;
 pub mod usage_backfill;
@@ -234,6 +235,23 @@ pub fn scanner_for(kind: &str) -> Option<Scan> {
     SOURCES.iter().find(|s| s.kind == kind).map(|s| s.scan)
 }
 
+/// Run one scan of `kind` (`run`: a full scan, the watcher's changed paths) with what it
+/// parsed counted, then judged and logged by [`parse_health::after_pass`]. `full`: the scan
+/// covered every file of the source (a reindex, `cal index`, the launch catch-up), not a
+/// watcher batch. A scan that fails records nothing: a retry parses the same files again.
+pub fn scan_counted(
+    conn: &mut Connection,
+    kind: &str,
+    full: bool,
+    run: impl FnOnce(&mut Connection) -> Result<IndexReport>,
+) -> Result<IndexReport> {
+    let (result, stats) = common::collect_parse_stats(|| run(conn));
+    if result.is_ok() {
+        parse_health::after_pass(conn, kind, &stats, full);
+    }
+    result
+}
+
 /// Kinds whose tool rows are stored capped (see [`Source::caps_tool_output`]).
 pub fn capped_tool_sources() -> impl Iterator<Item = &'static str> {
     SOURCES
@@ -262,13 +280,14 @@ pub fn scan_all_with_progress(
         // agent DB, an OS-specific quirk, a malformed store) must NOT abort the whole
         // index and zero out every other source. Log it, count it, keep going — the
         // same resilience each scan already applies per-file.
-        match (source.scan)(conn, &mut || {
+        let mut tick = || {
             seen += 1;
             // Emit the first 50 per-thread (so movement is obviously live), then every 10.
             if seen <= 50 || seen.is_multiple_of(10) {
                 on_progress(seen, name);
             }
-        }) {
+        };
+        match scan_counted(conn, name, true, |conn| (source.scan)(conn, &mut tick)) {
             Ok(r) => total.add(&r),
             Err(e) => {
                 // Not eprintln!, which panics on a closed stderr (`cal index 2>&1 | head`).
@@ -1310,6 +1329,18 @@ pub fn extract_paths(text: &str) -> Vec<String> {
 }
 
 /// Read the stored (mtime, size) for a file, if we've indexed it before.
+/// Where the stamp of a session file that could not be read at all is kept in `index_state`:
+/// the file's path plus `#unreadable`, a key no reader of the file itself looks up. Kept under
+/// the path itself, it would read as indexed and unchanged to a later Callimachus that can
+/// read the form, which would skip the file until it next changed. Such a file gets no stamp
+/// of its own, so it is read again on every pass (a Reindex included); this stamp only lets
+/// the parse canary count it once per change instead of once per pass: with the watcher's
+/// small batches summed (`parse_health`), one broken file counted every time would add up to
+/// a format-change warning.
+pub(crate) fn unreadable_key(path: &str) -> String {
+    format!("{path}#unreadable")
+}
+
 pub fn file_state(conn: &Connection, path: &str) -> Result<Option<(i64, i64)>> {
     Ok(conn
         .query_row(

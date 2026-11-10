@@ -20,6 +20,7 @@ use rusqlite::Connection;
 use std::borrow::Cow;
 use std::fmt::Write as _;
 use std::mem::ManuallyDrop;
+use std::sync::atomic::Ordering;
 
 /// Subcommands that identify a `cal` invocation when the app is launched directly.
 pub const COMMANDS: &[&str] = &[
@@ -65,6 +66,8 @@ pub const COMMANDS: &[&str] = &[
     "index",
     "watch",
     "embed",
+    "backup",
+    "doctor",
     "version",
     "--version",
 ];
@@ -185,6 +188,13 @@ USAGE:
                                 watcher; refuses while the app runs)
   cal embed [--no-download]     build the semantic index; may download the model
                                 (about 128 MB) unless --no-download
+  cal backup [--to DIR]         save a copy of the index in its snapshots folder (or
+                                DIR): a free clone on APFS, else a full copy
+  cal doctor [--quick-check] [--json]
+                                what decides whether Callimachus works here: the index
+                                and its schema, locks, each agent's hooks and MCP entry,
+                                hooks that gave up this week, parse health (read-only;
+                                home shown as ~, so it can go into a bug report)
   cal version                    print the Callimachus version (also --version)
   cal help
 
@@ -216,6 +226,8 @@ OPTIONS:
       --dry-run         `trace export`: count the records, write nothing
       --stdin           `why`: blame the file's contents read from stdin (an
                         editor's unsaved buffer) instead of the saved file
+      --quick-check     `doctor`: also run SQLite's quick_check over the whole
+                        index (about a minute per 5 GB)
   -S, --synthesize      prepend an LLM summary / decisions / gotchas / TODOs
                         to `export` (uses the first stored provider key)
       --json            machine-readable JSON output (unversioned: the shape
@@ -316,12 +328,114 @@ fn is_silent_hook(args: &[String]) -> bool {
 /// Run a hook command best-effort: any error (no index, a locked DB, a schema mismatch
 /// after an update, a bad payload) and even a panic exits 0 with nothing on stderr, so the
 /// agent carries on. Interactive users who want to see errors use `cal memory`.
+///
+/// Why it gave up is recorded, though: one line of a closed class in the skips file next to
+/// the index ([`ledger::append_skip`], `ledger.skips.jsonl`), so `cal doctor` can say "memory
+/// injection stopped: the index needs an upgrade" instead of nothing. Nothing is recorded
+/// when there is no index (hooks never create anything), and the record costs one stat and
+/// one append and no index access: a SessionEnd hook refused by a schema 2 versions behind
+/// took 9.7 ms instead of 8.6 ms (debug build, 40 runs each, interleaved), of which 0.7 ms
+/// was the larger binary starting up.
 fn run_hook_silently(args: &[String]) -> i32 {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
-    let _ = std::panic::catch_unwind(|| run(args));
+    let outcome = std::panic::catch_unwind(|| run(args));
+    // Under the silent panic hook as well: recording must never be what breaks a hook.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        record_hook_skip(args, &outcome)
+    }));
     std::panic::set_hook(previous);
     0
+}
+
+/// The skips-file line for a hook run that gave up; nothing for one that did its job (or
+/// stayed silent on purpose) or when there is no index.
+fn record_hook_skip(args: &[String], outcome: &std::thread::Result<anyhow::Result<()>>) {
+    let Some(class) = hook_skip_class(outcome, PAYLOAD_UNREADABLE.load(Ordering::Relaxed)) else {
+        return;
+    };
+    if !db::default_index_path().exists() {
+        return;
+    }
+    let command = args.first().map(String::as_str).unwrap_or_default();
+    ledger::append_skip(class, command, hook_for_agent(args));
+}
+
+/// Why a hook run gave up, from its result: a panic, a schema the hook may not migrate
+/// ([`db::SchemaMismatch`]), a lock it could not wait out ([`db::is_busy`]), input it could not
+/// read ([`BadHookInput`], or a payload that was not JSON: `payload_unreadable`), or another
+/// error. None for a run that ended well.
+fn hook_skip_class(
+    outcome: &std::thread::Result<anyhow::Result<()>>,
+    payload_unreadable: bool,
+) -> Option<ledger::SkipClass> {
+    use ledger::SkipClass;
+    let e = match outcome {
+        Err(_) => return Some(SkipClass::Panic),
+        Ok(Ok(())) => return payload_unreadable.then_some(SkipClass::Payload),
+        Ok(Err(e)) => e,
+    };
+    if let Some(m) = e
+        .chain()
+        .find_map(|c| c.downcast_ref::<db::SchemaMismatch>())
+    {
+        return Some(if m.pending > 0 {
+            SkipClass::SchemaBehind
+        } else {
+            SkipClass::SchemaAhead
+        });
+    }
+    if db::is_busy(e) {
+        return Some(SkipClass::Busy);
+    }
+    if e.chain()
+        .any(|c| c.downcast_ref::<BadHookInput>().is_some())
+    {
+        return Some(SkipClass::Payload);
+    }
+    // The read-only hooks (SessionStart, the prompt and error recall) never check the schema;
+    // on an index older than this binary their first query naming a newer table fails.
+    let text = format!("{e:#}");
+    if text.contains("no such table") || text.contains("no such column") {
+        return Some(SkipClass::SchemaBehind);
+    }
+    Some(SkipClass::Error)
+}
+
+/// The agent a hook's `--for` names, when it is one this binary knows (a closed set: the
+/// value reaches the skips file).
+fn hook_for_agent(args: &[String]) -> Option<&'static str> {
+    let at = args.iter().position(|a| a == "--for")?;
+    let value = args.get(at + 1)?;
+    ["claude", "codex", "gemini", "copilot", "cursor"]
+        .into_iter()
+        .find(|a| a == value)
+}
+
+/// Set by [`read_hook_payload`] when the agent wrote something to stdin that is not JSON: the
+/// hook then does nothing and returns Ok, and only this says why.
+static PAYLOAD_UNREADABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// A hook's flags could not be read (an unknown `--for`, a flag this binary does not have):
+/// the agent's hook entry and this binary disagree.
+#[derive(Debug)]
+struct BadHookInput(anyhow::Error);
+
+impl std::fmt::Display for BadHookInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:#}", self.0)
+    }
+}
+
+impl std::error::Error for BadHookInput {}
+
+/// A hook command's flags and agent, with a failure marked as [`BadHookInput`].
+fn hook_args(args: &[String]) -> anyhow::Result<(Opts, HookAgent)> {
+    let bad = |e: anyhow::Error| anyhow::Error::new(BadHookInput(e));
+    let o = parse(args).map_err(bad)?;
+    let agent = HookAgent::from_opts(&o).map_err(bad)?;
+    Ok((o, agent))
 }
 
 pub fn run(args: &[String]) -> anyhow::Result<()> {
@@ -371,6 +485,8 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
         "index" => crate::headless::cmd_index(rest),
         "watch" => crate::headless::cmd_watch(rest),
         "embed" => crate::headless::cmd_embed(rest),
+        "backup" => crate::backup::cmd_backup(rest).map(|line| println!("{line}")),
+        "doctor" => cmd_doctor(rest),
         // A cheap, explicit signature for tools probing whether a `cal` on PATH is ours
         // (the VS Code extension; the system calendar's `cal` prints a calendar instead).
         "version" | "--version" | "-v" => {
@@ -427,6 +543,8 @@ struct Opts {
     dry_run: bool,
     /// `why --stdin`: blame the buffer on stdin instead of the saved file.
     stdin: bool,
+    /// `doctor --quick-check`: also run `PRAGMA quick_check`.
+    quick_check: bool,
     positional: Vec<String>,
 }
 
@@ -513,6 +631,8 @@ const SCOPED_FLAGS: &[(&str, &[&str])] = &[
     // would perform the write (or the paid LLM call) the user asked only to preview.
     ("--dry-run", &["trace"]),
     ("--stdin", &["why"]),
+    // A whole-file read of a minute or more: only where it was asked for.
+    ("--quick-check", &["doctor"]),
     ("--markdown", &["report"]),
     // A write (`--replaces` hides the old fact from memory) and a change of what a listing
     // holds: ignored elsewhere, they would mislead.
@@ -616,6 +736,7 @@ fn parse_with(args: &[String], env_json_version: Option<&str>) -> anyhow::Result
             "--raw" => o.raw = true,
             "--dry-run" => o.dry_run = true,
             "--stdin" => o.stdin = true,
+            "--quick-check" => o.quick_check = true,
             s if s.starts_with('-') && s.len() > 1 => anyhow::bail!("unknown flag '{s}'"),
             _ => o.positional.push(a.clone()),
         }
@@ -1364,8 +1485,7 @@ fn cmd_hook(args: &[String]) -> anyhow::Result<()> {
         })
         .cloned()
         .collect();
-    let o = parse(&rest)?;
-    let agent = HookAgent::from_opts(&o)?;
+    let (o, agent) = hook_args(&rest)?;
     match action.as_deref() {
         Some("--mute") => return cmd_hook_mute(&o, true),
         Some("--unmute") => return cmd_hook_mute(&o, false),
@@ -1979,6 +2099,10 @@ fn hook_cwd(payload: Option<&serde_json::Value>) -> std::path::PathBuf {
 /// blocked when we finish, process exit ends it.
 fn read_hook_payload() -> Option<serde_json::Value> {
     use std::io::{IsTerminal, Read};
+    #[cfg(test)]
+    if let Some((payload, _)) = HOOK_TEST_IO.with(|io| io.borrow().clone()) {
+        return Some(payload);
+    }
     if std::io::stdin().is_terminal() {
         return None;
     }
@@ -1993,7 +2117,11 @@ fn read_hook_payload() -> Option<serde_json::Value> {
         let _ = tx.send(buf);
     });
     let input = rx.recv_timeout(std::time::Duration::from_secs(2)).ok()?;
-    serde_json::from_str(input.trim()).ok()
+    let parsed = serde_json::from_str(input.trim()).ok();
+    if parsed.is_none() && !input.trim().is_empty() {
+        PAYLOAD_UNREADABLE.store(true, Ordering::Relaxed);
+    }
+    parsed
 }
 
 /// The dirs whose CLAUDE.md Claude Code loads for a session in `cwd`: cwd and each of its
@@ -3473,6 +3601,36 @@ fn helped_line(conn: &Connection) -> String {
     )
 }
 
+/// `cal doctor`: the read-only report of [`crate::doctor`], as text or `--json` (the bare
+/// object, or with a JSON version its `Versioned` envelope, `schemas/cal/doctor.v1.json`).
+fn cmd_doctor(args: &[String]) -> anyhow::Result<()> {
+    let o = parse(args)?;
+    if let Some(a) = o.positional.first() {
+        anyhow::bail!("`cal doctor` takes no arguments (got '{a}'). Run `cal help`.");
+    }
+    if o.quick_check {
+        use std::io::IsTerminal;
+        if std::io::stderr().is_terminal() {
+            eprintln!(
+                "running PRAGMA quick_check over the whole index (about a minute per 5 GB)..."
+            );
+        }
+    }
+    let report = crate::doctor::collect(
+        &db::default_index_path(),
+        None,
+        crate::doctor::Options {
+            quick_check: o.quick_check,
+        },
+    );
+    if o.json {
+        println!("{}", o.json_object(&report)?);
+    } else {
+        print!("{}", crate::doctor::render(&report));
+    }
+    Ok(())
+}
+
 fn cmd_export(args: &[String]) -> anyhow::Result<()> {
     let o = parse(args)?;
     let id: i64 = o
@@ -3680,7 +3838,7 @@ fn run_agent_here(
 /// SILENT (`run_hook_silently`): a hook must never break the agent loop, and PreCompact's
 /// plain stdout becomes compaction instructions, so it prints nothing.
 fn cmd_snapshot_hook(args: &[String]) -> anyhow::Result<()> {
-    let agent = HookAgent::from_opts(&parse(args)?)?;
+    let (_, agent) = hook_args(args)?;
     let Some(v) = read_hook_payload() else {
         return Ok(());
     };
@@ -3819,7 +3977,7 @@ fn is_uuid(s: &str) -> bool {
 /// Cursor plugin's run: queuing a session again moves the same entry to the front
 /// (`knowledge::enqueue_distill_priority` replaces it), so the second run leaves one entry.
 fn cmd_session_end(args: &[String]) -> anyhow::Result<()> {
-    let agent = HookAgent::from_opts(&parse(args)?)?;
+    let (_, agent) = hook_args(args)?;
     let Some(v) = read_hook_payload() else {
         return Ok(());
     };
@@ -4022,7 +4180,20 @@ struct RecallState {
 
 /// Where the per-session hook state files live (`~/.callimachus/recall`).
 fn recall_dir() -> Option<std::path::PathBuf> {
+    #[cfg(test)]
+    if let Some((_, dir)) = HOOK_TEST_IO.with(|io| io.borrow().clone()) {
+        return Some(dir);
+    }
     Some(dirs::home_dir()?.join(".callimachus/recall"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's stand-ins for a hook process's stdin payload and its `~/.callimachus/recall`,
+    /// so a hook command runs in process without reading the test's stdin or writing to the
+    /// real home folder (`tests::with_hook_io`).
+    static HOOK_TEST_IO: std::cell::RefCell<Option<(serde_json::Value, std::path::PathBuf)>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// A session id reduced to characters safe in a file name; empty when none are left.
@@ -4702,6 +4873,94 @@ mod tests {
 
     fn argv(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Every way a hook gives up maps to its class, and a run that did its job maps to none.
+    #[test]
+    fn hook_outcomes_map_to_their_skip_class() {
+        use ledger::SkipClass;
+        let class =
+            |outcome: std::thread::Result<anyhow::Result<()>>| hook_skip_class(&outcome, false);
+        assert_eq!(class(Ok(Ok(()))), None);
+        assert_eq!(
+            hook_skip_class(&Ok(Ok(())), true),
+            Some(SkipClass::Payload),
+            "stdin was not JSON"
+        );
+        assert_eq!(class(Err(Box::new("boom"))), Some(SkipClass::Panic));
+        let behind = anyhow::Error::new(db::SchemaMismatch { pending: 2 }).context("opening");
+        assert_eq!(class(Ok(Err(behind))), Some(SkipClass::SchemaBehind));
+        let ahead = anyhow::Error::new(db::SchemaMismatch { pending: -1 });
+        assert_eq!(class(Ok(Err(ahead))), Some(SkipClass::SchemaAhead));
+        let busy = anyhow::anyhow!("database is locked").context("reading memory");
+        assert_eq!(class(Ok(Err(busy))), Some(SkipClass::Busy));
+        let Err(flags) = hook_args(&argv(&["--for", "emacs"])) else {
+            panic!("an unknown --for is refused");
+        };
+        assert_eq!(class(Ok(Err(flags))), Some(SkipClass::Payload));
+        let old_index = anyhow::anyhow!("no such table: fact_links");
+        assert_eq!(class(Ok(Err(old_index))), Some(SkipClass::SchemaBehind));
+        let other = anyhow::anyhow!("disk I/O error");
+        assert_eq!(class(Ok(Err(other))), Some(SkipClass::Error));
+    }
+
+    /// A hook that gave up leaves one line in the skips file next to the index and nothing
+    /// in `ledger.jsonl`, which an older app rolls up and prunes of every line it cannot
+    /// parse; with no index, nothing is created at all.
+    #[test]
+    fn a_hook_skip_goes_to_the_skips_file_and_only_next_to_an_index() {
+        let busy = || -> std::thread::Result<anyhow::Result<()>> {
+            Ok(Err(anyhow::anyhow!("database is locked")))
+        };
+        let none = db::test_support::TestDir::new("hook_skip_no_index");
+        db::test_support::with_default_index(&none, || {
+            record_hook_skip(&argv(&["session-end"]), &busy())
+        });
+        assert!(
+            std::fs::read_dir(none.parent().unwrap())
+                .unwrap()
+                .next()
+                .is_none(),
+            "no index: no file"
+        );
+
+        let dir = db::test_support::TestDir::new("hook_skip");
+        drop(db::open(&dir).unwrap());
+        db::test_support::with_default_index(&dir, || {
+            record_hook_skip(&argv(&["hook", "--for", "codex"]), &busy())
+        });
+        let skips = ledger::skips_path_for(&dir).unwrap();
+        let text = std::fs::read_to_string(&skips).unwrap();
+        assert_eq!(text.lines().count(), 1);
+        assert!(
+            text.contains(r#""kind":"hook_skipped","detail":"busy hook codex""#),
+            "{text}"
+        );
+        assert!(
+            !ledger::path_for(&dir).unwrap().exists(),
+            "nothing in the ledger"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&skips).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+    }
+
+    /// Only an agent from the known set reaches the skips file.
+    #[test]
+    fn a_hook_skip_names_only_known_agents() {
+        assert_eq!(
+            hook_for_agent(&argv(&["hook", "--for", "codex"])),
+            Some("codex")
+        );
+        assert_eq!(
+            hook_for_agent(&argv(&["hook", "--for", "/Users/me/x"])),
+            None
+        );
+        assert_eq!(hook_for_agent(&argv(&["hook"])), None);
+        assert_eq!(hook_for_agent(&argv(&["hook", "--for"])), None);
     }
 
     #[test]
@@ -7302,5 +7561,352 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ---- Older schemas ----
+
+    /// Run `f` as a hook process would see it: `payload` on stdin and `recall` as its
+    /// `~/.callimachus/recall`, on this thread only.
+    fn with_hook_io<R>(
+        payload: serde_json::Value,
+        recall: &std::path::Path,
+        f: impl FnOnce() -> R,
+    ) -> R {
+        let previous = HOOK_TEST_IO.with(|io| io.replace(Some((payload, recall.to_path_buf()))));
+        let out = f();
+        HOOK_TEST_IO.with(|io| *io.borrow_mut() = previous);
+        out
+    }
+
+    /// The index file's schema version, size and contents hash: a reader that never writes
+    /// leaves all three as they were.
+    fn index_fingerprint(index: &std::path::Path) -> (i64, usize, u64) {
+        let version = db::open_readonly(index)
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        let bytes = std::fs::read(index).unwrap();
+        (version, bytes.len(), crate::integration::fnv1a64(&bytes))
+    }
+
+    /// A git checkout at `repo` with one committed file, `src/auth.rs`, for `cal why`; None
+    /// where git is not installed.
+    fn checkout_with_one_commit(repo: &std::path::Path) -> Option<String> {
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                // A global signing setup would prompt for a key or fail the commit.
+                .args(["-c", "commit.gpgsign=false"])
+                .args(args)
+                .env("GIT_AUTHOR_DATE", "1700000000 +0000")
+                .env("GIT_COMMITTER_DATE", "1700000000 +0000")
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        };
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        git(&["init", "-q"])?;
+        git(&["config", "user.email", "t@t"])?;
+        git(&["config", "user.name", "t"])?;
+        std::fs::write(
+            repo.join("src/auth.rs"),
+            "fn rotate() {}\nfn refresh() {}\n",
+        )
+        .unwrap();
+        git(&["add", "."])?;
+        git(&["commit", "-q", "-m", "rotate refresh tokens"])?;
+        git(&["rev-parse", "HEAD"])
+    }
+
+    /// Every reader that runs on an index it never migrates, on an index one and two schemas
+    /// older than this binary: what an update leaves until the app (or a `cal` write command)
+    /// runs the migrations; the author's own index sat at 34 while main was at 35. The hooks for
+    /// every agent, `recall-now`, `recall-error`, `session-end`, `snapshot-hook`, `memory`,
+    /// `decisions`, `stats`, `doctor`, `backup` and `why` run in process as whole commands,
+    /// every MCP tool through the
+    /// protocol, and the memory renderer directly. Each answers (only the writers,
+    /// `session-end` and `snapshot-hook`, may instead stay quiet the documented way, a schema
+    /// mismatch), and the index
+    /// file is left byte for byte as it was: "hooks never migrate", enforced end to end. The
+    /// hook and recall readers must also still find the seeded memory, so one that names a
+    /// newer table without a `db::has_table` probe fails here instead of silently dropping
+    /// injection.
+    #[test]
+    fn every_reader_runs_on_older_schemas() {
+        let latest = db::migrations::MIGRATIONS
+            .pending_migrations(&Connection::open_in_memory().unwrap())
+            .unwrap() as usize;
+        for version in [latest - 1, latest - 2] {
+            readers_on_schema(version);
+        }
+    }
+
+    fn readers_on_schema(version: usize) {
+        use crate::export::MemoryBudget;
+        let dir = db::test_support::TestDir::new("older_schema");
+        let index: &std::path::Path = &dir;
+        let root = index.parent().unwrap();
+        let repo = root.join("repo");
+        let recall = root.join("recall");
+        let sha = checkout_with_one_commit(&repo);
+        std::fs::create_dir_all(&repo).unwrap();
+        let project = crate::indexer::canonical_project(&repo.to_string_lossy()).unwrap();
+        let decision = "Rotate refresh tokens on every 401";
+        let gotcha = "The staging proxy strips Authorization headers";
+        db::test_support::index_at_version(index, version, |conn| {
+            let tid = dts::session(
+                conn,
+                "older-1",
+                &project,
+                "Rotate the tokens",
+                600,
+                &["rotate the refresh tokens on a 401"],
+            );
+            dts::fact(conn, tid, "decision", decision, "llm");
+            dts::fact(conn, tid, "gotcha", gotcha, "llm");
+            // Marked embedded, as the app leaves a fact after its vector pass, so the
+            // `recall-now` keyword gate below has a candidate to find.
+            conn.execute("UPDATE facts SET embedded = 1 WHERE text = ?1", [decision])
+                .unwrap();
+            // A recurring error a linked commit fixed, for `recall-error` (as
+            // `index_with_a_fixed_error` seeds it on a current index).
+            let now = chrono::Utc::now().timestamp();
+            let err = "error[E0425]: cannot find value `total` in this scope";
+            for seq in 0..2 {
+                conn.execute(
+                    "INSERT INTO messages (thread_id, seq, role, text, ts)
+                     VALUES (?1, ?2, 'tool', ?3, ?4)",
+                    rusqlite::params![
+                        tid,
+                        100 + seq,
+                        format!("{err}\n --> src/cart.rs:4:9"),
+                        now - 900
+                    ],
+                )
+                .unwrap();
+            }
+            conn.execute(
+                "INSERT INTO file_edits (thread_id, path, op, ts) VALUES (?1, 'src/cart.rs', 'edit', ?2)",
+                rusqlite::params![tid, now - 800],
+            )
+            .unwrap();
+            for (commit, subject) in [
+                (Some("abcdef0123456".to_string()), "fix: declare total"),
+                (sha.clone(), "rotate refresh tokens"),
+            ] {
+                let Some(commit) = commit else { continue };
+                conn.execute(
+                    "INSERT INTO thread_commits
+                        (thread_id, sha, short_sha, subject, committed_at, overlap, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 1, ?5)",
+                    rusqlite::params![tid, commit, &commit[..7], subject, now - 700],
+                )
+                .unwrap();
+            }
+            issues::seed_commit_files("abcdef0123456", &["src/cart.rs"]);
+            issues::refresh_clusters(conn).unwrap();
+        });
+        let before = index_fingerprint(index);
+        assert_eq!(before.0 as usize, version);
+        let on = |what: &str| format!("{what} on an index at schema {version}");
+        // Every reader here opens read-only and must answer. Accepting a schema mismatch from
+        // them would let one that switched to `open_sidecar_current` pass this test while it
+        // refused every index one schema behind (no injection, `cal stats` failing).
+        let answers = |what: &str, result: anyhow::Result<()>| {
+            if let Err(e) = result {
+                panic!("{}: {e:#}", on(what));
+            }
+        };
+        // `session-end` is the one writer: it opens with `open_hook_db_write`, which refuses an
+        // older schema rather than migrate, and `run_hook_silently` swallows that. Quiet that
+        // way, or answering, are the only two outcomes.
+        let writer_answers = |what: &str, result: anyhow::Result<()>| match result {
+            Ok(()) => {}
+            Err(e) if db::is_schema_mismatch(&e) => {}
+            Err(e) => panic!("{}: {e:#}", on(what)),
+        };
+
+        db::test_support::with_default_index(index, || {
+            let session = serde_json::json!({
+                "session_id": "older-schema",
+                "source": "startup",
+                "hook_event_name": "SessionStart",
+                "cwd": repo.to_string_lossy(),
+                "workspace_roots": [repo.to_string_lossy()],
+            });
+            for agent in ["claude", "codex", "gemini", "copilot", "cursor"] {
+                with_hook_io(session.clone(), &recall, || {
+                    answers(agent, run(&argv(&["hook", "--for", agent])))
+                });
+            }
+            let prompt = serde_json::json!({
+                "session_id": "older-schema",
+                "cwd": repo.to_string_lossy(),
+                // No keyword overlap with the seeded memory, so a machine with the model
+                // cached stops at the keyword gate instead of loading it.
+                "prompt": "please write a short poem about autumn leaves and quiet rain",
+            });
+            with_hook_io(prompt, &recall, || {
+                answers("recall-now", run(&argv(&["recall-now"])))
+            });
+            let failure = serde_json::json!({
+                "session_id": "older-schema",
+                "hook_event_name": "PostToolUseFailure",
+                "tool_name": "Bash",
+                "cwd": repo.to_string_lossy(),
+                "error": "Exit code 101\nerror[E0425]: cannot find value `subtotal` in this scope",
+            });
+            with_hook_io(failure, &recall, || {
+                answers("recall-error", run(&argv(&["recall-error"])))
+            });
+            let end =
+                serde_json::json!({ "session_id": "older-schema", "cwd": repo.to_string_lossy() });
+            with_hook_io(end, &recall, || {
+                writer_answers("session-end", run(&argv(&["session-end"])))
+            });
+            // The PreCompact hooks save a snapshot: writers like `session-end`, quiet on an
+            // older schema. (`index --if-stale`, the one hook not run here, only starts a
+            // detached `cal index`, which a test must not spawn.)
+            let compact = serde_json::json!({
+                "session_id": "older-schema",
+                "hook_event_name": "PreCompact",
+                "trigger": "auto",
+                "transcript_path": repo.join("older-1.jsonl").to_string_lossy(),
+                "cwd": repo.to_string_lossy(),
+            });
+            for args in [
+                vec!["snapshot-hook"],
+                vec!["snapshot-hook", "--for", "codex"],
+            ] {
+                with_hook_io(compact.clone(), &recall, || {
+                    writer_answers(&args.join(" "), run(&argv(&args)))
+                });
+            }
+            for args in [
+                vec!["memory", project.as_str()],
+                vec!["memory", project.as_str(), "--json"],
+                vec!["stats"],
+                vec!["stats", "--json-version", "1"],
+                // What a user runs when the hooks went quiet after an update: it must answer
+                // on exactly this index, and say the schema is behind.
+                vec!["doctor"],
+                vec!["doctor", "--json-version", "1"],
+                // Not a reader, but bound by the same rule: it copies the index as it is and
+                // never upgrades it (a clone on APFS, SQLite's online backup elsewhere).
+                vec!["backup"],
+            ] {
+                answers(&args.join(" "), run(&argv(&args)));
+            }
+            if !embed::model_is_cached() {
+                // With the model cached the command would load it into this test process;
+                // its readers run below with a stand-in query vector either way.
+                answers("decisions", run(&argv(&["decisions", "rotate", "tokens"])));
+            }
+            if sha.is_some() {
+                let target = format!("{}:1", repo.join("src/auth.rs").display());
+                answers("why", run(&argv(&["why", &target])));
+                answers(
+                    "why --json",
+                    run(&argv(&["why", &target, "--json-version", "1"])),
+                );
+            }
+        });
+
+        // The readers behind those commands still find the memory on the old schema.
+        let conn = db::open_readonly(index).unwrap();
+        for agent in [
+            HookAgent::Claude,
+            HookAgent::Codex,
+            HookAgent::Gemini,
+            HookAgent::Copilot,
+            HookAgent::Cursor,
+        ] {
+            for source in ["startup", "compact"] {
+                let req = HookRequest {
+                    agent,
+                    source,
+                    cwd: &repo,
+                    project: &project,
+                    limit: None,
+                    max_chars: None,
+                    transcript: None,
+                };
+                let out = printed(hook_output(&conn, &req).unwrap_or_else(|e| {
+                    panic!("{}: {e:#}", on(&format!("{} {source} hook", agent.label())))
+                }));
+                assert!(
+                    out.contains(decision) && out.contains(gotcha),
+                    "{}: {out}",
+                    on("hook")
+                );
+            }
+        }
+        let mem = knowledge::get_project_memory_facts(&conn, &project, 40).unwrap();
+        for budget in [
+            MemoryBudget::HOOK,
+            MemoryBudget::COMPACT,
+            MemoryBudget::AGENTS_FILE,
+            MemoryBudget::MCP,
+        ] {
+            let md = export::agent_memory_md_budgeted(&project, &mem, None, &budget);
+            assert!(
+                md.contains(decision),
+                "{}: {md}",
+                on("agent_memory_md_budgeted")
+            );
+        }
+        let terms = knowledge::prompt_terms("rotate the refresh tokens on a 401 again", 8);
+        assert!(
+            knowledge::has_keyword_candidates(&conn, &terms, Some(&project)).unwrap(),
+            "{}",
+            on("the recall-now keyword gate")
+        );
+        let stand_in = vec![0.05_f32; embed::DIM];
+        knowledge::find_prior_work(&conn, &stand_in, Some(&project), 5).unwrap();
+        for qv in [None, Some(stand_in.as_slice())] {
+            let outcome = knowledge::recall_or_fallback(
+                &conn,
+                "rotate tokens",
+                qv,
+                "decision",
+                Some(&project),
+                20,
+                false,
+            )
+            .unwrap_or_else(|e| panic!("{}: {e:#}", on("decisions")));
+            recall_output(outcome, qv.is_some(), &Opts::default()).unwrap();
+        }
+        let failure = serde_json::json!({
+            "session_id": "older-schema-direct",
+            "hook_event_name": "PostToolUseFailure",
+            "cwd": repo.to_string_lossy(),
+            "error": "error[E0425]: cannot find value `subtotal` in this scope",
+        });
+        let hit = recall_error(&failure, index, &recall, std::time::SystemTime::now())
+            .unwrap_or_else(|e| panic!("{}: {e:#}", on("recall-error")));
+        assert!(
+            hit.is_some(),
+            "{}: the fixed error is recalled",
+            on("recall-error")
+        );
+        drop(conn);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let tools =
+            rt.block_on(crate::mcp_server::assert_every_tool_answers_with_the_schema_notice(index));
+        assert!(tools >= 23, "{tools} MCP tools answered");
+        drop(rt);
+
+        assert_eq!(
+            index_fingerprint(index),
+            before,
+            "{}: a reader migrated or wrote the index",
+            on("the readers")
+        );
     }
 }

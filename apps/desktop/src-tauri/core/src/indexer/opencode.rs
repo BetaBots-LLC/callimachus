@@ -18,7 +18,9 @@
 //! where `input` already excludes the cached tokens; read for spend. A message with no text
 //! part (a turn of tool calls only) still spent tokens: its usage lands on the last message.
 
-use super::common::{read_json, truncate_title};
+use super::common::{
+    begin_file, count_file, count_line, count_malformed, count_skipped, read_json, truncate_title,
+};
 use super::{
     file_change_state, file_state, open_external_readonly, set_file_state, source_id,
     upsert_thread, IndexReport, MsgUsage, ParsedMessage, ParsedThread,
@@ -286,6 +288,7 @@ fn sqlite_thread(ro: &Connection, row: &SessionRow) -> Result<Option<ParsedThrea
         grouped.push((msg_id, role, ts, parts));
     }
 
+    let file = begin_file();
     let mut thread = ParsedThread::default();
     let mut first_user: Option<String> = None;
 
@@ -299,10 +302,14 @@ fn sqlite_thread(ro: &Connection, row: &SessionRow) -> Result<Option<ParsedThrea
             thread.attach_usage(None, u);
         }
         let own = spent.next_if(|(id, _, _)| *id == msg_id).map(|(_, _, u)| u);
+        count_line();
         let role = match role.as_deref() {
             Some("assistant") => "assistant",
             Some("user") => "user",
-            _ => continue,
+            other => {
+                count_skipped("role:", other, &[]);
+                continue;
+            }
         };
         let text = parts.join("\n");
         let at = if text.is_empty() {
@@ -330,6 +337,7 @@ fn sqlite_thread(ro: &Connection, row: &SessionRow) -> Result<Option<ParsedThrea
         messages, usage, ..
     } = thread;
 
+    count_file(file, messages.len());
     if messages.is_empty() {
         return Ok(None);
     }
@@ -462,6 +470,7 @@ pub(super) fn json_session_thread(sf: &Path) -> Result<Option<ParsedThread>> {
 /// no text messages.
 fn session_thread(root: &Path, session: &Value, session_id: String) -> Option<ParsedThread> {
     let msg_dir = root.join("message").join(&session_id);
+    let file = begin_file();
     let mut thread = ParsedThread::default();
     let mut first_user: Option<String> = None;
     let mut max_ts: Option<i64> = None;
@@ -469,11 +478,19 @@ fn session_thread(root: &Path, session: &Value, session_id: String) -> Option<Pa
     let mut msg_files = read_dir_sorted(&msg_dir);
     msg_files.sort();
     for mf in msg_files {
-        let Some(msg) = read_json(&mf) else { continue };
-        let role = match msg.get("role").and_then(Value::as_str) {
+        let Some(msg) = read_json(&mf) else {
+            count_malformed();
+            continue;
+        };
+        count_line();
+        let role = msg.get("role").and_then(Value::as_str);
+        let role = match role {
             Some("assistant") => "assistant",
             Some("user") => "user",
-            _ => continue,
+            _ => {
+                count_skipped("role:", role, &[]);
+                continue;
+            }
         };
         let ts = msg
             .get("time")
@@ -511,6 +528,7 @@ fn session_thread(root: &Path, session: &Value, session_id: String) -> Option<Pa
         messages, usage, ..
     } = thread;
 
+    count_file(file, messages.len());
     if messages.is_empty() {
         return None;
     }
@@ -580,18 +598,41 @@ fn read_parts_text(root: &Path, message_id: &str) -> String {
     files.sort();
     let mut out = Vec::new();
     for pf in files {
-        let Some(part) = read_json(&pf) else { continue };
-        if part.get("type").and_then(Value::as_str) == Some("text") {
+        let Some(part) = read_json(&pf) else {
+            count_malformed();
+            continue;
+        };
+        let kind = part.get("type").and_then(Value::as_str);
+        if kind == Some("text") {
             if let Some(t) = part.get("text").and_then(Value::as_str) {
                 let t = t.trim();
                 if !t.is_empty() {
                     out.push(t.to_string());
                 }
             }
+        } else {
+            count_skipped("part:", kind, SKIPPED_PARTS);
         }
     }
     out.join("\n")
 }
+
+/// Part types of the JSON tree skipped on purpose (the parse canary, `parse_health`): tool
+/// calls and their output, step markers, reasoning, attached files, patches and snapshots.
+/// Only `text` parts are indexed; the SQLite path selects them in SQL.
+const SKIPPED_PARTS: &[&str] = &[
+    "tool",
+    "step-start",
+    "step-finish",
+    "reasoning",
+    "file",
+    "patch",
+    "snapshot",
+    "agent",
+    "subtask",
+    "retry",
+    "compaction",
+];
 
 fn read_dir_sorted(dir: &Path) -> Vec<PathBuf> {
     let Ok(entries) = fs::read_dir(dir) else {
@@ -631,6 +672,45 @@ mod tests {
         let p = std::env::temp_dir().join(format!("callimachus_{name}_{}_{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&p);
         p
+    }
+
+    /// The parse canary over the JSON tree: an invented role, an invented part type and a
+    /// broken message file are counted; tool and step parts are skipped on purpose.
+    #[test]
+    fn parse_counts_name_unknown_types_and_broken_files() {
+        let dir = crate::db::test_support::TestDir::new("oc_canary");
+        let root = dir.with_file_name("storage");
+        for d in ["session/p", "message/ses_1", "part/m1", "part/m2"] {
+            create_dir_all(root.join(d)).unwrap();
+        }
+        let write = |rel: &str, text: &str| fs::write(root.join(rel), text).unwrap();
+        write(
+            "session/p/ses_1.json",
+            r#"{"id":"ses_1","directory":"/p","time":{"created":1}}"#,
+        );
+        write("message/ses_1/a_m1.json", r#"{"id":"m1","role":"user"}"#);
+        write(
+            "message/ses_1/b_m2.json",
+            r#"{"id":"m2","role":"narrator"}"#,
+        );
+        write("message/ses_1/c_m3.json", r#"{"id":"m3","role":"#);
+        write("part/m1/0.json", r#"{"type":"text","text":"hi"}"#);
+        write("part/m1/1.json", r#"{"type":"step-start"}"#);
+        write("part/m1/2.json", r#"{"type":"hologram"}"#);
+        let mut conn = crate::db::open(&dir).unwrap();
+        let (report, stats) = crate::indexer::common::collect_parse_stats(|| {
+            scan_root(&mut conn, &root, &mut || {}).unwrap()
+        });
+        assert_eq!(report.messages_indexed, 1);
+        assert_eq!((stats.lines, stats.malformed_lines), (3, 1));
+        assert_eq!(
+            stats.unknown_kinds,
+            std::collections::BTreeMap::from([
+                ("part:hologram".to_string(), 1),
+                ("role:narrator".to_string(), 1),
+            ])
+        );
+        assert_eq!((stats.files, stats.files_with_zero_messages), (1, 0));
     }
 
     /// Build an OpenCode-shaped storage tree and verify reconstruction.

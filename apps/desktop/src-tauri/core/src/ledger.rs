@@ -7,6 +7,16 @@
 //! module touches the network. A line holds a timestamp, a kind and a short detail (a tool
 //! name or a project path).
 //!
+//! The hooks that gave up ([`Kind::HookSkipped`], [`append_skip`]) go to a file of their own
+//! next to it, `ledger.skips.jsonl` ([`skips_path_for`]): every hook exits 0 silently on any
+//! error, so without these lines a memory injection that stopped (a schema an update left
+//! behind, a locked index, a payload an agent changed) left nothing to report. Their detail
+//! is a closed class and the hook's subcommand, never project text; `cal doctor` prints the
+//! last seven days of them by class ([`skips`]). Never in `ledger.jsonl`: an app older than
+//! them (0.12) rolls that file up every minute and deletes each line it cannot parse, and the
+//! Claude Code plugin's `cal` updates itself while the app waits for the user, the very
+//! version skew these lines exist to explain.
+//!
 //! Writers are the hooks and the MCP server, short-lived processes that must never wait on
 //! the index lock (a hook has a 1.5-15 s budget, and the app may hold the writer for tens of
 //! seconds during an upgrade). So they never go through SQLite: each event is one `write(2)`
@@ -15,7 +25,10 @@
 //!
 //! Only the GUI reads the file back: [`rollup`] (at launch and on the watcher's minute tick)
 //! folds every line older than today into `ledger.daily` and empties the file, keeping 90
-//! days of per-day counts plus a running total.
+//! days of per-day counts plus a running total. It folds the skips file the same way, into
+//! `ledger.skips` by day and detail, so that file holds at most today's lines while the app
+//! (or `cal watch`) runs; without either it stops growing at [`MAX_FILE_BYTES`] like the
+//! ledger.
 //!
 //! A rollup renames the live file aside, puts today's lines back, commits the past days, and
 //! deletes the renamed file last, so a crash at any step neither loses nor recounts a line
@@ -49,6 +62,10 @@ const ROLLING_EXT: &str = "rolling";
 pub const DAILY_KEY: &str = "ledger.daily";
 /// app_config: how many lines rollups have ever folded, pruned days included.
 const TOTAL_KEY: &str = "ledger.total";
+/// app_config: JSON map `"YYYY-MM-DD"` (local day) -> {hook skip detail -> count}: the
+/// skips file's lines a rollup folded, by class and subcommand. Pruned to [`KEEP_DAYS`]
+/// like `ledger.daily`.
+const SKIPS_KEY: &str = "ledger.skips";
 /// app_config: JSON map of rolled file name -> bytes folded, for every rolled file whose
 /// commit landed but whose delete may not have. A rollup cut short after its commit (a
 /// crash, a quit) then never counts that file again. Pruned to files that still exist.
@@ -84,6 +101,53 @@ pub enum Kind {
     /// was fixed before. Its own kind: counted as a recall hit it inflated "prompts where past
     /// work was surfaced" with shell commands.
     Playbook,
+    /// A hook gave up (see [`SkipClass`]); the detail is `<class> <subcommand>[ <agent>]`.
+    /// Only in the skips file ([`skips_path_for`]). One met in `ledger.jsonl` (an unreleased
+    /// build wrote some there) is ignored by every reader of the ledger and dropped by its
+    /// rollup.
+    #[serde(rename = "hook_skipped")]
+    HookSkipped,
+}
+
+/// Why a hook gave up, as [`Kind::HookSkipped`] records it. A closed set: the detail is a
+/// class, never the error's text (which can hold paths and SQL).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SkipClass {
+    /// The index needs migrations this binary would apply, which hooks never run.
+    SchemaBehind,
+    /// A newer Callimachus upgraded the index past this binary.
+    SchemaAhead,
+    /// The index stayed locked past the hook's wait (an upgrade, a large cleanup).
+    Busy,
+    /// The agent sent flags or a stdin payload this binary could not read.
+    Payload,
+    /// The hook panicked.
+    Panic,
+    /// Any other error.
+    Error,
+}
+
+impl SkipClass {
+    /// Every class, in the order `cal doctor` prints them.
+    pub const ALL: [SkipClass; 6] = [
+        SkipClass::SchemaBehind,
+        SkipClass::SchemaAhead,
+        SkipClass::Busy,
+        SkipClass::Payload,
+        SkipClass::Panic,
+        SkipClass::Error,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SkipClass::SchemaBehind => "schema_behind",
+            SkipClass::SchemaAhead => "schema_ahead",
+            SkipClass::Busy => "busy",
+            SkipClass::Payload => "payload",
+            SkipClass::Panic => "panic",
+            SkipClass::Error => "error",
+        }
+    }
 }
 
 /// Events per kind (the `week` shape `value_ledger` returns and each `ledger.daily` day).
@@ -112,6 +176,8 @@ impl Counts {
             Kind::Recall => self.recall += 1,
             Kind::Digest => self.digest += 1,
             Kind::Playbook => self.playbook += 1,
+            // Not help: the skips file folds into `ledger.skips` ([`Fold::Skips`]).
+            Kind::HookSkipped => {}
         }
     }
 
@@ -174,6 +240,19 @@ fn base_name(ledger: &Path) -> String {
     }
 }
 
+/// The hook skips file next to `index` ([`append_skip`]): `ledger.skips.jsonl` for
+/// `index.db`, `<stem>.ledger.skips.jsonl` for any other name. Its lock and rolled files
+/// (`ledger.skips.lock`, `ledger.skips.<n>.rolling`) never match the ledger's, so an app
+/// older than this file neither rolls it up nor deletes it. None for a path with no parent.
+pub fn skips_path_for(index: &Path) -> Option<PathBuf> {
+    path_for(index).map(|ledger| skips_path(&ledger))
+}
+
+/// The skips file next to the ledger file `ledger`.
+fn skips_path(ledger: &Path) -> PathBuf {
+    ledger.with_file_name(format!("{}.skips.{LEDGER_EXT}", base_name(ledger)))
+}
+
 /// The ledger next to the database `conn` has open; None for an in-memory database.
 pub fn path_for_conn(conn: &Connection) -> Option<PathBuf> {
     conn.path()
@@ -186,6 +265,30 @@ pub fn path_for_conn(conn: &Connection) -> Option<PathBuf> {
 pub fn append(kind: Kind, detail: &str) {
     if let Some(path) = path_for(&crate::db::default_index_path()) {
         append_to(&path, kind, detail, chrono::Utc::now().timestamp());
+    }
+}
+
+/// Record that the hook `command` (a subcommand such as `hook` or `recall-now`, with the
+/// agent `--for` named, if any) gave up for `class`: one O_APPEND line in the default index's
+/// skips file ([`skips_path_for`]), created owner-only like the ledger and, like it, never
+/// creating the index's directory. Only names from closed sets reach the line: the caller
+/// passes the subcommand and agent it matched, never free text.
+pub fn append_skip(class: SkipClass, command: &str, agent: Option<&str>) {
+    if let Some(path) = skips_path_for(&crate::db::default_index_path()) {
+        let detail = skip_detail(class, command, agent);
+        append_to(
+            &path,
+            Kind::HookSkipped,
+            &detail,
+            chrono::Utc::now().timestamp(),
+        );
+    }
+}
+
+fn skip_detail(class: SkipClass, command: &str, agent: Option<&str>) -> String {
+    match agent {
+        Some(a) => format!("{} {command} {a}", class.as_str()),
+        None => format!("{} {command}", class.as_str()),
     }
 }
 
@@ -254,6 +357,12 @@ fn load_daily(conn: &Connection) -> Result<BTreeMap<String, Counts>> {
         .unwrap_or_default())
 }
 
+fn load_skips(conn: &Connection) -> Result<BTreeMap<String, BTreeMap<String, u64>>> {
+    Ok(app_config::get(conn, SKIPS_KEY)?
+        .and_then(|v| serde_json::from_str(&v).ok())
+        .unwrap_or_default())
+}
+
 fn load_folded(conn: &Connection) -> Result<BTreeMap<String, u64>> {
     Ok(app_config::get(conn, FOLDED_KEY)?
         .and_then(|v| serde_json::from_str(&v).ok())
@@ -269,22 +378,47 @@ fn load_total(conn: &Connection) -> Result<u64> {
 /// What a rollup did.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct RollupReport {
-    /// Lines folded into `ledger.daily`.
+    /// Lines folded into `app_config` (`ledger.daily`, and `ledger.skips` from the skips
+    /// file).
     pub folded: u64,
 }
 
-/// Fold the ledger next to `conn`'s database into `ledger.daily` (GUI only: the hooks and
-/// the MCP server only append). A no-op until the file holds a line from before today, so
-/// the minute tick costs one short read.
-pub fn rollup(conn: &Connection) -> Result<RollupReport> {
-    match path_for_conn(conn) {
-        Some(path) => rollup_at(conn, &path, chrono::Utc::now().timestamp()),
-        None => Ok(RollupReport::default()),
+/// Which file a rollup folds: the ledger (its help counts into `ledger.daily` and
+/// `ledger.total`) or the skips file (into `ledger.skips`). Each drops a line of the other's
+/// kind, as it drops a torn one: a `hook_skipped` line an unreleased build wrote into
+/// `ledger.jsonl` is never counted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Fold {
+    Help,
+    Skips,
+}
+
+impl Fold {
+    fn takes(self, kind: Kind) -> bool {
+        (kind == Kind::HookSkipped) == (self == Fold::Skips)
     }
 }
 
-/// [`rollup`] for an explicit ledger file at time `now`.
+/// Fold the ledger next to `conn`'s database into `ledger.daily`, and its skips file into
+/// `ledger.skips` (GUI only: the hooks and the MCP server only append). A no-op until a file
+/// holds a line from before today, so the minute tick costs two short reads.
+pub fn rollup(conn: &Connection) -> Result<RollupReport> {
+    let Some(path) = path_for_conn(conn) else {
+        return Ok(RollupReport::default());
+    };
+    let now = chrono::Utc::now().timestamp();
+    let mut report = rollup_at(conn, &path, now)?;
+    report.folded += roll(conn, &skips_path(&path), now, Fold::Skips)?.folded;
+    Ok(report)
+}
+
+/// [`rollup`] for an explicit ledger file at time `now` (the ledger alone, not its skips).
 pub fn rollup_at(conn: &Connection, ledger: &Path, now: i64) -> Result<RollupReport> {
+    roll(conn, ledger, now, Fold::Help)
+}
+
+/// Roll up `ledger` (the ledger or the skips file, as `fold` says) at time `now`.
+fn roll(conn: &Connection, ledger: &Path, now: i64, fold: Fold) -> Result<RollupReport> {
     let Some(dir) = ledger.parent() else {
         return Ok(RollupReport::default());
     };
@@ -296,7 +430,7 @@ pub fn rollup_at(conn: &Connection, ledger: &Path, now: i64) -> Result<RollupRep
     let mut report = RollupReport::default();
     // A rollup cut short (a crash between the rename and the delete) left its file behind.
     for leftover in rolling_files(dir, &base)? {
-        report.folded += fold_file(conn, ledger, &leftover, &today, now)?;
+        report.folded += fold_file(conn, ledger, &leftover, &today, now, fold)?;
     }
     if !starts_before(ledger, &today)? {
         return Ok(report);
@@ -320,7 +454,7 @@ pub fn rollup_at(conn: &Connection, ledger: &Path, now: i64) -> Result<RollupRep
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(report),
         Err(e) => return Err(e).with_context(|| format!("moving {}", ledger.display())),
     }
-    report.folded += fold_file(conn, ledger, &rolling, &today, now)?;
+    report.folded += fold_file(conn, ledger, &rolling, &today, now, fold)?;
     Ok(report)
 }
 
@@ -368,8 +502,8 @@ fn rolling_files(dir: &Path, base: &str) -> Result<Vec<PathBuf>> {
 }
 
 /// Fold the lines of the moved-aside `rolling` file from before `today` into
-/// `ledger.daily`, put today's back on the live ledger, and delete `rolling`. Returns the
-/// lines folded.
+/// `ledger.daily` (or, for the skips file, `ledger.skips`), put today's back on the live
+/// file, and delete `rolling`. Returns the lines folded.
 ///
 /// The steps run in the order that makes each crash point safe:
 /// 1. Today's lines go back on the live ledger first, tagged with `rolling`'s name. A crash
@@ -387,6 +521,7 @@ fn fold_file(
     rolling: &Path,
     today: &str,
     now: i64,
+    fold: Fold,
 ) -> Result<u64> {
     let name = rolling
         .file_name()
@@ -404,6 +539,7 @@ fn fold_file(
     }
 
     let mut by_day: BTreeMap<String, Counts> = BTreeMap::new();
+    let mut skips_by_day: BTreeMap<String, BTreeMap<String, u64>> = BTreeMap::new();
     let mut keep = Vec::new();
     let mut folded = 0u64;
     // A torn or foreign line (none should exist: every write is one whole line) is dropped
@@ -415,9 +551,21 @@ fn fold_file(
         if take(&mut back, &line) {
             continue; // put back by a fold that died before its commit
         }
+        if !fold.takes(line.kind) {
+            continue;
+        }
         let day = day_key(line.ts);
         if day.as_str() < today {
-            by_day.entry(day).or_default().add(line.kind);
+            match fold {
+                Fold::Help => by_day.entry(day).or_default().add(line.kind),
+                Fold::Skips => {
+                    *skips_by_day
+                        .entry(day)
+                        .or_default()
+                        .entry(line.detail)
+                        .or_insert(0) += 1
+                }
+            }
             folded += 1;
         } else {
             keep.push(line);
@@ -426,17 +574,32 @@ fn fold_file(
     put_back(ledger, &name, keep)?;
 
     let tx = conn.unchecked_transaction()?;
-    let mut daily = load_daily(&tx)?;
-    for (day, counts) in &by_day {
-        daily.entry(day.clone()).or_default().merge(counts);
-    }
     let oldest_kept = day_key(now - (KEEP_DAYS - 1) * 86_400);
-    daily.retain(|day, _| day.as_str() >= oldest_kept.as_str());
+    match fold {
+        Fold::Help => {
+            let mut daily = load_daily(&tx)?;
+            for (day, counts) in &by_day {
+                daily.entry(day.clone()).or_default().merge(counts);
+            }
+            daily.retain(|day, _| day.as_str() >= oldest_kept.as_str());
+            app_config::put(&tx, DAILY_KEY, &serde_json::to_string(&daily)?)?;
+            app_config::put(&tx, TOTAL_KEY, &(load_total(&tx)? + folded).to_string())?;
+        }
+        Fold::Skips => {
+            let mut skips = load_skips(&tx)?;
+            for (day, details) in skips_by_day {
+                let into = skips.entry(day).or_default();
+                for (detail, n) in details {
+                    *into.entry(detail).or_insert(0) += n;
+                }
+            }
+            skips.retain(|day, _| day.as_str() >= oldest_kept.as_str());
+            app_config::put(&tx, SKIPS_KEY, &serde_json::to_string(&skips)?)?;
+        }
+    }
     let dir = rolling.parent().unwrap_or(Path::new("."));
     folded_files.retain(|n, _| dir.join(n).exists());
     folded_files.insert(name.clone(), bytes.len() as u64);
-    app_config::put(&tx, DAILY_KEY, &serde_json::to_string(&daily)?)?;
-    app_config::put(&tx, TOTAL_KEY, &(load_total(&tx)? + folded).to_string())?;
     app_config::put(&tx, FOLDED_KEY, &serde_json::to_string(&folded_files)?)?;
     tx.commit()?;
 
@@ -594,6 +757,7 @@ pub fn summary(conn: &Connection, ledger: Option<&Path>, now: i64) -> Result<Sum
     for line in String::from_utf8_lossy(&bytes)
         .lines()
         .filter_map(parse_line)
+        .filter(|l| Fold::Help.takes(l.kind))
     {
         out.all_time += 1;
         if day_key(line.ts) >= first_day {
@@ -643,6 +807,7 @@ pub fn kept(conn: &Connection, ledger: Option<&Path>, from: Option<&str>) -> Res
     for line in String::from_utf8_lossy(&bytes)
         .lines()
         .filter_map(parse_line)
+        .filter(|l| Fold::Help.takes(l.kind))
     {
         out.all_time += 1;
         let day = day_key(line.ts);
@@ -650,6 +815,48 @@ pub fn kept(conn: &Connection, ledger: Option<&Path>, from: Option<&str>) -> Res
             out.counts.add(line.kind);
             note(&mut out, &day);
         }
+    }
+    Ok(out)
+}
+
+/// The hook skips of the last `days` local days (today included), by detail
+/// (`<class> <subcommand>[ <agent>]`): the days a rollup folded into `ledger.skips` (read
+/// through `conn`, when the index is open and readable) plus the lines of the skips file
+/// `skips_file` ([`skips_path_for`]) not rolled up yet. Read-only, like [`summary`]: `cal
+/// doctor` calls it on its read-only open, or with no index at all, when the file's lines
+/// are what explains why.
+pub fn skips(
+    conn: Option<&Connection>,
+    skips_file: Option<&Path>,
+    now: i64,
+    days: i64,
+) -> Result<BTreeMap<String, u64>> {
+    let first_day = day_key(now - (days.max(1) - 1) * 86_400);
+    let mut out: BTreeMap<String, u64> = BTreeMap::new();
+    // An index this binary cannot read (a newer schema, a damaged file) still leaves the
+    // file's lines to count.
+    let folded = conn.and_then(|c| load_skips(c).ok()).unwrap_or_default();
+    for (day, details) in folded {
+        if day >= first_day {
+            for (detail, n) in details {
+                *out.entry(detail).or_insert(0) += n;
+            }
+        }
+    }
+    let Some(file) = skips_file else {
+        return Ok(out);
+    };
+    let bytes = match std::fs::read(file) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", file.display())),
+    };
+    for line in String::from_utf8_lossy(&bytes)
+        .lines()
+        .filter_map(parse_line)
+        .filter(|l| Fold::Skips.takes(l.kind) && day_key(l.ts) >= first_day)
+    {
+        *out.entry(line.detail).or_insert(0) += 1;
     }
     Ok(out)
 }
@@ -846,6 +1053,196 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A hook skip is one line with a closed-set detail in the skips file, never in the
+    /// ledger; the skips rollup folds it into `ledger.skips` by class and leaves the help
+    /// counts alone.
+    #[test]
+    fn hook_skips_keep_their_class_through_their_own_rollup() {
+        let dir = crate::db::test_support::TestDir::new("ledger_skips");
+        let conn = crate::db::open(&dir).unwrap();
+        let ledger = path_for(&dir).unwrap();
+        let skips_file = skips_path_for(&dir).unwrap();
+        assert_eq!(skips_file, ledger.with_file_name("ledger.skips.jsonl"));
+        let now = noon(0);
+        append_to(&ledger, Kind::Hook, "/a", noon(2));
+        let skip = |class, command, agent, ts| {
+            append_to(
+                &skips_file,
+                Kind::HookSkipped,
+                &skip_detail(class, command, agent),
+                ts,
+            )
+        };
+        skip(SkipClass::SchemaBehind, "session-end", None, noon(2));
+        skip(SkipClass::Busy, "hook", Some("codex"), now);
+        assert_eq!(
+            std::fs::read_to_string(&skips_file)
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap(),
+            format!(
+                r#"{{"ts":{},"kind":"hook_skipped","detail":"schema_behind session-end"}}"#,
+                noon(2)
+            )
+        );
+        let help = summary(&conn, Some(&ledger), now).unwrap();
+        assert_eq!((help.week.total(), help.all_time), (1, 1));
+        let by_detail = BTreeMap::from([
+            ("busy hook codex".to_string(), 1),
+            ("schema_behind session-end".to_string(), 1),
+        ]);
+        assert_eq!(
+            skips(Some(&conn), Some(&skips_file), now, 7).unwrap(),
+            by_detail
+        );
+
+        let daily_before = app_config::get(&conn, DAILY_KEY).unwrap();
+        assert_eq!(
+            roll(&conn, &skips_file, now, Fold::Skips).unwrap().folded,
+            1
+        );
+        assert_eq!(
+            lines(&skips_file).len(),
+            1,
+            "today's skip stays in the file"
+        );
+        assert_eq!(
+            app_config::get(&conn, DAILY_KEY).unwrap(),
+            daily_before,
+            "the help counts are not the skips rollup's"
+        );
+        assert_eq!(load_total(&conn).unwrap(), 0);
+        assert_eq!(
+            skips(Some(&conn), Some(&skips_file), now, 7).unwrap(),
+            by_detail,
+            "the same counts either side of the rollup"
+        );
+        assert_eq!(
+            skips(Some(&conn), Some(&skips_file), now, 1).unwrap().len(),
+            1,
+            "today only"
+        );
+        // No index to read: the lines not rolled up yet still count.
+        assert_eq!(
+            skips(None, Some(&skips_file), now, 7).unwrap(),
+            BTreeMap::from([("busy hook codex".to_string(), 1)])
+        );
+        // `rollup` folds the ledger and the skips file, each with its own lock and leftovers.
+        assert_eq!(rollup_at(&conn, &ledger, now).unwrap().folded, 1);
+        assert!(rolling_files(dir.parent().unwrap(), "ledger.skips")
+            .unwrap()
+            .is_empty());
+        assert!(!dir.with_file_name("ledger.skips.lock").exists());
+    }
+
+    /// What 0.12's rollup does to `ledger.jsonl`: it keeps the lines it can parse (the five
+    /// help kinds) and deletes the rest, every minute. Skips live in their own file, so an
+    /// older app next to a newer hook binary (the plugin updates itself, the app waits for
+    /// the user) erases none of them.
+    #[test]
+    fn an_older_apps_rollup_of_the_ledger_loses_no_skip() {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "lowercase")]
+        #[allow(dead_code)]
+        enum OldKind {
+            Hook,
+            Mcp,
+            Recall,
+            Digest,
+            Playbook,
+        }
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct OldLine {
+            ts: i64,
+            kind: OldKind,
+        }
+        let dir = crate::db::test_support::TestDir::new("ledger_old_rollup");
+        let ledger = path_for(&dir).unwrap();
+        let skips_file = skips_path_for(&dir).unwrap();
+        // The index exists (the hooks record nothing without one).
+        drop(crate::db::open(&dir).unwrap());
+        append_to(&ledger, Kind::Hook, "/a", noon(1));
+        crate::db::test_support::with_default_index(&dir, || {
+            append_skip(SkipClass::SchemaBehind, "session-end", None);
+            append_skip(SkipClass::Busy, "hook", Some("claude"));
+        });
+        append_to(&ledger, Kind::Mcp, "search_threads", noon(0));
+        let skipped_before = std::fs::read(&skips_file).unwrap();
+
+        let text = std::fs::read_to_string(&ledger).unwrap();
+        let kept_by_old: Vec<&str> = text
+            .lines()
+            .filter(|l| serde_json::from_str::<OldLine>(l).is_ok())
+            .collect();
+        assert_eq!(kept_by_old.len(), text.lines().count(), "nothing to delete");
+        std::fs::write(&ledger, kept_by_old.join("\n") + "\n").unwrap();
+
+        assert_eq!(std::fs::read(&skips_file).unwrap(), skipped_before);
+        let now = chrono::Utc::now().timestamp();
+        assert_eq!(
+            skips(None, Some(&skips_file), now, 7)
+                .unwrap()
+                .values()
+                .sum::<u64>(),
+            2
+        );
+    }
+
+    /// The ledger's readers never see a skip: `cal report`'s totals and the Stats card read
+    /// the same with skips recorded (in the file and folded) or not. A `hook_skipped` line
+    /// an unreleased build wrote into `ledger.jsonl` is ignored there and dropped by its
+    /// rollup, and the skips count leaves it out.
+    #[test]
+    fn the_ledger_never_counts_a_skip() {
+        let dir = crate::db::test_support::TestDir::new("ledger_kept_skips");
+        let conn = crate::db::open(&dir).unwrap();
+        let ledger = path_for(&dir).unwrap();
+        let skips_file = skips_path_for(&dir).unwrap();
+        let now = noon(0);
+        append_to(&ledger, Kind::Hook, "/a", noon(2));
+        append_to(&ledger, Kind::Hook, "/b", noon(2));
+        let report = |conn: &Connection| {
+            (
+                kept(conn, Some(&ledger), None).unwrap(),
+                summary(conn, Some(&ledger), now).unwrap(),
+            )
+        };
+        let without = report(&conn);
+        let detail = skip_detail(SkipClass::SchemaBehind, "hook", Some("claude"));
+        for days in [3, 0] {
+            append_to(&skips_file, Kind::HookSkipped, &detail, noon(days));
+        }
+        roll(&conn, &skips_file, now, Fold::Skips).unwrap();
+        assert_eq!(report(&conn), without);
+
+        // The unreleased build's line, a day before the help.
+        let legacy = format!(
+            r#"{{"ts":{},"kind":"hook_skipped","detail":"busy hook"}}"#,
+            noon(3)
+        );
+        let text = std::fs::read_to_string(&ledger).unwrap();
+        std::fs::write(&ledger, format!("{legacy}\n{text}")).unwrap();
+        assert_eq!(report(&conn), without);
+        assert_eq!(rollup_at(&conn, &ledger, now).unwrap().folded, 2);
+        assert_eq!(report(&conn), without);
+        assert!(!std::fs::read_to_string(&ledger)
+            .unwrap_or_default()
+            .contains("hook_skipped"));
+        assert_eq!(
+            skips(Some(&conn), Some(&skips_file), now, 7).unwrap(),
+            BTreeMap::from([(detail, 2)])
+        );
+    }
+
+    /// An app older than a kind drops its lines instead of failing or miscounting.
+    #[test]
+    fn a_line_of_an_unknown_kind_is_dropped() {
+        assert!(parse_line(r#"{"ts":1,"kind":"from_the_future","detail":"x"}"#).is_none());
+        assert!(parse_line(r#"{"ts":1,"kind":"hook_skipped","detail":"busy hook"}"#).is_some());
+    }
+
     #[test]
     fn rollup_prunes_past_90_days_but_keeps_the_all_time_total() {
         let dir = temp_dir("prune");
@@ -1001,6 +1398,26 @@ mod tests {
             "and so are its rolled files"
         );
         assert!(rolling_files(&dir, "index.dev.ledger").unwrap().is_empty());
+
+        // The skips files follow the same names, and no ledger's rollup (an older app's
+        // included: the same `rolling_files` filter) takes a skips file's rolled files.
+        assert_eq!(
+            skips_path_for(&dir.join("index.db")),
+            Some(dir.join("ledger.skips.jsonl"))
+        );
+        assert_eq!(
+            skips_path_for(&dir.join("index.dev.db")),
+            Some(dir.join("index.dev.ledger.skips.jsonl"))
+        );
+        std::fs::write(dir.join("ledger.skips.8.rolling"), "").unwrap();
+        assert_eq!(
+            rolling_files(&dir, "ledger").unwrap(),
+            vec![dir.join("ledger.7.rolling")]
+        );
+        assert_eq!(
+            rolling_files(&dir, "ledger.skips").unwrap(),
+            vec![dir.join("ledger.skips.8.rolling")]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

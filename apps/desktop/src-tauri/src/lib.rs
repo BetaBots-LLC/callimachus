@@ -5,10 +5,10 @@
 extern crate callimachus_core;
 use callimachus_core::jobs::{self, lock_anyhow, short_error, JobFlags};
 pub use callimachus_core::{
-    agent, applog, cleanup, cli_core, context, cost, db, embed, error, export, gitlink, indexer,
-    integration, issues, jobclock, knowledge, ledger, locks, mcp_server, memtrim, onboarding,
-    pick_synth_provider, prepare_ask, report, resolve_distill_engine, search, secrets, snapshot,
-    today, AskPrep, AskSource,
+    agent, applog, backup, cleanup, cli_core, context, cost, db, embed, error, export, gitlink,
+    indexer, integration, issues, jobclock, knowledge, ledger, locks, mcp_server, memtrim,
+    onboarding, pick_synth_provider, prepare_ask, report, resolve_distill_engine, search, secrets,
+    snapshot, today, AskPrep, AskSource,
 };
 use callimachus_core::{is_keyless, resolve_synth};
 // Opt-in analytics, GUI only: constructed in `run()` and nowhere else (see its module docs).
@@ -83,6 +83,8 @@ impl jobs::JobHost for TauriHost {
             Ok(false) => {}
             Err(e) => app_log!("[integration] Claude Code plugin hand-over: {e:#}"),
         }
+        // The weekly index snapshot, when one is due and no job holds the writer.
+        jobs::snapshot_tick(self);
     }
 }
 
@@ -455,9 +457,11 @@ pub struct DbStats {
     pub reclaimable: Option<cleanup::Reclaimable>,
 }
 
+/// The shared writer. Never an error: a panic under an earlier guard is recovered from
+/// ([`db::lock_conn`]) instead of failing every later command until a restart. The `Result`
+/// keeps the commands' `?`.
 fn lock<'a>(db: &'a db::Db) -> AppResult<std::sync::MutexGuard<'a, rusqlite::Connection>> {
-    db.0.lock()
-        .map_err(|e| anyhow::anyhow!("db lock poisoned: {e}").into())
+    Ok(db::lock_conn(&db.0))
 }
 
 /// Check out a pooled READ-ONLY connection. Use in read commands so they run concurrently
@@ -734,6 +738,16 @@ async fn vacuum_db(app: AppHandle) -> AppResult<cleanup::VacuumReport> {
     .await;
     jobs::release_rewrite(&host, job);
     result
+}
+
+/// The index's snapshots for Settings > Index & storage: what exists, what it costs on disk,
+/// the last weekly integrity check (`backup::status`).
+#[tauri::command]
+async fn index_snapshots(pool: tauri::State<'_, db::ReadPool>) -> AppResult<backup::Status> {
+    read_blocking(&pool, |conn| {
+        Ok(backup::status(&db::default_index_path(), Some(conn)))
+    })
+    .await
 }
 
 /// Which background jobs hold their flags, so the UI can disable buttons that would collide
@@ -3093,6 +3107,55 @@ async fn set_claude_cleanup_days(app: AppHandle, days: Option<i64>) -> AppResult
     .await
 }
 
+// ---- diagnostics (`cal doctor`) and the parse canary ----
+
+/// What Settings > General's Copy diagnostics copies: `cal doctor`'s report, as text (the
+/// same renderer `cal doctor` prints with) and as the structure.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Diagnostics {
+    text: String,
+    report: callimachus_core::doctor::Doctor,
+}
+
+/// The `cal doctor` report for this app's index, read on a pooled reader. No quick_check: it
+/// reads the whole file (about a minute on a large index), so it stays a `cal doctor
+/// --quick-check` choice. Redacted, home shown as `~`.
+#[tauri::command]
+async fn diagnostics(pool: tauri::State<'_, db::ReadPool>) -> AppResult<Diagnostics> {
+    read_blocking(&pool, |conn| {
+        let report = callimachus_core::doctor::collect(
+            &db::default_index_path(),
+            Some(conn),
+            callimachus_core::doctor::Options::default(),
+        );
+        Ok(Diagnostics {
+            text: callimachus_core::doctor::render(&report),
+            report,
+        })
+    })
+    .await
+}
+
+/// Sources whose last passes read like a transcript format change and whose warning was not
+/// dismissed (Settings > Index).
+#[tauri::command]
+async fn parse_drifts(
+    pool: tauri::State<'_, db::ReadPool>,
+) -> AppResult<Vec<indexer::parse_health::SourceDrift>> {
+    read_blocking(&pool, |conn| Ok(indexer::parse_health::open_drifts(conn))).await
+}
+
+/// Dismiss a source's format-change warning. The same change found again within 30 days
+/// stays dismissed.
+#[tauri::command]
+async fn dismiss_parse_drift(app: AppHandle, source: String) -> AppResult<()> {
+    write_blocking(&app, move |conn| {
+        indexer::parse_health::dismiss(conn, &source)
+    })
+    .await
+}
+
 // ---- telemetry (opt-in analytics; see telemetry.rs) ----
 
 /// Telemetry consent + whether capture is live (for the consent card and Settings).
@@ -3323,52 +3386,161 @@ fn classify_startup_error(e: &anyhow::Error) -> StartupFailure {
     StartupFailure::Other
 }
 
-/// (title, paragraphs) for the startup error screen.
-fn startup_error_text(kind: &StartupFailure, db_path: &std::path::Path) -> (String, Vec<String>) {
+/// What the startup error screen knows beyond the error: the index's snapshots (`backup`)
+/// and, for a damaged index, how many sessions a rebuild could not bring back.
+#[derive(Debug, Default)]
+struct StartupContext {
+    /// The newest snapshot a restore may use (`backup::restore_candidates`: not the copy this
+    /// launch's own upgrade took of the file it then failed to read): (folder name, date as
+    /// shown).
+    newest: Option<(String, String)>,
+    /// The newest pre-upgrade snapshot: (folder name, date as shown).
+    pre_upgrade: Option<(String, String)>,
+    /// Claude Code sessions in the index whose transcript is gone (`ledger::preserved_claude_threads`).
+    lost_sessions: Option<i64>,
+}
+
+impl StartupContext {
+    /// Read from the snapshots folder of `db_path`; the session count only for `Corrupt`,
+    /// whose screen names it (about 21k stats on a large index; this is the startup thread).
+    fn gather(kind: &StartupFailure, db_path: &std::path::Path) -> Self {
+        if !matches!(kind, StartupFailure::Corrupt | StartupFailure::TooNew) {
+            return Self::default();
+        }
+        let snaps = backup::list(db_path);
+        let usable = backup::restore_candidates(db_path);
+        let shown = |s: &backup::Snapshot| (s.name.clone(), backup::display_date(s.taken_at));
+        let lost_sessions = (*kind == StartupFailure::Corrupt)
+            .then(|| backup::sessions_a_rebuild_loses(db_path, usable.first()))
+            .flatten();
+        Self {
+            newest: usable.first().map(shown),
+            pre_upgrade: snaps
+                .iter()
+                .find(|s| s.reason == backup::Reason::PreMigration)
+                .map(shown),
+            lost_sessions,
+        }
+    }
+}
+
+/// The startup error screen: title, paragraphs, and the label of its one action (restoring a
+/// snapshot of a damaged index), if it offers one.
+struct StartupScreen {
+    title: String,
+    paragraphs: Vec<String>,
+    action: Option<String>,
+}
+
+/// The startup error screen for `kind`.
+fn startup_error_text(
+    kind: &StartupFailure,
+    db_path: &std::path::Path,
+    cx: &StartupContext,
+) -> StartupScreen {
     let path = db_path.display();
+    let screen = |title: &str, paragraphs: Vec<String>| StartupScreen {
+        title: title.into(),
+        paragraphs,
+        action: None,
+    };
+    let name = db_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "index.db".into());
+    let dir = db_path
+        .parent()
+        .map(|d| d.display().to_string())
+        .unwrap_or_default();
     match kind {
-        StartupFailure::TooNew => (
-            "This index is from a newer Callimachus".into(),
-            vec![
+        StartupFailure::TooNew => {
+            let mut paras = vec![
                 format!(
                     "The index at {path} was upgraded by a newer version of Callimachus \
                      (or of its cal / MCP tools). This version can't open it safely."
                 ),
                 "Update Callimachus to the latest release, then open it again.".into(),
-            ],
-        ),
+            ];
+            // Not offered as a restore: going back would drop everything indexed since.
+            if let Some((folder, date)) = &cx.pre_upgrade {
+                let copy = backup::snapshots_dir(db_path).join(folder);
+                paras.push(format!(
+                    "A copy of the index from before an upgrade ({date}) is in {}. It is there \
+                     in case an upgrade goes wrong, not for going back: everything indexed \
+                     since {date} is missing from it.",
+                    copy.display()
+                ));
+            }
+            screen("This index is from a newer Callimachus", paras)
+        }
         StartupFailure::Corrupt => {
             // SQLite runs this index in WAL mode, so recent commits can live only in the
             // `-wal` file. Moving the three files together keeps the saved copy complete, and
             // keeps a leftover WAL from being replayed into the fresh index (which can corrupt
             // it). A folder keeps their names paired, so the copy still opens as one database.
-            let name = db_path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "index.db".into());
-            let dir = db_path
-                .parent()
-                .map(|d| d.display().to_string())
-                .unwrap_or_default();
-            (
-                "The index file is damaged".into(),
-                vec![
-                    format!("Callimachus couldn't read the index at {path}."),
-                    format!(
-                        "To start fresh: quit, then in {dir} move {name} together with \
-                         {name}-wal and {name}-shm (if they exist) into a new folder, for \
-                         example one named broken-index. Open Callimachus again and it \
-                         rebuilds the index from your agents' history."
-                    ),
-                    "Move all three files: the -wal file can hold your most recent changes, \
-                     and one left behind can damage the new index. Stars, tags, recorded \
-                     decisions and snapshots live only in these files, so keep that folder."
-                        .into(),
-                ],
-            )
+            let mut paras = vec![format!("Callimachus couldn't read the index at {path}.")];
+            let mut action = None;
+            if let Some((_, date)) = &cx.newest {
+                paras.push(format!(
+                    "A snapshot of the index from {date} is saved next to it. Restoring it \
+                     checks that copy (an older snapshot is used if it fails), puts it in \
+                     place and keeps the damaged files beside it as {name}.damaged-<date> \
+                     (nothing is deleted). What was indexed after {date} is not in the \
+                     snapshot: sessions whose transcripts are still on disk come back with the \
+                     next index pass, but stars, tags and memory added since then do not, and \
+                     threads you deleted since then are back."
+                ));
+                action = Some(format!("Restore the snapshot from {date}"));
+            }
+            // A new index has another identity: its retention never removes these.
+            let keep_snapshots = if cx.newest.is_some() || cx.pre_upgrade.is_some() {
+                format!(
+                    " Leave {} where it is: its snapshots still hold the old index's history, \
+                     and a new index never removes them.",
+                    backup::snapshots_dir(db_path).display()
+                )
+            } else {
+                String::new()
+            };
+            paras.push(format!(
+                "{}: quit, then in {dir} move {name} together with {name}-wal and {name}-shm \
+                 (if they exist) into a new folder, for example one named broken-index. Open \
+                 Callimachus again and it builds a new index from the transcripts your agents \
+                 still keep.{keep_snapshots}",
+                if action.is_some() {
+                    "Or start fresh instead"
+                } else {
+                    "To start fresh"
+                }
+            ));
+            // A rebuild reads the agents' transcripts, and Claude Code deletes those after
+            // `cleanupPeriodDays`: the index was often the only copy left.
+            paras.push(match cx.lost_sessions {
+                Some(n) if n > 0 => format!(
+                    "A rebuild cannot bring back the {n} Claude Code session{} in this index \
+                     whose transcripts Claude Code has already deleted.",
+                    if n == 1 { "" } else { "s" }
+                ),
+                _ => "A rebuild cannot bring back sessions whose transcripts your agents have \
+                      already deleted (Claude Code deletes them after 30 days unless its \
+                      cleanupPeriodDays setting says otherwise)."
+                    .into(),
+            });
+            paras.push(
+                "Move all three files: the -wal file can hold your most recent changes, \
+                 and one left behind can damage the new index. Stars, tags, recorded \
+                 decisions and session snapshots live only in these files, so keep that \
+                 folder."
+                    .into(),
+            );
+            StartupScreen {
+                title: "The index file is damaged".into(),
+                paragraphs: paras,
+                action,
+            }
         }
-        StartupFailure::Window => (
-            "Callimachus couldn't open its window".into(),
+        StartupFailure::Window => screen(
+            "Callimachus couldn't open its window",
             vec![
                 "Your index opened fine, but the main window couldn't be created.".into(),
                 "Quit and open Callimachus again. If it keeps happening, repair the Microsoft \
@@ -3377,11 +3549,69 @@ fn startup_error_text(kind: &StartupFailure, db_path: &std::path::Path) -> (Stri
                     .into(),
             ],
         ),
-        StartupFailure::Other => (
-            "Callimachus couldn't start".into(),
+        StartupFailure::Other => screen(
+            "Callimachus couldn't start",
             vec![format!("Opening the index at {path} failed.")],
         ),
     }
+}
+
+/// The snapshot the startup error screen offers to restore (a folder name in the index's
+/// snapshots folder), set only when a damaged index failed the startup. `restore_index_snapshot`
+/// restores this one and nothing else, so no window can name a path of its own.
+#[derive(Default)]
+struct RestoreOffer(Mutex<Option<String>>);
+
+/// The startup error screen's "Restore the snapshot from <date>", for a damaged index only
+/// (`backup::restore`: refuses while another process holds a lock next to the index, moves
+/// the damaged files aside, never deletes them). Restarts the app once it is done, so the
+/// restored index opens like any other launch.
+#[tauri::command]
+async fn restore_index_snapshot(app: AppHandle) -> AppResult<String> {
+    let offered = app
+        .try_state::<RestoreOffer>()
+        .and_then(|s| s.0.lock().ok().and_then(|g| g.clone()))
+        .ok_or_else(|| anyhow::anyhow!("no snapshot restore is on offer"))?;
+    let index = db::default_index_path();
+    let restored = blocking(move || backup::restore(&index, &offered)).await?;
+    if let Some(state) = app.try_state::<RestoreOffer>() {
+        if let Ok(mut slot) = state.0.lock() {
+            *slot = None;
+        }
+    }
+    let kept = restored
+        .damaged
+        .as_deref()
+        .and_then(std::path::Path::file_name)
+        .map(|n| format!(" The damaged index is kept as {}.", n.to_string_lossy()))
+        .unwrap_or_default();
+    // The offered snapshot (and any newer than the one used) failed its check or could not be
+    // staged: say so, since the button named its date.
+    let skipped = match restored.skipped.as_slice() {
+        [] => String::new(),
+        [one] => format!(
+            " The snapshot from {} could not be used (see callimachus.log).",
+            backup::display_date(one.taken_at)
+        ),
+        many => format!(
+            " The {} newer snapshots could not be used (see callimachus.log).",
+            many.len()
+        ),
+    };
+    app_log!(
+        "[startup] restored snapshot {}{}",
+        restored.snapshot.name,
+        kept
+    );
+    let app = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        app.restart();
+    });
+    Ok(format!(
+        "Restored the snapshot from {}.{skipped}{kept} Callimachus restarts now.",
+        backup::display_date(restored.snapshot.taken_at)
+    ))
 }
 
 /// Run `script` in a webview a few times over the next few seconds. A window created
@@ -3417,7 +3647,27 @@ fn set_splash_status(app: &AppHandle, text: &str) {
 /// bundled, so the message is rendered into the splash webview itself.
 fn show_startup_error(app: &AppHandle, kind: StartupFailure, e: &anyhow::Error) {
     let db_path = db::default_index_path();
-    let (title, paragraphs) = startup_error_text(&kind, &db_path);
+    let cx = StartupContext::gather(&kind, &db_path);
+    let StartupScreen {
+        title,
+        paragraphs,
+        action,
+    } = startup_error_text(&kind, &db_path, &cx);
+    // The restore button acts on exactly the snapshot named here.
+    let offer = action
+        .is_some()
+        .then(|| cx.newest.as_ref().map(|(name, _)| name.clone()))
+        .flatten();
+    match app.try_state::<RestoreOffer>() {
+        Some(state) => {
+            if let Ok(mut slot) = state.0.lock() {
+                *slot = offer;
+            }
+        }
+        None => {
+            app.manage(RestoreOffer(Mutex::new(offer)));
+        }
+    }
     let mut details = format!("{e:#}");
     if let Some(log) = applog::path() {
         details.push_str(&format!("\n\nLog: {}", log.display()));
@@ -3450,13 +3700,21 @@ fn show_startup_error(app: &AppHandle, kind: StartupFailure, e: &anyhow::Error) 
     eval_soon(
         app,
         "splashscreen",
-        startup_error_script(&title, &paragraphs, &details),
+        startup_error_script(&title, &paragraphs, &details, action.as_deref()),
     );
 }
 
 /// The script that renders the error screen into the splash page. Built from DOM calls with
-/// `textContent` (no HTML parsing), so nothing in an error message can inject markup.
-fn startup_error_script(title: &str, paragraphs: &[String], details: &str) -> String {
+/// `textContent` (no HTML parsing), so nothing in an error message can inject markup. With
+/// `action`, a button calls `restore_index_snapshot` (app commands need no capability, so the
+/// splash window can invoke it) and shows what it answered; the window is the splash, whose
+/// page has no bundle, hence the raw `__TAURI_INTERNALS__` call.
+fn startup_error_script(
+    title: &str,
+    paragraphs: &[String],
+    details: &str,
+    action: Option<&str>,
+) -> String {
     format!(
         r#"(function(){{
   var d=document,b=d.body;
@@ -3466,12 +3724,26 @@ fn startup_error_script(title: &str, paragraphs: &[String], details: &str) -> St
   b.innerHTML="";
   var h=d.createElement("h1");h.style.cssText="font-size:18px;font-weight:600;margin:0 0 12px";h.textContent={title};b.appendChild(h);
   {paras}.forEach(function(t){{var p=d.createElement("p");p.style.cssText="margin:0 0 10px;color:#e5e5e5";p.textContent=t;b.appendChild(p);}});
+  var a={action};
+  if(a){{
+    var btn=d.createElement("button");btn.type="button";btn.textContent=a;
+    btn.style.cssText="margin:4px 0 10px;padding:6px 12px;border-radius:6px;border:1px solid rgba(255,255,255,.2);background:#c16e2c;color:#fff;font:inherit;cursor:pointer";
+    var st=d.createElement("p");st.style.cssText="margin:0 0 10px;color:#e5e5e5";st.setAttribute("role","status");
+    btn.addEventListener("click",function(){{
+      var i=window.__TAURI_INTERNALS__;
+      if(!i){{st.textContent="This window can't restore the snapshot; quit and follow the steps below.";return;}}
+      btn.disabled=true;st.textContent="Checking and restoring the snapshot; on a large index this takes a minute or two…";
+      i.invoke("restore_index_snapshot").then(function(m){{st.textContent=String(m);}},function(e){{btn.disabled=false;st.textContent="The restore failed: "+String(e);}});
+    }});
+    b.appendChild(btn);b.appendChild(st);
+  }}
   var pre=d.createElement("pre");pre.style.cssText="margin:14px 0 10px;padding:10px 12px;border:1px solid rgba(255,255,255,.12);border-radius:6px;white-space:pre-wrap;word-break:break-word;font-size:12px;color:#a1a1a1";pre.textContent={details};b.appendChild(pre);
   var q=d.createElement("p");q.style.cssText="margin:0;color:#a1a1a1;font-size:12px";q.textContent="Close this window to quit.";b.appendChild(q);
 }})();"#,
         title = js_literal(title),
         paras = js_literal(paragraphs),
         details = js_literal(details),
+        action = js_literal(&action),
     )
 }
 
@@ -3489,13 +3761,17 @@ fn init_backend(app: &AppHandle) -> anyhow::Result<()> {
     // path is how you exercise a clean first-run / onboarding without touching the
     // real index.
     let db_path = db::default_index_path();
-    if let Some(parent) = db_path.parent() {
-        std::fs::create_dir_all(parent)?;
+    if let Some(parent) = db_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        db::create_private_dir(parent)?;
     }
     // gui.lock, held until exit, so `cal watch` refuses to start while the app indexes. A
     // second app on the same index finds it held: it keeps its watcher and auto-distill off
     // and spawn_watcher retries the lock every minute (the first app's quit frees it).
     app.state::<GuiLock>().take(&db_path);
+    // Before anything opens the index (which would give it a new `-wal` and hide this state): a
+    // restore left halfway through its swap reads as damaged (`SQLITE_CORRUPT`), so the user
+    // lands on the screen whose restore finishes the job. `db::open` refuses it too.
+    backup::refuse_interrupted_restore(&db_path)?;
     // An upgrade with pending migrations can take a while on a big index: say so.
     if db_path.exists() {
         let pending = rusqlite::Connection::open_with_flags(
@@ -3691,10 +3967,7 @@ fn spawn_background_jobs(app: &AppHandle) {
 
         let db = app.state::<db::Db>();
         let embedder = app.state::<embed::Embedder>();
-        let (has_vectors, facts_pending) =
-            db.0.lock()
-                .map(|c| startup_embed_state(&c))
-                .unwrap_or((false, false));
+        let (has_vectors, facts_pending) = startup_embed_state(&db::lock_conn(&db.0));
         // Load the model at launch only when this session needs it right away. Hybrid search,
         // recall and Ask load it from the cache on first use (about 150 ms), so a prefetch
         // for everyone with a semantic index pinned about 400 MB and 45 ORT threads for the
@@ -3935,7 +4208,7 @@ pub fn run() {
     // Persistent log + panic hook first (GUI only), so even a failed startup leaves a
     // record next to the index.
     if let Some(dir) = db::default_index_path().parent() {
-        let _ = std::fs::create_dir_all(dir);
+        let _ = db::create_private_dir(dir);
         applog::init(dir.join("callimachus.log"));
     }
     applog::install_panic_hook();
@@ -4002,6 +4275,8 @@ pub fn run() {
             delete_threads,
             vacuum_db,
             compact_index,
+            index_snapshots,
+            restore_index_snapshot,
             jobs_status,
             live_indexing,
             get_data_roots,
@@ -4051,6 +4326,9 @@ pub fn run() {
             set_onboarding_step,
             value_ledger,
             set_claude_cleanup_days,
+            diagnostics,
+            parse_drifts,
+            dismiss_parse_drift,
             set_star,
             set_thread_tags,
             list_tags,
@@ -4206,16 +4484,35 @@ mod startup_tests {
         );
     }
 
+    /// An index a restore left halfway through its swap lands on the damaged-index screen
+    /// (whose restore finishes the swap), and the details name where its latest changes are.
+    #[test]
+    fn an_interrupted_restore_is_reported_as_corrupt() {
+        let err = backup::interrupted_restore_error(std::path::Path::new(
+            "/x/index.db.damaged-20261101T000000Z",
+        ));
+        assert_eq!(classify_startup_error(&err), StartupFailure::Corrupt);
+        assert!(
+            format!("{err:#}").contains("/x/index.db.damaged-20261101T000000Z-wal"),
+            "{err:#}"
+        );
+    }
+
     #[test]
     fn error_script_encodes_every_string_as_a_literal() {
         let script = startup_error_script(
             "Title \"quoted\" </script>",
             &["one".to_string(), "two\nlines".to_string()],
             "C:\\path\\index.db",
+            Some("Restore \"it\""),
         );
         assert!(script.contains(r#"h.textContent="Title \"quoted\" </script>""#));
         assert!(script.contains(r#"["one","two\nlines"].forEach"#));
         assert!(script.contains(r#"pre.textContent="C:\\path\\index.db""#));
+        assert!(script.contains(r#"var a="Restore \"it\"";"#));
+        assert!(script.contains(r#"invoke("restore_index_snapshot")"#));
+        let plain = startup_error_script("t", &[], "d", None);
+        assert!(plain.contains("var a=null;"), "no action, no button");
         if let Ok(out) = std::env::var("CALLIMACHUS_DUMP_STARTUP_SCRIPT") {
             std::fs::write(out, &script).unwrap();
         }
@@ -4225,9 +4522,14 @@ mod startup_tests {
     fn other_failures_fall_back_to_the_generic_screen() {
         let err = anyhow::anyhow!("disk on fire");
         assert_eq!(classify_startup_error(&err), StartupFailure::Other);
-        let (title, paras) = startup_error_text(
+        let StartupScreen {
+            title,
+            paragraphs: paras,
+            action,
+        } = startup_error_text(
             &StartupFailure::Corrupt,
             std::path::Path::new("/x/index.db"),
+            &StartupContext::default(),
         );
         assert!(title.contains("damaged"));
         assert!(paras.iter().any(|p| p.contains("/x/index.db")));
@@ -4235,12 +4537,67 @@ mod startup_tests {
         assert!(paras
             .iter()
             .any(|p| p.contains("index.db-wal") && p.contains("index.db-shm")));
+        // No snapshot, no restore; and no promise that a rebuild brings everything back.
+        assert_eq!(action, None);
+        assert!(
+            !paras.iter().any(|p| p.contains("agents' history")),
+            "{paras:?}"
+        );
+        assert!(paras.iter().any(|p| p.contains("cannot bring back")));
+    }
+
+    /// A damaged index with a snapshot offers to restore it, says what is lost, and names how
+    /// many sessions a rebuild could not recover. A too-new index offers no restore, only a
+    /// note that a pre-upgrade copy exists.
+    #[test]
+    fn a_damaged_index_offers_its_newest_snapshot_and_a_too_new_one_does_not() {
+        let cx = StartupContext {
+            newest: Some((
+                "20261102T100000Z-weekly".into(),
+                "November 2, 2026 at 10:00".into(),
+            )),
+            pre_upgrade: Some((
+                "20261101T090000Z-pre-migration".into(),
+                "November 1, 2026 at 09:00".into(),
+            )),
+            lost_sessions: Some(555),
+        };
+        let path = std::path::Path::new("/x/index.db");
+        let corrupt = startup_error_text(&StartupFailure::Corrupt, path, &cx);
+        assert_eq!(
+            corrupt.action.as_deref(),
+            Some("Restore the snapshot from November 2, 2026 at 10:00")
+        );
+        let text = corrupt.paragraphs.join("\n");
+        assert!(text.contains("index.db.damaged-"), "{text}");
+        assert!(text.contains("after November 2, 2026 at 10:00"), "{text}");
+        assert!(text.contains("the 555 Claude Code sessions"), "{text}");
+        // Starting fresh must not lose the old history the snapshots hold.
+        assert!(
+            text.contains("Leave /x/snapshots where it is: its snapshots still hold the old"),
+            "{text}"
+        );
+        let too_new = startup_error_text(&StartupFailure::TooNew, path, &cx);
+        assert_eq!(too_new.action, None);
+        let text = too_new.paragraphs.join("\n");
+        assert!(text.contains("Update Callimachus"), "{text}");
+        assert!(
+            text.contains("/x/snapshots/20261101T090000Z-pre-migration"),
+            "{text}"
+        );
     }
 
     #[test]
     fn a_window_failure_does_not_blame_the_index() {
-        let (title, paras) =
-            startup_error_text(&StartupFailure::Window, std::path::Path::new("/x/index.db"));
+        let StartupScreen {
+            title,
+            paragraphs: paras,
+            ..
+        } = startup_error_text(
+            &StartupFailure::Window,
+            std::path::Path::new("/x/index.db"),
+            &StartupContext::default(),
+        );
         assert!(title.contains("window"), "{title}");
         assert!(
             !paras.iter().any(|p| p.contains("/x/index.db")),
@@ -4705,7 +5062,9 @@ mod command_surface_tests {
     fn every_command_has_a_frontend_wrapper_and_every_wrapper_a_command() {
         // Invoked directly, not through a wrapper: the splash handshake in main.tsx and
         // ErrorBoundary.tsx, which must work even when the app's own modules fail to load.
-        const INVOKED_OUTSIDE_WRAPPERS: &[&str] = &["set_complete"];
+        // And the startup error screen's restore button, which `startup_error_script` renders
+        // into the splash window (no app bundle there).
+        const INVOKED_OUTSIDE_WRAPPERS: &[&str] = &["set_complete", "restore_index_snapshot"];
         let wrapper_sources = [
             include_str!("../../src/lib/api.ts"),
             include_str!("../../src/lib/telemetry.ts"),

@@ -1,0 +1,717 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://callimachus.app/schemas/cal/doctor.v1.json",
+  "title": "cal doctor --json",
+  "description": "What decides whether Callimachus works on this machine: the index and its schema against this binary, the locks next to it, each agent's hooks and MCP entry, the model and vector table, Claude Code's retention, the hooks that gave up in the last seven days by class, and each source's parse health. Paths show the home folder as ~; no project text.",
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "description": "Major version of this payload's shape. A reader refuses a version newer than it knows.",
+      "minimum": 0
+    },
+    "version": {
+      "type": "string",
+      "description": "This binary's Callimachus version."
+    },
+    "platform": {
+      "type": "string",
+      "description": "`<os> <arch>`, e.g. `macos aarch64`."
+    },
+    "index": {
+      "$ref": "#/$defs/IndexState"
+    },
+    "locks": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/LockState"
+      },
+      "description": "The cross-process locks next to the index (`locks`), probed, never taken."
+    },
+    "agents": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/AgentSetup"
+      },
+      "description": "Each agent's Callimachus hooks and MCP entry."
+    },
+    "calLink": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/CalLink"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The `cal` command on PATH (`~/.local/bin/cal`, Unix), when there is one."
+    },
+    "modelCached": {
+      "type": "boolean",
+      "description": "The embedding model is on disk (without it semantic search falls back to keywords)."
+    },
+    "vectors": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/VectorState"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "snapshots": {
+      "$ref": "#/$defs/SnapshotState",
+      "description": "The index's snapshots (`backup`) and the last weekly integrity check."
+    },
+    "claudeRetention": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ClaudeRetention"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "hookSkips": {
+      "$ref": "#/$defs/HookSkips"
+    },
+    "parseHealth": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/SourceHealth"
+      },
+      "description": "The parse canary per source (`indexer::parse_health`)."
+    },
+    "problems": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "What looks wrong, in plain words."
+    }
+  },
+  "required": [
+    "schema_version",
+    "version",
+    "platform",
+    "index",
+    "locks",
+    "agents",
+    "calLink",
+    "modelCached",
+    "vectors",
+    "snapshots",
+    "claudeRetention",
+    "hookSkips",
+    "parseHealth",
+    "problems"
+  ],
+  "$defs": {
+    "IndexState": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "exists": {
+          "type": "boolean"
+        },
+        "bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "`index.db` plus its `-wal`, in bytes.",
+          "minimum": 0
+        },
+        "freeBytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Free bytes on the index's volume.",
+          "minimum": 0
+        },
+        "schema": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "The schema version in the file (`PRAGMA user_version`)."
+        },
+        "binarySchema": {
+          "type": "integer",
+          "description": "The schema version this binary writes."
+        },
+        "schemaState": {
+          "type": "string",
+          "description": "`current`, `behind` (this binary would migrate it; hooks and the MCP server will not),\n`ahead` (a newer Callimachus upgraded it) or `unknown`."
+        },
+        "threads": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "newestThreadAt": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "The newest session activity in the index (unix seconds): how current the index is,\nwhoever keeps it so."
+        },
+        "lastPassAt": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "When the last full indexing pass finished (unix seconds): the app's Reindex or\nonboarding, or `cal index`. None while only the app's watcher has kept the index\ncurrent, which stamps no pass."
+        },
+        "quickCheck": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "With `--quick-check`: `ok`, or SQLite's first findings."
+        },
+        "openError": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Why the index could not be opened, when it could not."
+        }
+      },
+      "required": [
+        "path",
+        "exists",
+        "bytes",
+        "freeBytes",
+        "schema",
+        "binarySchema",
+        "schemaState",
+        "threads",
+        "newestThreadAt",
+        "lastPassAt",
+        "quickCheck",
+        "openError"
+      ]
+    },
+    "LockState": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "`gui`, `watch`, `distill`, `index`, `embed` or `rewrite`."
+        },
+        "held": {
+          "type": "boolean"
+        },
+        "pid": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        }
+      },
+      "required": [
+        "name",
+        "held",
+        "pid"
+      ]
+    },
+    "AgentSetup": {
+      "type": "object",
+      "properties": {
+        "agent": {
+          "type": "string",
+          "description": "`claude`, `codex`, `gemini`, `copilot` or `cursor`."
+        },
+        "present": {
+          "type": "boolean",
+          "description": "The agent's config dir exists."
+        },
+        "hooks": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/FoundHook"
+          }
+        },
+        "mcp": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FoundMcp"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "plugin": {
+          "type": "boolean",
+          "description": "Claude Code only: the Callimachus plugin is enabled, so its own hooks and MCP server\n(not listed here) run instead of the app's."
+        }
+      },
+      "required": [
+        "agent",
+        "present",
+        "hooks",
+        "mcp",
+        "plugin"
+      ],
+      "description": "One agent's Callimachus setup on this machine."
+    },
+    "FoundHook": {
+      "type": "object",
+      "properties": {
+        "event": {
+          "type": "string"
+        },
+        "subcommand": {
+          "type": "string",
+          "description": "The `cal` subcommand it runs (`hook --for codex`, `session-end`, ...)."
+        },
+        "exe": {
+          "type": "string",
+          "description": "The binary it runs, as written in the file."
+        },
+        "exeExists": {
+          "type": "boolean",
+          "description": "Whether that binary exists. A hook whose binary is gone fails (or, guarded, stays\nsilent) at every session start."
+        }
+      },
+      "required": [
+        "event",
+        "subcommand",
+        "exe",
+        "exeExists"
+      ],
+      "description": "One Callimachus hook found in an agent's hooks file."
+    },
+    "FoundMcp": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "description": "`app` (the app run with `--mcp`), `npx` (the npm launcher), `binary` (a\n`callimachus-mcp` binary) or `other`."
+        },
+        "command": {
+          "type": "string",
+          "description": "The command it runs (for `npx`, the package with its pinned version, if any)."
+        },
+        "exeExists": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "Whether an absolute command exists; None for a command looked up on PATH."
+        },
+        "version": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The version it runs, when it can be read without running it: the npx pin, or the\napp bundle's version on macOS."
+        }
+      },
+      "required": [
+        "kind",
+        "command",
+        "exeExists",
+        "version"
+      ],
+      "description": "The `callimachus` MCP entry of an agent's config."
+    },
+    "CalLink": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "target": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Where the link points, when it is a link."
+        },
+        "live": {
+          "type": "boolean",
+          "description": "It resolves to an existing file."
+        }
+      },
+      "required": [
+        "path",
+        "target",
+        "live"
+      ]
+    },
+    "VectorState": {
+      "type": "object",
+      "properties": {
+        "partitioned": {
+          "type": "boolean",
+          "description": "`vec_chunks` has its 0036 shape (`embed::vec_partitioned`)."
+        },
+        "rebuildDue": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "The one-time rebuild (or a compaction) is still due (`cleanup::vec_rebuild_due`)."
+        }
+      },
+      "required": [
+        "partitioned",
+        "rebuildDue"
+      ]
+    },
+    "SnapshotState": {
+      "type": "object",
+      "properties": {
+        "automatic": {
+          "type": "boolean",
+          "description": "Automatic snapshots are taken here: free file clones (macOS), on a disk the app has not\nfound unable to clone. Elsewhere only `cal backup` makes them."
+        },
+        "count": {
+          "type": "integer",
+          "description": "Snapshot folders next to the index.",
+          "minimum": 0
+        },
+        "otherIndex": {
+          "type": "integer",
+          "description": "Of those, automatic snapshots of another index than this one (an earlier index, before\na fresh start): never removed automatically. 0 when the index could not be read.",
+          "minimum": 0
+        },
+        "newestAt": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "When the newest was taken (unix seconds)."
+        },
+        "newestReason": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Why the newest was taken: `pre-migration`, `weekly` or `manual`."
+        },
+        "bytesOnDisk": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "What the snapshots cost on disk together, where the system reports it.",
+          "minimum": 0
+        },
+        "lastCheckAt": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "When the app last ran its weekly integrity check (unix seconds). Null also when a\nfailed check's result was carried across a Shrink index or Reclaim space rewrite."
+        },
+        "lastCheckOk": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "Whether that check passed. A weekly snapshot is taken only after one that did."
+        },
+        "damagedCopies": {
+          "type": "integer",
+          "description": "Damaged indexes a restore moved aside that are still next to the index.",
+          "minimum": 0
+        },
+        "damagedBytes": {
+          "type": "integer",
+          "description": "Their size with their `-wal` and `-shm`, in bytes.",
+          "minimum": 0
+        },
+        "stagedCopies": {
+          "type": "integer",
+          "description": "Copies of a snapshot that an interrupted restore staged and left next to the index.",
+          "minimum": 0
+        },
+        "stagedBytes": {
+          "type": "integer",
+          "description": "Their size with their `-wal` and `-shm`, in bytes.",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "automatic",
+        "count",
+        "otherIndex",
+        "newestAt",
+        "newestReason",
+        "bytesOnDisk",
+        "lastCheckAt",
+        "lastCheckOk",
+        "damagedCopies",
+        "damagedBytes",
+        "stagedCopies",
+        "stagedBytes"
+      ]
+    },
+    "ClaudeRetention": {
+      "type": "object",
+      "properties": {
+        "cleanupPeriodDays": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Claude Code's `cleanupPeriodDays`, None when unset."
+        },
+        "effectiveDays": {
+          "type": "integer",
+          "description": "What Claude Code applies (its 30-day default when unset)."
+        },
+        "preservedSessions": {
+          "type": "integer",
+          "description": "Indexed Claude Code sessions whose transcript is gone: the index is their only copy."
+        }
+      },
+      "required": [
+        "cleanupPeriodDays",
+        "effectiveDays",
+        "preservedSessions"
+      ]
+    },
+    "HookSkips": {
+      "type": "object",
+      "properties": {
+        "days": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "total": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "byClass": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "description": "By class (`schema_behind`, `busy`, ...)."
+        },
+        "byHook": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "description": "By class, hook and agent, as the ledger records them (`busy hook codex`)."
+        }
+      },
+      "required": [
+        "days",
+        "total",
+        "byClass",
+        "byHook"
+      ]
+    },
+    "SourceHealth": {
+      "type": "object",
+      "properties": {
+        "source": {
+          "type": "string"
+        },
+        "last": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LastPass"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The latest pass that was a full one or at least 50 records."
+        },
+        "rolling": {
+          "$ref": "#/$defs/PassSums",
+          "description": "The sums of the judged passes the warning compares against."
+        },
+        "drift": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Drift"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "A format change found (`dismissed` says whether the user dismissed its warning)."
+        }
+      },
+      "required": [
+        "source",
+        "last",
+        "rolling",
+        "drift"
+      ]
+    },
+    "LastPass": {
+      "type": "object",
+      "properties": {
+        "at": {
+          "type": "integer",
+          "description": "Unix seconds."
+        },
+        "full": {
+          "type": "boolean",
+          "description": "A pass over every file of the source (a reindex, `cal index`, the launch catch-up),\nnot a watcher batch."
+        },
+        "stats": {
+          "$ref": "#/$defs/ParseStats"
+        }
+      },
+      "required": [
+        "at",
+        "full",
+        "stats"
+      ],
+      "description": "The latest pass of a source worth keeping: a full pass, or one of at least 50 records or\n5 files."
+    },
+    "ParseStats": {
+      "type": "object",
+      "properties": {
+        "lines": {
+          "type": "integer",
+          "description": "Records read: a JSONL line, an item of a JSON array, a row of an agent's database.",
+          "minimum": 0
+        },
+        "malformedLines": {
+          "type": "integer",
+          "description": "Records that were not valid JSON (counted in `lines` too).",
+          "minimum": 0
+        },
+        "unknownKinds": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "description": "Record or part types the indexer does not know and dropped (or, for a role, misread),\nby name: at most 32 names of at most 48 chars, the rest under `(other)`. Types an\nindexer skips on purpose (thinking, images, snapshots) are not here."
+        },
+        "files": {
+          "type": "integer",
+          "description": "Files (or conversations of a database source) parsed whole.",
+          "minimum": 0
+        },
+        "filesWithZeroMessages": {
+          "type": "integer",
+          "description": "Of those, the ones that held at least one record and yielded no message (an empty\nfile is not one).",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "lines",
+        "malformedLines",
+        "unknownKinds",
+        "files",
+        "filesWithZeroMessages"
+      ],
+      "description": "What one pass over one source parsed, by count only: type names from the files and\nnumbers, never text from them (these land in logs, `app_config` and `cal doctor`, which a\nuser pastes into a public issue)."
+    },
+    "PassSums": {
+      "type": "object",
+      "properties": {
+        "lines": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "bad": {
+          "type": "integer",
+          "description": "Unknown plus malformed records.",
+          "minimum": 0
+        },
+        "files": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "zero": {
+          "type": "integer",
+          "description": "Files that held records but yielded no message.",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "lines",
+        "bad",
+        "files",
+        "zero"
+      ],
+      "description": "One judged pass, summed."
+    },
+    "Drift": {
+      "type": "object",
+      "properties": {
+        "at": {
+          "type": "integer",
+          "description": "When the pass ran (unix seconds)."
+        },
+        "share": {
+          "type": "number",
+          "description": "Its unknown-plus-malformed share of records (0 to 1)."
+        },
+        "baseline": {
+          "type": "number",
+          "description": "The same share over the source's passes before it (of at least 50 records; 0 when\nthere is none yet)."
+        },
+        "malformed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "kinds": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Its unknown type names, most frequent first."
+        },
+        "files": {
+          "type": "integer",
+          "description": "Files it parsed, and how many of them yielded no message.",
+          "minimum": 0
+        },
+        "zeroFiles": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "byShare": {
+          "type": "boolean",
+          "description": "Which rule fired: the share of unknown and malformed records, the files without\nmessages, or both."
+        },
+        "byZeroFiles": {
+          "type": "boolean"
+        },
+        "dismissed": {
+          "type": "boolean",
+          "description": "The user dismissed the warning. The same change found again within 30 days of this\none stays dismissed; a different one (new type names, another rule), or the same one\nfound later, raises it again.",
+          "default": false
+        }
+      },
+      "required": [
+        "at",
+        "share",
+        "baseline",
+        "malformed",
+        "kinds",
+        "files",
+        "zeroFiles",
+        "byShare",
+        "byZeroFiles",
+        "dismissed"
+      ],
+      "description": "A pass that read like a format change."
+    }
+  }
+}

@@ -8,7 +8,20 @@ you choose and the excerpts that agents you connect pull into their own sessions
 Specifically:
 
 - Your conversation index (`index.db`) lives only on your machine and is never
-  uploaded anywhere.
+  uploaded anywhere. It keeps transcripts as they were written, secrets included,
+  so on macOS and Linux its folder is created readable only by you (0700),
+  `index.db` and its `-wal` and `-shm` files are made owner-only (0600) by the app
+  and `cal` whenever they open it for writing, and `index.db.index.log` is created
+  owner-only (an existing one keeps its mode). The lock files next to the index
+  hold a process id and nothing else, and keep the default mode so that a lock
+  another user left behind still reads as free; in the app's own data folder,
+  which is tightened to 0700, nobody else can reach any of these. A folder you
+  chose with `CALLIMACHUS_DB` keeps its own mode; read-only tools and hooks change
+  nothing.
+- Snapshots of the index (`snapshots/` next to it, taken on macOS before each
+  schema upgrade and weekly, and by `cal backup`) hold the same unredacted text:
+  their folders are 0700 and their files 0600. They stay on your machine; a copy
+  you make with `cal backup --to DIR` is as private as the folder you put it in.
 - Embeddings are computed **on-device**; no text is sent to a cloud embedding API.
 - API keys are stored in the **OS keychain**, never in plaintext on disk or in the
   repo.
@@ -98,6 +111,11 @@ Specifically:
   **CLI and MCP server never send analytics.** The exact list of events and
   properties is in the [privacy policy](https://callimachus.app/privacy).
 
+This list is enforced by tests, not only by review: a network client anywhere
+except the LLM engines (`agent`), the model download (`embed`), the analytics
+client and the updater fails the build (`egress_is_confined`, and
+`app_egress_is_confined` for the app).
+
 The website (callimachus.app) uses PostHog in cookieless mode: no cookies, no
 browser storage, no cross-site tracking.
 
@@ -109,11 +127,15 @@ browser storage, no cross-site tracking.
   briefs and conflict review, every MCP tool result, the hooks and the managed
   memory block, the context Open in CLI passes to a new agent session, and
   Obsidian exports. Common secret formats (OpenAI, Anthropic and OpenRouter
-  `sk-` keys, Stripe keys and webhook secrets, GitHub and Slack tokens, AWS
-  access key IDs, Google `AIza...` API keys, bearer tokens, JWTs, private-key
+  `sk-` keys, Stripe keys and webhook secrets, GitHub, GitLab and Slack tokens,
+  AWS access key IDs, Google `AIza...` API keys, OAuth access tokens and client
+  secrets, npm, Hugging Face, PostHog personal, Groq, xAI, Perplexity,
+  Replicate, Supabase secret, DigitalOcean, Shopify, Linear and SendGrid keys,
+  age secret keys, bearer tokens and `Basic` credentials, JWTs, private-key
   blocks including one cut off before its END line, the password in a URL such
-  as `postgres://user:password@host` (even one holding an `@` or `#`), and `api_key=`/`password:`-style
-  assignments) are replaced with `[REDACTED]` in transcripts, thread titles,
+  as `postgres://user:password@host` (even one holding an `@` or `#`),
+  `api_key=`/`password:`/`AccountKey=`-style assignments and `--token <value>`-style
+  command-line flags) are replaced with `[REDACTED]` in transcripts, thread titles,
   search snippets, distilled facts and error signatures alike. A key with
   zero-width or other invisible characters inside it, or partly spelled as JSON
   `\uXXXX` escapes, is still matched, and the whole original span is removed.

@@ -161,6 +161,23 @@ turn tool calls into `tool_name` + a compact string, skip unknown block types, a
 tolerate malformed lines (continue, don't bail). Only `user`/`assistant` messages
 are embedded; `tool`/`system` are searchable via FTS but skipped by the embedder.
 
+But count what you skip, so a format change is seen before the agent deletes its
+originals (the parse canary, `parse_health.rs`): `common::count_line` per record read,
+`count_malformed` per record that is not valid JSON, `count_skipped(prefix, kind,
+SKIPPED)` where a record or part type is dropped (list the types you drop on purpose,
+thinking and images say, in `SKIPPED`), and `let file = begin_file()` before a whole
+file's first record with `count_file(file, messages)` after it. Only around a whole file:
+a path that parses just the lines appended since a cursor counts their records and no
+file, or a tail of records without a message would read as a file that lost its messages.
+The same holds for a whole re-read of a file that only grew (Claude's fallback when there is
+no stored thread to append to): wrap the bytes counted before in `common::uncounted`.
+A JSON-document source counts a document whose container is missing or of another shape
+as one record of an unknown kind (`history:object`), so a renamed container is seen rather
+than skipped. Type names and counts only. `indexer::scan_counted` collects them per pass
+(the watcher's small batches are summed until they are worth judging), and Settings >
+Index and `cal doctor` warn when a pass reads far worse than the source's own history.
+Add a test that feeds an invented record type and checks the counter moves.
+
 ## Verified storage map (macOS)
 
 | Kind | Path | Format |

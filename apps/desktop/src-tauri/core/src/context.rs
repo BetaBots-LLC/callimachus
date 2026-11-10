@@ -57,14 +57,27 @@ pub const REDACTED: &str = "[REDACTED]";
 /// Covered: OpenAI / Anthropic keys (`sk-…`, `sk-ant-…`, `sk-proj-…`), Stripe secret and
 /// restricted keys plus webhook secrets (`sk_live_`, `sk_test_`, `rk_live_`, `rk_test_`,
 /// `whsec_`), GitHub tokens (`ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`, `github_pat_`), AWS
-/// access key ids (`AKIA…` / `ASIA…`), Google API keys (`AIza…`), Slack tokens
-/// (`xox[baprs]-…`), PEM private-key blocks (a block cut off before its END line is redacted
-/// through its base64 body), `Bearer` tokens, JWTs, the password in a URL
-/// (`postgres://user:pass@host` keeps `postgres://user:` and `@host`), and generic
-/// assignments to a key whose name contains `api_key|secret|token|password` anywhere
-/// (`AWS_SECRET_ACCESS_KEY=…`, `"client_secret": …`; `=` or `:`, quoted or not). For the
-/// assignment, URL and `Bearer` forms only the value is replaced, so the shape stays
-/// readable. PostHog `phc_` project keys are public by design and are left alone.
+/// access key ids (`AKIA…` / `ASIA…`), Google API keys (`AIza…`), Google OAuth access tokens
+/// and client secrets (`ya29.`, `GOCSPX-`), Slack tokens (`xox[baprs]-…`), GitLab
+/// (`glpat-`, `glptt-`), npm (`npm_`), Hugging Face (`hf_`), PostHog personal (`phx_`), Groq
+/// (`gsk_`), xAI (`xai-`), Perplexity (`pplx-`), Replicate (`r8_`), Supabase (`sb_secret_`),
+/// DigitalOcean (`dop_v1_`, `doo_v1_`, `dor_v1_`), Shopify (`shpat_`, `shpss_`, `shpca_`,
+/// `shppa_`), Linear (`lin_api_`) and SendGrid (`SG.….…`) keys, age secret keys
+/// (`AGE-SECRET-KEY-1…`), PEM private-key blocks (a block cut off before its END line is
+/// redacted through its base64 body), `Bearer` and `Basic` credentials (outside an
+/// `Authorization` header, only base64 that decodes to a `user:password` or a bare key), JWTs,
+/// the password in a URL (`postgres://user:pass@host` keeps `postgres://user:` and `@host`; a
+/// key in the username goes too), and generic assignments to a key whose name contains
+/// `api_key|secret|token|password` anywhere or ends in
+/// `passwd|credential(s)|accountkey|account_key` (`AWS_SECRET_ACCESS_KEY=…`,
+/// `"client_secret": …`; `=` or `:`, quoted or not, or a space after a `--flag` or a
+/// `config set` name that names the secret, such as `--token …` but not `--token-file …`),
+/// unless the value is a path, a file name or a Docker secret's name or spec. For the
+/// assignment, URL, `Bearer` and `Basic` forms
+/// only the value is replaced, so the shape stays readable. PostHog `phc_` project keys and
+/// Supabase `sb_publishable_` keys are public by design and are left alone. Each prefix
+/// rule needs its alphabet and a minimum length after the prefix, so identifiers that share
+/// one (`npm_config_cache`, `hf_hub_download`, `xai-grok-2`) survive.
 ///
 /// A hand-rolled scanner instead of regexes: it is one linear pass with a first-byte
 /// dispatch, allocates nothing when the text is clean (`Cow::Borrowed`), and needs no
@@ -89,22 +102,24 @@ pub fn redact_secrets(text: &str) -> Cow<'_, str> {
         scan(shadow.text.as_bytes(), |from, to| {
             spans.push((shadow.origin[from], shadow.origin[to]))
         });
-        spans.sort_unstable();
-        // Coalesce overlapping or touching ranges so the copy loop below never steps back.
-        // Every bound is a char boundary (a scan match starts and ends on ASCII, and an
-        // `origin` entry is a char start or the text length), so the slices stay valid.
-        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(spans.len());
-        for (from, to) in spans.drain(..) {
-            match merged.last_mut() {
-                Some(last) if from <= last.1 => last.1 = last.1.max(to),
-                _ => merged.push((from, to)),
-            }
-        }
-        spans = merged;
     }
     if spans.is_empty() {
         return Cow::Borrowed(text);
     }
+    // Neither scan reports in order (a URL's password comes before a token in its username,
+    // see `scan`), and the shadow's spans interleave with the original's: sort, then
+    // coalesce overlapping or touching ranges so the copy loop below never steps back.
+    // Every bound is a char boundary (a scan match starts and ends on ASCII, and an `origin`
+    // entry is a char start or the text length), so the slices stay valid.
+    spans.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(spans.len());
+    for (from, to) in spans {
+        match merged.last_mut() {
+            Some(last) if from <= last.1 => last.1 = last.1.max(to),
+            _ => merged.push((from, to)),
+        }
+    }
+    let spans = merged;
     let mut out = String::with_capacity(text.len());
     let mut copied = 0; // end of the source text already copied into `out`
     for (from, to) in spans {
@@ -116,15 +131,36 @@ pub fn redact_secrets(text: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
-/// Run the scanner over `b`, reporting each secret's byte range in order. Ranges never
-/// overlap: the scan resumes after each match.
+/// Run the scanner over `b`, reporting each secret's byte range. A match that starts where
+/// it was found is skipped past whole. A value-only match (a URL's password, an assignment's
+/// value, a `Bearer` token) starts further on, and the bytes before it can hold a key of
+/// their own: `https://<token>:x-oauth-basic@github.com` puts a GitHub token in the
+/// username, which resuming after the password copied out verbatim. So the scan steps on
+/// through those bytes first and only then jumps over the value, which keeps what it reads
+/// inside values as it was; ranges can overlap and come out of order. Still one pass: `i`
+/// only moves forward.
 fn scan(b: &[u8], mut hit: impl FnMut(usize, usize)) {
     let memo = ScanMemo::default();
     let mut i = 0;
+    // The value-only match whose leading bytes are being stepped through.
+    let mut value: Option<(usize, usize)> = None;
     while i < b.len() {
+        if let Some((_, to)) = value.filter(|&(from, _)| i >= from) {
+            value = None;
+            i = i.max(to);
+            continue;
+        }
         // Every pattern starts with an ASCII byte, so a match can only begin on a char
         // boundary; UTF-8 continuation bytes never match and are simply stepped over.
         match secret_at(b, i, &memo) {
+            Some((from, to)) if from > i => {
+                hit(from, to);
+                // One found while stepping toward another (a name with two keywords reports
+                // the same value twice) leaves the first in place, and its own bytes are
+                // stepped through too: rare, and no worse than reading them.
+                value.get_or_insert((from, to));
+                i += 1;
+            }
             Some((from, to)) => {
                 hit(from, to);
                 i = to.max(i + 1);
@@ -145,6 +181,23 @@ struct ScanMemo {
     /// The last line found by [`pem_line_end`]: searched from `.0`, it ends at `.1` and the
     /// next one starts at `.2`, which holds for any start in `.0..=.1`.
     line: std::cell::Cell<Option<(usize, usize, usize)>>,
+    /// The last key name [`keyword_assignment`] read: from `.0` it ends at `.1`, which holds
+    /// for any start in `.0..=.1`. Every keyword inside one long name (`tokentoken…`) shares
+    /// it, so the scan reads the name once instead of once per keyword (quadratic before).
+    name: std::cell::Cell<Option<(usize, usize)>>,
+    /// The same for the last value read: its end, and its last digit and letter, which say
+    /// whether the value from any start in `.0..=.1` has both.
+    value: std::cell::Cell<Option<ValueRun>>,
+}
+
+/// A run of value bytes in [`ScanMemo`]: from `from` it ends at `end`; `digit` and `alpha`
+/// are the positions of the last ASCII digit and letter in it.
+#[derive(Clone, Copy)]
+struct ValueRun {
+    from: usize,
+    end: usize,
+    digit: Option<usize>,
+    alpha: Option<usize>,
 }
 
 /// The text the scanner sees when the original hides a key behind default-ignorable
@@ -365,18 +418,29 @@ impl serde_json::ser::Formatter for RedactingFormatter {
 fn secret_at(b: &[u8], i: usize, memo: &ScanMemo) -> Option<(usize, usize)> {
     let boundary = at_boundary(b, i);
     let whole = |end: Option<usize>| end.map(|e| (i, e));
+    // The minimum lengths sit below each vendor's documented body length (npm 36, Hugging
+    // Face 34, Groq 52, xAI 80, Perplexity 48, Replicate 37, DigitalOcean 64, Shopify 32,
+    // Linear 40, age 58, SendGrid 22 + 43) and well above the identifiers that share a
+    // prefix (`npm_config_cache`, `hf_hub_download`, `xai-grok-2`, `lin_api_key`).
     let hit = match b[i] {
         b's' if boundary => whole(
             prefixed(b, i, b"sk-", 16, is_key_dash)
-                .or_else(|| prefixed_any(b, i, &[b"sk_live_", b"sk_test_"], 16, is_alnum)),
+                .or_else(|| prefixed_any(b, i, &[b"sk_live_", b"sk_test_"], 16, is_alnum))
+                .or_else(|| prefixed_random(b, i, &[b"sb_secret_"], 20))
+                .or_else(|| {
+                    prefixed_any(
+                        b,
+                        i,
+                        &[b"shpat_", b"shpss_", b"shpca_", b"shppa_"],
+                        32,
+                        is_alnum,
+                    )
+                }),
         ),
-        b'r' if boundary => whole(prefixed_any(
-            b,
-            i,
-            &[b"rk_live_", b"rk_test_"],
-            16,
-            is_alnum,
-        )),
+        b'r' if boundary => whole(
+            prefixed_any(b, i, &[b"rk_live_", b"rk_test_"], 16, is_alnum)
+                .or_else(|| prefixed(b, i, b"r8_", 30, is_alnum)),
+        ),
         b'w' if boundary => whole(prefixed(b, i, b"whsec_", 16, is_alnum)),
         b'g' if boundary => whole(
             prefixed_any(
@@ -386,19 +450,67 @@ fn secret_at(b: &[u8], i: usize, memo: &ScanMemo) -> Option<(usize, usize)> {
                 20,
                 is_alnum,
             )
-            .or_else(|| prefixed(b, i, b"github_pat_", 20, is_alnum_underscore)),
+            .or_else(|| prefixed(b, i, b"github_pat_", 20, is_alnum_underscore))
+            // GitLab's routable tokens carry `.`-joined parts after the body.
+            .or_else(|| {
+                prefixed_random(b, i, &[b"glpat-", b"glptt-"], 20)
+                    .map(|end| dotted_end(b, end, is_key_dash))
+            })
+            .or_else(|| prefixed(b, i, b"gsk_", 40, is_alnum)),
         ),
-        b'A' if boundary => {
-            whole(aws_key_id(b, i).or_else(|| prefixed(b, i, b"AIza", 35, is_key_dash)))
+        b'A' if boundary => whole(
+            aws_key_id(b, i)
+                .or_else(|| prefixed(b, i, b"AIza", 35, is_key_dash))
+                .or_else(|| prefixed(b, i, b"AGE-SECRET-KEY-1", 50, is_upper_digit)),
+        ),
+        b'x' if boundary => {
+            whole(slack_token(b, i).or_else(|| prefixed(b, i, b"xai-", 40, is_alnum)))
         }
-        b'x' if boundary => whole(slack_token(b, i)),
+        b'n' if boundary => whole(prefixed(b, i, b"npm_", 36, is_alnum)),
+        b'h' if boundary => whole(prefixed(b, i, b"hf_", 34, is_alnum)),
+        b'p' if boundary => whole(
+            prefixed(b, i, b"phx_", 30, is_alnum)
+                .or_else(|| prefixed(b, i, b"pplx-", 40, is_alnum)),
+        ),
+        b'y' if boundary => whole(
+            prefixed(b, i, b"ya29.", 30, is_key_dash).map(|end| dotted_end(b, end, is_key_dash)),
+        ),
+        b'G' if boundary => whole(prefixed(b, i, b"GOCSPX-", 24, is_key_dash)),
+        b'd' if boundary => whole(prefixed_any(
+            b,
+            i,
+            &[b"dop_v1_", b"doo_v1_", b"dor_v1_"],
+            40,
+            is_alnum,
+        )),
+        b'l' if boundary => whole(prefixed(b, i, b"lin_api_", 32, is_alnum)),
+        b'S' if boundary => whole(sendgrid_key(b, i)),
         b'e' if boundary => whole(jwt(b, i)),
         b'-' => whole(private_key_block(b, i, memo)),
         b'B' | b'b' if boundary => bearer(b, i),
         b':' => url_credentials(b, i),
         _ => None,
     };
-    hit.or_else(|| keyword_assignment(b, i))
+    hit.or_else(|| keyword_assignment(b, i, memo))
+}
+
+/// `end` extended through `.`-joined segments of `pred` bytes (`glpat-….01.…`, `ya29.…`). A
+/// dot counts only when a segment follows it, so a sentence's full stop is left alone.
+fn dotted_end(b: &[u8], mut end: usize, pred: fn(u8) -> bool) -> usize {
+    while end + 1 < b.len() && b[end] == b'.' && pred(b[end + 1]) {
+        end = run_end(b, end + 1, pred);
+    }
+    end
+}
+
+/// A SendGrid key: `SG.`, a 22-char id and a 43-char secret, base64url, joined by a dot.
+fn sendgrid_key(b: &[u8], i: usize) -> Option<usize> {
+    let id = prefixed(b, i, b"SG.", 16, is_key_dash)?;
+    if b.get(id) != Some(&b'.') {
+        return None;
+    }
+    let end = run_end(b, id + 1, is_key_dash);
+    (end - (id + 1) >= 30).then_some(end)
 }
 
 /// Whether a prefixed pattern may start at `i`: the byte before it is not alphanumeric, so
@@ -429,6 +541,10 @@ fn is_key_dash(c: u8) -> bool {
     c.is_ascii_alphanumeric() || c == b'_' || c == b'-'
 }
 
+fn is_upper_digit(c: u8) -> bool {
+    c.is_ascii_uppercase() || c.is_ascii_digit()
+}
+
 /// End of the run of bytes matching `pred` starting at `from`.
 fn run_end(b: &[u8], from: usize, pred: impl Fn(u8) -> bool) -> usize {
     let mut j = from;
@@ -456,6 +572,23 @@ fn prefixed_any(
     pred: fn(u8) -> bool,
 ) -> Option<usize> {
     prefixes.iter().find_map(|p| prefixed(b, i, p, min, pred))
+}
+
+/// [`prefixed`] with an `is_key_dash` body, for a lowercase prefix that kebab- and
+/// snake-case names share (`glpat-` before a long kebab-case file or branch name,
+/// `sb_secret_` inside a long snake-case test name). A random body has an uppercase letter or
+/// a digit in its first `min` chars (a 20-char one lacks both at odds of (28/64)^20, under
+/// 1e-7); such a name has neither. Those `min` chars decide before the rest of the run is
+/// read, so a long lowercase run full of the prefix stays linear.
+fn prefixed_random(b: &[u8], i: usize, prefixes: &[&[u8]], min: usize) -> Option<usize> {
+    let prefix = prefixes.iter().find(|p| b[i..].starts_with(p))?;
+    let body = i + prefix.len();
+    let head = b.get(body..body + min)?;
+    let random = head.iter().all(|&c| is_key_dash(c))
+        && head
+            .iter()
+            .any(|c| c.is_ascii_uppercase() || c.is_ascii_digit());
+    random.then(|| run_end(b, body + min, is_key_dash))
 }
 
 /// AWS access key id: `AKIA` / `ASIA` plus exactly 16 uppercase letters or digits.
@@ -510,17 +643,8 @@ fn jwt(b: &[u8], i: usize) -> Option<usize> {
 /// A PEM private-key block, `-----BEGIN … PRIVATE KEY-----` through its END line (or through
 /// its body when the paste was cut off before the END line).
 fn private_key_block(b: &[u8], i: usize, memo: &ScanMemo) -> Option<usize> {
-    const BEGIN: &[u8] = b"-----BEGIN ";
     const DASHES: &[u8] = b"-----";
-    if !b[i..].starts_with(BEGIN) {
-        return None;
-    }
-    let label_start = i + BEGIN.len();
-    let label_end = run_end(b, label_start, |c| c.is_ascii_uppercase() || c == b' ');
-    if !b[label_start..label_end].ends_with(b"PRIVATE KEY") || !b[label_end..].starts_with(DASHES) {
-        return None;
-    }
-    let after_header = label_end + DASHES.len();
+    let after_header = pem_header_end(b, i)?;
     // No END line after this header: skip the forward search, which would otherwise run to
     // the end of the text again for every cut-off header. When one does exist, the search
     // stops there and the match consumes everything it read.
@@ -539,6 +663,21 @@ fn private_key_block(b: &[u8], i: usize, memo: &ScanMemo) -> Option<usize> {
         Some(rel) => Some(end_label + rel + DASHES.len()),
         None => Some(b.len()),
     }
+}
+
+/// End of a `-----BEGIN … PRIVATE KEY-----` header line starting at `i`.
+fn pem_header_end(b: &[u8], i: usize) -> Option<usize> {
+    const BEGIN: &[u8] = b"-----BEGIN ";
+    const DASHES: &[u8] = b"-----";
+    if !b[i..].starts_with(BEGIN) {
+        return None;
+    }
+    let label_start = i + BEGIN.len();
+    let label_end = run_end(b, label_start, |c| c.is_ascii_uppercase() || c == b' ');
+    if !b[label_start..label_end].ends_with(b"PRIVATE KEY") || !b[label_end..].starts_with(DASHES) {
+        return None;
+    }
+    Some(label_end + DASHES.len())
 }
 
 /// End of a PEM body cut off before its END line: optional RFC 1421 header lines
@@ -705,8 +844,48 @@ fn url_credentials(b: &[u8], i: usize) -> Option<(usize, usize)> {
     (pass < at && host && !digest && !kept).then_some((pass, at))
 }
 
-/// `Bearer <token>`: replaces only the token so the header shape stays readable.
+/// `Bearer <token>` or `Basic <base64 user:password>`: replaces only the credential so the
+/// header shape stays readable.
 fn bearer(b: &[u8], i: usize) -> Option<(usize, usize)> {
+    if b[i..].starts_with(b"Basic ") || b[i..].starts_with(b"basic ") {
+        let start = i + "Basic ".len();
+        let end = run_end(b, start, |c| {
+            c.is_ascii_alphanumeric() || matches!(c, b'+' | b'/' | b'=')
+        });
+        let run = &b[start..end];
+        let body = run.len() - run.iter().rev().take_while(|&&c| c == b'=').count();
+        let padded = run.len() - body <= 2;
+        let credential = if after_authorization_header(b, i) {
+            // Base64 of `user:password` has a digit, `+` / `/` / `=`, or mixed case past its
+            // first char; a long plain word (`basic internationalization`) has none of them.
+            let encoded = run
+                .iter()
+                .any(|c| c.is_ascii_digit() || matches!(c, b'+' | b'/' | b'='))
+                || (run.iter().skip(1).any(u8::is_ascii_uppercase)
+                    && run.iter().any(u8::is_ascii_lowercase));
+            // A short credential counts too (`root:toor` encodes to 12 chars, under the 16
+            // that keep prose out), when it decodes to the `user:password` RFC 7617 requires:
+            // the colon keeps a challenge (`Basic realm="api"`) and a label
+            // (`Authorization: basic auth`) out.
+            (run.len() >= 16 && encoded) || (padded && base64_has_colon(&run[..body]))
+        } else {
+            // Anywhere else `basic` is mostly an English word, and a slash list after it
+            // (`basic read/write/execute`, `a basic src/components/Header.tsx`) has the `/`
+            // and digits that made the test above redact it. So the run has to decode, as
+            // standard base64 (whole quads when padded, a valid remainder when not), to what
+            // a credential decodes to; see [`basic_credential`].
+            let quads = if padded && body < run.len() {
+                run.len().is_multiple_of(4)
+            } else {
+                body % 4 != 1
+            };
+            run.len() >= 16
+                && padded
+                && quads
+                && base64_bytes(&run[..body]).is_some_and(|bytes| basic_credential(&bytes))
+        };
+        return credential.then_some((start, end));
+    }
     if !(b[i..].starts_with(b"Bearer ") || b[i..].starts_with(b"bearer ")) {
         return None;
     }
@@ -718,18 +897,138 @@ fn bearer(b: &[u8], i: usize) -> Option<(usize, usize)> {
     (end - start >= 20).then_some((start, end))
 }
 
-/// A key name containing `api_key|secret|token|password` followed by `:` or `=` and a
-/// credential-looking value. Returns only the value's range.
-fn keyword_assignment(b: &[u8], i: usize) -> Option<(usize, usize)> {
-    const KEYWORDS: [&[u8]; 6] = [
+/// Whether the scheme word at `i` is an `Authorization` (or `Proxy-Authorization`) header's
+/// value: `Authorization: Basic`, curl's `-H 'authorization: basic`, JSON's
+/// `"Authorization": "Basic`, an env or query form `Authorization=Basic`. Case-insensitive,
+/// an optional quote on either side of the `:` or `=`.
+fn after_authorization_header(b: &[u8], i: usize) -> bool {
+    const NAME: &[u8] = b"authorization";
+    let mut j = i;
+    if j > 0 && matches!(b[j - 1], b'"' | b'\'') {
+        j -= 1;
+    }
+    while j > 0 && matches!(b[j - 1], b' ' | b'\t') {
+        j -= 1;
+    }
+    if j == 0 || !matches!(b[j - 1], b':' | b'=') {
+        return false;
+    }
+    j -= 1;
+    if j > 0 && matches!(b[j - 1], b'"' | b'\'') {
+        j -= 1;
+    }
+    j >= NAME.len() && b[j - NAME.len()..j].eq_ignore_ascii_case(NAME)
+}
+
+/// Whether standard base64 `body` (no padding) decodes to bytes containing a `:`. False for
+/// any byte outside the alphabet, an `=` included.
+fn base64_has_colon(body: &[u8]) -> bool {
+    let mut acc: u32 = 0;
+    let mut bits = 0;
+    for &c in body {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return false,
+        };
+        acc = (acc << 6) | u32::from(v);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            if (acc >> bits) & 0xff == u32::from(b':') {
+                return true;
+            }
+            acc &= (1 << bits) - 1;
+        }
+    }
+    false
+}
+
+/// Whether bytes decoded from a bare `Basic` run are a credential, as opposed to the bytes a
+/// slash list of words decodes to:
+/// - RFC 7617's `user:password` as UTF-8 text with no control char;
+/// - `user:password` with an id-like user (`[A-Za-z0-9._@+-]`) and a password of printable
+///   ASCII, tabs and Latin-1 letters (`0xA0`+), at least 3/4 of it ASCII: a client that sends
+///   Latin-1, or a tab, is not UTF-8 text;
+/// - a bare key (an API key sent as Basic auth, no colon): 16+ bytes of token chars with a
+///   letter and a digit.
+///
+/// Measured on 2.76M slash lists of 2 to 6 dictionary and tech words, each a run of 16+
+/// chars after `basic`: none passes. The second form with any password bytes but controls
+/// let 169 through (`azotize/forestlike` decodes to an ASCII run, a `:`, then high bytes).
+fn basic_credential(bytes: &[u8]) -> bool {
+    let token = |c: &u8| c.is_ascii_alphanumeric() || b"._~+/=-".contains(c);
+    let Some(colon) = bytes.iter().position(|&c| c == b':') else {
+        return bytes.len() >= 16
+            && bytes.iter().all(token)
+            && bytes.iter().any(u8::is_ascii_digit)
+            && bytes.iter().any(u8::is_ascii_alphabetic);
+    };
+    if std::str::from_utf8(bytes).is_ok_and(|text| !text.chars().any(char::is_control)) {
+        return true;
+    }
+    let (user, password) = (&bytes[..colon], &bytes[colon + 1..]);
+    let ascii = password
+        .iter()
+        .filter(|c| (0x20..0x7F).contains(*c))
+        .count();
+    !user.is_empty()
+        && user
+            .iter()
+            .all(|c| c.is_ascii_alphanumeric() || b"._@+-".contains(c))
+        && password
+            .iter()
+            .all(|&c| (0x20..0x7F).contains(&c) || c == b'\t' || c >= 0xA0)
+        && ascii * 4 >= password.len() * 3
+}
+
+/// Standard base64 `body` (no padding) decoded; None for a byte outside the alphabet.
+fn base64_bytes(body: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(body.len() * 3 / 4);
+    let mut acc: u32 = 0;
+    let mut bits = 0;
+    for &c in body {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        };
+        acc = (acc << 6) | u32::from(v);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    Some(out)
+}
+
+/// A key name containing `api_key|secret|token|password`, or ending in
+/// `passwd|credential(s)|accountkey|account_key`, followed by `:` or `=` (or a space, after a
+/// `--flag` or a `config set` name that names the secret) and a credential-looking value.
+/// Returns only the value's range.
+fn keyword_assignment(b: &[u8], i: usize, memo: &ScanMemo) -> Option<(usize, usize)> {
+    const KEYWORDS: [&[u8]; 11] = [
         b"api_key",
         b"api-key",
         b"apikey",
+        b"accountkey",
+        b"account_key",
+        b"account-key",
         b"secret",
         b"token",
         b"password",
+        b"passwd",
+        b"credential",
     ];
-    if !matches!(b[i].to_ascii_lowercase(), b'a' | b's' | b't' | b'p') {
+    if !matches!(b[i].to_ascii_lowercase(), b'a' | b's' | b't' | b'p' | b'c') {
         return None;
     }
     let kw = KEYWORDS
@@ -738,29 +1037,198 @@ fn keyword_assignment(b: &[u8], i: usize) -> Option<(usize, usize)> {
     // The keyword may sit anywhere in the key name, so consume the rest of the identifier:
     // `AWS_SECRET_ACCESS_KEY=…`, `SECRET_KEY = '…'`, `DB_PASSWORD_PROD=…`. The value guard
     // below (letters + digits, 16+ chars) is what keeps `max_tokens: 4096` out.
-    let mut j = run_end(b, i + kw.len(), |c| {
-        c.is_ascii_alphanumeric() || c == b'_' || c == b'-'
-    });
+    let from = i + kw.len();
+    let name_end = match memo.name.get() {
+        Some((start, end)) if start <= from && from <= end => end,
+        _ => {
+            let end = run_end(b, from, |c| {
+                c.is_ascii_alphanumeric() || c == b'_' || c == b'-'
+            });
+            memo.name.set(Some((from, end)));
+            end
+        }
+    };
+    // What the name says after the keyword. `passwd`, `credential` and `accountkey` name the
+    // secret only at the end of it (`DB_PASSWD`, `credentials`, `AccountKey`): AWS config's
+    // `credential_source = Ec2InstanceMetadata` and `credential_process = /usr/local/bin/…`,
+    // Jenkins' `credentialsId`, `passwd_file` and `accountKeyName` hold an enum, a path, an
+    // id or a name, and the value guard lets most of them through.
+    let tail = &b[from..name_end];
+    let ends_name = tail.is_empty() || tail.eq_ignore_ascii_case(b"s");
+    if matches!(
+        *kw,
+        b"passwd" | b"credential" | b"accountkey" | b"account_key" | b"account-key"
+    ) && !ends_name
+    {
+        return None;
+    }
+    let flag = cli_flag(b, i, name_end);
+    let mut j = name_end;
     // A quoted key (`"client_secret": "…"`) has its closing quote before the separator.
     if j < b.len() && matches!(b[j], b'"' | b'\'') {
         j += 1;
     }
     j = run_end(b, j, |c| c == b' ' || c == b'\t');
-    if j >= b.len() || !matches!(b[j], b':' | b'=') {
-        return None;
+    if j < b.len() && matches!(b[j], b':' | b'=') {
+        j += 1;
+    } else {
+        // `--token <value>`, `--api-key <value>`: a command-line flag takes its value after
+        // a space (agents' shell commands are full of them), and so does a name after `set`
+        // (`aws configure set aws_secret_access_key <value>`, `yarn config set npmAuthToken
+        // <value>`), when it names the secret and the next argument does not start with `-`
+        // (a flag itself); any other key needs `:` or `=`.
+        let negated = flag.is_some_and(|f| {
+            [b"no-".as_slice(), b"no_", b"ask-"]
+                .iter()
+                .any(|w| f.len() > w.len() && f[..w.len()].eq_ignore_ascii_case(w))
+        });
+        let spaced = j > name_end
+            && b.get(j) != Some(&b'-')
+            && names_the_secret(tail)
+            && ((flag.is_some() && !negated) || after_set(b, i));
+        if !spaced {
+            return None;
+        }
     }
-    j = run_end(b, j + 1, |c| c == b' ' || c == b'\t');
+    j = run_end(b, j, |c| c == b' ' || c == b'\t');
     if j < b.len() && matches!(b[j], b'"' | b'\'') {
         j += 1;
     }
-    let end = run_end(b, j, |c| {
-        c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.' | b'+' | b'/' | b'=' | b'~')
-    });
+    let run = match memo.value.get() {
+        Some(run) if run.from <= j && j <= run.end => run,
+        _ => {
+            let end = run_end(b, j, |c| {
+                c.is_ascii_alphanumeric()
+                    || matches!(c, b'_' | b'-' | b'.' | b'+' | b'/' | b'=' | b'~')
+            });
+            let last = |pred: fn(&u8) -> bool| b[j..end].iter().rposition(pred).map(|p| j + p);
+            let run = ValueRun {
+                from: j,
+                end,
+                digit: last(u8::is_ascii_digit),
+                alpha: last(u8::is_ascii_alphabetic),
+            };
+            memo.value.set(Some(run));
+            run
+        }
+    };
+    let end = run.end;
+    let credential_like =
+        end - j >= 16 && run.digit.is_some_and(|d| d >= j) && run.alpha.is_some_and(|a| a >= j);
     let value = &b[j..end];
-    let credential_like = value.len() >= 16
-        && value.iter().any(u8::is_ascii_digit)
-        && value.iter().any(u8::is_ascii_alphabetic);
-    credential_like.then_some((j, end))
+    let names_something_else = || {
+        names_a_file(value)
+            || docker_secret_spec(value)
+            || (flag.is_some_and(|f| f.eq_ignore_ascii_case(b"secret"))
+                && docker_secret_name(value))
+    };
+    (credential_like && !names_something_else()).then_some((j, end))
+}
+
+/// Whether a key name's `tail` (what follows the keyword) still names the secret, so a
+/// `--flag` or `config set` name with it takes the secret as its next argument: the keyword
+/// ends the name (`--token`, `--auth-token`, `--client-secret`), a plural (`--credentials`),
+/// only `key` follows (`--secret-key`, `--s3-secret-access-key`) or a value suffix
+/// (`--secret-string`, AWS Secrets Manager's create-secret / put-secret-value, `--token-value`).
+/// A name that just mentions the keyword takes something else: a file (`--token-file`), a
+/// model (`--tokenizer`), a secret's name (`--secret-id`), stdin (`--password-stdin`).
+fn names_the_secret(tail: &[u8]) -> bool {
+    const VALUE_SUFFIXES: [&[u8]; 4] = [b"-string", b"_string", b"-value", b"_value"];
+    tail.is_empty()
+        || tail.eq_ignore_ascii_case(b"s")
+        || (tail.len() >= 3 && tail[tail.len() - 3..].eq_ignore_ascii_case(b"key"))
+        || VALUE_SUFFIXES.iter().any(|s| tail.eq_ignore_ascii_case(s))
+}
+
+/// The name of the long command-line flag holding the keyword at `b[i]` (without its `--`,
+/// through `name_end`), when its run of name characters starts with `--`. Looks back at most
+/// 64 bytes, so a long run of name characters keeps the scan linear; no flag is that long.
+fn cli_flag(b: &[u8], i: usize, name_end: usize) -> Option<&[u8]> {
+    let from = i.saturating_sub(64);
+    let name = |c: &u8| c.is_ascii_alphanumeric() || *c == b'_' || *c == b'-';
+    let start = match b[from..i].iter().rposition(|c| !name(c)) {
+        Some(p) => from + p + 1,
+        None if from == 0 => 0,
+        None => return None,
+    };
+    b[start..name_end].strip_prefix(b"--")
+}
+
+/// Whether the argument holding the keyword at `b[i]` comes right after the word `set`
+/// (`aws configure set`, `npm config set`, `yarn config set`), whose next argument is the
+/// value. Looks back at most 128 bytes, past any non-blank bytes (`default.`, npm's
+/// `//registry.npmjs.org/:_`) to the argument's start.
+fn after_set(b: &[u8], i: usize) -> bool {
+    let from = i.saturating_sub(128);
+    let Some(p) = b[from..i].iter().rposition(u8::is_ascii_whitespace) else {
+        return false;
+    };
+    let mut j = from + p + 1;
+    while j > 0 && matches!(b[j - 1], b' ' | b'\t') {
+        j -= 1;
+    }
+    j >= 3 && b[j - 3..j].eq_ignore_ascii_case(b"set") && (j == 3 || b[j - 4].is_ascii_whitespace())
+}
+
+/// Whether a keyword's value is a path or a file name rather than the secret:
+/// `GOOGLE_APPLICATION_CREDENTIALS=/Users/me/keys/sa.json`, `--password /run/secrets/db`,
+/// `TOKEN_FILE=~/.cache/hf/token`. `~/`, `./` and `../` never start base64, and nothing a
+/// vendor issues ends in a file extension. Base64 can start with `/`, so there the segments
+/// must read as names: two or more, no `+` or `=`, and no capital past a segment's first
+/// char (a random segment of 8 has one at odds of 1 - (38/64)^7, about 97%). Reads at most
+/// the value's first and last 128 bytes: every keyword in one long name (`tokentoken…=`)
+/// shares one value, and a check that read it whole for each would be quadratic.
+fn names_a_file(value: &[u8]) -> bool {
+    if value.starts_with(b"~/") || value.starts_with(b"./") || value.starts_with(b"../") {
+        return true;
+    }
+    let tail = &value[value.len().saturating_sub(128)..];
+    if let Some(dot) = tail.iter().rposition(|&c| c == b'.') {
+        const EXTENSIONS: &str = "json pem key crt cer der p12 pfx jks keystore txt env ini cfg \
+            conf yaml yml toml xml gpg asc secrets";
+        let ext = &tail[dot + 1..];
+        let file = EXTENSIONS
+            .split_ascii_whitespace()
+            .any(|e| ext.eq_ignore_ascii_case(e.as_bytes()));
+        if dot > 0 && file {
+            return true;
+        }
+    }
+    let Some(rest) = value.strip_prefix(b"/") else {
+        return false;
+    };
+    let head = &rest[..rest.len().min(128)];
+    let mut segments = 0;
+    for segment in head.split(|&c| c == b'/').filter(|s| !s.is_empty()) {
+        if segment.iter().any(|c| matches!(c, b'+' | b'='))
+            || segment.iter().skip(1).any(u8::is_ascii_uppercase)
+        {
+            return false;
+        }
+        segments += 1;
+    }
+    segments >= 2
+}
+
+/// Whether a value is a Docker / BuildKit secret spec (`id=npmrc,src=…`,
+/// `source=db_password,target=db`): what `--secret` takes in `docker build` and
+/// `docker service create`, which names the secret and where it goes.
+fn docker_secret_spec(value: &[u8]) -> bool {
+    const KEYS: [&[u8]; 6] = [b"id=", b"src=", b"source=", b"target=", b"env=", b"type="];
+    KEYS.iter().any(|k| value.starts_with(k))
+}
+
+/// Whether a value given to a bare `--secret` is a secret's name (`db_password_prod_v2`,
+/// `my-api-token-2024`), which `docker run`, `podman run` and `docker service create` take:
+/// lowercase words joined by `_`, `-` or `.`, at most 64 chars (Docker's limit). A key has
+/// capitals or no separator. Lost with it: a lowercase passphrase given to another tool's
+/// bare `--secret` (`jwt encode --secret correct-horse-battery-2024`).
+fn docker_secret_name(value: &[u8]) -> bool {
+    value.len() <= 64
+        && value.iter().any(|c| matches!(c, b'_' | b'-' | b'.'))
+        && value.iter().all(|c| {
+            c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, b'_' | b'-' | b'.')
+        })
 }
 
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -785,7 +1253,9 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// line break or a space so the words on either side do not run together. An OSC or DCS
 /// string with no terminator ends at the next line break rather than at the end of the
 /// text, so a stray one cannot swallow everything after it, and a lone 8-bit introducer
-/// (mojibake, mostly) is dropped by itself. Borrowed when nothing changes.
+/// (mojibake, mostly) is dropped by itself. A sequence never takes the first char of a key,
+/// and a key right after anything removed gets a space before it, so the redaction that
+/// follows still knows it ([`Visible`]). Borrowed when nothing changes.
 pub fn strip_controls(text: &str) -> Cow<'_, str> {
     let plain = |c: u8| (0x20..0x7F).contains(&c) || c == b'\n' || c == b'\t';
     if text.bytes().all(plain) || !text.chars().any(is_stripped_control) {
@@ -804,15 +1274,24 @@ pub fn strip_controls(text: &str) -> Cow<'_, str> {
 /// Reading from any char of a text gives the same chars as reading the whole text and
 /// dropping what came before, as long as the full read emitted that char: a char that is
 /// emitted ends whatever sequence came before it.
+///
+/// A key is never read as part of a sequence. A bare escape right before one (`ESC (`,
+/// `ESC SP`, `ESC [`, an 8-bit CSI) would take its first char as the final byte, and every
+/// path that strips before it redacts (`prepare`, `export::fact_line`) then handed the
+/// redaction `k-ant-…`, `hp_…` or `KIA…`, with no prefix to know the key by. So a sequence
+/// ends before a byte where [`starts_secret`] holds. And a key right after anything dropped
+/// gets a space before it: `word\x1B[0mghp_…` or `word\0sk-…` would otherwise come out glued
+/// to the word, which the redaction deliberately leaves alone. Both depend only on the text
+/// from the key on, so the property above still holds.
 #[derive(Clone)]
 struct Visible<'a> {
-    chars: std::iter::Peekable<std::str::Chars<'a>>,
+    chars: std::str::Chars<'a>,
 }
 
 impl<'a> Visible<'a> {
     fn new(text: &'a str) -> Self {
         Visible {
-            chars: text.chars().peekable(),
+            chars: text.chars(),
         }
     }
 }
@@ -822,9 +1301,15 @@ impl Iterator for Visible<'_> {
 
     fn next(&mut self) -> Option<char> {
         let chars = &mut self.chars;
+        // Whether this call dropped something right before the char about to be read.
+        let mut dropped = false;
         loop {
+            if dropped && starts_secret(chars.as_str()) {
+                return Some(' ');
+            }
+            dropped = true;
             match chars.next()? {
-                '\u{1B}' => match chars.peek().copied() {
+                '\u{1B}' => match peek(chars) {
                     Some('[') => {
                         chars.next();
                         skip_csi(chars);
@@ -835,12 +1320,12 @@ impl Iterator for Visible<'_> {
                     }
                     // nF: intermediates, then one final byte.
                     Some(' '..='/') => {
-                        while chars.next_if(|c| matches!(c, ' '..='/')).is_some() {}
-                        chars.next_if(|c| matches!(c, '0'..='~'));
+                        while take_unless_secret(chars, |c| matches!(c, ' '..='/')) {}
+                        take_unless_secret(chars, |c| matches!(c, '0'..='~'));
                     }
                     // Fp / Fe / Fs: one byte (`ESC 7`, `ESC c`, `ESC M`).
                     Some('0'..='~') => {
-                        chars.next();
+                        take_unless_secret(chars, |_| true);
                     }
                     _ => {}
                 },
@@ -850,13 +1335,50 @@ impl Iterator for Visible<'_> {
                 // (`9D 0;title` closed on the same line) takes its payload along; any other
                 // lone one goes alone.
                 '\u{9D}' if is_8bit_osc(chars.clone()) => skip_control_string(chars),
-                '\r' if chars.peek() == Some(&'\n') => {}
+                '\r' if peek(chars) == Some('\n') => {}
                 '\r' => return Some('\n'),
                 '\u{B}' | '\u{C}' => return Some(' '),
                 c if is_stripped_control(c) => {}
                 c => return Some(c),
             }
         }
+    }
+}
+
+fn peek(chars: &std::str::Chars<'_>) -> Option<char> {
+    chars.clone().next()
+}
+
+fn next_if(chars: &mut std::str::Chars<'_>, f: impl FnOnce(char) -> bool) -> Option<char> {
+    match peek(chars) {
+        Some(c) if f(c) => chars.next(),
+        _ => None,
+    }
+}
+
+/// Take the next char into an escape sequence when `f` accepts it and no key starts there.
+fn take_unless_secret(chars: &mut std::str::Chars<'_>, f: impl FnOnce(char) -> bool) -> bool {
+    match peek(chars) {
+        Some(c) if f(c) && !starts_secret(chars.as_str()) => {
+            chars.next();
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Whether a secret [`redact_secrets`] knows starts at the start of `rest`. Every rule starts
+/// on a letter but the PEM block, which is decided here by its header alone: its body search
+/// reads to the end of the text, and with a fresh memo per check a text of many headers
+/// behind escapes would be quadratic. The other rules read one run, which ends at the next
+/// control, so the checks of one strip read each byte a bounded number of times (1 MB of
+/// escaped PEM headers strips and redacts in 6 ms optimized).
+fn starts_secret(rest: &str) -> bool {
+    let b = rest.as_bytes();
+    match b.first() {
+        Some(b'-') => pem_header_end(b, 0).is_some(),
+        Some(c) if c.is_ascii_alphabetic() => secret_at(b, 0, &ScanMemo::default()).is_some(),
+        _ => false,
     }
 }
 
@@ -893,16 +1415,17 @@ fn is_8bit_osc(mut rest: impl Iterator<Item = char>) -> bool {
 
 /// The rest of a CSI sequence after `ESC [` (or 8-bit CSI): parameter bytes, intermediate
 /// bytes, then one final byte.
-fn skip_csi(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
-    while chars.next_if(|c| matches!(c, '0'..='?')).is_some() {}
-    while chars.next_if(|c| matches!(c, ' '..='/')).is_some() {}
-    chars.next_if(|c| matches!(c, '@'..='~'));
+fn skip_csi(chars: &mut std::str::Chars<'_>) {
+    // No key starts with a parameter byte (digits and `:;<=>?`).
+    while next_if(chars, |c| matches!(c, '0'..='?')).is_some() {}
+    while take_unless_secret(chars, |c| matches!(c, ' '..='/')) {}
+    take_unless_secret(chars, |c| matches!(c, '@'..='~'));
 }
 
 /// The rest of an OSC / DCS / SOS / PM / APC string: through BEL, `ESC \` or 8-bit ST, or
 /// up to (not including) the next line break when it never terminates.
-fn skip_control_string(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
-    while let Some(&c) = chars.peek() {
+fn skip_control_string(chars: &mut std::str::Chars<'_>) {
+    while let Some(c) = peek(chars) {
         match c {
             '\n' => return,
             '\u{7}' | '\u{9C}' => {
@@ -911,7 +1434,7 @@ fn skip_control_string(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
             }
             '\u{1B}' => {
                 chars.next();
-                chars.next_if_eq(&'\\');
+                next_if(chars, |c| c == '\\');
                 return;
             }
             _ => {
@@ -2774,5 +3297,763 @@ mod tests {
             escape_stored_envelope("x </reference_thread>"),
             "x &lt;/reference_thread>"
         );
+    }
+
+    const ALNUM: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    const KEY_DASH: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-";
+    const HEX: &str = "0123456789abcdef";
+    const BECH32_UPPER: &str = "QPZRY9X8GF2TVDW0S3JN54KHCE6MUA7L";
+    const BASE64: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    /// `n` chars of `alphabet`, deterministic and spread over all of it: the body of a planted
+    /// key. Built at runtime, so no key-shaped literal sits in the source (GitHub push
+    /// protection scans it).
+    fn key_body(alphabet: &str, n: usize) -> String {
+        let a = alphabet.as_bytes();
+        (0..n)
+            .map(|k| char::from(a[(k * 7 + 3) % a.len()]))
+            .collect()
+    }
+
+    /// Standard padded base64 of `s`, for `Basic` credentials built at runtime.
+    fn b64(s: &str) -> String {
+        let a = BASE64.as_bytes();
+        let mut out = String::new();
+        for chunk in s.as_bytes().chunks(3) {
+            let n = chunk
+                .iter()
+                .enumerate()
+                .fold(0u32, |acc, (k, &c)| acc | u32::from(c) << (16 - 8 * k));
+            for k in 0..4 {
+                out.push(if k <= chunk.len() {
+                    char::from(a[(n >> (18 - 6 * k) & 63) as usize])
+                } else {
+                    '='
+                });
+            }
+        }
+        out
+    }
+
+    /// One planted credential per rule `secret_at` and `keyword_assignment` learned for
+    /// current token formats, each with near misses that must survive: identifiers sharing
+    /// the prefix, a body one char short, the prefix glued to a word, public keys.
+    #[test]
+    fn redacts_every_known_prefix() {
+        let key =
+            |prefix: &str, alphabet: &str, n: usize| format!("{prefix}{}", key_body(alphabet, n));
+        let prefixed = [
+            key("glpat-", KEY_DASH, 20),
+            format!("{}.01.{}", key("glpat-", KEY_DASH, 27), key_body(ALNUM, 9)),
+            key("glptt-", HEX, 40),
+            key("npm_", ALNUM, 36),
+            key("hf_", ALNUM, 34),
+            key("phx_", ALNUM, 43),
+            key("gsk_", ALNUM, 52),
+            key("xai-", ALNUM, 80),
+            key("pplx-", ALNUM, 48),
+            key("r8_", ALNUM, 37),
+            key("sb_secret_", KEY_DASH, 31),
+            key("ya29.", KEY_DASH, 60),
+            format!("{}.{}", key("ya29.", KEY_DASH, 40), key_body(KEY_DASH, 20)),
+            key("GOCSPX-", KEY_DASH, 28),
+            key("dop_v1_", HEX, 64),
+            key("doo_v1_", HEX, 64),
+            key("dor_v1_", HEX, 64),
+            key("shpat_", HEX, 32),
+            key("shpss_", HEX, 32),
+            key("shpca_", HEX, 32),
+            key("shppa_", HEX, 32),
+            key("lin_api_", ALNUM, 40),
+            key("AGE-SECRET-KEY-1", BECH32_UPPER, 58),
+            format!("{}.{}", key("SG.", KEY_DASH, 22), key_body(KEY_DASH, 43)),
+        ];
+        for secret in &prefixed {
+            for (input, want) in [
+                (
+                    format!("use {secret} here"),
+                    "use [REDACTED] here".to_string(),
+                ),
+                (format!("\"{secret}\","), "\"[REDACTED]\",".to_string()),
+                (format!("x\\n{secret}"), "x\\n[REDACTED]".to_string()),
+                (
+                    format!("end {secret}. Next"),
+                    "end [REDACTED]. Next".to_string(),
+                ),
+            ] {
+                assert_eq!(redact_secrets(&input), want, "input: {input}");
+            }
+        }
+
+        let basic = format!("{}==", key_body(BASE64, 30));
+        // `user:pw` pairs short enough to encode under the bare form's 16 chars; the second
+        // unpadded, as a hand-built header may be.
+        let short = b64(&format!("{}:{}", "ci", "pass1"));
+        let unpadded = b64(&format!("{}:{}", "ab", "cd"))
+            .trim_end_matches('=')
+            .to_string();
+        assert_eq!((short.len(), unpadded.len()), (12, 7));
+        let value = key_body(ALNUM, 24);
+        let only_value = [
+            (
+                format!("Authorization: Basic {basic}"),
+                "Authorization: Basic [REDACTED]",
+            ),
+            (
+                format!("-H 'authorization: basic {basic}'"),
+                "-H 'authorization: basic [REDACTED]'",
+            ),
+            (
+                format!("Authorization: Basic {short}"),
+                "Authorization: Basic [REDACTED]",
+            ),
+            (
+                format!("{{\"Authorization\": \"Basic {short}\"}}"),
+                "{\"Authorization\": \"Basic [REDACTED]\"}",
+            ),
+            (
+                format!("-H 'Proxy-Authorization:Basic {unpadded}'"),
+                "-H 'Proxy-Authorization:Basic [REDACTED]'",
+            ),
+            (format!("cal --token {value}"), "cal --token [REDACTED]"),
+            (
+                format!("x --github-token  \"{value}\""),
+                "x --github-token  \"[REDACTED]\"",
+            ),
+            (
+                format!("cli --api-key {value} -v"),
+                "cli --api-key [REDACTED] -v",
+            ),
+            (format!("--password {value}"), "--password [REDACTED]"),
+            (format!("passwd: {value}"), "passwd: [REDACTED]"),
+            (format!("DB_PASSWD={value}"), "DB_PASSWD=[REDACTED]"),
+            (
+                format!("\"credentials\": \"{value}\""),
+                "\"credentials\": \"[REDACTED]\"",
+            ),
+            (
+                format!("AccountName=x;AccountKey={basic};EndpointSuffix=core.windows.net"),
+                "AccountName=x;AccountKey=[REDACTED];EndpointSuffix=core.windows.net",
+            ),
+        ];
+        for (input, want) in &only_value {
+            assert_eq!(redact_secrets(input), *want, "input: {input}");
+        }
+
+        let near_misses = [
+            "npm_config_cache=/tmp/npm".to_string(),
+            "echo $npm_package_version".to_string(),
+            key("npm_", ALNUM, 35),
+            "from huggingface_hub import hf_hub_download".to_string(),
+            "HF_HUB_ENABLE_HF_TRANSFER=1".to_string(),
+            key("hf_", ALNUM, 33),
+            // PostHog project keys and Supabase publishable keys are public by design.
+            key("phc_", ALNUM, 43),
+            key("sb_publishable_", KEY_DASH, 31),
+            key("phx_", ALNUM, 29),
+            format!("x{}", key("gsk_", ALNUM, 52)),
+            key("gsk_", ALNUM, 39),
+            "model: xai-grok-2-latest".to_string(),
+            key("xai-", ALNUM, 39),
+            "pplx-api and pplx-7b-online".to_string(),
+            key("r8_", ALNUM, 29),
+            format!("var8_{}", key_body(ALNUM, 37)),
+            "sb_secret_short".to_string(),
+            "ya29.short".to_string(),
+            "GOCSPX-short".to_string(),
+            key("dop_v1_", HEX, 39),
+            key("shpat_", HEX, 31),
+            "lin_api_key and lin_api_base_url".to_string(),
+            key("lin_api_", ALNUM, 31),
+            "AGE-SECRET-KEY-1 goes in keys.txt".to_string(),
+            key("AGE-SECRET-KEY-1", BECH32_UPPER, 49),
+            "SG.ok and SG.Tools".to_string(),
+            format!("{}.{}", key("SG.", KEY_DASH, 22), key_body(KEY_DASH, 10)),
+            format!("{}-and-more", key("glpat", KEY_DASH, 19)),
+            "glpat-short".to_string(),
+            "Basic authentication and basic internationalization".to_string(),
+            "Authorization: Basic realm=\"api\"".to_string(),
+            // A header's value that does not decode to `user:password` is a label or a
+            // placeholder, not a credential.
+            "Authorization: basic auth over TLS".to_string(),
+            "Authorization: Basic xxxx".to_string(),
+            "\"Authorization\": \"Basic <base64 of user:password>\"".to_string(),
+            "Authorization: Basic ${CREDENTIALS}".to_string(),
+            format!("Basic {short} is how the docs spell it"),
+            "gh auth --token $GITHUB_TOKEN".to_string(),
+            "--max-tokens 4096 --token-file ./token.txt".to_string(),
+            format!("my-token {value}"),
+            "cat /etc/passwd; git config credential.helper store".to_string(),
+            "credential_helper = store".to_string(),
+        ];
+        for input in &near_misses {
+            assert_eq!(redact_secrets(input), input.as_str(), "near miss: {input}");
+        }
+
+        // Every planted form is fully scrubbed and stays put on a second pass.
+        let all: Vec<String> = prefixed
+            .iter()
+            .cloned()
+            .chain(only_value.iter().map(|(input, _)| input.clone()))
+            .collect();
+        for input in &all {
+            let once = redact_secrets(input).into_owned();
+            assert!(matches!(redact_secrets(&once), Cow::Borrowed(_)), "{once}");
+        }
+    }
+
+    /// The `--flag value` form looks back at most 64 bytes for the `--`, so a megabyte of
+    /// name characters with spaces after keywords stays a linear scan.
+    #[test]
+    fn the_flag_form_stays_linear_on_long_names() {
+        let text = format!("--{} {}", "x_token".repeat(150_000), key_body(ALNUM, 24));
+        let t = std::time::Instant::now();
+        let _ = redact_secrets(&text);
+        let spaced = "token_secret ".repeat(80_000);
+        let _ = redact_secrets(&spaced);
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(20),
+            "{:?}",
+            t.elapsed()
+        );
+    }
+
+    /// A token as the username of a URL with a password, the form GitHub documents
+    /// (`https://<token>:x-oauth-basic@github.com`) and GitLab accepts (`https://<token>:x@`).
+    /// The URL rule matches at `://` and reports only the password; the scan used to resume
+    /// after it, so the username was never checked: the token was copied out whole and only a
+    /// second pass caught it.
+    #[test]
+    fn a_token_as_a_url_username_is_redacted_on_the_first_pass() {
+        let ghp = format!("ghp_{}", key_body(ALNUM, 36));
+        let glpat = format!("glpat-{}", key_body(KEY_DASH, 20));
+        let cases = [
+            (
+                format!("git clone https://{ghp}:x-oauth-basic@github.com/o/r.git"),
+                "git clone https://[REDACTED]:[REDACTED]@github.com/o/r.git",
+            ),
+            (
+                format!("git push https://{glpat}:x@gitlab.com/g/p.git main"),
+                "git push https://[REDACTED]:[REDACTED]@gitlab.com/g/p.git main",
+            ),
+            (
+                format!("REMOTE=https://{ghp}:{glpat}@h.io/x"),
+                "REMOTE=https://[REDACTED]:[REDACTED]@h.io/x",
+            ),
+            // Text with an ignorable goes through the shadow scan, whose spans are merged
+            // with the original's.
+            (
+                format!("é\u{200B} https://{glpat}:x@gitlab.com"),
+                "é\u{200B} https://[REDACTED]:[REDACTED]@gitlab.com",
+            ),
+        ];
+        for (input, want) in &cases {
+            let once = redact_secrets(input).into_owned();
+            assert_eq!(once, *want, "input: {input}");
+            assert!(matches!(redact_secrets(&once), Cow::Borrowed(_)), "{once}");
+        }
+    }
+
+    /// Outside an `Authorization` header, `basic` is mostly an English word, and a slash list
+    /// after it (`read/write/execute`) has the `/` and digits a base64 run has. Only a run that
+    /// decodes, as padded standard base64, to `user:password` text is a credential there.
+    #[test]
+    fn basic_before_a_slash_list_is_prose() {
+        for prose in [
+            "It only needs basic read/write/execute permissions",
+            "Add basic CRUD/REST/GraphQL endpoints",
+            "Basic input/output/formatting is handled",
+            "Create a basic src/components/Header.tsx layout",
+            "Use basic ARIA/keyboard/focus handling",
+            "basic GET/POST/PUT/DELETE routes",
+            // Whole base64 quads, and the first decodes to bytes holding a `:`, so only the
+            // decoded bytes not being text keeps them.
+            "Ship basic arm64/wasm32/x86 builds",
+            "a basic src/routes/index.tsx page",
+            "basic user/group/role/perm checks",
+        ] {
+            assert_eq!(redact_secrets(prose), prose, "prose: {prose}");
+        }
+        let credential = b64(&format!("{}:{}", "someuser", "somepassword1"));
+        for (input, want) in [
+            (
+                format!("Basic {credential}"),
+                "Basic [REDACTED]".to_string(),
+            ),
+            (
+                format!("{{\"value\": \"Basic {credential}\"}}"),
+                "{\"value\": \"Basic [REDACTED]\"}".to_string(),
+            ),
+            (
+                format!("send basic {credential} first"),
+                "send basic [REDACTED] first".to_string(),
+            ),
+        ] {
+            assert_eq!(redact_secrets(&input), want, "input: {input}");
+        }
+    }
+
+    /// `--flag value` takes the next argument only for a flag named for the secret it takes.
+    /// One that mentions a keyword takes something else (a file, a model, a secret's name), a
+    /// negated or prompting one takes nothing, and an argument starting with `-` is a flag.
+    #[test]
+    fn the_flag_form_needs_a_flag_named_for_the_secret() {
+        let value = key_body(ALNUM, 24);
+        for (input, want) in [
+            (
+                format!("x --auth-token {value}"),
+                "x --auth-token [REDACTED]",
+            ),
+            (
+                format!("x --client-secret '{value}'"),
+                "x --client-secret '[REDACTED]'",
+            ),
+            (format!("x --secret {value} -v"), "x --secret [REDACTED] -v"),
+            (
+                format!("rclone --s3-secret-access-key {value}"),
+                "rclone --s3-secret-access-key [REDACTED]",
+            ),
+            (format!("x --API-KEY {value}"), "x --API-KEY [REDACTED]"),
+            // The `=` form after any flag name, as before.
+            (format!("x --api-key={value}"), "x --api-key=[REDACTED]"),
+        ] {
+            assert_eq!(redact_secrets(&input), want, "input: {input}");
+        }
+        for clean in [
+            "docker login -u AWS --password-stdin 123456789012.dkr.ecr.us-east-1.amazonaws.com"
+                .to_string(),
+            "pg_dump --no-password mydb_production_2024".to_string(),
+            "pg_dump --no-password --file=backup_2024_11_09.sql mydb".to_string(),
+            "vllm serve x --tokenizer meta-llama/Llama-3.1-8B-Instruct".to_string(),
+            "python run.py --tokenizer_name bert-base-uncased-v2".to_string(),
+            "x --token-file /var/run/secrets/kubernetes.io/serviceaccount/token2".to_string(),
+            "x --token-file ~/.cache/hf/token2".to_string(),
+            "aws secretsmanager get-secret-value --secret-id prod/api-keys-v2".to_string(),
+            "aws secretsmanager describe-secret --secret-name prod/db-password-v2".to_string(),
+            "x --credential-process /usr/local/bin/aws-vault-v7".to_string(),
+            "ansible-playbook --ask-vault-password playbooks/deploy_v2.yml".to_string(),
+            format!("x --token -{value}"),
+        ] {
+            assert_eq!(redact_secrets(&clean), clean.as_str(), "near miss: {clean}");
+        }
+    }
+
+    /// `credential` names the secret only at the end of a key name (`credential`,
+    /// `credentials`, `CLIENT_CREDENTIAL`); `credential_source`, `credential_process`,
+    /// `credential.helper` and `credentialsId` hold enums, paths, helpers and ids.
+    #[test]
+    fn credential_settings_that_name_no_secret_survive() {
+        let value = key_body(ALNUM, 24);
+        for (input, want) in [
+            (format!("credential = {value}"), "credential = [REDACTED]"),
+            (format!("credentials={value}"), "credentials=[REDACTED]"),
+            (
+                format!("AZURE_CLIENT_CREDENTIAL: {value}"),
+                "AZURE_CLIENT_CREDENTIAL: [REDACTED]",
+            ),
+        ] {
+            assert_eq!(redact_secrets(&input), want, "input: {input}");
+        }
+        for clean in [
+            "credential_source = Ec2InstanceMetadata",
+            "credential_process = /usr/local/bin/aws-vault-v7",
+            "git config --global credential.helper=osxkeychain",
+            "credential.helper=osxkeychain",
+            "fetch(url, { credentials: \"include\" })",
+            "credentialsId: \"jenkins-deploy-key-2024\"",
+            "withCredentials([usernamePassword(credentialsId: 'github-app-ci-2024')])",
+        ] {
+            assert_eq!(redact_secrets(clean), clean, "near miss: {clean}");
+        }
+    }
+
+    /// Ordinary text that starts the way a newer rule's secret does: a prefix named in prose,
+    /// identifiers and file names that share it, config keys that share a keyword.
+    #[test]
+    fn lookalikes_of_the_newer_rules_survive() {
+        // Kebab- and snake-case names long enough to reach the rule's minimum, joined at
+        // runtime: spelled out whole they match the vendors' published token regexes, which
+        // push protection scans for.
+        let names = [
+            // glpat- / glptt-: kebab-case names after the prefix.
+            format!("see {}{}", "glpat-", "token-rotation-reminder.yml"),
+            format!("git checkout {}{}", "glpat-", "scanner-false-positives"),
+            // sb_secret_: snake_case names after the prefix.
+            format!(
+                "fn test_{}{}()",
+                "sb_secret_", "key_is_never_printed_to_logs"
+            ),
+            format!("{}{}", "sb_secret_", "and_sb_publishable_keys"),
+        ];
+        for clean in &names {
+            assert_eq!(redact_secrets(clean), clean.as_str(), "near miss: {clean}");
+        }
+        for clean in [
+            "GitLab tokens start with glpat- and trigger tokens with glptt-",
+            "sb_secret_key",
+            // npm_
+            "npm_config_registry=https://registry.npmjs.org/",
+            "process.env.npm_lifecycle_event",
+            "npm_package_dependencies_typescript",
+            // hf_
+            "hf_hub_url(repo_id, filename)",
+            "pip install hf_transfer",
+            "huggingface_hub.hf_api.HfApi",
+            // phx_: Phoenix channel events.
+            "phx_join",
+            "phx_reply",
+            "phx_leave",
+            // gsk_: GTK's scene kit.
+            "gsk_render_node_draw(node, cr)",
+            "gsk_renderer_realize",
+            "gsk_transform_translate",
+            // xai-
+            "xai-org/grok-1",
+            "pip install xai-sdk",
+            "model=xai-grok-beta",
+            // pplx-
+            "pplx-embed-v1-0.6b",
+            "pplx-api",
+            "pplx-70b-online",
+            // r8_
+            "the r8_ prefix",
+            "let r8_lo = r8_value & 0xff",
+            "r8_token",
+            // sb_secret_ aside, the other key-dash bodies: ya29., GOCSPX-, SG.
+            "ya29.a0 tokens expire in an hour",
+            "client secrets start with GOCSPX-",
+            "SG.Config.Load() and SG.mail_send.Client",
+            // dop_v1_ / shp*_ / lin_api_ / AGE-SECRET-KEY-1
+            "DIGITALOCEAN_TOKEN=dop_v1_$TOKEN",
+            "shpat_token_for_admin_api",
+            "LINEAR_API_KEY=lin_api_xxx",
+            "# AGE-SECRET-KEY-1 lines are private keys",
+            // passwd
+            "cat /etc/passwd",
+            "passwd: files systemd",
+            "passwd_file: /etc/rsyncd/passwd-2024.secrets",
+            // accountkey
+            "storage.listAccountKeys()",
+            "\"accountKeyName\": \"storage-account-key-2024\"",
+            "AccountKeyExpirationPeriodInDays=90",
+        ] {
+            assert_eq!(redact_secrets(clean), clean, "near miss: {clean}");
+        }
+    }
+
+    /// Whether any 12-char window of `body` survived in `out`: a key whose prefix was lost
+    /// still leaks its body.
+    fn body_leaked(out: &str, body: &str) -> bool {
+        (0..=body.len().saturating_sub(12))
+            .any(|k| out.contains(&body[k..(k + 12).min(body.len())]))
+    }
+
+    /// A bare escape right before a key (`ESC (`, `ESC SP`, `ESC [`, an 8-bit CSI) reads the
+    /// key's first char as its final byte. Every path that strips before it redacts
+    /// (`prepare`, `envelope`, `export::fact_line`) then left `k-ant-…`, `hp_…` or `KIA…` with
+    /// no prefix for the redaction to know it by. And a key that a stripped sequence or control
+    /// glued to the word before it (`word\x1B[0mghp_…`) read as part of that word.
+    #[test]
+    fn an_escape_before_a_key_never_hides_it_from_the_redaction() {
+        let pem_body = key_body(BASE64, 64);
+        let token = key_body(ALNUM, 24);
+        let keys = [
+            (format!("sk-ant-api03-{}", key_body(ALNUM, 40)), 13),
+            (format!("ghp_{}", key_body(ALNUM, 36)), 4),
+            (format!("AKIA{}", key_body(BECH32_UPPER, 16)), 4),
+            (format!("token={token}"), 6),
+            (format!("Bearer {token}"), 7),
+            (
+                format!("-----BEGIN RSA PRIVATE KEY-----\n{pem_body}\n"),
+                "-----BEGIN RSA PRIVATE KEY-----\n".len(),
+            ),
+        ];
+        let leads = [
+            "\u{1B}",
+            "\u{1B} ",
+            "\u{1B}(",
+            "\u{1B}#",
+            "\u{1B}[",
+            "\u{9B}",
+            "\u{1B}[1;",
+            "\u{1B}[0m",
+            "\u{1B}]0;t\u{7}",
+            "\u{0}",
+            "\u{7F}",
+            "\u{202E}",
+        ];
+        for (key, prefix) in &keys {
+            let body = &key[*prefix..];
+            for lead in leads {
+                for (before, after) in [("out: ", " done"), ("word", " done"), ("\"", "\",")] {
+                    let input = format!("{before}{lead}{key}{after}");
+                    let stripped = strip_controls(&input);
+                    for out in [
+                        redact_secrets(&stripped).into_owned(),
+                        crate::export::fact_line(&input, 10_000),
+                    ] {
+                        assert!(
+                            !body_leaked(&out, body) && out.contains(REDACTED),
+                            "input: {input:?}\nout: {out:?}"
+                        );
+                    }
+                }
+            }
+        }
+        // What the guard leaves alone: an escape whose final byte starts plain text still
+        // takes it, as a terminal would (grep's `ESC[K`, a progress line's `ESC[K`, `ESC(B`).
+        for (input, want) in [
+            ("\r\u{1B}[Kdownloading 50%", "\ndownloading 50%"),
+            (
+                "\u{1B}[01;31m\u{1B}[Kmatch\u{1B}[m\u{1B}[K rest",
+                "match rest",
+            ),
+            ("\u{1B}(Bhello", "hello"),
+            ("\u{1B}[mbar", "bar"),
+            ("\u{1B}[Aup", "up"),
+            ("\u{1B}7saved", "saved"),
+            ("\u{1B}[skip", "kip"),
+            ("red \u{1B}[31mtoken\u{1B}[0m count", "red token count"),
+        ] {
+            assert_eq!(strip_controls(input), want, "input: {input:?}");
+        }
+    }
+
+    /// `--secret-string` (AWS Secrets Manager's create-secret and put-secret-value), the
+    /// `-value` forms and a plural (`--credentials`) take the secret as their next argument,
+    /// as `--token` does.
+    #[test]
+    fn value_suffixed_and_plural_secret_flags_take_the_next_argument() {
+        let value = key_body(ALNUM, 32);
+        for flag in [
+            "--secret-string",
+            "--secret_string",
+            "--secret-value",
+            "--token-value",
+            "--password-value",
+            "--credentials",
+            "--Credentials",
+            "--secrets",
+        ] {
+            let input = format!("aws x create-secret --name n {flag} {value} --region r");
+            let want = format!("aws x create-secret --name n {flag} [REDACTED] --region r");
+            assert_eq!(redact_secrets(&input), want, "input: {input}");
+        }
+        assert_eq!(
+            redact_secrets(&format!("x --credentials={value}")),
+            "x --credentials=[REDACTED]"
+        );
+        for clean in [
+            "aws secretsmanager create-secret --name n --secret-string file://creds-2024.json",
+            "aws secretsmanager get-secret-value --secret-id prod/api-keys-v2",
+            "x --secret-values-file conf/secrets_2024.env",
+            "x --credentials-file conf/creds_2024_v2",
+        ] {
+            assert_eq!(redact_secrets(clean), clean, "near miss: {clean}");
+        }
+    }
+
+    /// A path or a file name is what `GOOGLE_APPLICATION_CREDENTIALS` and its kind hold, and
+    /// what a `--password` flag gets pointed at in a container. A secret is neither: base64
+    /// can start with `/`, but its segments are not lowercase words, and nothing a vendor
+    /// issues ends in `.json`.
+    #[test]
+    fn a_path_or_file_name_under_a_secret_name_survives() {
+        for clean in [
+            "export GOOGLE_APPLICATION_CREDENTIALS=/Users/me/keys/project-123456-abcdef.json",
+            "\"GOOGLE_APPLICATION_CREDENTIALS\": \"/secrets/sa-key-2024.json\"",
+            "GOOGLE_APPLICATION_CREDENTIALS=~/.config/gcloud/sa-2024.json",
+            "credentials: ./keys/service-account-2024.json",
+            "credentials=sa-prod-2024.json",
+            "x --password /run/secrets/db_password_2024",
+            "SECRET_PATH=/var/run/secrets/kubernetes.io/serviceaccount/token2",
+            "client_secret: ../config/client_secret_2024.json",
+            "TOKEN_FILE=~/.cache/hf/token2",
+            "PASSWORD_FILE=/run/secrets/postgres-password-v2",
+        ] {
+            assert_eq!(redact_secrets(clean), clean, "near miss: {clean}");
+        }
+        let aws = key_body(BASE64, 39);
+        let azure = format!("{}==", key_body(BASE64, 86));
+        let dotted = format!("{}.{}", key_body(ALNUM, 20), key_body(ALNUM, 8));
+        for (input, want) in [
+            (
+                format!("aws_secret_access_key = /{aws}"),
+                "aws_secret_access_key = [REDACTED]",
+            ),
+            (
+                format!("AccountName=a;AccountKey=/{azure};x"),
+                "AccountName=a;AccountKey=[REDACTED];x",
+            ),
+            (format!("credentials=/{aws}"), "credentials=[REDACTED]"),
+            (format!("password = {dotted}"), "password = [REDACTED]"),
+        ] {
+            assert_eq!(redact_secrets(&input), want, "input: {input}");
+        }
+        // A type name with no digit fails the value guard. One with a digit is redacted: a
+        // CamelCase rule cannot tell it from a random alnum key. Of random 16-char ones, 1 in
+        // 5,600 parses as `([A-Z][a-z]{2,}[0-9]?)+` (measured over 2M), and "starts with a
+        // capital, no `+/=`" would pass 42% of them.
+        for clean in [
+            "credentials: AwsCredentialIdentity",
+            "fn sign(credential: StaticCredentialsProvider)",
+        ] {
+            assert_eq!(redact_secrets(clean), clean, "near miss: {clean}");
+        }
+        let upper_first = format!("Q{}", key_body(ALNUM, 23));
+        assert_eq!(
+            redact_secrets(&format!("credential: {upper_first}")),
+            "credential: [REDACTED]"
+        );
+    }
+
+    /// Docker, Podman and BuildKit's `--secret` takes a secret's name or a `key=value` spec
+    /// (`id=…,src=…`, `source=…,target=…`), never the secret itself.
+    #[test]
+    fn docker_secret_names_and_specs_survive() {
+        for clean in [
+            "docker run --secret db_password_prod_v2 img",
+            "docker buildx build --secret id=npmrc_token_2024,src=/run/x .",
+            "docker build --secret=id=npmrc_token_2024,src=$HOME/.npmrc .",
+            "docker service create --secret source=db_password_v2,target=db img",
+            "podman run --secret my-api-token-2024,type=env,target=TOKEN img",
+        ] {
+            assert_eq!(redact_secrets(clean), clean, "near miss: {clean}");
+        }
+        let value = key_body(ALNUM, 24);
+        for (input, want) in [
+            (
+                format!("jwt encode --secret {value} '{{}}'"),
+                "jwt encode --secret [REDACTED] '{}'",
+            ),
+            (
+                format!("x --client-secret db_password_prod_v2_{value}"),
+                "x --client-secret [REDACTED]",
+            ),
+        ] {
+            assert_eq!(redact_secrets(&input), want, "input: {input}");
+        }
+    }
+
+    /// Two shell forms of cloud keys with no `--flag` or separator a rule knew:
+    /// `aws configure set <name> <value>` (and npm's and yarn's `config set`), and Azure's
+    /// `--account-key`, which spells the keyword with a dash.
+    #[test]
+    fn cloud_cli_keys_given_after_a_space_are_redacted() {
+        let aws = key_body(BASE64, 40);
+        let key = key_body(ALNUM, 32);
+        for (input, want) in [
+            (
+                format!("aws configure set aws_secret_access_key {aws}"),
+                "aws configure set aws_secret_access_key [REDACTED]".to_string(),
+            ),
+            (
+                format!("aws configure set default.aws_secret_access_key {aws} --profile p"),
+                "aws configure set default.aws_secret_access_key [REDACTED] --profile p"
+                    .to_string(),
+            ),
+            (
+                format!("aws configure set aws_session_token {key}"),
+                "aws configure set aws_session_token [REDACTED]".to_string(),
+            ),
+            (
+                format!("yarn config set npmAuthToken {key}"),
+                "yarn config set npmAuthToken [REDACTED]".to_string(),
+            ),
+            (
+                format!("npm config set //registry.npmjs.org/:_authToken {key}"),
+                "npm config set //registry.npmjs.org/:_authToken [REDACTED]".to_string(),
+            ),
+            (
+                format!("az storage blob list --account-name acct --account-key {key} -c c"),
+                "az storage blob list --account-name acct --account-key [REDACTED] -c c"
+                    .to_string(),
+            ),
+            (
+                format!("AZURE_STORAGE_ACCOUNT_KEY={key}"),
+                "AZURE_STORAGE_ACCOUNT_KEY=[REDACTED]".to_string(),
+            ),
+            (
+                format!("\"account_key\": \"{key}\""),
+                "\"account_key\": \"[REDACTED]\"".to_string(),
+            ),
+        ] {
+            assert_eq!(redact_secrets(&input), want, "input: {input}");
+        }
+        for clean in [
+            "aws configure set region us-east-1",
+            "aws configure set aws_access_key_id_2024 x",
+            "storage_account_key_name: storage-account-key-2024",
+            "account_key_id = abc123def456ghi789",
+            "set token_limit 409600000000abc",
+            "we set the token budget2024 aside",
+        ] {
+            assert_eq!(redact_secrets(clean), clean, "near miss: {clean}");
+        }
+    }
+
+    /// Standard padded base64 of raw bytes (a Latin-1 password is not a `&str`).
+    fn b64_bytes(bytes: &[u8]) -> String {
+        let a = BASE64.as_bytes();
+        let mut out = String::new();
+        for chunk in bytes.chunks(3) {
+            let n = chunk
+                .iter()
+                .enumerate()
+                .fold(0u32, |acc, (k, &c)| acc | u32::from(c) << (16 - 8 * k));
+            for k in 0..4 {
+                out.push(if k <= chunk.len() {
+                    char::from(a[(n >> (18 - 6 * k) & 63) as usize])
+                } else {
+                    '='
+                });
+            }
+        }
+        out
+    }
+
+    /// Outside an `Authorization` header a `Basic` credential is still caught when its
+    /// password is Latin-1 or holds a tab, when its padding was dropped, and when it encodes a
+    /// bare key with no `user:` (an API key passed as Basic auth). The slash lists that came
+    /// closest in a 2.7M-list run (an ASCII run, a colon, then bytes) stay prose.
+    #[test]
+    fn bare_basic_takes_every_user_password_and_an_encoded_key() {
+        let pw = key_body(ALNUM, 12);
+        let latin1 = b64_bytes(&[b"user:".as_slice(), &[0xE9, 0xE8], pw.as_bytes()].concat());
+        let tab = b64(&format!("user:\t{pw}"));
+        let unpadded = b64(&format!("user:{}", key_body(ALNUM, 14)))
+            .trim_end_matches('=')
+            .to_string();
+        let colonless = b64(&key_body(ALNUM, 30));
+        let utf8 = b64("us\u{E9}r:p\u{E4}ssw\u{F6}rd-2024");
+        assert_ne!(unpadded.len() % 4, 0);
+        for cred in [&latin1, &tab, &unpadded, &colonless, &utf8] {
+            for (input, want) in [
+                (
+                    format!("send Basic {cred} first"),
+                    "send Basic [REDACTED] first".to_string(),
+                ),
+                (
+                    format!("{{\"auth\": \"basic {cred}\"}}"),
+                    "{\"auth\": \"basic [REDACTED]\"}".to_string(),
+                ),
+            ] {
+                assert_eq!(redact_secrets(&input), want, "input: {input}");
+            }
+        }
+        let short = b64(&format!("{}:{}", "ci", "pass1"));
+        assert_eq!(
+            redact_secrets(&format!("Authorization=Basic {short}")),
+            "Authorization=Basic [REDACTED]"
+        );
+        for prose in [
+            "basic azotize/forestlike",
+            "basic azorubine/victrola88",
+            "basic ajoint/yarn/snuffboxer99",
+            "basic azon/balminess/Manatus/flunkydom/sidesman/giver",
+            "basic AbstractSingletonProxyFactoryBean",
+        ] {
+            assert_eq!(redact_secrets(prose), prose, "prose: {prose}");
+        }
     }
 }

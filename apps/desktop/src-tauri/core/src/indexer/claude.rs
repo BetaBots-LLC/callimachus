@@ -15,7 +15,10 @@
 //! like a pure append (shrink, rewrite, fingerprint mismatch, thread missing from the
 //! index) falls back to a full parse.
 
-use super::common::{join_text_parts, parse_rfc3339, push_message, truncate_title};
+use super::common::{
+    begin_file, count_file, count_line, count_malformed, count_skipped, join_text_parts,
+    parse_rfc3339, push_message, truncate_title, uncounted,
+};
 use super::{
     append_messages_at, file_stamp, source_id, upsert_thread_at, IndexReport, MsgUsage,
     ParsedThread,
@@ -30,6 +33,46 @@ use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
 pub const KIND: &str = "claude_code";
+
+/// Record types that carry no message and are skipped on purpose, so the parse canary
+/// (`parse_health`) does not count them as unknown. Measured on 2026-11-09 over one machine's
+/// 4,357 transcripts (684,167 lines): every type there besides `user`, `assistant` and
+/// `ai-title`, `attachment` alone 249,168 lines (36%). `summary` is the older compaction
+/// summary line.
+const SKIPPED_TYPES: &[&str] = &[
+    "attachment",
+    "atis-latch",
+    "mode",
+    "last-prompt",
+    "started",
+    "result",
+    "system",
+    "bridge-session",
+    "queue-operation",
+    "permission-mode",
+    "api-request",
+    "pr-link",
+    "api-request-blob",
+    "file-history-snapshot",
+    "frame-link",
+    "file-history-delta",
+    "launched",
+    "artifact-autoreact-ledger",
+    "session-owner",
+    "cost-state",
+    "api-request-shape",
+    "tools-used",
+    "artifact-comment-monitor",
+    "agent-name",
+    "custom-title",
+    "continued-in",
+    "failed",
+    "summary",
+];
+
+/// Content blocks skipped on purpose (87,417 `thinking` blocks and one `image` on the same
+/// machine; `text`, `tool_use` and `tool_result` are indexed).
+const SKIPPED_BLOCKS: &[&str] = &["thinking", "redacted_thinking", "image", "document"];
 
 // ---------------------------------------------------------------------------------------
 // Data root
@@ -465,18 +508,19 @@ fn index_file(conn: &mut Connection, sid: i64, root: &Path, path: &Path) -> Resu
     }
 
     // Fast path: the file only grew since the cursor, so parse just the new bytes.
+    let mut counted = 0;
     if let Some(c) = cursor.as_ref().filter(|c| c.offset > 0 && size >= c.offset) {
         match try_append(conn, sid, path, &path_str, &external_id, c, mtime, size)? {
             Append::Applied(n) => return Ok(Some(n)),
             Append::NoChange => return Ok(None),
-            Append::Fallback => {}
+            Append::Fallback { counted: n } => counted = n,
         }
     }
 
     // Project fallback: top-level dir name is the cwd-slug (used when a subagent
     // file carries no cwd of its own).
     let project_fallback = external_id.split('/').next().map(decode_slug);
-    let parsed = parse_full(path, &external_id, project_fallback.as_deref())
+    let parsed = parse_full(path, &external_id, project_fallback.as_deref(), counted)
         .with_context(|| format!("parsing {path_str}"))?;
     let mut thread = parsed.thread;
     if let Some(t) = thread.as_mut() {
@@ -632,8 +676,10 @@ enum Append {
     Applied(usize),
     /// Only non-message lines were appended; the cursor advanced, the thread is unchanged.
     NoChange,
-    /// Not a clean append (or no stored thread to append to): do a full parse.
-    Fallback,
+    /// Not a clean append (or no stored thread to append to): do a full parse. `counted` is
+    /// how many leading bytes the parse canary already counted: the cursor's offset when the
+    /// file only grew since its last whole parse, else 0.
+    Fallback { counted: usize },
 }
 
 /// The append fast path. Proof that the file only grew comes from the cursor alone: its
@@ -656,22 +702,29 @@ fn try_append(
 ) -> Result<Append> {
     let Some((expected_fp, expected_count)) = cursor.fingerprint.as_deref().and_then(split_tag)
     else {
-        return Ok(Append::Fallback);
+        return Ok(Append::Fallback { counted: 0 });
     };
     let offset = cursor.offset as u64;
     let mut file = fs::File::open(path)?;
     if fingerprint_file(&mut file, offset)? != expected_fp {
-        return Ok(Append::Fallback); // rewritten in place, not appended to
+        // Rewritten in place, not appended to: a new file to the canary too.
+        return Ok(Append::Fallback { counted: 0 });
     }
+    // From here the file only grew since a whole parse that counted it.
+    let grown = Append::Fallback {
+        counted: cursor.offset as usize,
+    };
+    // A file without a message (a workflow's journal, a session closed before its first
+    // prompt) has no stored thread, so each change to it lands here.
     let Some((mut thread, stored_count)) = load_thread_meta(conn, sid, external_id)? else {
-        return Ok(Append::Fallback);
+        return Ok(grown);
     };
     // Outside a full scan's batch (the watcher path) the cursor and the write are separate
     // commits. If the last pass stored the new messages but died (or lost a lock race)
     // before advancing the cursor, re-reading from the stale offset would append the same
     // lines twice; the count catches that.
     if stored_count != expected_count {
-        return Ok(Append::Fallback);
+        return Ok(grown);
     }
 
     let mut tail = Vec::with_capacity((size as u64).saturating_sub(offset) as usize);
@@ -706,7 +759,7 @@ fn try_append(
         match append_messages_at(conn, sid, &thread, stored_count, &cwds)? {
             Some(n) => Append::Applied(n),
             // Another writer moved the thread since the check above.
-            None => return Ok(Append::Fallback),
+            None => return Ok(grown),
         }
     } else {
         Append::NoChange
@@ -781,10 +834,20 @@ pub fn parse_file(
     external_id: &str,
     project_fallback: Option<&str>,
 ) -> Result<Option<ParsedThread>> {
-    Ok(parse_full(path, external_id, project_fallback)?.thread)
+    Ok(parse_full(path, external_id, project_fallback, 0)?.thread)
 }
 
-fn parse_full(path: &Path, external_id: &str, project_fallback: Option<&str>) -> Result<FullParse> {
+/// `counted`: leading bytes the parse canary already counted ([`Append::Fallback`]). When
+/// non-zero, only the records after them count, and the file does not: the file only grew
+/// since its last whole parse, which counted it. Counted again on each re-read, a growing
+/// file without a message (a workflow's journal) read as a new transcript that lost its
+/// messages on every watcher batch, and five of those summed to a false warning.
+fn parse_full(
+    path: &Path,
+    external_id: &str,
+    project_fallback: Option<&str>,
+    counted: usize,
+) -> Result<FullParse> {
     let content = fs::read(path)?;
     let mut thread = ParsedThread {
         external_id: external_id.to_string(),
@@ -793,7 +856,23 @@ fn parse_full(path: &Path, external_id: &str, project_fallback: Option<&str>) ->
     };
     let mut first_user_text: Option<String> = None;
     let mut cwds = Vec::new();
-    let offset = ingest_jsonl(&mut thread, &content, &mut first_user_text, &mut cwds);
+    let offset = if counted == 0 {
+        let file = begin_file();
+        let offset = ingest_jsonl(&mut thread, &content, &mut first_user_text, &mut cwds);
+        count_file(file, thread.messages.len());
+        offset
+    } else {
+        // `counted` ends a line (a cursor offset), so two reads split there fold the same
+        // lines as one, exactly as the append path reads its tail.
+        let head = &content[..counted.min(content.len())];
+        let done = uncounted(|| ingest_jsonl(&mut thread, head, &mut first_user_text, &mut cwds));
+        done + ingest_jsonl(
+            &mut thread,
+            &content[done..],
+            &mut first_user_text,
+            &mut cwds,
+        )
+    };
     let fingerprint = fingerprint_bytes(&content, offset);
     if thread.messages.is_empty() {
         return Ok(FullParse {
@@ -827,8 +906,14 @@ fn ingest_jsonl(
     while pos < bytes.len() {
         match bytes[pos..].iter().position(|&b| b == b'\n') {
             Some(len) => {
-                if let Some(obj) = parse_line(&bytes[pos..pos + len]) {
-                    ingest_line(thread, &obj, first_user_text, cwds);
+                let line = &bytes[pos..pos + len];
+                match parse_line(line) {
+                    Some(obj) => {
+                        count_line();
+                        ingest_line(thread, &obj, first_user_text, cwds);
+                    }
+                    None if !line.iter().all(u8::is_ascii_whitespace) => count_malformed(),
+                    None => {}
                 }
                 pos += len + 1;
                 consumed = pos;
@@ -840,9 +925,11 @@ fn ingest_jsonl(
                     .and_then(|s| serde_json::from_str::<Value>(s.trim()).ok())
                     .filter(Value::is_object)
                 {
+                    count_line();
                     ingest_line(thread, &obj, first_user_text, cwds);
                     consumed = bytes.len();
                 }
+                // A fragment that does not parse yet is a writer mid-append, not a bad line.
                 break;
             }
         }
@@ -900,7 +987,8 @@ fn ingest_line(
         thread.updated_at = Some(thread.updated_at.map_or(ts, |u| u.max(ts)));
     }
 
-    match obj.get("type").and_then(Value::as_str) {
+    let kind = obj.get("type").and_then(Value::as_str);
+    match kind {
         Some("ai-title") => {
             if let Some(t) = obj.get("aiTitle").and_then(Value::as_str) {
                 thread.title = Some(t.to_string());
@@ -925,7 +1013,7 @@ fn ingest_line(
                 }
             }
         }
-        _ => {}
+        _ => count_skipped("", kind, SKIPPED_TYPES),
     }
 }
 
@@ -984,11 +1072,26 @@ fn extract_messages(
                         let text = join_text_parts(block.get("content"));
                         push_message(out, "tool", &cap_tool_text(text.trim()), None, ts);
                     }
-                    _ => {} // thinking, image, etc. — skipped for now
+                    // thinking, images: never indexed (see SKIPPED_BLOCKS)
+                    other => count_skipped("block:", other, SKIPPED_BLOCKS),
                 }
             }
         }
-        _ => {}
+        None | Some(Value::Null) => {}
+        // Content of another shape (none seen on the author's machine): a format change.
+        other => count_skipped("content:", Some(json_kind(other)), &[]),
+    }
+}
+
+/// A JSON value's type name, for a content field of an unexpected shape.
+pub(crate) fn json_kind(v: Option<&Value>) -> &'static str {
+    match v {
+        None | Some(Value::Null) => "null",
+        Some(Value::Bool(_)) => "bool",
+        Some(Value::Number(_)) => "number",
+        Some(Value::String(_)) => "string",
+        Some(Value::Array(_)) => "array",
+        Some(Value::Object(_)) => "object",
     }
 }
 
@@ -1096,6 +1199,37 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 4, "re-upsert replaces rather than appends");
+    }
+
+    /// The parse canary: an invented record type, an invented block type and a broken line
+    /// are counted; the types skipped on purpose (thinking, snapshots) are not.
+    #[test]
+    fn parse_counts_name_unknown_types_and_broken_lines() {
+        let path = temp_path("canary.jsonl");
+        let text = format!(
+            "{SAMPLE}{}\n{}\n{}\n{}\n",
+            r#"{"type":"file-history-snapshot","snapshot":{}}"#,
+            r#"{"type":"brand-new-record","timestamp":"2026-06-01T10:00:07.000Z"}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"hologram","x":1},{"type":"text","text":"ok"}]}}"#,
+            r#"{"type":"user","message":{"content": {"broken"#,
+        );
+        std::fs::write(&path, text).unwrap();
+        let (thread, stats) = crate::indexer::common::collect_parse_stats(|| {
+            parse_file(&path, "slug/x.jsonl", None).unwrap().unwrap()
+        });
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(thread.messages.len(), 5, "the known lines still index");
+        assert_eq!(stats.lines, 4 + 4, "every line, the broken one too");
+        assert_eq!(stats.malformed_lines, 1);
+        assert_eq!(
+            stats.unknown_kinds,
+            std::collections::BTreeMap::from([
+                ("block:hologram".to_string(), 1),
+                ("brand-new-record".to_string(), 1),
+            ]),
+            "thinking and the snapshot are skipped on purpose"
+        );
+        assert_eq!((stats.files, stats.files_with_zero_messages), (1, 0));
     }
 
     /// Real-data smoke test against the live ~/.claude history. Ignored by default;
@@ -1393,6 +1527,147 @@ mod tests {
             )
             .unwrap();
         assert_eq!(bytes, stored_bytes, "the appended tail's bytes are added");
+    }
+
+    /// The parse canary on the append path: a tail of records that yield no message (a
+    /// snapshot, a thinking-only turn) counts its records and no file. The watcher's small
+    /// batches add up (`parse_health`), so a tail counted as a file would read as a
+    /// transcript that lost its messages.
+    #[test]
+    fn a_tail_only_batch_counts_records_and_no_file() {
+        let dir = crate::db::test_support::TestDir::new("claude_tail_canary");
+        let root = dir.with_file_name("projects");
+        std::fs::create_dir_all(root.join("-Users-me-proj")).unwrap();
+        let path = root.join("-Users-me-proj").join("sess.jsonl");
+        std::fs::write(
+            &path,
+            format!("{}\n{}\n", user_line("one"), user_line("two")),
+        )
+        .unwrap();
+        let mut conn = crate::db::open(&dir).unwrap();
+        let sid = source_id(&conn, KIND).unwrap();
+        let ((), first) = crate::indexer::common::collect_parse_stats(|| {
+            assert_eq!(index_file(&mut conn, sid, &root, &path).unwrap(), Some(2));
+        });
+        assert_eq!(
+            (first.lines, first.files),
+            (2, 1),
+            "a new file is parsed whole"
+        );
+        append(
+            &path,
+            &format!(
+                "{}\n{}\n",
+                r#"{"type":"file-history-snapshot","snapshot":{}}"#,
+                r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"x"}]}}"#,
+            ),
+        );
+        let (indexed, tail) = crate::indexer::common::collect_parse_stats(|| {
+            index_file(&mut conn, sid, &root, &path).unwrap()
+        });
+        assert_eq!(indexed, None, "nothing the index stores changed");
+        assert_eq!(tail.lines, 2);
+        assert_eq!((tail.files, tail.files_with_zero_messages), (0, 0));
+        let size = std::fs::metadata(&path).unwrap().len() as i64;
+        assert_eq!(cursor_offset(&conn, &path), size, "the tail was consumed");
+    }
+
+    /// A file that holds records and never a message (a workflow's `journal.jsonl`: launched,
+    /// started and result lines) has no stored thread for the append path to extend, so each
+    /// change re-reads it whole. On the author's machine 283 of the 284 Claude files without a
+    /// message were such journals; counted as a new file on every re-read, a workflow whose
+    /// agents finished one at a time summed (`parse_health`) to five transcripts that lost
+    /// their messages and raised a false format warning.
+    #[test]
+    fn a_message_less_file_that_grows_counts_once() {
+        use crate::indexer::common::{collect_parse_stats, ParseStats};
+        use crate::indexer::parse_health;
+        let dir = crate::db::test_support::TestDir::new("claude_journal_canary");
+        let root = dir.with_file_name("projects");
+        let wf = root.join("-Users-me-proj/sess/subagents/workflows/wf_x");
+        std::fs::create_dir_all(&wf).unwrap();
+        let path = wf.join("journal.jsonl");
+        let mut conn = crate::db::open(&dir).unwrap();
+        let sid = source_id(&conn, KIND).unwrap();
+        // A history like the author's: full passes where 6.4% of the files hold no message.
+        let full = ParseStats {
+            lines: 684_000,
+            files: 4_404,
+            files_with_zero_messages: 284,
+            ..ParseStats::default()
+        };
+        for _ in 0..2 {
+            parse_health::after_pass(&conn, KIND, &full, true);
+        }
+        let line = |kind: &str, i: usize| format!(r#"{{"type":"{kind}","agentId":"a{i}"}}"#);
+        std::fs::write(&path, format!("{}\n", line("launched", 0))).unwrap();
+        let mut total = ParseStats::default();
+        for i in 0..6 {
+            if i > 0 {
+                append(
+                    &path,
+                    &format!("{}\n{}\n", line("started", i), line("result", i)),
+                );
+            }
+            // One watcher batch per change.
+            let (indexed, stats) =
+                collect_parse_stats(|| index_file(&mut conn, sid, &root, &path).unwrap());
+            assert_eq!(indexed, Some(0), "no message, so no thread");
+            parse_health::after_pass(&conn, KIND, &stats, false);
+            total.merge(&stats);
+        }
+        assert_eq!(parse_health::load(&conn, KIND).drift, None);
+        assert_eq!(
+            (total.files, total.files_with_zero_messages),
+            (1, 1),
+            "the file counts on its first whole parse only"
+        );
+        assert_eq!(total.lines, 11, "each record counts once");
+        let size = std::fs::metadata(&path).unwrap().len() as i64;
+        assert_eq!(cursor_offset(&conn, &path), size);
+    }
+
+    /// A session whose first records (a mode line) reach the watcher before its first prompt:
+    /// the re-read that finds the prompt indexes the whole file, as a first parse would, and
+    /// counts only the new records.
+    #[test]
+    fn a_re_read_of_a_grown_file_indexes_it_whole_and_counts_the_tail() {
+        let mut f = fixture(&[r#"{"type":"mode","mode":"default"}"#.to_string()]);
+        let ((), first) = crate::indexer::common::collect_parse_stats(|| {
+            assert_eq!(
+                index_file(&mut f.conn, f.sid, &f.root, &f.path).unwrap(),
+                Some(0)
+            );
+        });
+        assert_eq!(
+            (first.lines, first.files, first.files_with_zero_messages),
+            (1, 1, 1)
+        );
+        append(
+            &f.path,
+            &format!("{}\n{}\n", user_line("one"), user_line("two")),
+        );
+        let (indexed, grown) = crate::indexer::common::collect_parse_stats(|| {
+            index_file(&mut f.conn, f.sid, &f.root, &f.path).unwrap()
+        });
+        assert_eq!(indexed, Some(2));
+        assert_eq!((grown.lines, grown.files), (2, 0));
+        assert_eq!(texts(&f.conn), vec!["one", "two"]);
+        let (title, project): (Option<String>, Option<String>) = f
+            .conn
+            .query_row("SELECT title, project_path FROM threads", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(title.as_deref(), Some("one"));
+        assert_eq!(project.as_deref(), Some("/Users/me/proj"));
+        // Stored now, so the next prompt takes the append path.
+        append(&f.path, &format!("{}\n", user_line("three")));
+        assert_eq!(
+            index_file(&mut f.conn, f.sid, &f.root, &f.path).unwrap(),
+            Some(1)
+        );
+        assert_eq!(texts(&f.conn), vec!["one", "two", "three"]);
     }
 
     #[test]

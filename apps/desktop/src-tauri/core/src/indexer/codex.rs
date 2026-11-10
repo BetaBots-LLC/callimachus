@@ -3,7 +3,10 @@
 //! per-thread rollout file at `threads.rollout_path` (JSONL of `response_item` /
 //! `event_msg` / etc.).
 
-use super::common::{parse_rfc3339, push_message, truncate_title};
+use super::common::{
+    begin_file, count_file, count_line, count_malformed, count_skipped, parse_rfc3339,
+    push_message, truncate_title,
+};
 use super::{
     file_change_state, set_file_state, source_id, upsert_thread, IndexReport, MsgUsage,
     ParsedMessage, ParsedThread,
@@ -17,6 +20,15 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 pub const KIND: &str = "codex";
+
+/// Rollout record types skipped on purpose (the parse canary, `parse_health`): the session
+/// header (read for metadata by `meta_from_rollout`), the UI events that mirror response
+/// items (`event_msg`, whose `token_count` is read for usage), and compaction markers.
+const SKIPPED_TYPES: &[&str] = &["session_meta", "event_msg", "compacted"];
+
+/// Response item types skipped on purpose: the model's reasoning, and snapshots of the
+/// worktree.
+const SKIPPED_ITEMS: &[&str] = &["reasoning", "ghost_snapshot"];
 
 static CODEX_HOME_OVERRIDE: std::sync::RwLock<Option<PathBuf>> = std::sync::RwLock::new(None);
 
@@ -388,6 +400,7 @@ struct Rollout {
 /// Parse a rollout JSONL file into ordered messages and their usage.
 fn parse_rollout(path: &Path) -> Result<Rollout> {
     let content = fs::read_to_string(path)?;
+    let file = begin_file();
     let mut thread = ParsedThread::default();
     let mut tokens = TokenCounter::default();
     for line in content.lines() {
@@ -395,12 +408,16 @@ fn parse_rollout(path: &Path) -> Result<Rollout> {
             continue;
         }
         let Ok(obj) = serde_json::from_str::<Value>(line) else {
+            count_malformed();
             continue;
         };
+        count_line();
+        let kind = obj.get("type").and_then(Value::as_str);
         let Some(payload) = obj.get("payload") else {
+            count_skipped("", kind, SKIPPED_TYPES);
             continue;
         };
-        match obj.get("type").and_then(Value::as_str) {
+        match kind {
             Some("response_item") => {
                 let ts = obj
                     .get("timestamp")
@@ -419,9 +436,10 @@ fn parse_rollout(path: &Path) -> Result<Rollout> {
             {
                 tokens.ingest(&mut thread, payload);
             }
-            _ => {}
+            other => count_skipped("", other, SKIPPED_TYPES),
         }
     }
+    count_file(file, thread.messages.len());
     Ok(Rollout {
         messages: thread.messages,
         usage: thread.usage,
@@ -551,7 +569,7 @@ fn ingest_payload(out: &mut Vec<ParsedMessage>, payload: &Value, ts: Option<i64>
             let output = super::claude::cap_tool_text(output.trim());
             push_message(out, "tool", &output, None, ts);
         }
-        _ => {} // reasoning, etc. — skipped
+        other => count_skipped("item:", other, SKIPPED_ITEMS),
     }
 }
 
@@ -697,6 +715,35 @@ fn first_line(s: &str) -> Option<String> {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// The parse canary: an invented record type, an invented response item and a broken
+    /// line are counted; the session header, UI events and reasoning are skipped on purpose.
+    #[test]
+    fn parse_counts_name_unknown_types_and_broken_lines() {
+        let dir = crate::db::test_support::TestDir::new("codex_canary");
+        let path = dir.with_file_name("rollout-x.jsonl");
+        let sample = r#"{"timestamp":"2026-04-25T22:09:38.623Z","type":"session_meta","payload":{"id":"t1","cwd":"/proj"}}
+{"type":"event_msg","payload":{"type":"agent_message","message":"x"}}
+{"type":"response_item","payload":{"type":"reasoning","summary":[]}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}}
+{"type":"response_item","payload":{"type":"telepathy","text":"x"}}
+{"type":"brand_new_record","payload":{}}
+{"type":"response_item","payload":
+"#;
+        std::fs::write(&path, sample).unwrap();
+        let (rollout, stats) =
+            crate::indexer::common::collect_parse_stats(|| parse_rollout(&path).unwrap());
+        assert_eq!(rollout.messages.len(), 1);
+        assert_eq!((stats.lines, stats.malformed_lines), (7, 1));
+        assert_eq!(
+            stats.unknown_kinds,
+            std::collections::BTreeMap::from([
+                ("brand_new_record".to_string(), 1),
+                ("item:telepathy".to_string(), 1),
+            ])
+        );
+        assert_eq!((stats.files, stats.files_with_zero_messages), (1, 0));
+    }
 
     #[test]
     fn parses_rollout_messages() {

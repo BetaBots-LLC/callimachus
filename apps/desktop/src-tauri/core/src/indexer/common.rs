@@ -1,9 +1,226 @@
 //! Small parsing helpers shared by the source indexers. Each one used to be copied into
 //! several indexers, and the copies had started to drift.
+//!
+//! Also the parse counters ([`ParseStats`]): every indexer drops malformed lines and record
+//! types it does not know, which is right for one odd line and silent data loss when an
+//! agent changes its transcript format (the index is the only copy once the agent's own
+//! cleanup deletes the file). Each indexer reports what it read through [`count_line`],
+//! [`count_malformed`], [`count_skipped`] and [`begin_file`] / [`count_file`]; a pass collects
+//! them per source with [`collect_parse_stats`], and `indexer::parse_health` judges them.
 
 use super::ParsedMessage;
 use serde_json::Value;
+use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+
+/// What one pass over one source parsed, by count only: type names from the files and
+/// numbers, never text from them (these land in logs, `app_config` and `cal doctor`, which a
+/// user pastes into a public issue).
+#[derive(
+    Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "camelCase")]
+pub struct ParseStats {
+    /// Records read: a JSONL line, an item of a JSON array, a row of an agent's database.
+    pub lines: u64,
+    /// Records that were not valid JSON (counted in `lines` too).
+    pub malformed_lines: u64,
+    /// Record or part types the indexer does not know and dropped (or, for a role, misread),
+    /// by name: at most 32 names of at most 48 chars, the rest under `(other)`. Types an
+    /// indexer skips on purpose (thinking, images, snapshots) are not here.
+    pub unknown_kinds: BTreeMap<String, u64>,
+    /// Files (or conversations of a database source) parsed whole.
+    pub files: u64,
+    // An empty file is not one: all 807 of the 2,079 Cursor composers on the author's
+    // machine that yield nothing hold no bubble at all (unused chat tabs, measured
+    // 2026-11-09), and counted here they would read as a format change on a full reindex.
+    /// Of those, the ones that held at least one record and yielded no message (an empty
+    /// file is not one).
+    pub files_with_zero_messages: u64,
+}
+
+/// Most distinct names [`ParseStats::unknown_kinds`] keeps, [`OTHER_KINDS`] included: a file
+/// full of invented types must not grow the map (it is stored per source in `app_config`).
+pub const MAX_KINDS: usize = 32;
+/// Longest kept name, in chars.
+pub const MAX_KIND_CHARS: usize = 48;
+/// Where names past [`MAX_KINDS`] are counted.
+pub const OTHER_KINDS: &str = "(other)";
+/// The name of a record with no type field at all.
+pub const NO_KIND: &str = "(none)";
+
+impl ParseStats {
+    /// Records dropped as unknown, all names together.
+    pub fn unknown(&self) -> u64 {
+        self.unknown_kinds.values().sum()
+    }
+
+    /// Nothing was parsed (no record, no file): the source has nothing on disk, or nothing
+    /// changed since the last pass.
+    pub fn is_empty(&self) -> bool {
+        self.lines == 0 && self.files == 0
+    }
+
+    /// Fold another tally into this one.
+    pub fn merge(&mut self, other: &ParseStats) {
+        self.lines += other.lines;
+        self.malformed_lines += other.malformed_lines;
+        self.files += other.files;
+        self.files_with_zero_messages += other.files_with_zero_messages;
+        for (name, n) in &other.unknown_kinds {
+            self.add_unknown(name, *n);
+        }
+    }
+
+    fn add_unknown(&mut self, name: &str, n: u64) {
+        if let Some(count) = self.unknown_kinds.get_mut(name) {
+            *count += n;
+            return;
+        }
+        let key = if self.unknown_kinds.len() + 1 >= MAX_KINDS {
+            OTHER_KINDS
+        } else {
+            name
+        };
+        *self.unknown_kinds.entry(key.to_string()).or_insert(0) += n;
+    }
+}
+
+thread_local! {
+    /// The tally of the [`collect_parse_stats`] running on this thread, if any. A thread-local
+    /// rather than a parameter: the parse functions are shared with paths nobody counts (the
+    /// usage backfill, the compaction anchor, tests), and the scans of all 13 sources keep
+    /// their signature. Every scan parses on the thread that runs it.
+    static PARSE_STATS: RefCell<Option<ParseStats>> = const { RefCell::new(None) };
+}
+
+/// Apply `f` to the running tally; a no-op when nothing collects. Per record this is a
+/// thread-local read and a counter increment: a fresh index of 300 real Claude transcripts
+/// (267 MiB) took 3.4 s before and after (release `cal index`, median of 5 runs).
+#[inline]
+fn with_stats(f: impl FnOnce(&mut ParseStats)) {
+    PARSE_STATS.with(|cell| {
+        if let Some(stats) = cell.borrow_mut().as_mut() {
+            f(stats);
+        }
+    });
+}
+
+/// One record read.
+#[inline]
+pub fn count_line() {
+    with_stats(|s| s.lines += 1);
+}
+
+/// One record that was not valid JSON (also a line).
+#[inline]
+pub fn count_malformed() {
+    with_stats(|s| {
+        s.lines += 1;
+        s.malformed_lines += 1;
+    });
+}
+
+/// A record (or a part of one) of type `kind` that the indexer dropped. Counted as unknown,
+/// under `prefix` + the type's name, unless `on_purpose` lists the type (`NO_KIND` stands for
+/// a record without one). The name is only built for an unknown type, so the common skips
+/// cost a few comparisons.
+pub fn count_skipped(prefix: &str, kind: Option<&str>, on_purpose: &[&str]) {
+    let kind = kind.unwrap_or(NO_KIND);
+    if on_purpose.contains(&kind) {
+        return;
+    }
+    with_stats(|s| s.add_unknown(&kind_name(prefix, kind), 1));
+}
+
+/// Where one file's records start in the running tally ([`begin_file`]), so [`count_file`]
+/// can tell an empty file from one whose records yielded nothing.
+#[derive(Clone, Copy, Debug)]
+#[must_use = "pass it to count_file once the file is parsed"]
+pub struct FileStart(u64);
+
+/// Mark the start of a whole file (or conversation), before its first record is counted.
+#[inline]
+pub fn begin_file() -> FileStart {
+    FileStart(PARSE_STATS.with(|cell| cell.borrow().as_ref().map_or(0, |s| s.lines)))
+}
+
+/// The file begun at `start` parsed into `messages` messages. It counts as a file without
+/// messages only when it held a record ([`ParseStats::files_with_zero_messages`]). A token
+/// rather than "records since the last file": records read between files (a Claude
+/// transcript's appended lines, a session file that is not JSON) would make an empty file
+/// look full.
+#[inline]
+pub fn count_file(start: FileStart, messages: usize) {
+    with_stats(|s| {
+        s.files += 1;
+        if messages == 0 && s.lines > start.0 {
+            s.files_with_zero_messages += 1;
+        }
+    });
+}
+
+/// Run `f` and return what it parsed on this thread. Nested calls each see their own part,
+/// and the outer one gets it too.
+pub fn collect_parse_stats<T>(f: impl FnOnce() -> T) -> (T, ParseStats) {
+    let outer = PARSE_STATS.with(|cell| cell.borrow_mut().replace(ParseStats::default()));
+    // Restored on unwind as well: a panicking scan must not leave this thread collecting.
+    struct Restore(Option<Option<ParseStats>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            if let Some(outer) = self.0.take() {
+                PARSE_STATS.with(|cell| *cell.borrow_mut() = outer);
+            }
+        }
+    }
+    let mut restore = Restore(Some(outer));
+    let out = f();
+    let mine = PARSE_STATS
+        .with(|cell| cell.borrow_mut().take())
+        .unwrap_or_default();
+    let mut outer = restore.0.take().flatten();
+    if let Some(o) = outer.as_mut() {
+        o.merge(&mine);
+    }
+    PARSE_STATS.with(|cell| *cell.borrow_mut() = outer);
+    (out, mine)
+}
+
+/// Run `f` without counting what it parses, for bytes an earlier pass already counted (a
+/// Claude file re-read whole because it has no stored thread to append to).
+pub fn uncounted<T>(f: impl FnOnce() -> T) -> T {
+    let saved = PARSE_STATS.with(|cell| cell.borrow_mut().take());
+    // Put back on unwind as well, as in `collect_parse_stats`.
+    struct Restore(Option<ParseStats>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let saved = self.0.take();
+            PARSE_STATS.with(|cell| *cell.borrow_mut() = saved);
+        }
+    }
+    let _restore = Restore(saved);
+    f()
+}
+
+/// `prefix` + `kind` as a stored name: only ASCII letters, digits, space and `_.:/@-()` kept
+/// (anything else becomes `?`, so a type field holding text or control characters cannot
+/// carry it into a log or an issue), cut at [`MAX_KIND_CHARS`]. A name can still be
+/// token-shaped; `cal doctor` redacts it on the way out.
+fn kind_name(prefix: &str, kind: &str) -> String {
+    prefix
+        .chars()
+        .chain(kind.chars())
+        .take(MAX_KIND_CHARS)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || "_.:/@-() ".contains(c) {
+                c
+            } else {
+                '?'
+            }
+        })
+        .collect()
+}
 
 /// Longest title derived from message text, in chars (an ellipsis marks the cut).
 const TITLE_CHARS: usize = 80;
@@ -257,6 +474,90 @@ mod tests {
         std::os::unix::fs::symlink(root.join("note"), root.join("linked")).unwrap();
         assert_eq!(dir_for_slug(&root, "-linked"), None);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parse_stats_count_only_inside_a_collector() {
+        count_line(); // nobody collects: dropped
+        let ((), stats) = collect_parse_stats(|| {
+            let full = begin_file();
+            count_line();
+            count_malformed();
+            count_skipped("", Some("thinking"), &["thinking"]);
+            count_skipped("", Some("brand_new"), &["thinking"]);
+            count_skipped("block:", Some("brand_new"), &[]);
+            count_skipped("", None, &[]);
+            // Records but no message: a file that lost its messages.
+            count_file(full, 0);
+            // No record at all: an empty file, not one without messages.
+            let empty = begin_file();
+            count_file(empty, 0);
+            // Records read between files (an appended transcript) do not fill the next one.
+            count_line();
+            let empty = begin_file();
+            count_file(empty, 0);
+            let good = begin_file();
+            count_file(good, 3);
+            // A nested collector sees its own part; the outer one gets it as well.
+            let ((), inner) = collect_parse_stats(count_line);
+            assert_eq!(inner.lines, 1);
+        });
+        assert_eq!(stats.lines, 4);
+        assert_eq!(stats.malformed_lines, 1);
+        assert_eq!(stats.files, 4);
+        assert_eq!(stats.files_with_zero_messages, 1);
+        assert_eq!(
+            stats.unknown_kinds,
+            BTreeMap::from([
+                ("(none)".to_string(), 1),
+                ("block:brand_new".to_string(), 1),
+                ("brand_new".to_string(), 1),
+            ])
+        );
+        let ((), after) = collect_parse_stats(|| {});
+        assert!(after.is_empty(), "nothing leaks into the next collector");
+    }
+
+    /// Type names come from the files: anything but a short, plain identifier is cut and
+    /// masked, and a flood of invented types folds into one bucket.
+    #[test]
+    fn unknown_kind_names_are_capped_and_masked() {
+        let ((), stats) = collect_parse_stats(|| {
+            count_skipped("", Some("secret text\nwith a newline and é"), &[]);
+            count_skipped("", Some(&"x".repeat(200)), &[]);
+            for i in 0..100 {
+                count_skipped("", Some(&format!("kind{i}")), &[]);
+            }
+        });
+        assert!(stats.unknown_kinds.len() <= MAX_KINDS);
+        assert_eq!(stats.unknown(), 102);
+        assert!(stats
+            .unknown_kinds
+            .contains_key("secret text?with a newline and ?"));
+        assert!(stats
+            .unknown_kinds
+            .keys()
+            .all(|k| k.chars().count() <= MAX_KIND_CHARS && !k.contains('\n')));
+        assert!(stats.unknown_kinds[OTHER_KINDS] > 0);
+    }
+
+    /// A scan that panics must not leave its thread collecting into a dead tally.
+    #[test]
+    fn a_panicking_collector_restores_the_outer_one() {
+        let ((), outer) = collect_parse_stats(|| {
+            let caught = std::panic::catch_unwind(|| {
+                collect_parse_stats(|| {
+                    count_line();
+                    panic!("scan failed");
+                })
+            });
+            assert!(caught.is_err());
+            count_line();
+        });
+        assert_eq!(
+            outer.lines, 1,
+            "the outer tally survives and keeps counting"
+        );
     }
 
     #[test]

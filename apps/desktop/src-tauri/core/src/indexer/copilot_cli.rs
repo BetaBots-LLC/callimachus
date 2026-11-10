@@ -23,7 +23,10 @@
 //! (as Claude Code transcripts do, see claude.rs): a later pass parses just the appended
 //! lines onto the stored thread instead of re-reading the whole journal on every write.
 
-use super::common::{fnv1a, parse_rfc3339, push_message, truncate_title};
+use super::common::{
+    begin_file, count_file, count_line, count_malformed, count_skipped, fnv1a, parse_rfc3339,
+    push_message, truncate_title,
+};
 use super::{
     append_messages, file_stamp, source_id, upsert_thread, IndexReport, MsgUsage, ParsedMessage,
     ParsedThread,
@@ -221,6 +224,7 @@ fn index_session(conn: &mut Connection, sid: i64, session: &Session) -> Result<O
         }
     }
 
+    let file = begin_file();
     let mut parsed = Parsed::default();
     let mut offset = 0;
     for j in &session.journals {
@@ -231,6 +235,7 @@ fn index_session(conn: &mut Connection, sid: i64, session: &Session) -> Result<O
         parsed.read(&String::from_utf8_lossy(&bytes[..end]));
         offset = end;
     }
+    count_file(file, parsed.messages.len());
     // Archives are replayed whole each time, so only a lone live journal keeps a cursor.
     let offset = if live.is_some() { offset } else { 0 };
     let tag = |n: usize, totals: &HashMap<String, Counters>| -> Result<Option<String>> {
@@ -281,6 +286,33 @@ fn index_session(conn: &mut Connection, sid: i64, session: &Session) -> Result<O
     write_cursor(conn, &key, mtime, size, offset as i64, tag.as_deref())?;
     Ok(Some(n))
 }
+
+/// Event types skipped on purpose (the parse canary, `parse_health`): turn markers, errors,
+/// usage checkpoints, permissions, skills and the tool start events whose completion is read.
+/// Seen on the author's machine: `system.message`, `assistant.turn_start`,
+/// `assistant.turn_end`, `session.error` (63 sessions, 441 lines).
+const SKIPPED_EVENTS: &[&str] = &[
+    "system.message",
+    "assistant.turn_start",
+    "assistant.turn_end",
+    "assistant.reasoning",
+    "assistant.intent",
+    "session.error",
+    "session.info",
+    "session.warning",
+    "session.usage_checkpoint",
+    "session.model_change",
+    "session.truncation",
+    "session.compaction_start",
+    "tool.execution_start",
+    "tool.execution_partial_result",
+    "tool.user_requested",
+    "permission.requested",
+    "permission.completed",
+    "skill.invoked",
+    "hook.start",
+    "hook.end",
+];
 
 /// Bytes up to and including the last newline: the journal's complete lines.
 fn complete_lines(bytes: &[u8]) -> usize {
@@ -578,9 +610,15 @@ struct Parsed {
 impl Parsed {
     fn read(&mut self, text: &str) {
         for line in text.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            // Callers pass complete lines only, so a line that does not parse is broken.
             let Ok(ev) = serde_json::from_str::<Value>(line) else {
-                continue; // a half-written last line
+                count_malformed();
+                continue;
             };
+            count_line();
             self.event(&ev);
         }
     }
@@ -613,7 +651,8 @@ impl Parsed {
         let null = Value::Null;
         let data = ev.get("data").unwrap_or(&null);
         let s = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
-        match ev.get("type").and_then(Value::as_str).unwrap_or_default() {
+        let kind = ev.get("type").and_then(Value::as_str);
+        match kind.unwrap_or_default() {
             "session.start" => {
                 self.started = s(data, "startTime").as_deref().and_then(parse_rfc3339);
                 self.context(data.get("context"));
@@ -664,7 +703,7 @@ impl Parsed {
                 }
             }
             "session.shutdown" => self.shutdown(data, ts),
-            _ => {} // turn markers, errors, permissions, skills, ...
+            _ => count_skipped("", kind, SKIPPED_EVENTS),
         }
     }
 
@@ -1152,6 +1191,30 @@ mod tests {
         assert_eq!(n, 7);
         assert_eq!(offset(&conn) as usize, complete_lines(body.as_bytes()));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The parse canary: an invented event type and a broken line are counted; turn markers
+    /// are skipped on purpose.
+    #[test]
+    fn parse_counts_name_unknown_types_and_broken_lines() {
+        let text = concat!(
+            r#"{"type":"user.message","id":"a","data":{"content":"hi"}}"#,
+            "\n",
+            r#"{"type":"assistant.turn_start","id":"b","data":{}}"#,
+            "\n",
+            r#"{"type":"assistant.hologram","id":"c","data":{"content":"x"}}"#,
+            "\n",
+            r#"{"type":"assistant.message","id":"d","data":"#,
+            "\n",
+        );
+        let mut p = Parsed::default();
+        let ((), stats) = crate::indexer::common::collect_parse_stats(|| p.read(text));
+        assert_eq!(p.messages.len(), 1);
+        assert_eq!((stats.lines, stats.malformed_lines), (4, 1));
+        assert_eq!(
+            stats.unknown_kinds,
+            std::collections::BTreeMap::from([("assistant.hologram".to_string(), 1)])
+        );
     }
 
     /// A shutdown whose counters fell below the previous one's (a run that started its

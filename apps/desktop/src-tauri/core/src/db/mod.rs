@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, ErrorCode, OpenFlags, TransactionBehavior};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, Once};
+use std::sync::{Mutex, MutexGuard, Once, TryLockError};
 use std::time::Duration;
 
 /// How long a write on an app connection waits for another connection's write lock before
@@ -45,6 +45,47 @@ const MMAP_SIZE: i64 = 256 << 20;
 /// Managed Tauri state wrapper around the app's SQLite connection.
 pub struct Db(pub Mutex<Connection>);
 
+/// Lock a shared connection (the app's writer, the MCP server's), surviving a panic under an
+/// earlier guard. A panic while the guard is held poisons the mutex, and a plain `lock()`
+/// then fails forever: one panicking MCP handler, Tauri command or job broke every later
+/// call until a restart. The connection itself outlives the unwind (rusqlite's `Transaction`
+/// rolls back on drop), but a raw `BEGIN` has no such guard and would keep the write lock,
+/// so an open transaction is rolled back here. Nothing keeps a transaction open across
+/// guards (a `Transaction` borrows the guard), so one found open at acquisition is abandoned.
+pub fn lock_conn(m: &Mutex<Connection>) -> MutexGuard<'_, Connection> {
+    let guard = m.lock().unwrap_or_else(|poisoned| {
+        // Cleared so later callers take the plain path; the rollback below runs either way.
+        m.clear_poison();
+        crate::app_log!("[db] recovered the connection lock after a panic under it");
+        poisoned.into_inner()
+    });
+    roll_back_abandoned(&guard);
+    guard
+}
+
+/// [`lock_conn`] without waiting: None while another thread holds the lock.
+pub fn try_lock_conn(m: &Mutex<Connection>) -> Option<MutexGuard<'_, Connection>> {
+    let guard = match m.try_lock() {
+        Ok(guard) => guard,
+        Err(TryLockError::WouldBlock) => return None,
+        Err(TryLockError::Poisoned(poisoned)) => {
+            m.clear_poison();
+            crate::app_log!("[db] recovered the connection lock after a panic under it");
+            poisoned.into_inner()
+        }
+    };
+    roll_back_abandoned(&guard);
+    Some(guard)
+}
+
+fn roll_back_abandoned(conn: &Connection) {
+    if !conn.is_autocommit() {
+        if let Err(e) = conn.execute_batch("ROLLBACK") {
+            crate::app_log!("[db] rolling back an abandoned transaction: {e}");
+        }
+    }
+}
+
 /// Register the sqlite-vec (vec0) extension exactly once, for all connections
 /// opened afterwards. Must run before the first `Connection::open`.
 // The transmute is the documented sqlite-vec registration idiom (fn ptr -> the
@@ -77,10 +118,33 @@ fn register_vec() {
 /// the app crashed unless launched as administrator. `data_local_dir` (not the
 /// roaming `data_dir`) keeps the index out of the Windows roaming profile.
 pub fn default_index_path() -> PathBuf {
+    // Tests run `cal` commands in process against a temp index; the environment is shared by
+    // every test thread, so they point this thread at it instead.
+    #[cfg(test)]
+    if let Some(p) = test_support::default_index_override() {
+        return p;
+    }
     if let Ok(p) = std::env::var("CALLIMACHUS_DB") {
         return PathBuf::from(p);
     }
+    implicit_index_path()
+}
+
+/// The index nobody named: the app's own.
+#[cfg(not(test))]
+fn implicit_index_path() -> PathBuf {
     app_data_dir().join("index.db")
+}
+
+/// In this crate's unit tests the index nobody named is one that does not exist, never the
+/// user's real one. A test that runs a command in process without `with_default_index` must
+/// not reach the machine's own data folder: the tests that feed `run_and_exit` a bad hook
+/// payload once recorded their "hook gave up" lines in the developer's real ledger, four per
+/// test run, because the real index existed. (`CALLIMACHUS_DB` set by whoever runs the tests
+/// is still honored: that is a choice, this was an accident.)
+#[cfg(test)]
+fn implicit_index_path() -> PathBuf {
+    test_support::no_default_index()
 }
 
 /// The folder of the app's own index (and the dev build's `index.dev.db`), whatever
@@ -172,6 +236,7 @@ pub fn open_sidecar_current_with(path: &Path, busy: Duration) -> Result<Connecti
     if !path.exists() {
         anyhow::bail!("no index at {}", path.display());
     }
+    crate::backup::refuse_interrupted_restore(path)?;
     // READ_WRITE without CREATE: a vanished file is an error, not a new empty index.
     let conn = Connection::open_with_flags(
         path,
@@ -287,17 +352,94 @@ pub fn has_table(conn: &Connection, name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Create `dir` if it is missing, owner-only (0700) on Unix: it is about to hold the index,
+/// which keeps transcripts unredacted, secrets included. Only the last component gets the
+/// mode; missing parents above it are created as usual (a `CALLIMACHUS_DB` under a new
+/// `/srv/shared/x/` must not make `/srv/shared` private). An existing folder is left as it is.
+pub fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    if dir.is_dir() {
+        return Ok(());
+    }
+    if let Some(up) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(up)?;
+    }
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    match builder.create(dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && dir.is_dir() => Ok(()),
+        other => other,
+    }
+}
+
+/// Drop the group and other bits of `path`'s mode when it has any (0644 becomes 0600, 0755
+/// becomes 0700), keeping the owner's. One `lstat` when nothing needs changing, so a writable
+/// open costs three of them. Best effort: a file another user owns (a shared
+/// `CALLIMACHUS_DB`) refuses the chmod, and that is not this open's problem to report. Never
+/// through a symbolic link: the index folder's own entries only. A no-op off Unix (Windows
+/// gives `%LOCALAPPDATA%` per-user ACLs).
+pub(crate) fn tighten_mode(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let Ok(meta) = std::fs::symlink_metadata(path) else {
+            return;
+        };
+        if meta.file_type().is_symlink() {
+            return;
+        }
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o700));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
+/// The index's folder before a writable open: a missing one is created owner-only; an
+/// existing one is tightened only when it is `default_dir`, the app's own data folder
+/// ([`app_data_dir`]; injected so tests never touch the real one). A folder the user chose
+/// for `CALLIMACHUS_DB` keeps whatever mode they gave it.
+fn prepare_index_dir(parent: &Path, default_dir: &Path) -> Result<()> {
+    if !parent.exists() {
+        create_private_dir(parent)
+            .with_context(|| format!("creating db directory {}", parent.display()))?;
+    } else if parent == default_dir {
+        tighten_mode(parent);
+    }
+    Ok(())
+}
+
+/// The index file and its WAL and shared-memory files to 0600, for an index created before
+/// files were owner-only (they were 0644). SQLite gives a new `-wal` / `-shm` the database
+/// file's mode, so tightening `index.db` first covers the sidecars it creates from then on.
+fn restrict_index_files(path: &Path) {
+    tighten_mode(path);
+    for suffix in ["-wal", "-shm"] {
+        let mut name = path.as_os_str().to_owned();
+        name.push(suffix);
+        tighten_mode(Path::new(&name));
+    }
+}
+
 fn open_with(path: &Path, busy: Duration, upgrade_wait: Duration) -> Result<Connection> {
     register_vec();
     // Create the parent dir so a first run (e.g. the MCP server in a fresh
     // container, or CALLIMACHUS_DB pointing somewhere new) can create the file —
     // rusqlite makes the file but not the directory.
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating db directory {}", parent.display()))?;
+        prepare_index_dir(parent, &app_data_dir())?;
     }
+    // A restore halfway through its swap: this open would hide that state for good.
+    crate::backup::refuse_interrupted_restore(path)?;
     let mut conn = Connection::open(path)
         .with_context(|| format!("opening database at {}", path.display()))?;
+    // Writable opens only: read-only sidecars, pooled readers and hooks never change modes.
+    restrict_index_files(path);
 
     // WAL = concurrent readers while we write; required so indexing doesn't block reads.
     conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -330,6 +472,9 @@ fn open_with(path: &Path, busy: Duration, upgrade_wait: Duration) -> Result<Conn
 /// migrations that were just applied. So when anything is pending: wait for the write lock
 /// first (an upgrade in flight finishes, and to_latest then re-reads the version and
 /// finds nothing to do), and migrate in IMMEDIATE transactions with the same long wait.
+/// Holding that first lock, the index is cloned into `snapshots/<UTC>-pre-migration-<id>/`
+/// next to it ([`crate::backup`]), so an upgrade that goes wrong has a copy to go back to.
+/// Hooks and the MCP server never get here (they never migrate).
 fn migrate(conn: &mut Connection, busy: Duration, upgrade_wait: Duration) -> Result<()> {
     let m = &*migrations::MIGRATIONS;
     let pending = m
@@ -356,12 +501,30 @@ fn migrate(conn: &mut Connection, busy: Duration, upgrade_wait: Duration) -> Res
         }
     }
     conn.busy_timeout(upgrade_wait)?;
+    // Before the write lock, in autocommit: the index's identity, which the snapshot below must
+    // carry (committed) and which retention compares; None skips the snapshot.
+    let snapshot_id = crate::backup::pre_migration_prepare(conn);
     conn.set_transaction_behavior(TransactionBehavior::Immediate);
+    let mut snapshot = None;
     let result = conn
-        .execute_batch("BEGIN IMMEDIATE; ROLLBACK;")
+        .execute_batch("BEGIN IMMEDIATE;")
         .map_err(anyhow::Error::from)
-        .and_then(|()| m.to_latest(conn).map_err(anyhow::Error::from));
+        .and_then(|()| {
+            // Holding the write lock: clone the index as it is before the upgrade (instant
+            // on APFS; skipped, with one log line, where it cannot be cloned or the disk is
+            // short). Never fails the upgrade.
+            let taken = snapshot_id
+                .as_deref()
+                .and_then(|id| crate::backup::pre_migration_locked(conn, id));
+            conn.execute_batch("ROLLBACK;")?;
+            snapshot = crate::backup::pre_migration_verify(taken);
+            m.to_latest(conn).map_err(anyhow::Error::from)
+        });
     conn.set_transaction_behavior(TransactionBehavior::Deferred);
+    // The new snapshot replaces the older pre-migration one only when the upgrade went through
+    // (here or, in the race below, in another process); a failed upgrade's copy is removed.
+    let upgraded = result.is_ok() || m.pending_migrations(conn).ok() == Some(0);
+    crate::backup::pre_migration_done(snapshot, upgraded);
     conn.busy_timeout(busy)?;
     match result {
         Ok(()) => Ok(()),
@@ -509,6 +672,8 @@ pub fn open_readonly(path: &Path) -> Result<Connection> {
             path.display()
         );
     }
+    // Even read-only: with the `-shm` still beside it, SQLite gives the index a new `-wal`.
+    crate::backup::refuse_interrupted_restore(path)?;
     let conn = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
@@ -705,6 +870,51 @@ pub(crate) mod test_support {
         }
     }
 
+    thread_local! {
+        /// What [`default_index_path`] returns on this thread inside [`with_default_index`].
+        static DEFAULT_INDEX: std::cell::RefCell<Option<PathBuf>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Run `f` with [`default_index_path`] naming `path` on this thread, so a test can run a
+    /// whole `cal` command in process against a temp index (`CALLIMACHUS_DB` would leak into
+    /// every test running beside it).
+    pub fn with_default_index<R>(path: &Path, f: impl FnOnce() -> R) -> R {
+        let previous = DEFAULT_INDEX.with(|p| p.replace(Some(path.to_path_buf())));
+        let out = f();
+        DEFAULT_INDEX.with(|p| *p.borrow_mut() = previous);
+        out
+    }
+
+    pub(super) fn default_index_override() -> Option<PathBuf> {
+        DEFAULT_INDEX.with(|p| p.borrow().clone())
+    }
+
+    /// What [`default_index_path`] names in a unit test that set no override: a path in a
+    /// temp folder that is never created (hooks create nothing next to a missing index), so
+    /// "no index" is what such a test meets instead of the developer's real one.
+    pub(super) fn no_default_index() -> PathBuf {
+        std::env::temp_dir()
+            .join("calli_no_default_index")
+            .join("index.db")
+    }
+
+    /// An index file at `path` built to schema `version` (an older app's), `seed`ed on a raw
+    /// connection at that version, checkpointed so the main file holds every row, and closed:
+    /// what a reader that never migrates meets after an update.
+    pub fn index_at_version(path: &Path, version: usize, seed: impl FnOnce(&mut Connection)) {
+        register_vec();
+        let mut conn = Connection::open(path).expect("create the index");
+        conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        migrations::MIGRATIONS
+            .to_version(&mut conn, version)
+            .expect("migrate to the old version");
+        seed(&mut conn);
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
+    }
+
     /// A fresh temp folder, `calli_<tag>_<pid>_<n>`, removed with all it holds on drop. Derefs
     /// to the (not yet created) `index.db` path inside it, for tests whose index needs a
     /// folder of its own: lock files and logs land next to the index. The sweep leaves
@@ -857,19 +1067,18 @@ mod tests {
     use super::*;
 
     /// Regression guard: the cross-platform path switch must NOT move an existing
-    /// macOS user's index. `default_index_path()` on macOS must stay byte-identical
-    /// to the original hardcoded `~/Library/Application Support/...` location.
+    /// macOS user's index. The app's own index on macOS must stay byte-identical
+    /// to the original hardcoded `~/Library/Application Support/...` location. Asserted on
+    /// `app_data_dir()`, which the shipped `default_index_path()` joins `index.db` to: in
+    /// this crate's tests the default path itself is a stand-in that does not exist
+    /// (`implicit_index_path`).
     #[test]
     #[cfg(target_os = "macos")]
     fn default_index_path_unchanged_on_macos() {
-        // Only meaningful without the override; never mutate process env in a test.
-        if std::env::var_os("CALLIMACHUS_DB").is_some() {
-            return;
-        }
         let home = std::env::var("HOME").expect("HOME is set on macOS");
         let expected = std::path::PathBuf::from(home)
             .join("Library/Application Support/dev.shaller.callimachus/index.db");
-        assert_eq!(default_index_path(), expected);
+        assert_eq!(app_data_dir().join("index.db"), expected);
     }
 
     use super::test_support::{
@@ -1351,5 +1560,194 @@ mod tests {
             )
             .unwrap();
         assert_eq!(hits_after, 0, "delete trigger cleaned the FTS index");
+    }
+
+    /// A unit test that names no index gets one that does not exist, never the machine's own
+    /// (see `implicit_index_path`); an override still wins.
+    #[test]
+    fn a_test_without_an_override_never_names_the_real_index() {
+        if std::env::var_os("CALLIMACHUS_DB").is_some() {
+            return; // whoever runs the tests chose an index
+        }
+        let implicit = default_index_path();
+        assert!(
+            !implicit.starts_with(app_data_dir()),
+            "{}",
+            implicit.display()
+        );
+        assert!(!implicit.exists());
+        let dir = test_support::TestDir::new("default_override");
+        let seen = test_support::with_default_index(&dir, default_index_path);
+        assert_eq!(seen, dir.to_path_buf());
+        assert_eq!(default_index_path(), implicit);
+    }
+
+    /// A panic under the shared connection's guard, inside a raw `BEGIN` (no rusqlite
+    /// `Transaction` to roll it back on drop), poisons the mutex and leaves the write lock
+    /// held. The next caller still gets the connection, the half-done write is gone, and
+    /// another connection can write again.
+    #[test]
+    fn a_panic_under_the_connection_lock_does_not_break_the_next_caller() {
+        let dir = test_support::TestDir::new("poison");
+        let db = Db(Mutex::new(open(&dir).unwrap()));
+        let wrote = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let conn = lock_conn(&db.0);
+            conn.execute_batch(
+                "BEGIN IMMEDIATE; INSERT INTO app_config (key, value) VALUES ('half', 'done');",
+            )
+            .unwrap();
+            panic!("a handler bug under the guard");
+        }));
+        assert!(wrote.is_err());
+        assert!(db.0.is_poisoned());
+
+        let conn = lock_conn(&db.0);
+        assert!(
+            !db.0.is_poisoned(),
+            "recovered once, for every later caller"
+        );
+        assert!(conn.is_autocommit(), "the abandoned BEGIN was rolled back");
+        let half: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM app_config WHERE key = 'half'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(half, 0);
+        conn.execute(
+            "INSERT INTO app_config (key, value) VALUES ('next', 'ok')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let other = open(&dir).unwrap();
+        other
+            .execute(
+                "INSERT INTO app_config (key, value) VALUES ('other', 'ok')",
+                [],
+            )
+            .expect("the write lock was released");
+
+        // The non-blocking form recovers the same way, and stays None while the lock is held.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let conn = lock_conn(&db.0);
+            conn.execute_batch("BEGIN").unwrap();
+            panic!("again");
+        }));
+        let conn = try_lock_conn(&db.0).expect("a poisoned lock is still free");
+        assert!(conn.is_autocommit());
+        let held = std::thread::scope(|s| s.spawn(|| try_lock_conn(&db.0).is_none()).join());
+        assert!(held.unwrap(), "None while another thread holds it");
+    }
+
+    #[cfg(unix)]
+    fn mode(p: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    fn set_mode(p: &Path, m: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn sidecar(index: &Path, suffix: &str) -> PathBuf {
+        let mut s = index.as_os_str().to_owned();
+        s.push(suffix);
+        PathBuf::from(s)
+    }
+
+    /// A first open in a missing folder makes it owner-only, and the index with its WAL and
+    /// shared memory 0600: the index keeps transcripts unredacted.
+    #[cfg(unix)]
+    #[test]
+    fn a_new_index_and_its_folder_are_owner_only() {
+        let dir = test_support::TestDir::new("db_perms_new");
+        let index = dir.parent().unwrap().join("sub").join("index.db");
+        let above = mode(dir.parent().unwrap());
+        let conn = open(&index).unwrap();
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS t (x); INSERT INTO t VALUES (1);")
+            .unwrap();
+        assert_eq!(mode(index.parent().unwrap()), 0o700);
+        for p in [
+            index.clone(),
+            sidecar(&index, "-wal"),
+            sidecar(&index, "-shm"),
+        ] {
+            assert_eq!(mode(&p), 0o600, "{}", p.display());
+        }
+        // Only the new folder: the one above it, which existed, keeps its mode.
+        assert_eq!(mode(dir.parent().unwrap()), above);
+    }
+
+    /// An index from before files were owner-only (0644) is tightened by the next writable
+    /// open, and never by a read-only one, a hook's or a pooled reader's.
+    #[cfg(unix)]
+    #[test]
+    fn writable_opens_tighten_a_wide_index_and_read_only_ones_never_do() {
+        let dir = test_support::TestDir::new("db_perms_old");
+        drop(open(&dir).unwrap());
+        let files = [
+            dir.to_path_buf(),
+            sidecar(&dir, "-wal"),
+            sidecar(&dir, "-shm"),
+        ];
+        // A live reader keeps the WAL and shared memory around between the opens below.
+        let keep = open_readonly(&dir).unwrap();
+        keep.query_row("SELECT count(*) FROM sqlite_master", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .unwrap();
+        for p in &files {
+            if p.exists() {
+                set_mode(p, 0o644);
+            }
+        }
+        let wide = || {
+            files
+                .iter()
+                .filter(|p| p.exists())
+                .all(|p| mode(p) == 0o644)
+        };
+        drop(open_readonly(&dir).unwrap());
+        drop(open_sidecar_current(&dir).unwrap());
+        drop(open_sidecar_current_long_lived(&dir).unwrap());
+        let pool = read_pool(&dir, 2).unwrap();
+        drop(pool.0.get().unwrap());
+        assert!(wide(), "read-only and hook opens leave modes alone");
+        drop(open(&dir).unwrap());
+        for p in files.iter().filter(|p| p.exists()) {
+            assert_eq!(mode(p), 0o600, "{}", p.display());
+        }
+        drop(keep);
+    }
+
+    /// Only the app's own data folder is tightened when it already exists; a folder the user
+    /// chose for `CALLIMACHUS_DB` keeps its mode.
+    #[cfg(unix)]
+    #[test]
+    fn only_the_default_data_folder_is_tightened() {
+        let dir = test_support::TestDir::new("db_perms_dirs");
+        let theirs = dir.parent().unwrap().join("theirs");
+        let ours = dir.parent().unwrap().join("ours");
+        for d in [&theirs, &ours] {
+            std::fs::create_dir(d).unwrap();
+            set_mode(d, 0o755);
+        }
+        prepare_index_dir(&theirs, &ours).unwrap();
+        assert_eq!(mode(&theirs), 0o755);
+        prepare_index_dir(&ours, &ours).unwrap();
+        assert_eq!(mode(&ours), 0o700);
+        // A symbolic link named like the data folder is never followed into a chmod.
+        let target = dir.parent().unwrap().join("target");
+        std::fs::create_dir(&target).unwrap();
+        set_mode(&target, 0o755);
+        let link = dir.parent().unwrap().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        prepare_index_dir(&link, &link).unwrap();
+        assert_eq!(mode(&target), 0o755);
     }
 }

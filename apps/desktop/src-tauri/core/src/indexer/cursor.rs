@@ -34,7 +34,8 @@
 //! rewrote every thread.
 
 use super::common::{
-    dir_for_project_slug, is_drive_path, normalize_slug, push_message, slug_of, truncate_title,
+    begin_file, count_file, count_line, count_malformed, count_skipped, dir_for_project_slug,
+    is_drive_path, normalize_slug, push_message, slug_of, truncate_title,
 };
 use super::{
     canonical_project, file_change_state, set_file_state, source_id, upsert_thread, IndexReport,
@@ -47,6 +48,11 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 pub const KIND: &str = "cursor";
+
+/// Message parts of the agent transcripts and CLI chat stores skipped on purpose (the parse
+/// canary, `parse_health`): reasoning (often redacted) and images. On the author's machine
+/// the 342 transcripts held only `text` and `tool_use` parts.
+const SKIPPED_PARTS: &[&str] = &["reasoning", "redacted-reasoning", "thinking", "image"];
 
 /// Path to Cursor's global state DB. Uses the platform per-user config dir
 /// (macOS `~/Library/Application Support`, Windows `%APPDATA%`, Linux `~/.config`),
@@ -273,6 +279,9 @@ fn scan_path(
             continue;
         }
 
+        // A composer without a bubble (an unused chat tab: 807 of 2,079 on the author's
+        // machine) is an empty file, not one that lost its messages.
+        let file = begin_file();
         let mut messages: Vec<ParsedMessage> = Vec::new();
         let mut first_user: Option<String> = None;
         let mut max_ts: Option<i64> = None;
@@ -287,10 +296,21 @@ fn scan_path(
 
         for row in rows {
             let (kind, text, ts_ms) = row?;
+            count_line();
             let Some(text) = text.map(|t| t.trim().to_string()).filter(|t| !t.is_empty()) else {
                 continue;
             };
-            let role = if kind == Some(2) { "assistant" } else { "user" };
+            let role = match kind {
+                Some(2) => "assistant",
+                Some(1) => "user",
+                // Read as the user's, as before; counted so a new bubble type shows up
+                // (`parse_health`) instead of quietly relabelling messages.
+                other => {
+                    let name = other.map(|k| k.to_string());
+                    count_skipped("bubble:", name.as_deref(), &[]);
+                    "user"
+                }
+            };
             let ts = ts_ms.map(|ms| ms / 1000);
             if role == "user" && first_user.is_none() {
                 first_user = Some(text.clone());
@@ -306,6 +326,7 @@ fn scan_path(
             });
         }
 
+        count_file(file, messages.len());
         if messages.is_empty() {
             // Nothing to index yet, but remember the fingerprint so the next pass doesn't
             // re-extract it again, marked so a transcript of this id is indexed instead.
@@ -885,19 +906,33 @@ fn tool_paths(input: &Value, out: &mut Vec<String>) {
 /// `<timestamp>` block dates it and the turns after it).
 fn parse_transcript(path: &Path) -> Result<(Vec<ParsedMessage>, Vec<String>)> {
     let content = std::fs::read_to_string(path)?;
+    let file = begin_file();
     let mut out = Vec::new();
     let mut paths = Vec::new();
     let mut ts: Option<i64> = None;
-    for line in content.lines() {
+    let mut lines = content.lines().peekable();
+    while let Some(line) = lines.next() {
+        if line.trim().is_empty() {
+            continue;
+        }
         let Ok(obj) = serde_json::from_str::<Value>(line) else {
-            continue; // a half-written last line, or noise
+            // A half-written last line is not a broken one; anything else is.
+            if lines.peek().is_some() || content.ends_with('\n') {
+                count_malformed();
+            }
+            continue;
         };
+        count_line();
         let role = obj.get("role").and_then(Value::as_str).unwrap_or_default();
         let parts = obj.get("message").and_then(|m| m.get("content"));
         let parts: Vec<&Value> = match parts {
             Some(Value::Array(a)) => a.iter().collect(),
             Some(v @ Value::String(_)) => vec![v],
-            _ => continue,
+            None | Some(Value::Null) => continue,
+            other => {
+                count_skipped("content:", Some(super::claude::json_kind(other)), &[]);
+                continue;
+            }
         };
         for part in parts {
             let (kind, text) = match part {
@@ -925,11 +960,20 @@ fn parse_transcript(path: &Path) -> Result<(Vec<ParsedMessage>, Vec<String>)> {
                     push_tool_call(&mut out, name, input, ts);
                 }
                 (_, "tool_result") => push_tool_result(&mut out, part.get("content"), ts),
-                _ => {} // reasoning, images, unknown parts
+                _ => skipped_part(role, kind),
             }
         }
     }
+    count_file(file, out.len());
     Ok((out, paths))
+}
+
+/// Count a part of `role` and `kind` the transcript and chat parsers drop: unknown unless
+/// [`SKIPPED_PARTS`] lists the kind.
+fn skipped_part(role: &str, kind: &str) {
+    if !SKIPPED_PARTS.contains(&kind) {
+        count_skipped(&format!("{role}:"), Some(kind), &[]);
+    }
 }
 
 /// A file's (birth, modification) time in epoch seconds, where the platform reports them.
@@ -1126,6 +1170,7 @@ fn parse_chat(ro: &Connection) -> Result<ChatParse> {
     let Some(root) = load(root_id) else {
         return Ok(out);
     };
+    let file = begin_file();
     for (field, bytes) in pb_bytes_fields(&root) {
         let json = match field {
             1 if bytes.len() == 32 => load(&hex_encode(bytes)),
@@ -1138,10 +1183,16 @@ fn parse_chat(ro: &Connection) -> Result<ChatParse> {
             }
             _ => None,
         };
-        if let Some(msg) = json.and_then(|j| serde_json::from_slice::<Value>(&j).ok()) {
-            chat_message(&mut out.messages, &msg);
+        let Some(json) = json else { continue };
+        match serde_json::from_slice::<Value>(&json) {
+            Ok(msg) => {
+                count_line();
+                chat_message(&mut out.messages, &msg);
+            }
+            Err(_) => count_malformed(),
         }
     }
+    count_file(file, out.messages.len());
     Ok(out)
 }
 
@@ -1150,7 +1201,11 @@ fn chat_message(out: &mut Vec<ParsedMessage>, msg: &Value) {
     let parts: Vec<&Value> = match msg.get("content") {
         Some(Value::Array(a)) => a.iter().collect(),
         Some(v @ Value::String(_)) => vec![v],
-        _ => return,
+        None | Some(Value::Null) => return,
+        other => {
+            count_skipped("content:", Some(super::claude::json_kind(other)), &[]);
+            return;
+        }
     };
     for part in parts {
         let (kind, text) = match part {
@@ -1178,7 +1233,8 @@ fn chat_message(out: &mut Vec<ParsedMessage>, msg: &Value) {
                 push_tool_call(out, name, part.get("args"), None);
             }
             ("tool", "tool-result") => push_tool_result(out, part.get("result"), None),
-            _ => {} // reasoning (often redacted), images, unknown parts
+            // reasoning (often redacted), images: see SKIPPED_PARTS
+            _ => skipped_part(role, kind),
         }
     }
 }
@@ -1346,6 +1402,80 @@ fn read_chat_copy(store: &Path) -> Result<ChatParse> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The parse canary over an agent transcript and the CLI chat parser: an invented part
+    /// and an invented role are counted, reasoning is skipped on purpose, a broken line in
+    /// the middle counts and a half-written last line does not.
+    #[test]
+    fn parse_counts_name_unknown_types_and_broken_lines() {
+        let dir = crate::db::test_support::TestDir::new("cursor_canary");
+        let path = dir.with_file_name("t.jsonl");
+        let text = concat!(
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"hi"}]}}"#,
+            "\n",
+            r#"{"role":"assistant","message":{"content":[{"type":"reasoning","text":"x"},{"type":"hologram"},{"type":"text","text":"ok"}]}}"#,
+            "\n",
+            r#"{"role":"assistant","message":"#,
+            "\n",
+            r#"{"role":"narrator","message":{"content":[{"type":"text","text":"x"}]}}"#,
+            "\n",
+            r#"{"role":"assistant","mess"#,
+        );
+        std::fs::write(&path, text).unwrap();
+        let ((messages, _), stats) =
+            crate::indexer::common::collect_parse_stats(|| parse_transcript(&path).unwrap());
+        assert_eq!(messages.len(), 2);
+        assert_eq!((stats.lines, stats.malformed_lines), (4, 1));
+        assert_eq!(
+            stats.unknown_kinds,
+            std::collections::BTreeMap::from([
+                ("assistant:hologram".to_string(), 1),
+                ("narrator:text".to_string(), 1),
+            ])
+        );
+        assert_eq!((stats.files, stats.files_with_zero_messages), (1, 0));
+
+        let ((), stats) = crate::indexer::common::collect_parse_stats(|| {
+            let mut out = Vec::new();
+            chat_message(
+                &mut out,
+                &serde_json::json!({"role": "assistant", "content": [
+                    {"type": "redacted-reasoning"}, {"type": "hologram"}]}),
+            );
+        });
+        assert_eq!(
+            stats.unknown_kinds,
+            std::collections::BTreeMap::from([("assistant:hologram".to_string(), 1)])
+        );
+    }
+
+    /// A composer without a bubble (an unused chat tab) is an empty file; one whose bubbles
+    /// yield no text lost its messages. Only the second reaches `files_with_zero_messages`,
+    /// so a full reindex over hundreds of unused tabs does not read as a format change.
+    #[test]
+    fn unused_composers_are_empty_files_not_lost_ones() {
+        let dir = crate::db::test_support::TestDir::new("cursor_canary_empty");
+        let src = dir.with_file_name("state.vscdb");
+        Connection::open(&src)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value BLOB);
+                 INSERT INTO cursorDiskKV VALUES
+                   ('composerData:used', json('{\"name\":\"a\",\"createdAt\":1733732099602}')),
+                   ('bubbleId:used:b1', json('{\"type\":1,\"text\":\"hi\"}')),
+                   ('composerData:unused', json('{\"createdAt\":1733732099602}')),
+                   ('composerData:blank', json('{\"createdAt\":1733732099602}')),
+                   ('bubbleId:blank:b1', json('{\"type\":2,\"richText\":\"moved\"}'));",
+            )
+            .unwrap();
+        let mut conn = crate::db::open(&dir).unwrap();
+        let (report, stats) = crate::indexer::common::collect_parse_stats(|| {
+            scan_path(&mut conn, &src, &HashMap::new(), &mut || {}).unwrap()
+        });
+        assert_eq!(report.threads_indexed, 1);
+        assert_eq!(stats.lines, 2);
+        assert_eq!((stats.files, stats.files_with_zero_messages), (3, 1));
+    }
 
     /// Build a tiny Cursor-shaped DB and verify we extract a thread + messages.
     #[test]
