@@ -418,9 +418,10 @@ struct CompactFact<'a> {
     text: std::borrow::Cow<'a, str>,
     #[serde(skip_serializing_if = "is_false")]
     pinned: bool,
-    /// Who wrote it (`llm`, `heuristic`, `user`, `agent`, `claude-memory`, or `repo` for a
-    /// fact imported from the repo's committed `.callimachus/memory/` files), so an agent can
-    /// weigh a harvested or team note differently from a distilled decision.
+    /// Who wrote it (`llm`, `heuristic`, `followup` for an item from an agent's deferred-work
+    /// list, `user`, `agent`, `claude-memory`, or `repo` for a fact imported from the repo's
+    /// committed `.callimachus/memory/` files), so an agent can weigh a harvested or team note
+    /// differently from a distilled decision.
     extractor: &'a str,
     /// Always present (null when absent), matching the Tauri `MemoryFact` shape the frontend
     /// reads, so one fact JSON contract covers both surfaces.
@@ -3881,13 +3882,120 @@ mod tests {
         }
     }
 
+    /// Memory handed to an agent leaves unpinned playbooks out
+    /// (`knowledge::MemoryQuery::playbooks`): `project_memory` in both formats, the AGENTS.md
+    /// block and a snapshot's carry show the distilled gotcha alone, while `recurring_issues`
+    /// still answers the error's own question with the fix and its playbook line, on the same
+    /// index.
+    #[tokio::test]
+    async fn memory_for_agents_leaves_playbooks_to_the_error_readers() {
+        let mut conn = empty_db();
+        let now = chrono::Utc::now().timestamp();
+        // Three plain words or more, so it names its error (`issues::is_specific`).
+        let err =
+            "error[E0308]: mismatched types, expected `u32`, found `i64`\n --> src/cart.rs:4:9";
+        seed(
+            &mut conn,
+            "pb-fixer",
+            "fix the cart types",
+            vec![
+                msg("user", "fix the cart types", now - 1_000),
+                msg("tool", err, now - 900),
+                msg("tool", err, now - 890),
+            ],
+        );
+        let tid: i64 = conn
+            .query_row(
+                "SELECT id FROM threads WHERE external_id = 'pb-fixer'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO file_edits (thread_id, path, op, ts) VALUES (?1, 'src/cart.rs', 'edit', ?2)",
+            rusqlite::params![tid, now - 800],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO thread_commits
+                (thread_id, sha, short_sha, subject, committed_at, overlap, created_at)
+             VALUES (?1, '0ddba11cafe01', '0ddba11', 'fix: cast the cart total', ?2, 1, ?2)",
+            rusqlite::params![tid, now - 700],
+        )
+        .unwrap();
+        crate::issues::seed_commit_files("0ddba11cafe01", &["src/cart.rs"]);
+        crate::issues::refresh_clusters_at(&conn, now).unwrap();
+        let playbook: String = conn
+            .query_row(
+                "SELECT text FROM facts WHERE extractor = 'playbook'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(playbook.contains("fixed in 0ddba11"), "{playbook}");
+        let gotcha = "the cart total is cents, not dollars";
+        crate::export::digest_test_support::fact(&conn, tid, "gotcha", gotcha, "llm");
+        let srv = Callimachus::new(conn);
+
+        let memory = |format: Option<&str>| ProjectMemoryArgs {
+            project: Some("/proj/app".into()),
+            format: format.map(str::to_string),
+            limit: None,
+            kinds: vec![],
+        };
+        let json = text_of(
+            &srv.project_memory(Parameters(memory(Some("json"))))
+                .await
+                .unwrap(),
+        );
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["gotchas"].as_array().map(Vec::len), Some(1), "{json}");
+        assert_eq!(v["gotchas"][0]["text"], gotcha);
+        let md = text_of(&srv.project_memory(Parameters(memory(None))).await.unwrap());
+        assert!(
+            md.contains(gotcha) && !md.contains("mismatched types"),
+            "{md}"
+        );
+        {
+            let conn = srv.lock().unwrap();
+            let agents = crate::export::agents_file_body(&conn, "/proj/app").unwrap();
+            assert!(
+                agents.contains(gotcha) && !agents.contains("mismatched types"),
+                "{agents}"
+            );
+            // The transcript after the carry quotes the error itself.
+            let snap = crate::snapshot::create(&conn, tid, None).unwrap();
+            let body = crate::snapshot::load(&conn, snap.id).unwrap().unwrap().body;
+            assert!(crate::snapshot::carries_memory(&body), "{body}");
+            let (carry, _) = body.split_once("\n\n---\n\n").unwrap();
+            assert!(
+                carry.contains(gotcha) && !carry.contains("mismatched types"),
+                "{carry}"
+            );
+        }
+
+        let issues = srv
+            .recurring_issues(Parameters(RecurringIssuesArgs {
+                project: Some("/proj/app".into()),
+                since_days: None,
+                limit: None,
+            }))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&text_of(&issues)).unwrap();
+        assert_eq!(v[0]["fix"]["shortSha"], "0ddba11", "{v}");
+        assert_eq!(v[0]["playbook"].as_str(), Some(playbook.as_str()), "{v}");
+    }
+
     #[tokio::test]
     async fn issue_recent_and_search_tools_redact_a_planted_key() {
         // The index stores transcripts raw, so the key must be scrubbed on the way out: in the
         // error signature recurring_issues returns and the title recent_threads lists.
         let key = "sk-ant-api03-AbCdEfGhIjKlMnOpQrStUv0123456789";
         let now = chrono::Utc::now().timestamp();
-        let err = format!("Error: invalid x-api-key {key}");
+        // Worded so it names its error (`issues::is_specific`): the listing leaves out
+        // generic lines, and a bare `invalid x-api-key` is one plain word.
+        let err = format!("Error: request rejected because the x-api-key {key} is invalid");
         let mut conn = empty_db();
         seed(
             &mut conn,
@@ -3909,7 +4017,10 @@ mod tests {
         // takes the same exit ([`redacted_value`] / [`list_result`]).
         let mut structured = vec![structured_of(&issues)];
         let issues = text_of(&issues);
-        assert!(issues.contains("invalid x-api-key [REDACTED]"), "{issues}");
+        assert!(
+            issues.contains("the x-api-key [REDACTED] is invalid"),
+            "{issues}"
+        );
 
         let recent = srv
             .recent_threads(Parameters(RecentArgs {

@@ -117,6 +117,10 @@ USAGE:
   cal memory import [--review] [<path>]
                                 import the repo's .callimachus/memory/ now (--review:
                                 list what would change, write nothing)
+  cal memory review [-p PROJECT] [--json]
+                                what agents did to memory that nobody reviewed: open
+                                flags and disputes, and the facts agents replaced or
+                                recorded in the last 7 days (read-only)
   cal done <todo-id>            mark an open TODO done (id from `cal todos`)
   cal remember <decision|gotcha> <text…> [--because WHY] [--replaces ID]
                                 record a fact in the current repo's project memory
@@ -143,10 +147,11 @@ USAGE:
                                 one JSON bundle for an external PR auditor: per-commit
                                 provenance (the session behind each sha), per-file prior
                                 threads + reasoning, repo recurring errors + project memory
-  cal issues [<project>] [-n LIMIT] [--json]
+  cal issues [<project>] [-n LIMIT] [--all] [--json]
                                 recurring errors you keep hitting across sessions
                                 (last 180 days, most frequent first), each with the
-                                commit that fixed it once one is linked
+                                commit that fixed it once one is linked; --all adds
+                                the generic ones (a bare `error:`, a CI exit code)
   cal cost [<project>] [--by thread|commit|project|day] [--since DAYS] [-n LIMIT] [--json]
                                 estimated $ spend by model + priciest threads, or broken
                                 down per session (with waste signals), per commit the
@@ -1167,21 +1172,13 @@ fn cmd_memory(args: &[String]) -> anyhow::Result<()> {
     match args.first().map(String::as_str) {
         Some("publish") => return cmd_memory_publish(&args[1..]),
         Some("import") => return cmd_memory_import(&args[1..]),
+        Some("review") => return cmd_memory_review(&args[1..]),
         _ => {}
     }
     let o = parse(args)?;
     let project = project_arg(&o);
     let conn = open_db()?;
-    let mem = knowledge::get_project_memory_with(
-        &conn,
-        &project,
-        &knowledge::MemoryQuery {
-            per_kind: o.limit.unwrap_or(40) as usize,
-            exclude: None,
-            history: o.include_superseded,
-            coverage: true,
-        },
-    )?;
+    let mem = knowledge::get_project_memory_with(&conn, &project, &memory_query(&o))?;
     if o.json {
         println!("{}", o.json_object(&mem)?);
         return Ok(());
@@ -1191,6 +1188,132 @@ fn cmd_memory(args: &[String]) -> anyhow::Result<()> {
         eprintln!("\n(no distilled knowledge yet: distill this project's threads in the app)");
     }
     Ok(())
+}
+
+/// What `cal memory` reads (text and `--json`): every extractor, playbooks included (after
+/// the other gotchas), since a person reads this list; plain `--json` keeps its shape and
+/// still lists them.
+fn memory_query(o: &Opts) -> knowledge::MemoryQuery<'static> {
+    knowledge::MemoryQuery {
+        per_kind: o.limit.unwrap_or(40) as usize,
+        exclude: None,
+        history: o.include_superseded,
+        coverage: true,
+        playbooks: true,
+    }
+}
+
+/// How far back `cal memory review` lists what agents replaced or recorded. Flags and
+/// disputes stay listed until they are settled, whenever they were raised. Today uses the
+/// last time the app showed it instead; a terminal has no such moment. What the user kept on
+/// Today stays off this list too, while it is this recent (`today::keep_review_item`).
+const MEMORY_REVIEW_DAYS: i64 = crate::today::REVIEW_RECENT_SECS / 86_400;
+
+/// `cal memory review [-p PROJECT] [--json]`: what agents and memory passes did to memory
+/// that nobody reviewed ([`today::memory_review`], the list Today shows as "Memory to
+/// review"), across every project or the `-p` one. Read-only: keeping, undoing or hiding is
+/// the app's (or `cal remember --replaces` for a new decision).
+fn cmd_memory_review(args: &[String]) -> anyhow::Result<()> {
+    let o = parse(args)?;
+    if let Some(a) = o.positional.first() {
+        anyhow::bail!("`cal memory review` takes -p PROJECT, not '{a}'. Run `cal help`.");
+    }
+    if o.include_superseded {
+        anyhow::bail!("--include-superseded does not apply to `cal memory review`");
+    }
+    let scope = crate::scope::ProjectScope::fragment(o.project.as_deref());
+    let conn = open_db()?;
+    let since = chrono::Utc::now().timestamp() - MEMORY_REVIEW_DAYS * 86_400;
+    let review = crate::today::memory_review(&conn, &scope, since)?;
+    if o.json {
+        // Plain `--json` stays the bare array; the envelope also counts what the cap left out.
+        let json = match o.json_version {
+            Some(_) => o.json(&crate::cli_contract::ReviewListing {
+                listing: Listing::new(&review.items),
+                more: review.more,
+            })?,
+            None => o.json(&review.items)?,
+        };
+        println!("{json}");
+        return Ok(());
+    }
+    print!("{}", memory_review_text(&review.items, review.more, &o));
+    Ok(())
+}
+
+/// `cal memory review`'s listing: each fact under why it is listed, with its id (for the
+/// app, `cal check` or `cal remember --replaces`) and the fact on the other side, then how
+/// many more there are when the list stopped at `today::MAX_REVIEW`.
+fn memory_review_text(items: &[crate::today::ReviewItem], more: usize, o: &Opts) -> String {
+    use crate::today::ReviewReason;
+    if items.is_empty() {
+        return format!(
+            "Nothing to review: no open flags or disputes, and agents replaced or recorded \
+             nothing in the last {MEMORY_REVIEW_DAYS} days.\n"
+        );
+    }
+    let mut out = format!(
+        "Memory to review: {} (what agents replaced or recorded in the last \
+         {MEMORY_REVIEW_DAYS} days; open disputes and flags)\n",
+        items.len()
+    );
+    let who = |source: &str| match source {
+        "agent" => "an agent",
+        "distill" => "a memory pass",
+        "repo" => "a repo import",
+        "review" => "a conflict review",
+        _ => "you",
+    };
+    for i in items {
+        let date = knowledge::fact_date(i.at);
+        let head = match i.reason {
+            ReviewReason::Flagged => format!(
+                "flagged {} by {} on {date}",
+                i.flag.as_deref().unwrap_or("stale"),
+                who(&i.source)
+            ),
+            ReviewReason::Disputed => format!("disputed ({}) since {date}", who(&i.source)),
+            ReviewReason::Replaced => format!("replaced by {} on {date}", who(&i.source)),
+            ReviewReason::Recorded => format!("recorded by {} on {date}", who(&i.source)),
+        };
+        let _ = writeln!(
+            out,
+            "\n  {head}  [{}, id {}]  {}",
+            i.kind, i.fact_id, i.project
+        );
+        let _ = writeln!(out, "    {}", o.shown(i.text.trim()));
+        if let Some(note) = &i.note {
+            let _ = writeln!(out, "    reason: {}", o.shown(note.trim()));
+        }
+        if let Some(other) = &i.other {
+            let by = if i.reason == ReviewReason::Disputed {
+                "disputed by"
+            } else {
+                "replaced by"
+            };
+            let _ = writeln!(out, "    {by} {}: {}", other.id, o.shown(other.text.trim()));
+        }
+        if i.reason == ReviewReason::Flagged {
+            let _ = writeln!(
+                out,
+                "    {}",
+                match (i.injectable, i.trusted) {
+                    (true, true) => "pinned or edited, so it stays in memory",
+                    (true, false) => "left out of memory until you keep or hide it",
+                    // An unpinned playbook or subagent fact: keeping it brings nothing back.
+                    (false, _) => "not part of injected memory either way",
+                }
+            );
+        }
+    }
+    if more > 0 {
+        let _ = write!(
+            out,
+            "\n...and {more} more not listed: settle these to see the rest.\n"
+        );
+    }
+    out.push_str("\nKeep, undo or hide them on Today in the app.\n");
+    out
 }
 
 /// `cal memory`'s listing: each fact with its provenance as the hook prints it
@@ -1893,20 +2016,30 @@ fn hook_output(conn: &Connection, req: &HookRequest) -> anyhow::Result<HookOutco
     // Filtered in SQL, so a repo full of recent auto memories still fills the window with
     // its other facts. Codex and Gemini CLI never see Claude's auto memory, so for them the
     // harvested facts are the point, labeled with where they came from.
-    let mem = if req.agent == HookAgent::Claude {
-        knowledge::get_project_memory_facts_excluding(
-            conn,
-            req.project,
-            per_kind,
-            knowledge::harvest::EXTRACTOR_CLAUDE_MEMORY,
-        )?
-    } else {
-        label_harvested(knowledge::get_project_memory_facts(
-            conn,
-            req.project,
-            per_kind,
-        )?)
-    };
+    // Facts naming a file the project's latest sessions edited go right after the pinned
+    // ones (`knowledge::working_set`); the branch comes from HEAD, with no git call. Any
+    // trouble there leaves the date order.
+    let working = knowledge::working_set::working_set(
+        conn,
+        req.project,
+        knowledge::working_set::head_branch(req.cwd).as_deref(),
+    )
+    .unwrap_or_default();
+    let claude = req.agent == HookAgent::Claude;
+    // The budget's caps after `-n`: the working-set facts take at most half of each kind. The
+    // session's own checkout too, as `file_edits` anchors it: a linked worktree's, whose
+    // sessions cite its paths while `req.project` keys on the main checkout.
+    let mem = knowledge::get_project_memory_for_working_set(
+        conn,
+        req.project,
+        &crate::indexer::file_edits::checkout_root(&req.cwd.to_string_lossy()),
+        per_kind,
+        budget.max_decisions,
+        budget.max_gotchas,
+        claude.then_some(knowledge::harvest::EXTRACTOR_CLAUDE_MEMORY),
+        &working,
+    )?;
+    let mem = if claude { mem } else { label_harvested(mem) };
     let pinned_todo = mem.open_todos.iter().any(|t| t.pinned);
     let has_facts = !mem.decisions.is_empty() || !mem.gotchas.is_empty() || pinned_todo;
     // A compacted session is its own recent activity: facts only.
@@ -2828,8 +2961,12 @@ fn cmd_audit_pr(args: &[String]) -> anyhow::Result<()> {
 
     // 3. Repo-scoped recurring errors (no error→file edge exists; the caller intersects with the
     //    touched-thread set client-side). 4. Repo project memory (decisions/gotchas/open TODOs).
+    //    Only errors that name what went wrong, as `cal issues` lists them: a CI exit-code line
+    //    tells the auditor nothing about the change.
     let since = chrono::Utc::now().timestamp() - 180 * 24 * 3600;
-    let errors = issues::recurring_issues(&conn, Some(&key), since, 20).unwrap_or_default();
+    let errors = issues::recurring_issues(&conn, Some(&key), since, issues::CLUSTER_TABLE_CAP)
+        .map(|ranked| issues::specific_clusters(ranked, 20))
+        .unwrap_or_default();
     let memory = knowledge::get_project_memory(&conn, &key, 20).ok();
 
     let bundle = AuditPrOutput {
@@ -4537,10 +4674,12 @@ fn cursor_conversation_id(v: &serde_json::Value) -> Option<&str> {
     })
 }
 
-/// `cal issues [project] [-n N] [--json]`: recurring errors across sessions (last 180 days),
-/// each with the commit that fixed it once one is known.
+/// `cal issues [project] [-n N] [--all] [--json]`: recurring errors across sessions (last 180
+/// days), each with the commit that fixed it once one is known. Only errors that say what
+/// went wrong, unless `--all` adds the generic ones (`error:`, a CI exit-code line).
 fn cmd_issues(args: &[String]) -> anyhow::Result<()> {
-    let o = parse(args)?;
+    let (all, rest) = take_flag(args, "--all");
+    let o = parse(&rest)?;
     let project = if o.positional.is_empty() {
         None
     } else {
@@ -4548,12 +4687,13 @@ fn cmd_issues(args: &[String]) -> anyhow::Result<()> {
     };
     let conn = open_db()?;
     let since = chrono::Utc::now().timestamp() - 180 * 86_400;
-    let found = issues::recurring_issues_with_fixes(
+    let found = issues::listed_issues(
         &conn,
         project.as_deref(),
         search::ProjectMatch::Substring,
         since,
         o.limit.unwrap_or(20) as usize,
+        all,
     )?;
     if o.json {
         // The unversioned output keeps the bare clusters it printed before fixes existed.
@@ -5191,6 +5331,100 @@ mod tests {
         assert!(
             out.contains("    replaced on 2026-10-03 by fact 2: use JSON for the cache\n"),
             "{out}"
+        );
+    }
+
+    /// `cal memory review`: each fact under why it is listed, with its id, the fact on the
+    /// other side, a flag's reason and whether the flag took it out of memory; cleaned for the
+    /// terminal unless `--raw`.
+    #[test]
+    fn memory_review_text_names_why_each_fact_is_listed() {
+        use crate::today::{ReviewItem, ReviewOther, ReviewReason};
+        let item = |reason, fact_id, text: &str, source: &str| ReviewItem {
+            reason,
+            fact_id,
+            kind: "decision".into(),
+            text: text.into(),
+            project: "/p".into(),
+            at: OCT_3,
+            source: source.into(),
+            other: None,
+            flag: None,
+            note: None,
+            trusted: false,
+            injectable: true,
+        };
+        // Terminal escapes in stored text never reach the terminal (as `cal memory`).
+        let hostile = "use \u{1B}]0;pwned\u{7}JSON \u{202E}now";
+        let items = vec![
+            ReviewItem {
+                flag: Some("stale".into()),
+                note: Some("the v3 API accepts any amount".into()),
+                ..item(
+                    ReviewReason::Flagged,
+                    4,
+                    "the sandbox rejects small amounts",
+                    "agent",
+                )
+            },
+            ReviewItem {
+                other: Some(ReviewOther {
+                    id: 6,
+                    text: "use JSON for the cache".into(),
+                }),
+                ..item(
+                    ReviewReason::Replaced,
+                    5,
+                    "use bincode for the cache",
+                    "agent",
+                )
+            },
+            item(ReviewReason::Recorded, 7, hostile, "agent"),
+        ];
+        let out = memory_review_text(&items, 0, &Opts::default());
+        assert!(out.starts_with("Memory to review: 3 "), "{out}");
+        assert!(!out.contains("more not listed"), "{out}");
+        assert!(
+            out.contains(
+                "  flagged stale by an agent on 2026-10-03  [decision, id 4]  /p\n    \
+                 the sandbox rejects small amounts\n    reason: the v3 API accepts any amount\n    \
+                 left out of memory until you keep or hide it\n"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains("    replaced by 6: use JSON for the cache\n"),
+            "{out}"
+        );
+        assert!(!out.contains(hostile), "{out}");
+        let raw = Opts {
+            raw: true,
+            ..Opts::default()
+        };
+        assert!(memory_review_text(&items, 0, &raw).contains(hostile));
+        assert!(memory_review_text(&[], 0, &Opts::default()).starts_with("Nothing to review"));
+        // A flag says truthfully what it does to memory, and a cut list says how much is left.
+        let flagged = |trusted, injectable| ReviewItem {
+            trusted,
+            injectable,
+            ..items[0].clone()
+        };
+        let cut = memory_review_text(
+            &[flagged(true, true), flagged(true, false)],
+            12,
+            &Opts::default(),
+        );
+        assert!(
+            cut.contains("    pinned or edited, so it stays in memory\n"),
+            "{cut}"
+        );
+        assert!(
+            cut.contains("    not part of injected memory either way\n"),
+            "{cut}"
+        );
+        assert!(
+            cut.contains("\n...and 12 more not listed: settle these to see the rest.\n"),
+            "{cut}"
         );
     }
 
@@ -5860,6 +6094,29 @@ mod tests {
         assert!(out.chars().count() < 9_000);
         assert!(out.contains("could not compile"));
         assert!(hook_tool_output(&serde_json::json!({})).trim().is_empty());
+
+        // A failing Python script: the hook looks up the exception line, never the header
+        // that every Python error shares, nor a frame's source line.
+        let traceback = serde_json::json!({
+            "hook_event_name": "PostToolUseFailure",
+            "error": "Exit code 1\nTraceback (most recent call last):\n  \
+                      File \"/srv/app/load.py\", line 12, in <module>\n    \
+                      except KeyError: pass\nKeyError: 'user_id'"
+        });
+        assert_eq!(
+            issues::extract_errors(&hook_tool_output(&traceback)),
+            ["KeyError: 'user_id'"]
+        );
+        // `cat -n` of a file, then a script read without a gutter: file content and a
+        // command, so the hook exits before it opens the index. Each line is one only its
+        // own rule rejects (the gutter, the `echo`).
+        let gutter = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "tool_response": {"stdout": "    40\tTypeError: this line is in a file that was read\n\
+                              echo \"error: the release tag is missing\" >&2\n",
+                              "stderr": ""}
+        });
+        assert!(issues::extract_errors(&hook_tool_output(&gutter)).is_empty());
     }
 
     /// A temp index where `error[E0425]` was hit twice in `project` and a session that then
@@ -6477,6 +6734,191 @@ mod tests {
         let out = printed(hook_output(&conn, &hook_req("compact")).unwrap());
         assert!(
             out.contains("signing key") && !out.contains("Recent sessions"),
+            "{out}"
+        );
+    }
+
+    /// A playbook line for `hook_conn`'s repo, newer than its session's distilled facts.
+    fn hook_playbook(conn: &Connection, tid: i64, i: i64) -> String {
+        let text = format!(
+            "error[E0308]: mismatched types ({i}): seen 2 times; fixed in abc{i:04}, see thread {tid}"
+        );
+        let origin = format!("playbook:sig{i}@{HOOK_PROJ}");
+        let now = chrono::Utc::now().timestamp();
+        knowledge::upsert_playbook(conn, &origin, tid, &text, now + i).unwrap();
+        text
+    }
+
+    /// Unpinned playbooks take no slot in the SessionStart block
+    /// (`knowledge::MemoryQuery::playbooks`): a repo whose only facts are playbooks has no
+    /// memory (the digest, or silence after compaction, as for a repo never distilled), one
+    /// with a distilled gotcha too injects the gotcha alone, and a pinned playbook is the
+    /// user's choice and is injected.
+    #[test]
+    fn hook_injects_no_unpinned_playbook() {
+        let (conn, tid) = hook_conn();
+        let playbooks: Vec<String> = (0..3).map(|i| hook_playbook(&conn, tid, i)).collect();
+        let out = printed(hook_output(&conn, &hook_req("startup")).unwrap());
+        assert!(out.starts_with("## Recent sessions in this repo"), "{out}");
+        assert!(!out.contains("mismatched types"), "{out}");
+        assert!(silent(hook_output(&conn, &hook_req("compact")).unwrap()).contains("facts only"));
+
+        dts::fact(
+            &conn,
+            tid,
+            "gotcha",
+            "the release job needs the signing key",
+            "llm",
+        );
+        for source in ["startup", "compact"] {
+            let out = printed(hook_output(&conn, &hook_req(source)).unwrap());
+            assert!(
+                out.contains("the release job needs the signing key"),
+                "{out}"
+            );
+            assert!(!out.contains("mismatched types"), "{source}: {out}");
+        }
+
+        conn.execute(
+            "UPDATE facts SET pinned = 1 WHERE text = ?1",
+            [&playbooks[1]],
+        )
+        .unwrap();
+        let out = printed(hook_output(&conn, &hook_req("startup")).unwrap());
+        assert!(out.contains("mismatched types (1)"), "{out}");
+        assert!(
+            !out.contains("mismatched types (0)") && !out.contains("mismatched types (2)"),
+            "{out}"
+        );
+    }
+
+    /// `cal memory` is a list a person reads: text and plain `--json` keep every playbook,
+    /// after the distilled gotchas, though each is newer than they are, and a `--limit`
+    /// keeps the facts it kept before the reorder.
+    #[test]
+    fn cal_memory_lists_playbooks_after_the_other_gotchas() {
+        let (conn, tid) = hook_conn();
+        dts::fact(
+            &conn,
+            tid,
+            "gotcha",
+            "the release job needs the signing key",
+            "llm",
+        );
+        let playbook = hook_playbook(&conn, tid, 0);
+        let o = parse(&argv(&["--json"])).unwrap();
+        let mem = knowledge::get_project_memory_with(&conn, HOOK_PROJ, &memory_query(&o)).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&o.json_object(&mem).unwrap()).unwrap();
+        let gotchas: Vec<&str> = json["gotchas"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|g| g["text"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            gotchas,
+            ["the release job needs the signing key", playbook.as_str()]
+        );
+        let text = memory_text(HOOK_PROJ, &mem, &Opts::default());
+        let at = |needle: &str| {
+            text.find(needle)
+                .unwrap_or_else(|| panic!("{needle}: {text}"))
+        };
+        assert!(at("the release job needs the signing key") < at("mismatched types"));
+
+        // A limit below the other gotchas keeps the facts it printed before the reorder (the
+        // newest, here the playbook), not the older gotcha in its place.
+        let o = parse(&argv(&["--json", "--limit", "1"])).unwrap();
+        let mem = knowledge::get_project_memory_with(&conn, HOOK_PROJ, &memory_query(&o)).unwrap();
+        let texts: Vec<&str> = mem.gotchas.iter().map(|g| g.text.as_str()).collect();
+        assert_eq!(texts, [playbook.as_str()]);
+    }
+
+    /// The working set as the hook wires it (`knowledge::working_set`): the branch is read
+    /// from the checkout at `cwd`, not from the project key, so a buried fact naming the file
+    /// the branch's session edited reaches startup and compact even though a newer session on
+    /// main edited more files than the set holds. Claude never gets the harvested copy of
+    /// its own memory; other agents get it, labeled.
+    #[test]
+    fn hook_puts_facts_about_the_branch_files_first() {
+        const PROJ: &str = "/r/hook-ws";
+        let dir = crate::db::test_support::TestDir::new("hook_ws");
+        let repo = dir.parent().unwrap().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::write(repo.join(".git/HEAD"), "ref: refs/heads/feat/ws\n").unwrap();
+
+        let mut conn = dts::temp_db("hook_ws");
+        let old = dts::session(&mut conn, "ws-old", PROJ, "old", 90_000, &["go"]);
+        dts::fact(
+            &conn,
+            old,
+            "decision",
+            "Invoice totals round once, in `src/billing/invoice.rs`",
+            "llm",
+        );
+        dts::fact(
+            &conn,
+            old,
+            "gotcha",
+            "Harvested note on `src/billing/invoice.rs`",
+            knowledge::harvest::EXTRACTOR_CLAUDE_MEMORY,
+        );
+        for i in 0..12i64 {
+            let t = dts::session(
+                &mut conn,
+                &format!("ws-{i}"),
+                PROJ,
+                "s",
+                80_000 - i * 1000,
+                &[],
+            );
+            dts::fact(&conn, t, "decision", &format!("Newer decision {i}"), "llm");
+            dts::fact(&conn, t, "gotcha", &format!("Newer gotcha {i}"), "llm");
+        }
+        let feat = dts::session(&mut conn, "ws-feat", PROJ, "feat", 5_000, &[]);
+        let main = dts::session(&mut conn, "ws-main", PROJ, "main", 60, &[]);
+        conn.execute(
+            "UPDATE threads SET git_branch = 'feat/ws' WHERE id = ?1",
+            [feat],
+        )
+        .unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let edit = |t: i64, path: &str, ts: i64| {
+            conn.execute(
+                "INSERT INTO file_edits (thread_id, path, op, ts) VALUES (?1, ?2, 'edit', ?3)",
+                rusqlite::params![t, path, ts],
+            )
+            .unwrap();
+        };
+        edit(feat, "apps/api/src/billing/invoice.rs", now - 5_000);
+        for i in 0..25i64 {
+            edit(main, &format!("apps/api/src/other_{i}.rs"), now - 60 + i);
+        }
+
+        let req = |source: &'static str| HookRequest {
+            agent: HookAgent::Claude,
+            source,
+            cwd: repo.as_path(),
+            project: PROJ,
+            limit: None,
+            max_chars: None,
+            transcript: None,
+        };
+        for source in ["startup", "compact"] {
+            let out = printed(hook_output(&conn, &req(source)).unwrap());
+            assert!(out.contains("Invoice totals round once"), "{source}: {out}");
+            assert!(!out.contains("Harvested note"), "{source}: {out}");
+        }
+        // The project key is no checkout: no branch, so main's newer edits fill the set.
+        let mut keyed = req("startup");
+        keyed.cwd = std::path::Path::new(PROJ);
+        let out = printed(hook_output(&conn, &keyed).unwrap());
+        assert!(!out.contains("Invoice totals round once"), "{out}");
+        let mut codex = req("startup");
+        codex.agent = HookAgent::Codex;
+        let out = printed(hook_output(&conn, &codex).unwrap());
+        assert!(
+            out.contains("Invoice totals round once") && out.contains("Harvested note"),
             "{out}"
         );
     }
@@ -7787,8 +8229,20 @@ mod tests {
             for args in [
                 vec!["memory", project.as_str()],
                 vec!["memory", project.as_str(), "--json"],
+                vec!["memory", "review"],
+                vec![
+                    "memory",
+                    "review",
+                    "-p",
+                    project.as_str(),
+                    "--json-version",
+                    "1",
+                ],
                 vec!["stats"],
                 vec!["stats", "--json-version", "1"],
+                vec!["issues"],
+                vec!["issues", "--all"],
+                vec!["issues", "--json"],
                 // What a user runs when the hooks went quiet after an update: it must answer
                 // on exactly this index, and say the schema is behind.
                 vec!["doctor"],

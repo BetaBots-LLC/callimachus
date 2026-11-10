@@ -224,6 +224,22 @@ pub fn search(conn: &Connection, query: &str, filters: &SearchFilters) -> Result
     Ok(cap_per_thread(hits, limit))
 }
 
+/// How many rows the strict (every token) keyword pass alone matches, up to `limit`: 0 means
+/// whatever [`search`] returns came from the OR back-fill. For the eval's loose-rerun probe
+/// (`eval::loose_rerun`), which only measures.
+#[cfg(test)]
+pub(crate) fn strict_pass_len(
+    conn: &Connection,
+    query: &str,
+    filters: &SearchFilters,
+    limit: i64,
+) -> Result<usize> {
+    match FtsQuery::parse(query) {
+        Some(q) => Ok(run_fts(conn, &q.strict, filters, limit)?.len()),
+        None => Ok(0),
+    }
+}
+
 /// One FTS pass for [`search`], appended to `hits` (deduped, total capped at `fetch`).
 ///
 /// A pass that comes back with all `fetch` rows was cut off, and when a few long threads

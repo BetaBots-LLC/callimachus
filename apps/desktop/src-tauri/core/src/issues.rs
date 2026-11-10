@@ -88,19 +88,101 @@ const FILES_PER_ERROR: usize = 4;
 /// `--> src/a.rs:3:5` on the next line, Python's `File "a.py", line 3` on the ones before, a
 /// JS stack's `at f (a.js:1:2)` after). `:line:col` suffixes are stripped. The playbook
 /// resolver matches these against the files a session edited.
+///
+/// Three kinds of line that carry an error marker are not errors: file content read with a
+/// line-number gutter ([`behind_gutter`]), a source line that only names an error variable
+/// ([`reads_as_code`]), and a Python traceback's header and frames. A traceback yields its
+/// exception line instead (`KeyError: 'id'`), filed under its frames' files, the session's
+/// own code innermost first ([`traceback_files`]): the header alone was the top recurring
+/// error on a large index (403 sightings), one cluster that merged every Python error. A
+/// pytest failure counts once: its short-summary line (`FAILED <node> - <message>`) shares
+/// the `E` line's signature and adds the node's test file to it. It runs inside the
+/// `recall-error` hook after every shell command, so it stays a single pass with no
+/// allocation per plain line.
 pub fn extract_errors_with_files(text: &str) -> Vec<(String, Vec<String>)> {
     let lines: Vec<&str> = text.lines().collect();
-    let mut out = Vec::new();
-    let mut seen = HashSet::new();
+    let mut out: Vec<(String, Vec<String>)> = Vec::new();
+    // Each signature taken so far, with its place in `out`.
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    // Inside a traceback: the header's indent, and its frames' files so far, outermost first.
+    let mut traceback: Option<(usize, Vec<&str>)> = None;
     for (i, raw) in lines.iter().enumerate() {
+        if behind_gutter(raw) {
+            continue;
+        }
         let line = raw.trim();
+        let indent = raw.len() - raw.trim_start().len();
+        // The exception line that closes a traceback counts even without a marker
+        // (`http.client.InvalidURL: ...`), and is filed under the block's frames.
+        let mut closes_traceback: Option<Vec<&str>> = None;
+        if let Some((header_indent, frames)) = traceback.as_mut() {
+            // Frames (`File "a.py", line 3, in f`), their source lines and 3.11's carets sit
+            // deeper than the header; the first line that does not ends the block.
+            if line.is_empty() || indent > *header_indent {
+                if let Some(path) = python_frame_file(line) {
+                    // Bounded: a recursion error prints a thousand frames.
+                    if frames.len() == TRACEBACK_FRAMES {
+                        frames.remove(0);
+                    }
+                    frames.push(path);
+                }
+                continue;
+            }
+            let frames = std::mem::take(frames);
+            traceback = None;
+            if is_python_exception(line) {
+                closes_traceback = Some(frames);
+            }
+        }
+        if starts_with_ci(line, TRACEBACK_HEADER) {
+            traceback = Some((indent, Vec::new()));
+            continue;
+        }
         if line.len() < 6 || line.len() > 400 {
             continue;
         }
-        if !is_error_line(line) || !seen.insert(normalize(line)) {
+        if !(closes_traceback.is_some() || is_error_line(line)) || reads_as_code(line) {
             continue;
         }
-        let mut files: Vec<String> = Vec::new();
+        let key = normalize(line);
+        // pytest's short summary repeats the `E` line of the failure above it ([`normalize`]
+        // reads both as the message): it adds only its test file, which that line's
+        // neighbours do not name. A summary cut to the terminal width ends in `...` and
+        // repeats the one whole error it starts. When two or more start with it (two
+        // `ValueError: invalid ...`), it repeats one of them, which one is unknown: it adds
+        // nothing. When none does (`--tb=no` prints only summaries, themselves cut), it is an
+        // error of its own: matching a cut key merged two different failures.
+        let node_file = pytest_node_file(line);
+        let cut = key.strip_suffix("...").filter(|_| node_file.is_some());
+        let earlier = match (seen.get(&key), cut) {
+            (Some(&at), _) => Some(at),
+            (None, Some(cut)) => {
+                let mut whole = seen
+                    .iter()
+                    .filter(|(k, _)| k.starts_with(cut) && !k.ends_with("..."))
+                    .map(|(_, &at)| at);
+                match (whole.next(), whole.next()) {
+                    (Some(_), Some(_)) => continue,
+                    (at, _) => at,
+                }
+            }
+            (None, None) => None,
+        };
+        if let Some(at) = earlier {
+            let files = &mut out[at].1;
+            if let Some(f) = node_file.filter(|f| !files.contains(f)) {
+                if files.len() < FILES_PER_ERROR {
+                    files.push(f);
+                }
+            }
+            continue;
+        }
+        seen.insert(key, out.len());
+        let mut files: Vec<String> = match &closes_traceback {
+            Some(frames) => traceback_files(frames),
+            None => Vec::new(),
+        };
+        files.extend(node_file);
         let around = lines[i.saturating_sub(2)..(i + 4).min(lines.len())].iter();
         for tok in around.flat_map(|l| l.split_whitespace()) {
             if files.len() >= FILES_PER_ERROR {
@@ -115,6 +197,204 @@ pub fn extract_errors_with_files(text: &str) -> Vec<(String, Vec<String>)> {
         out.push((line.to_string(), files));
     }
     out
+}
+
+/// Python's traceback header, lowercase.
+const TRACEBACK_HEADER: &str = "traceback (most recent call last)";
+
+/// Whether `raw` is a line of file content behind a line-number gutter: Claude Code's Read
+/// tool and `cat -n` print `   12\t...` (older Read output `   12→...`). Those are a file's
+/// lines, not an error that happened: on a large index the source line
+/// `error: error instanceof Error ? error.message : String(error),` read from files was a
+/// recurring "error" with 43 sightings.
+fn behind_gutter(raw: &str) -> bool {
+    let rest = raw.trim_start_matches(' ');
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    (1..=7).contains(&digits)
+        && (rest[digits..].starts_with('\t') || rest[digits..].starts_with('\u{2192}'))
+}
+
+/// Whether an error-marked line reads as source code rather than as a message: outside
+/// quotes it has an arrow function (`onError: (error) => toast.error(...)`), an `instanceof`
+/// test or a `? :` conditional, or it ends by opening a block or continuing a list
+/// (`error: {`, `} catch (error) {`, `error: { code: "x", message: "y" },`). Diffs, grep
+/// hits and pasted code carry these past the Read gutter. Quoted text is skipped, so a
+/// TypeScript message about a type `'(e: Event) => void'` or rustc's `` expected `=>` ``
+/// stays an error, and so does a message that ends by opening the payload it prints
+/// (`MCP error -32602: Invalid arguments for tool lookup: [`, 9 sightings on a large index
+/// that the opener alone dropped): its text before the last colon has a `: ` of its own and
+/// no `{`, where a key opening a value (`error: {`, `"errors": [`, `return { error: {`) has
+/// none and a nested key (`json({ error: e.message, details: {`) sits in an open object.
+/// Node's print of an error object without its stack (`[Error: EACCES: permission denied,
+/// open '/etc/x'] {`, then its `errno` and `code` lines) stays an error too, also behind
+/// the REPL's `Uncaught ` or as the value of a logged object's key (`error: [Error: ...] {`).
+/// An `echo` or `printf` command ([`is_print_command`]) is what a script or workflow file
+/// read without a gutter runs, not what it prints.
+fn reads_as_code(line: &str) -> bool {
+    if is_print_command(line) {
+        return true;
+    }
+    if let Some(rest) = line.strip_suffix(['{', '[']) {
+        let rest = rest.trim_end();
+        let printed = rest
+            .strip_prefix("Uncaught ")
+            .or_else(|| {
+                let (key, value) = rest.split_once(": ")?;
+                let is_key = !key.is_empty()
+                    && key.bytes().all(|c| {
+                        c.is_ascii_alphanumeric() || matches!(c, b'_' | b'$' | b'\'' | b'"' | b'-')
+                    });
+                is_key.then_some(value)
+            })
+            .unwrap_or(rest);
+        let node_error =
+            printed.starts_with('[') && printed.ends_with(']') && printed.contains(": ");
+        match rest.strip_suffix(':') {
+            Some(message) if message.contains(": ") && !message.contains('{') => {}
+            _ if node_error => {}
+            _ => return true,
+        }
+    } else if line.ends_with(['(', ',', ';']) {
+        return true;
+    }
+    let b = line.as_bytes();
+    let mut quote: Option<u8> = None;
+    let mut question = false;
+    for (i, &c) in b.iter().enumerate() {
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            b'"' | b'`' => quote = Some(c),
+            // An apostrophe opens a quote only where a quote can start, so the one in
+            // "can't" does not hide the rest of the line.
+            b'\'' if i == 0 || !b[i - 1].is_ascii_alphanumeric() => quote = Some(c),
+            b'=' if b.get(i + 1) == Some(&b'>') => return true,
+            b'?' if i > 0 && b[i - 1] == b' ' && b.get(i + 1) == Some(&b' ') => question = true,
+            b':' if question && b[i - 1] == b' ' && b.get(i + 1) == Some(&b' ') => return true,
+            b' ' if b[i..].starts_with(b" instanceof ") => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Whether `line` runs `echo` or `printf`: bare, or as a diff's added or removed line
+/// (`+    echo "Error: ..." >&2`), a `set -x` trace (`+ echo ...`), a prompt (`$ echo ...`)
+/// or a workflow step (`run: echo ...`, `- run: echo ...`). Each of these forms came out
+/// as an error when only a bare `echo ` at the start was a command. `echo: write error:
+/// Broken pipe` is the shell's own error.
+fn is_print_command(line: &str) -> bool {
+    let rest = line.trim_start_matches(['+', '-', ' ', '\t']);
+    let rest = rest.strip_prefix("$ ").unwrap_or(rest).trim_start();
+    let rest = rest.strip_prefix("run: ").unwrap_or(rest).trim_start();
+    rest.starts_with("echo ") || rest.starts_with("printf ")
+}
+
+/// The file of a traceback frame line (`File "/app/a.py", line 3, in f`), as written.
+fn python_frame_file(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix("File \"")?;
+    let end = rest.find('"')?;
+    Some(&rest[..end])
+}
+
+/// Most frame files a traceback keeps while it is read (the innermost ones).
+const TRACEBACK_FRAMES: usize = 32;
+
+/// The files a traceback's exception line is filed under: the frames in the session's own
+/// code, innermost first, else the innermost frame. An exception raised inside a library
+/// (`json.loads` failing in `json/decoder.py`) has its innermost frame there, a file no
+/// session edits, so filing it there alone left the resolver nothing to match.
+fn traceback_files(frames: &[&str]) -> Vec<String> {
+    let mut files: Vec<String> = Vec::new();
+    let own = frames.iter().rev().filter(|f| !is_library_frame(f));
+    for f in own.filter_map(|f| file_token(f)) {
+        if files.len() == FILES_PER_ERROR {
+            break;
+        }
+        if !files.contains(&f) {
+            files.push(f);
+        }
+    }
+    if files.is_empty() {
+        files.extend(frames.last().and_then(|f| file_token(f)));
+    }
+    files
+}
+
+/// Whether a traceback frame is the interpreter's or an installed package's: the standard
+/// library (`/usr/lib/python3.12/json/decoder.py`, a venv's `lib/python3.12/`, Windows'
+/// `\Lib\`), `site-packages` / `dist-packages`, or a frozen or generated module
+/// (`<frozen runpy>`, `<string>`).
+fn is_library_frame(path: &str) -> bool {
+    path.starts_with('<')
+        || [
+            "site-packages",
+            "dist-packages",
+            "/lib/python",
+            "\\lib\\python",
+            "\\Lib\\",
+        ]
+        .iter()
+        .any(|p| path.contains(p))
+}
+
+/// Builtin exceptions whose names end in none of `Error`, `Exception` or `Warning`.
+const PYTHON_OTHER_EXCEPTIONS: &[&str] = &[
+    "BaseExceptionGroup",
+    "ExceptionGroup",
+    "GeneratorExit",
+    "KeyboardInterrupt",
+    "StopAsyncIteration",
+    "StopIteration",
+    "SystemExit",
+];
+
+/// Whether `line` is the exception line that closes a traceback: an exception's name, then
+/// `: ` and the message. The name ends in `Error`, `Exception` or `Warning` (`KeyError`,
+/// `json.decoder.JSONDecodeError`, `UserWarning`; bare `Warning` is a console prefix), is
+/// another builtin ([`PYTHON_OTHER_EXCEPTIONS`]), is a module's `error` (`re.error`), or is
+/// a class in a lowercase module (`jinja2.exceptions.TemplateNotFound`,
+/// `subprocess.TimeoutExpired`). Any capitalized word was taken before, and a traceback cut
+/// off before its exception line (the head and tail of a long log are joined) then made
+/// the next line an error: a server's `INFO:     Application shutdown complete.` or
+/// `Status: 404`. A bare name (`AssertionError`) says nothing more than the header did and
+/// is not taken.
+fn is_python_exception(line: &str) -> bool {
+    let Some((name, message)) = line.split_once(": ") else {
+        return false;
+    };
+    if message.trim().is_empty()
+        || name.len() > 120
+        || !name
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'.')
+    {
+        return false;
+    }
+    let (module, last) = match name.rsplit_once('.') {
+        Some((module, last)) => (Some(module), last),
+        None => (None, name),
+    };
+    let in_module = module.is_some_and(|m| {
+        m.split('.')
+            .all(|seg| seg.starts_with(|c: char| c.is_ascii_lowercase() || c == '_'))
+    });
+    let class = last.starts_with(|c: char| c.is_ascii_uppercase())
+        && last.bytes().any(|c| c.is_ascii_lowercase());
+    (last.ends_with("Error") || last.ends_with("Exception"))
+        || (last.ends_with("Warning") && last != "Warning")
+        || PYTHON_OTHER_EXCEPTIONS.contains(&last)
+        || (in_module && (last == "error" || class))
+}
+
+/// Whether `hay` starts with `needle` (ASCII lowercase), ignoring ASCII case.
+fn starts_with_ci(hay: &str, needle: &str) -> bool {
+    hay.len() >= needle.len()
+        && hay.as_bytes()[..needle.len()].eq_ignore_ascii_case(needle.as_bytes())
 }
 
 /// A token that names a source file, as written minus quotes, brackets and a `:line:col`
@@ -157,30 +437,45 @@ fn file_token(tok: &str) -> Option<String> {
         && stem
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'+' | b'@'));
-    (ext_ok && stem_ok && !t.contains(' ')).then(|| t.to_string())
+    // A duration (`0.03s` in pytest's closing `1 failed in 0.03s`), which filed a pytest
+    // failure under the run's timing.
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let duration = digits(stem) && ext.strip_suffix('s').is_some_and(digits);
+    (ext_ok && stem_ok && !duration && !t.contains(' ')).then(|| t.to_string())
 }
 
 /// Marker check. Looks at the first ~60 chars so a stray "error:" deep in a prose paragraph
-/// doesn't match, while real errors (which lead the line) do.
+/// doesn't match, while real errors (which lead the line) do. A Python traceback's header is
+/// no marker ([`extract_errors_with_files`] takes the block's exception line instead).
 fn is_error_line(line: &str) -> bool {
-    let lower = line.to_ascii_lowercase();
-    // Char-safe: a byte slice could land inside a multi-byte char (e.g. box-drawing `━` from
-    // cargo output) and panic. Take the first 64 chars instead.
-    let head: String = lower.chars().take(64).collect();
+    // The first 64 chars, lowercased in a stack buffer: this runs on every line of every
+    // candidate message and of every shell command's output in the `recall-error` hook,
+    // where two Strings per line were most of its allocations. Char-safe: a byte slice
+    // could land inside a multi-byte char (e.g. box-drawing `━` from cargo output) and panic.
+    let head = match line.char_indices().nth(64) {
+        Some((at, _)) => &line[..at],
+        None => line,
+    };
+    let mut buf = [0u8; 256];
+    let buf = &mut buf[..head.len()];
+    buf.copy_from_slice(head.as_bytes());
+    buf.make_ascii_lowercase();
+    // ASCII lowercasing keeps it UTF-8.
+    let Ok(head) = std::str::from_utf8(buf) else {
+        return false;
+    };
     head.starts_with("error[")
-        || head.starts_with("error:")
         || head.starts_with("error ")
         || head.starts_with("fatal:")
         || head.starts_with("fatal error")
         || head.starts_with("panic:")
-        || head.contains("error:")        // TypeError:/ValueError:/RuntimeError: ...
-        || head.contains("exception:")
+        || has_marker(head, line, "error:") // error:, TypeError:/ValueError:/RuntimeError: ...
+        || has_marker(head, line, "exception:")
         // tsc: `a.ts(3,5): error TS2322: ...` (plain) and `a.ts:3:5 - error TS2322: ...`
         // (pretty) carry no `error:`, and most of its messages no other marker either.
         || head.contains("): error ts")
         || head.contains(" - error ts")
         || head.contains("panicked at")
-        || head.contains("traceback (most recent call last)")
         || head.contains("command not found")
         || head.contains("undefined reference")
         || head.contains("cannot find")
@@ -188,13 +483,65 @@ fn is_error_line(line: &str) -> bool {
         || head.contains("assertion `")
         || head.contains("no such file")
         || head.contains("segmentation fault")
+        || pytest_failure(line)
+}
+
+/// Whether `head` holds `marker` (one ending in `:`) somewhere it is not directly followed by
+/// another `:`. A Rust path (`EmbedError::Init`, `io::Error::new`) and a workflow script's
+/// `echo "::error::..."` hold `error:` only as part of `error::`: on a large index such text
+/// made a recurring "error" with a recorded fix. `foo::Error: bad input` is still one. The
+/// next byte is read from `line`, of which `head` is a lowercased byte prefix: a path whose
+/// `error:` ends the head (53 chars of prose, then `EmbedError::Init`) is no marker either.
+fn has_marker(head: &str, line: &str, marker: &str) -> bool {
+    head.match_indices(marker)
+        .any(|(at, _)| line.as_bytes().get(at + marker.len()) != Some(&b':'))
+}
+
+/// Whether `line` is pytest's short summary of a failed test whose message is an error
+/// (`FAILED tests/a.py::TestParseError::test_empty - ValueError: empty input`). The node id
+/// comes first and a long one pushes the message past the head; a class named `...Error`
+/// used to supply the marker by accident (`testparseerror::`), which [`has_marker`] no
+/// longer takes. The verbose status line (`tests/a.py::TestParseError::test_empty FAILED`)
+/// holds no message and is not taken.
+fn pytest_failure(line: &str) -> bool {
+    line.strip_prefix("FAILED ")
+        .and_then(|rest| rest.split_once(" - "))
+        .is_some_and(|(_, message)| is_error_line(message) || is_python_exception(message))
+}
+
+/// The test file of pytest's short-summary line (`FAILED tests/a.py::test_x - ...`): its
+/// node id up to the first `::`. Only an error line reaches here, so a plain line allocates
+/// nothing.
+fn pytest_node_file(line: &str) -> Option<String> {
+    let (node, _) = line.strip_prefix("FAILED ")?.split_once(" - ")?;
+    file_token(node.split_once("::")?.0)
+}
+
+/// The error a pytest line reports: an exception line without pytest's `E` gutter
+/// (`E       ValueError: empty input`), a short-summary line's message without its node id
+/// (`FAILED tests/a.py::test_x - ValueError: empty input`), any other line as it is. One
+/// failure printed both and mined two clusters.
+fn pytest_message(line: &str) -> &str {
+    let line = line.trim_start();
+    if let Some(rest) = line.strip_prefix("E   ") {
+        return rest.trim_start();
+    }
+    match line
+        .strip_prefix("FAILED ")
+        .and_then(|r| r.split_once(" - "))
+    {
+        Some((_, message)) => message,
+        None => line,
+    }
 }
 
 /// Collapse a raw error line to a recurrence key: lowercase, with paths, quoted identifiers,
 /// line:col, and hashes/long numbers replaced by placeholders, so the same error with different
-/// specifics groups together. Token-based so it stays dependency-free.
+/// specifics groups together, and a pytest line read as its message ([`pytest_message`]).
+/// Token-based so it stays dependency-free.
 pub fn normalize(line: &str) -> String {
-    line.split_whitespace()
+    pytest_message(line)
+        .split_whitespace()
         .map(canon_token)
         .filter(|t| !t.is_empty())
         .collect::<Vec<_>>()
@@ -255,39 +602,84 @@ pub fn recurring_issues_cached(
     })
 }
 
-/// The candidate fetch for [`recurring_issues`]: error-ish messages since `since`, newest
-/// first, as (text head + tail, ts, thread_id, the thread's project key).
+/// Which sessions' messages mining reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sightings {
+    /// Top-level sessions' user and tool rows, plus subagents' tool rows filed under their
+    /// parent session: on a large index 90% of error output lands in subagent transcripts.
+    All,
+    /// Top-level sessions only, for Today's live strip, which lists top-level sessions and
+    /// must stay a fraction of a second: the subagent arm reads several times the text.
+    TopLevel,
+}
+
+/// One candidate fetch of [`mine`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Arm {
+    /// Top-level sessions: tool output and the user's turns (a pasted log is an error the
+    /// user hit too).
+    TopLevel,
+    /// Subagent transcripts, tool output only: their `user` turns are the orchestrator's
+    /// prompts, full of quoted code and of errors quoted from other sessions.
+    Subagents,
+}
+
+/// Most candidate rows each arm reads, newest first. On a 5.3 GB index the top-level arm
+/// had 19k rows over 180 days, under its cap. Subagents had 120k, 37k of them over 8 KB, and
+/// a long row is read whole before its head and tail are cut, so their cap is what bounds a
+/// refresh (10 s at most): their newest 40k took 4.2 s to read in the sqlite3 shell, the
+/// top-level arm 2.2 s. The newest 20k cover the last 25 days there, and mining both arms
+/// took 8.2 s from a cold cache and 1.2 s warm in a release build (a project-scoped read
+/// 5.8 s and 0.9 s), the resolve after it about a second.
+const TOP_LEVEL_CANDIDATE_CAP: i64 = 40_000;
+const SUBAGENT_CANDIDATE_CAP: i64 = 20_000;
+
+/// The candidate fetch of one [`Arm`]: error-ish messages since `since`, as (text head +
+/// tail, ts, thread_id, the thread's project key). The top-level arm comes newest first;
+/// the subagent arm in id order (the newest [`SUBAGENT_CANDIDATE_CAP`] of them).
 fn candidates_sql(
     conn: &Connection,
     project: Option<&str>,
     mode: ProjectMatch,
     since: i64,
+    arm: Arm,
 ) -> (String, Vec<Box<dyn ToSql>>) {
-    // Cap the candidate scan; errors lead the line, so the FTS pre-filter keeps this cheap.
-    const CANDIDATE_CAP: i64 = 40_000;
     // Long tool output is read as its head and tail only: errors lead a command's output
     // or close it (the summary / final failure), and copying every multi-KB log body into
     // Rust is what made this view allocate 100+ MB. octet_length() reads only the record
     // header, so short rows skip the substr work entirely.
-    //
+    let text = |m: &str| {
+        format!(
+            "CASE WHEN octet_length({m}.text) > {long}
+                  THEN substr({m}.text, 1, {head}) || char(10) || substr({m}.text, -{tail})
+                  ELSE {m}.text END",
+            long = TEXT_HEAD_CHARS + TEXT_TAIL_CHARS,
+            head = TEXT_HEAD_CHARS,
+            tail = TEXT_TAIL_CHARS,
+        )
+    };
     // The role / ts / subagent / project filters run off the covering index that
     // fts_message_join names, so only surviving rows read the table: 385k page reads down
     // to 51k, ~15 s down to ~3 s from a cold cache on a large index.
-    let mut sql = format!(
-        "SELECT CASE WHEN octet_length(m.text) > {long}
-                     THEN substr(m.text, 1, {head}) || char(10) || substr(m.text, -{tail})
-                     ELSE m.text END,
-                m.ts, m.thread_id, COALESCE(t.project_key, t.project_path)
-         FROM messages_fts
+    // Subagents of Claude Code only: theirs are the transcripts `subagent_parents` maps to a
+    // parent session. OpenCode, Gemini CLI and Cursor mark subagents too, with no mapping,
+    // so each of theirs would count as a session of its own.
+    let (roles, sessions) = match arm {
+        Arm::TopLevel => ("'user', 'tool'", "t.is_subagent = 0"),
+        Arm::Subagents => (
+            "'tool'",
+            "t.is_subagent = 1
+           AND t.source_id = (SELECT id FROM sources WHERE kind = 'claude_code')",
+        ),
+    };
+    let mut filter = format!(
+        "FROM messages_fts
          {join}
          JOIN threads t ON t.id = m.thread_id
          WHERE messages_fts MATCH ?1
-           AND m.role IN ('user', 'tool')
+           AND m.role IN ({roles})
            AND m.ts >= ?2
-           AND t.is_subagent = 0",
-        long = TEXT_HEAD_CHARS + TEXT_TAIL_CHARS,
-        head = TEXT_HEAD_CHARS,
-        tail = TEXT_TAIL_CHARS,
+           AND {sessions}",
         join = crate::search::fts_message_join(conn),
     );
     let mut args: Vec<Box<dyn ToSql>> = vec![
@@ -296,10 +688,33 @@ fn candidates_sql(
     ];
     if let Some(p) = project.filter(|p| !p.is_empty()) {
         let cond = crate::search::project_condition("t", p, mode, &mut args);
-        sql.push_str(&format!(" AND {cond}"));
+        filter.push_str(&format!(" AND {cond}"));
     }
-    args.push(Box::new(CANDIDATE_CAP));
-    sql.push_str(&format!(" ORDER BY m.ts DESC LIMIT ?{}", args.len()));
+    let sql = match arm {
+        Arm::TopLevel => {
+            args.push(Box::new(TOP_LEVEL_CANDIDATE_CAP));
+            format!(
+                "SELECT {text}, m.ts, m.thread_id, COALESCE(t.project_key, t.project_path)
+                 {filter} ORDER BY m.ts DESC LIMIT ?{n}",
+                text = text("m"),
+                n = args.len()
+            )
+        }
+        // The newest ids first, off the covering index alone, then the text of those rows
+        // only: sorting the rows with their text read every one of the 120k rows' text
+        // (15 s in the sqlite3 shell on a large index for the newest 40k, 4.2 s this way),
+        // and the outer query has no ORDER BY so the text is streamed, never sorted.
+        Arm::Subagents => {
+            args.push(Box::new(SUBAGENT_CANDIDATE_CAP));
+            format!(
+                "SELECT {text}, o.ts, o.thread_id, COALESCE(ot.project_key, ot.project_path)
+                 FROM messages o JOIN threads ot ON ot.id = o.thread_id
+                 WHERE o.id IN (SELECT m.id {filter} ORDER BY m.ts DESC LIMIT ?{n})",
+                text = text("o"),
+                n = args.len()
+            )
+        }
+    };
     (sql, args)
 }
 
@@ -325,13 +740,26 @@ pub fn recurring_issues_matching(
     since: i64,
     limit: usize,
 ) -> Result<Vec<IssueCluster>> {
-    if project.is_none_or(str::is_empty) {
+    recurring_issues_from(conn, project, mode, since, limit, Sightings::All)
+}
+
+/// [`recurring_issues_matching`] over the sessions `sightings` names. Only
+/// [`Sightings::All`] can be served from `issue_clusters`, which a refresh mines that way.
+pub fn recurring_issues_from(
+    conn: &Connection,
+    project: Option<&str>,
+    mode: ProjectMatch,
+    since: i64,
+    limit: usize,
+    sightings: Sightings,
+) -> Result<Vec<IssueCluster>> {
+    if sightings == Sightings::All && project.is_none_or(str::is_empty) {
         let now = chrono::Utc::now().timestamp();
         if let Some(stored) = stored_clusters(conn, since, limit, now) {
             return Ok(stored);
         }
     }
-    mine_clusters(conn, project, mode, since, limit)
+    mine_clusters(conn, project, mode, since, limit, sightings)
 }
 
 /// The history `issue_clusters` covers: the 180 days `cal issues`, MCP and the Project page
@@ -352,6 +780,20 @@ pub const CLUSTERS_IDLE_SECS: i64 = 86_400;
 /// app_config key: unix time of the last [`refresh_clusters`]. Stored apart from the rows so
 /// a refresh that found no recurring errors is fresh too.
 const CLUSTERS_REFRESHED_AT: &str = "issues.clusters_refreshed_at";
+/// The extraction rules a refresh mined with. Bump it when a change to
+/// [`extract_errors_with_files`], [`normalize`] or the mined rows moves signatures: the
+/// stored rows then count as no refresh at all ([`refresh_state`]), so readers mine live
+/// with the new rules and the next watcher tick or `cal index` re-mines, instead of serving
+/// the old rows for up to a day ([`CLUSTERS_IDLE_SECS`]). 2: the read-gutter, code-line and
+/// traceback rules, and subagent tool output.
+const EXTRACTION_VERSION: u32 = 2;
+/// app_config key: `<EXTRACTION_VERSION>@<refreshed_at>` of the last refresh this build's
+/// rules wrote. Tied to that refresh's time, so a later refresh by an older build (a dev
+/// build and the installed app share one index) leaves it behind and reads as stale. The
+/// re-mine is an ordinary refresh, mined on a reader and stored in one short transaction:
+/// one that yields to a writer job or dies with its process wrote nothing, and the next
+/// tick starts it over.
+const CLUSTERS_EXTRACTION: &str = "issues.clusters_extraction";
 /// How far a caller's `since` may sit from the stored window's start and still be served
 /// from it: `recurring_issues_cached` buckets `since` to the hour, and an hour at the far end
 /// of 180 days does not move a cluster's rank.
@@ -412,6 +854,7 @@ pub fn mine_for_refresh(conn: &Connection, now: i64) -> Result<MinedClusters> {
         ProjectMatch::Exact,
         now - CLUSTER_WINDOW_SECS,
         CLUSTER_TABLE_CAP,
+        Sightings::All,
     )?;
     let fixes = resolve(conn, &mined)?;
     Ok(MinedClusters { mined, fixes })
@@ -423,7 +866,9 @@ pub fn mine_for_refresh(conn: &Connection, now: i64) -> Result<MinedClusters> {
 /// the current refresh's rows): a fixed error stops recurring and loses rank, and it is
 /// exactly the row the playbook resolver filled, so dropping it threw the resolution away
 /// with it. Rows with `resolved_*` set are never dropped; the rest go once unseen for
-/// [`CLUSTER_WINDOW_SECS`].
+/// [`CLUSTER_WINDOW_SECS`]. A fix of a signature this refresh did not mine and whose stored
+/// example the current line rules reject is dropped, with its row's resolution and its
+/// uncurated playbook facts.
 pub fn store_clusters(conn: &Connection, clusters: &MinedClusters, now: i64) -> Result<usize> {
     let MinedClusters { mined, fixes } = clusters;
     let threads: HashMap<&str, &[i64]> = mined
@@ -467,12 +912,21 @@ pub fn store_clusters(conn: &Connection, clusters: &MinedClusters, now: i64) -> 
             kept.insert(project.clone(), fix.clone());
         }
     }
+    // Every stored fix's playbook ref, for telling a playbook fact's signature apart from its
+    // project key, which can hold an `@` too ([`drop_generic_playbooks`]).
+    let refs: HashMap<String, String> = all
+        .iter()
+        .flat_map(|(s, per)| per.keys().map(move |p| (playbook_ref(s, p), s.clone())))
+        .collect();
     let mut unresolved: Vec<String> = Vec::new();
+    // Signatures the current rules no longer produce (see below).
+    let mut retired: HashSet<String> = HashSet::new();
     {
         // A fix whose commit link is gone (gitlink drops a link that stops matching, a thread
         // delete cascades) no longer has a commit to show.
         let mut link = tx.prepare(LINK_EXISTS_SQL)?;
         let mut latest = tx.prepare(LATEST_PROJECT_SQL)?;
+        let mut example_of = tx.prepare(STORED_EXAMPLE_SQL)?;
         let mut set = tx.prepare(
             "UPDATE issue_clusters SET resolved_thread_id = ?2, resolved_sha = ?3
              WHERE signature = ?1",
@@ -491,6 +945,21 @@ pub fn store_clusters(conn: &Connection, clusters: &MinedClusters, now: i64) -> 
                 gone.push(signature.clone());
                 continue;
             };
+            // A fix recorded under older rules for a line they took and the current ones do
+            // not (a grep or diff hit on a source line, `error: 'Unable to refresh the
+            // token',`) is no fix of an error: never mined again, resolved and so never
+            // pruned, its playbook stayed in project memory for good. Judged by the stored
+            // example's line rules, not a re-run of the extractor: a traceback's exception
+            // line without a marker only survives inside its block.
+            if !threads.contains_key(signature.as_str()) {
+                let example: Option<String> =
+                    example_of.query_row([signature], |r| r.get(0)).optional()?;
+                if example.is_some_and(|e| !still_an_error(&e)) {
+                    retired.insert(signature.clone());
+                    unresolved.push(signature.clone());
+                    continue;
+                }
+            }
             match unscoped_fix(per_project, latest_project.as_deref()) {
                 Some((_, fix)) => {
                     set.execute(rusqlite::params![signature, fix.thread_id, fix.sha])?;
@@ -512,11 +981,25 @@ pub fn store_clusters(conn: &Connection, clusters: &MinedClusters, now: i64) -> 
     }
     tx.execute(PRUNE_CLUSTERS_SQL, [now, now - CLUSTER_WINDOW_SECS])?;
     crate::knowledge::app_config::put(&tx, CLUSTERS_REFRESHED_AT, &now.to_string())?;
+    crate::knowledge::app_config::put(&tx, CLUSTERS_EXTRACTION, &extraction_stamp(now))?;
     crate::knowledge::app_config::put(&tx, CLUSTER_THREADS, &serde_json::to_string(&threads)?)?;
     crate::knowledge::app_config::put(&tx, CLUSTER_FIXES, &serde_json::to_string(&all)?)?;
     refresh_playbooks(&tx, &all, now)?;
+    drop_generic_playbooks(&tx, &refs, &retired)?;
     tx.commit()?;
     Ok(mined.len())
+}
+
+/// A stored cluster's example line.
+const STORED_EXAMPLE_SQL: &str = "SELECT example FROM issue_clusters WHERE signature = ?1";
+
+/// Whether a stored example line still passes the line rules of
+/// [`extract_errors_with_files`]: a marker or a traceback's exception line, no source line
+/// and no read gutter.
+fn still_an_error(example: &str) -> bool {
+    (is_error_line(example) || is_python_exception(example))
+        && !reads_as_code(example)
+        && !behind_gutter(example)
 }
 
 /// One project's fix of one cluster: the session that hit the error and the linked commit
@@ -690,11 +1173,16 @@ pub(crate) fn resolve(conn: &Connection, mined: &[Mined]) -> Result<Fixes> {
             }
             let thread_edits = match edits.entry(s.thread) {
                 Entry::Occupied(e) => e.into_mut(),
-                Entry::Vacant(e) => e.insert(
-                    edits_of
-                        .query_map([s.thread], |r| Ok((r.get(0)?, r.get(1)?)))?
-                        .collect::<rusqlite::Result<Vec<_>>>()?,
-                ),
+                Entry::Vacant(e) => {
+                    // The session's subagents edit for it, as their errors count for it.
+                    let mut session = Vec::new();
+                    for id in crate::indexer::session_thread_ids(conn, s.thread)? {
+                        for edit in edits_of.query_map([id], |r| Ok((r.get(0)?, r.get(1)?)))? {
+                            session.push(edit?);
+                        }
+                    }
+                    e.insert(session)
+                }
             };
             let erroring = erroring_edits(&s.files, thread_edits, s.seen);
             let Some(edited_at) = erroring.iter().map(|(_, ts)| *ts).min() else {
@@ -807,7 +1295,13 @@ const MARKER_WORDS: &[&str] = &[
 pub(crate) fn is_specific(signature: &str) -> bool {
     // cargo's closing summaries (`could not compile '…' (lib) due to 2 previous errors`,
     // `aborting due to 2 previous errors`) and npm's (`npm err! code elifecycle`,
-    // `command failed`) follow nearly every failed build, whichever error caused it.
+    // `command failed`) follow nearly every failed build, whichever error caused it. So do
+    // the runners' (turbo's `error run failed: command exited 1`, 69 sightings on a large
+    // index; CI's `process completed with exit code 1`), and `git apply`'s `<path> patch
+    // does not apply` only says a hunk no longer matched (yet one of the seven fixes
+    // recorded there was for it). cargo's `error: test failed, to rerun pass '-p <crate>
+    // --lib'` closes every failing `cargo test` run (118 sightings there once subagents
+    // counted, the third most frequent cluster).
     const GENERIC: &[&str] = &[
         "exit code",
         "no such file",
@@ -816,6 +1310,9 @@ pub(crate) fn is_specific(signature: &str) -> bool {
         "previous error",
         "elifecycle",
         "command failed",
+        "command exited",
+        "patch does not apply",
+        "to rerun pass",
     ];
     if signature.starts_with("traceback") || GENERIC.iter().any(|g| signature.contains(g)) {
         return false;
@@ -960,13 +1457,73 @@ fn refresh_playbooks(conn: &Connection, fixes: &Fixes, now: i64) -> Result<usize
     Ok(written)
 }
 
+/// The playbook gotchas a refresh may remove: every one, off the `origin_ref` index
+/// (`playbook:` up to the next character, `;`), the user's own kept out. A pinned or edited
+/// one is the user's, and a hidden one is a tombstone that keeps it from coming back.
+const MACHINE_PLAYBOOKS_SQL: &str = "SELECT id, origin_ref FROM facts
+     WHERE origin_ref >= 'playbook:' AND origin_ref < 'playbook;'
+       AND extractor = 'playbook' AND pinned = 0 AND edited = 0 AND hidden = 0";
+
+/// Delete the playbook gotchas of signatures that no longer name their error
+/// ([`is_specific`]): ones written before a rule made them generic (`<path> patch does not
+/// apply`, one of the seven fixes recorded on a large index) stayed in the repo's memory,
+/// injected at session start and in the AGENTS block, though every list hid the cluster.
+/// A signature that reads as specific again gets a new one on the next refresh. The facts
+/// of the `retired` signatures, which the current rules no longer produce, go too. A
+/// fact's signature is the one `refs` (each stored fix's [`playbook_ref`]) gives for its
+/// `origin_ref`, else [`playbook_signature`]'s guess. Returns how many were deleted.
+fn drop_generic_playbooks(
+    conn: &Connection,
+    refs: &HashMap<String, String>,
+    retired: &HashSet<String>,
+) -> Result<usize> {
+    let generic: Vec<i64> = {
+        let mut stmt = conn.prepare(MACHINE_PLAYBOOKS_SQL)?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+        let mut ids = Vec::new();
+        for row in rows {
+            let (id, origin) = row?;
+            let signature = refs
+                .get(&origin)
+                .map(String::as_str)
+                .or_else(|| playbook_signature(&origin));
+            if signature.is_some_and(|s| !is_specific(s) || retired.contains(s)) {
+                ids.push(id);
+            }
+        }
+        ids
+    };
+    let mut delete = conn.prepare("DELETE FROM facts WHERE id = ?1")?;
+    for id in &generic {
+        delete.execute([id])?;
+    }
+    Ok(generic.len())
+}
+
+/// The signature of a [`playbook_ref`], guessed: the project key follows the last `@`, as a
+/// signature can hold an npm scope (`@scope/pkg`). A key can hold one too (a cloud-storage
+/// folder named after an email address), which cuts the signature short and can make a
+/// specific one read as generic, so a ref of a stored fix is looked up first.
+fn playbook_signature(origin_ref: &str) -> Option<&str> {
+    let rest = origin_ref
+        .strip_prefix(crate::knowledge::EXTRACTOR_PLAYBOOK)?
+        .strip_prefix(':')?;
+    Some(rest.rsplit_once('@')?.0)
+}
+
 const PRUNE_CLUSTERS_SQL: &str = "DELETE FROM issue_clusters
      WHERE refreshed_at <> ?1 AND last_seen < ?2
        AND resolved_thread_id IS NULL AND resolved_sha IS NULL";
 
+/// [`CLUSTERS_EXTRACTION`]'s value for a refresh at `at`.
+fn extraction_stamp(at: i64) -> String {
+    format!("{EXTRACTION_VERSION}@{at}")
+}
+
 /// The last refresh's time, and whether anything was indexed after it (a thread's
-/// `last_indexed_at` past it, off 0034's index). None before the first refresh, or on an
-/// index from before 0034 (a read-only connection never migrates).
+/// `last_indexed_at` past it, off 0034's index). None before the first refresh, after one
+/// mined with other rules ([`EXTRACTION_VERSION`]), or on an index from before 0034 (a
+/// read-only connection never migrates).
 fn refresh_state(conn: &Connection) -> Option<(i64, bool)> {
     if !crate::db::has_table(conn, "issue_clusters") {
         return None;
@@ -975,6 +1532,10 @@ fn refresh_state(conn: &Connection) -> Option<(i64, bool)> {
         .ok()??
         .parse()
         .ok()?;
+    let stamp = crate::knowledge::app_config::get(conn, CLUSTERS_EXTRACTION).ok()??;
+    if stamp != extraction_stamp(at) {
+        return None;
+    }
     let newest: Option<i64> = conn
         .query_row("SELECT MAX(last_indexed_at) FROM threads", [], |r| r.get(0))
         .ok()?;
@@ -1056,7 +1617,9 @@ const STORED_CLUSTERS_SQL: &str =
     "SELECT example, count, threads, first_seen, last_seen, last_thread_id FROM issue_clusters
      WHERE refreshed_at = ?2 ORDER BY count DESC, last_seen DESC LIMIT ?1";
 
-/// [`recurring_issues_matching`] with each cluster's fix and playbook ([`with_fixes`]).
+/// [`recurring_issues_matching`] with each cluster's fix and playbook ([`with_fixes`]), only
+/// the clusters that name their error ([`names_the_error`]): what `cal issues`, MCP
+/// `recurring_issues` and the report list.
 pub fn recurring_issues_with_fixes(
     conn: &Connection,
     project: Option<&str>,
@@ -1064,8 +1627,47 @@ pub fn recurring_issues_with_fixes(
     since: i64,
     limit: usize,
 ) -> Result<Vec<Issue>> {
-    let clusters = recurring_issues_matching(conn, project, mode, since, limit)?;
+    listed_issues(conn, project, mode, since, limit, false)
+}
+
+/// [`recurring_issues_with_fixes`], or with `all` the generic clusters too
+/// (`cal issues --all`).
+pub fn listed_issues(
+    conn: &Connection,
+    project: Option<&str>,
+    mode: ProjectMatch,
+    since: i64,
+    limit: usize,
+    all: bool,
+) -> Result<Vec<Issue>> {
+    let clusters = if all {
+        recurring_issues_matching(conn, project, mode, since, limit)?
+    } else {
+        // Filtered before the limit, from as many as the table keeps: mining ranks every
+        // cluster anyway, and the stored read is a few hundred rows.
+        let ranked =
+            recurring_issues_matching(conn, project, mode, since, limit.max(CLUSTER_TABLE_CAP))?;
+        specific_clusters(ranked, limit)
+    };
     Ok(with_fixes(conn, clusters, project, mode))
+}
+
+/// Whether a cluster names what went wrong ([`is_specific`] of its signature). The listings
+/// (`cal issues`, MCP, the report, Today, the Project page) show only these: on a large
+/// index 32% of the stored clusters failed it, 11 of the top 30 (`error:`, CI's exit-code
+/// line, cargo's `could not compile`). The table keeps the rest, so counts stay honest and
+/// `cal issues --all` lists them.
+pub fn names_the_error(cluster: &IssueCluster) -> bool {
+    is_specific(&normalize(&cluster.example))
+}
+
+/// The first `limit` of `clusters` that name their error, in order.
+pub fn specific_clusters(clusters: Vec<IssueCluster>, limit: usize) -> Vec<IssueCluster> {
+    clusters
+        .into_iter()
+        .filter(names_the_error)
+        .take(limit)
+        .collect()
 }
 
 /// A fix's commit (`?1` thread, `?2` sha) and its project's visible playbook text (`?3`, the
@@ -1186,7 +1788,9 @@ pub fn playbooks_for(
     let mut hit = conn.prepare(PLAYBOOK_HIT_SQL)?;
     let fixes = load_fixes(conn);
     let mut out = Vec::new();
-    for signature in signatures {
+    // A fix stored before its signature counted as generic (`patch does not apply`) is no
+    // playbook either.
+    for signature in signatures.iter().filter(|s| is_specific(s)) {
         let Some(fix) = fixes.get(signature).and_then(|p| p.get(project)) else {
             continue;
         };
@@ -1233,8 +1837,9 @@ fn mine_clusters(
     mode: ProjectMatch,
     since: i64,
     limit: usize,
+    sightings: Sightings,
 ) -> Result<Vec<IssueCluster>> {
-    Ok(mine(conn, project, mode, since, limit)?
+    Ok(mine(conn, project, mode, since, limit, sightings)?
         .into_iter()
         .map(|m| m.cluster)
         .collect())
@@ -1254,6 +1859,7 @@ pub(crate) struct Mined {
 
 /// One session's sightings of a cluster.
 pub(crate) struct Sighting {
+    /// The session: a subagent's sightings are its parent session's.
     pub thread: i64,
     /// Its latest sighting (epoch secs).
     pub seen: i64,
@@ -1266,6 +1872,104 @@ pub(crate) struct Sighting {
     pub files: Vec<String>,
 }
 
+/// A cluster while [`mine`] reads candidates.
+struct Acc {
+    example: String,
+    count: i64,
+    /// session -> its latest sighting, its earliest, and the files its error lines named.
+    threads: HashMap<i64, (i64, i64, Vec<String>)>,
+    first_seen: i64,
+    last_seen: i64,
+    last_thread_id: i64,
+}
+
+/// File one candidate message's errors under `session`, but those `copied(signature)`
+/// leaves out. The example and the last session follow the newest sighting, whichever arm
+/// read it first.
+fn accumulate(
+    clusters: &mut HashMap<String, Acc>,
+    text: &str,
+    ts: i64,
+    session: i64,
+    copied: impl Fn(&str) -> bool,
+) {
+    for (err, files) in extract_errors_with_files(text) {
+        let signature = normalize(&err);
+        if copied(&signature) {
+            continue;
+        }
+        let acc = match clusters.entry(signature) {
+            Entry::Occupied(e) => e.into_mut(),
+            Entry::Vacant(e) => e.insert(Acc {
+                example: err.clone(),
+                count: 0,
+                threads: HashMap::new(),
+                first_seen: ts,
+                last_seen: ts,
+                last_thread_id: session,
+            }),
+        };
+        acc.count += 1;
+        let (latest, earliest, named) = acc.threads.entry(session).or_insert((ts, ts, Vec::new()));
+        *latest = (*latest).max(ts);
+        *earliest = (*earliest).min(ts);
+        add_files(named, files);
+        acc.first_seen = acc.first_seen.min(ts);
+        if ts > acc.last_seen {
+            acc.last_seen = ts;
+            acc.last_thread_id = session;
+            acc.example = err;
+        }
+    }
+}
+
+/// Add `files` to a session's named files, each once, up to [`FILES_PER_SIGHTING`].
+fn add_files(named: &mut Vec<String>, files: Vec<String>) {
+    for f in files {
+        if named.len() < FILES_PER_SIGHTING && !named.contains(&f) {
+            named.push(f);
+        }
+    }
+}
+
+/// Fold the clusters `later` read into `clusters` as if its rows had been read after theirs:
+/// counts add up, each session keeps its latest sighting and its files in that order, and
+/// the example and last session move only to a strictly newer sighting.
+fn merge_clusters(clusters: &mut HashMap<String, Acc>, later: HashMap<String, Acc>) {
+    for (signature, b) in later {
+        let a = match clusters.entry(signature) {
+            Entry::Occupied(e) => e.into_mut(),
+            Entry::Vacant(e) => {
+                e.insert(b);
+                continue;
+            }
+        };
+        a.count += b.count;
+        for (session, (seen, first, files)) in b.threads {
+            let (latest, earliest, named) =
+                a.threads
+                    .entry(session)
+                    .or_insert((seen, first, Vec::new()));
+            *latest = (*latest).max(seen);
+            *earliest = (*earliest).min(first);
+            add_files(named, files);
+        }
+        a.first_seen = a.first_seen.min(b.first_seen);
+        if b.last_seen > a.last_seen {
+            a.last_seen = b.last_seen;
+            a.last_thread_id = b.last_thread_id;
+            a.example = b.example;
+        }
+    }
+}
+
+/// One candidate row: (text head + tail, ts, thread id, the thread's project key).
+type Candidate = (String, i64, i64, Option<String>);
+
+fn candidate(r: &rusqlite::Row<'_>) -> rusqlite::Result<Candidate> {
+    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+}
+
 /// [`mine_clusters`] keeping every session's latest sighting and the files it named.
 fn mine(
     conn: &Connection,
@@ -1273,59 +1977,64 @@ fn mine(
     mode: ProjectMatch,
     since: i64,
     limit: usize,
+    sightings: Sightings,
 ) -> Result<Vec<Mined>> {
-    let (sql, args) = candidates_sql(conn, project, mode, since);
-
-    struct Acc {
-        example: String,
-        count: i64,
-        /// thread id -> its latest sighting and the files its error lines named.
-        threads: HashMap<i64, (i64, Vec<String>)>,
-        first_seen: i64,
-        last_seen: i64,
-        last_thread_id: i64,
-    }
     let mut clusters: HashMap<String, Acc> = HashMap::new();
     let mut projects: HashMap<i64, Option<String>> = HashMap::new();
 
-    let arg_refs: Vec<&dyn ToSql> = args.iter().map(|b| b.as_ref()).collect();
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(arg_refs.as_slice(), |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, i64>(1)?,
-            r.get::<_, i64>(2)?,
-            r.get::<_, Option<String>>(3)?,
-        ))
-    })?;
-    for row in rows {
-        let (text, ts, thread_id, thread_project) = row?;
-        projects.entry(thread_id).or_insert(thread_project);
-        for (err, files) in extract_errors_with_files(&text) {
-            let key = normalize(&err);
-            let acc = clusters.entry(key).or_insert_with(|| Acc {
-                example: err.clone(),
-                count: 0,
-                threads: HashMap::new(),
-                first_seen: ts,
-                last_seen: ts,
-                last_thread_id: thread_id,
-            });
-            acc.count += 1;
-            let (latest, named) = acc.threads.entry(thread_id).or_insert((ts, Vec::new()));
-            *latest = (*latest).max(ts);
-            for f in files {
-                if named.len() < FILES_PER_SIGHTING && !named.contains(&f) {
-                    named.push(f);
+    // Subagents are read first, apart. A subagent's final report comes back to its parent
+    // as a top-level tool row that quotes its output, so one error a subagent hit counted
+    // twice in one session and passed the `count >= 2` gate: after the re-mine of a real
+    // index, 11 of 38 recorded fixes came from a single session. A parent's sighting of a
+    // signature at or after its subagents' first one is taken for that copy and left out;
+    // a parent that really hits it again later is undercounted, which is accepted. They
+    // are folded in afterwards as if read after the top-level rows, as they were before.
+    let mut subagents: HashMap<String, Acc> = HashMap::new();
+    if sightings == Sightings::All {
+        // Counts, projects and the resolver's commit windows are the parent session's.
+        let parents = crate::indexer::subagent_parents(conn)?;
+        let mut project_of = conn.prepare_cached(PROJECT_OF_SQL)?;
+        let (sql, args) = candidates_sql(conn, project, mode, since, Arm::Subagents);
+        let arg_refs: Vec<&dyn ToSql> = args.iter().map(|b| b.as_ref()).collect();
+        let mut stmt = conn.prepare(&sql)?;
+        for row in stmt.query_map(arg_refs.as_slice(), candidate)? {
+            let (text, ts, subagent, own_project) = row?;
+            let session = match parents.get(&subagent) {
+                Some(&parent) => {
+                    if let Entry::Vacant(e) = projects.entry(parent) {
+                        e.insert(
+                            project_of
+                                .query_row([parent], |r| r.get(0))
+                                .optional()?
+                                .flatten(),
+                        );
+                    }
+                    parent
                 }
-            }
-            acc.first_seen = acc.first_seen.min(ts);
-            if ts > acc.last_seen {
-                acc.last_seen = ts;
-                acc.last_thread_id = thread_id;
-            }
+                None => {
+                    projects.entry(subagent).or_insert(own_project);
+                    subagent
+                }
+            };
+            accumulate(&mut subagents, &text, ts, session, |_| false);
         }
     }
+
+    let (sql, args) = candidates_sql(conn, project, mode, since, Arm::TopLevel);
+    let arg_refs: Vec<&dyn ToSql> = args.iter().map(|b| b.as_ref()).collect();
+    let mut stmt = conn.prepare(&sql)?;
+    for row in stmt.query_map(arg_refs.as_slice(), candidate)? {
+        let (text, ts, thread_id, thread_project) = row?;
+        projects.entry(thread_id).or_insert(thread_project);
+        let copied = |signature: &str| {
+            subagents
+                .get(signature)
+                .and_then(|a| a.threads.get(&thread_id))
+                .is_some_and(|&(_, first, _)| ts >= first)
+        };
+        accumulate(&mut clusters, &text, ts, thread_id, copied);
+    }
+    merge_clusters(&mut clusters, subagents);
 
     let mut out: Vec<Mined> = clusters
         .into_iter()
@@ -1334,7 +2043,7 @@ fn mine(
             let mut sightings: Vec<Sighting> = a
                 .threads
                 .into_iter()
-                .map(|(thread, (seen, files))| Sighting {
+                .map(|(thread, (seen, _, files))| Sighting {
                     thread,
                     seen,
                     project: projects.get(&thread).cloned().flatten(),
@@ -1453,7 +2162,8 @@ mod tests {
 
     /// The candidate scan must stay FTS-driven, with each hit's filters answered by the
     /// covering index (not a table read per hit), and must still run on an index that
-    /// predates the covering index.
+    /// predates the covering index. The subagent arm picks its newest ids off that index
+    /// alone and reads the text of those rows only, by rowid, never sorting it.
     #[test]
     fn candidate_scan_uses_the_covering_index_and_falls_back_without_it() {
         let p = std::env::temp_dir().join(format!("calli_issues_plan_{}.db", std::process::id()));
@@ -1466,21 +2176,45 @@ mod tests {
             (Some("proj"), ProjectMatch::Substring),
             (Some("/r/proj"), ProjectMatch::Exact),
         ] {
-            let (sql, args) = candidates_sql(&conn, project, mode, 0);
-            let plan = plan(&conn, &sql, &args);
+            let (sql, args) = candidates_sql(&conn, project, mode, 0, Arm::TopLevel);
+            let top = plan(&conn, &sql, &args);
+            assert!(top.starts_with("SCAN messages_fts VIRTUAL TABLE"), "{top}");
             assert!(
-                plan.starts_with("SCAN messages_fts VIRTUAL TABLE"),
-                "{plan}"
+                top.contains("SEARCH m USING INDEX idx_messages_cover (id=?)"),
+                "{top}"
+            );
+            let (sql, args) = candidates_sql(&conn, project, mode, 0, Arm::Subagents);
+            let sub = plan(&conn, &sql, &args);
+            assert!(
+                sub.starts_with("SEARCH o USING INTEGER PRIMARY KEY (rowid=?)"),
+                "{sub}"
+            );
+            assert!(sub.contains("LIST SUBQUERY"), "{sub}");
+            assert!(sub.contains("SCAN messages_fts VIRTUAL TABLE"), "{sub}");
+            // Covering: the subquery reads only id, thread_id, role and ts, so the ids come
+            // off the index with no table read.
+            assert!(
+                sub.contains("SEARCH m USING COVERING INDEX idx_messages_cover (id=?)"),
+                "{sub}"
+            );
+            // The Claude Code source id is looked up once, by its unique kind.
+            assert!(
+                sub.contains("SCALAR SUBQUERY") && sub.contains("SEARCH sources USING"),
+                "{sub}"
             );
             assert!(
-                plan.contains("SEARCH m USING INDEX idx_messages_cover (id=?)"),
-                "{plan}"
+                sub.contains("SEARCH ot USING INTEGER PRIMARY KEY (rowid=?)"),
+                "{sub}"
             );
+            // The one sort is the subquery's, over ids: the text is streamed.
+            assert_eq!(sub.matches("TEMP B-TREE").count(), 1, "{sub}");
         }
 
         conn.execute_batch("DROP INDEX idx_messages_cover").unwrap();
-        let (sql, _) = candidates_sql(&conn, None, ProjectMatch::Substring, 0);
-        assert!(!sql.contains("INDEXED BY"), "{sql}");
+        for arm in [Arm::TopLevel, Arm::Subagents] {
+            let (sql, _) = candidates_sql(&conn, None, ProjectMatch::Substring, 0, arm);
+            assert!(!sql.contains("INDEXED BY"), "{sql}");
+        }
         conn.execute(
             "INSERT INTO threads (source_id, external_id, title) VALUES (1, 't', 't')",
             [],
@@ -1719,6 +2453,9 @@ mod tests {
         assert_eq!(file_token("Cargo.toml:"), Some("Cargo.toml".into()));
         assert_eq!(file_token("https://x.dev/a.js"), None);
         assert_eq!(file_token("1.2.3"), None);
+        assert_eq!(file_token("0.03s"), None);
+        assert_eq!(file_token("12.5s"), None);
+        assert_eq!(file_token("v1.ts"), Some("v1.ts".into()));
 
         assert_eq!(path_match_len("/Users/me/repo/src/lib.rs", "src/lib.rs"), 2);
         assert_eq!(path_match_len("./src/lib.rs", "src/lib.rs"), 2);
@@ -1763,6 +2500,9 @@ mod tests {
             "error: aborting due to 2 previous errors",
             "npm err! code elifecycle",
             "error: command failed: '…'",
+            &normalize("error: test failed, to rerun pass `-p app-core --lib`"),
+            &normalize("error: run failed: command exited (1)"),
+            &normalize("error: patch failed: src/a.rs:12\nerror: src/a.rs: patch does not apply"),
         ] {
             assert!(!is_specific(generic), "{generic}");
         }
@@ -2071,6 +2811,133 @@ mod tests {
         assert!(read(Some("/r/b"))[0].fix.is_none());
     }
 
+    /// Stores a fix of `signature` in `project` by `tid`'s commit `sha`, as an earlier
+    /// refresh did: the cluster row (resolved, last seen at `last_seen`), the fix in
+    /// [`CLUSTER_FIXES`] and the playbook fact.
+    fn stored_fix(
+        conn: &Connection,
+        tid: i64,
+        project: &str,
+        example: &str,
+        sha: &str,
+        last_seen: i64,
+    ) {
+        let signature = normalize(example);
+        commit(conn, tid, sha, "fix: it", last_seen);
+        conn.execute(
+            "INSERT INTO issue_clusters (signature, example, count, threads, first_seen,
+                last_seen, last_thread_id, refreshed_at, resolved_thread_id, resolved_sha)
+             VALUES (?1, ?2, 3, 1, 0, ?3, ?4, 1, ?4, ?5)",
+            rusqlite::params![signature, example, last_seen, tid, sha],
+        )
+        .unwrap();
+        let mut fixes = load_fixes(conn);
+        fixes.entry(signature.clone()).or_default().insert(
+            project.to_string(),
+            Resolution {
+                thread_id: tid,
+                sha: sha.to_string(),
+                committed_at: last_seen,
+            },
+        );
+        crate::knowledge::app_config::put(
+            conn,
+            CLUSTER_FIXES,
+            &serde_json::to_string(&fixes).unwrap(),
+        )
+        .unwrap();
+        let origin = playbook_ref(&signature, project);
+        crate::knowledge::upsert_playbook(conn, &origin, tid, &signature, last_seen).unwrap();
+    }
+
+    fn playbook_refs(conn: &Connection) -> Vec<String> {
+        conn.prepare("SELECT origin_ref FROM facts WHERE extractor = 'playbook' ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    /// A fix recorded under older rules for a line the current ones reject (a grep hit on a
+    /// source line) loses its fix, its row's resolution and its uncurated playbook on the
+    /// next refresh, while a pinned playbook of it stays. A fix of a real error that this
+    /// refresh simply did not mine (aged out of the window) keeps all three.
+    #[test]
+    fn a_fix_of_a_line_the_rules_no_longer_take_is_dropped() {
+        let conn = crate::db::test_support::TestIndex::new("issues_retired");
+        let now = chrono::Utc::now().timestamp();
+        let tid = thread(&conn, "t", "/r/app");
+        let code = "src/api/client.ts:88:      error: 'Unable to refresh the session token',";
+        let retired = normalize(code);
+        assert!(is_specific(&retired) && is_error_line(code) && reads_as_code(code));
+        stored_fix(
+            &conn,
+            tid,
+            "/r/app",
+            code,
+            "c0dec0dec0de",
+            now - 30 * 86_400,
+        );
+        stored_fix(
+            &conn,
+            tid,
+            "/r/app",
+            BORROW,
+            "f1f1f1f1f1f1",
+            now - CLUSTER_WINDOW_SECS - 10,
+        );
+        let real = normalize(BORROW);
+        let pinned = playbook_ref(&retired, "/r/pinned");
+        crate::knowledge::upsert_playbook(&conn, &pinned, tid, "keep this one", now).unwrap();
+        conn.execute(
+            "UPDATE facts SET pinned = 1 WHERE origin_ref = ?1",
+            [&pinned],
+        )
+        .unwrap();
+
+        refresh_clusters_at(&conn, now).unwrap();
+        let fixes = load_fixes(&conn);
+        assert_eq!(fixes.keys().collect::<Vec<_>>(), [&real]);
+        let resolved = |sig: &str| -> Option<String> {
+            conn.query_row(
+                "SELECT resolved_sha FROM issue_clusters WHERE signature = ?1",
+                [sig],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(resolved(&retired), None);
+        assert_eq!(resolved(&real).as_deref(), Some("f1f1f1f1f1f1"));
+        assert_eq!(
+            playbook_refs(&conn),
+            [playbook_ref(&real, "/r/app"), pinned]
+        );
+    }
+
+    /// A project key can hold an `@` (a cloud-storage folder named after an email address):
+    /// a playbook of a stored fix is judged by that fix's signature, not by a split at the
+    /// last `@`, which cut `typeerror: failed to fetch` down to a generic one and deleted
+    /// its playbook on every refresh.
+    #[test]
+    fn a_playbook_in_a_project_key_with_an_at_is_kept() {
+        let conn = crate::db::test_support::TestIndex::new("issues_at_key");
+        let now = chrono::Utc::now().timestamp();
+        let project = "/r/Drive-me@example.com/app";
+        let tid = thread(&conn, "t", project);
+        let example = "TypeError: Failed to fetch";
+        let signature = normalize(example);
+        let origin = playbook_ref(&signature, project);
+        assert!(is_specific(&signature));
+        assert!(
+            !is_specific(playbook_signature(&origin).unwrap()),
+            "the guess"
+        );
+        stored_fix(&conn, tid, project, example, "a7a7a7a7a7a7", now - 86_400);
+        refresh_clusters_at(&conn, now).unwrap();
+        assert_eq!(playbook_refs(&conn), [origin]);
+    }
+
     /// A commit git cannot vouch for (no checkout of the session on this machine, nothing
     /// cached) resolves nothing.
     #[test]
@@ -2232,6 +3099,15 @@ mod tests {
                 "{p}"
             );
         }
+        // Runs inside the refresh's write transaction, so it reads the playbook range of
+        // the origin_ref index, never every fact.
+        let p = plan(&conn, MACHINE_PLAYBOOKS_SQL, &[]);
+        assert!(
+            p.contains(
+                "SEARCH facts USING INDEX idx_facts_origin_ref (origin_ref>? AND origin_ref<?)"
+            ),
+            "{p}"
+        );
     }
 
     /// Measures resolution on a real index. Run the test binary directly against a disposable
@@ -2252,6 +3128,7 @@ mod tests {
             ProjectMatch::Exact,
             now - CLUSTER_WINDOW_SECS,
             500,
+            Sightings::All,
         )
         .unwrap();
         let with_files = mined
@@ -2374,6 +3251,309 @@ mod tests {
         );
     }
 
+    /// The precision gate on a real index, read-only (it never migrates, so a clone at an
+    /// older schema is read as it is): what a refresh would mine over the standard window,
+    /// with subagents (first, so a fresh clone's first pass is cold) and then top-level
+    /// sessions only, each cold-or-warm then warm, with the resolve after it; the share of
+    /// the stored top [`CLUSTER_TABLE_CAP`] that fails [`is_specific`]; how many of those
+    /// [`resolve`] finds a fix for, and in how many projects a specific one; the top 30 by
+    /// count as signatures (placeholders for paths, quotes and hashes; no session text); a
+    /// project-scoped read's time; and, per arm and line rule, how many error-marked lines
+    /// of the candidates it drops, with the signatures it drops most, to check it drops no
+    /// real error, and what the traceback rule emits.
+    ///
+    /// CALLIMACHUS_GROUNDING_DB=<an APFS clone of index.db> cargo test -p callimachus-core \
+    ///   real_issue_clusters_gate -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn real_issue_clusters_gate() {
+        let Ok(path) = std::env::var("CALLIMACHUS_GROUNDING_DB") else {
+            eprintln!("set CALLIMACHUS_GROUNDING_DB to an index clone");
+            return;
+        };
+        let conn = crate::db::open_readonly(std::path::Path::new(&path)).unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let since = now - CLUSTER_WINDOW_SECS;
+        let t = std::time::Instant::now();
+        let parents = crate::indexer::subagent_parents(&conn).unwrap();
+        eprintln!("subagent_parents: {} in {:?}", parents.len(), t.elapsed());
+        let mut busiest: Option<String> = None;
+        for sightings in [Sightings::All, Sightings::TopLevel] {
+            let mut mined = Vec::new();
+            for pass in ["first", "warm"] {
+                let t = std::time::Instant::now();
+                mined = mine(
+                    &conn,
+                    None,
+                    ProjectMatch::Exact,
+                    since,
+                    usize::MAX,
+                    sightings,
+                )
+                .unwrap();
+                let mined_in = t.elapsed();
+                let top = &mined[..mined.len().min(CLUSTER_TABLE_CAP)];
+                let t = std::time::Instant::now();
+                let fixes = resolve(&conn, top).unwrap();
+                eprintln!(
+                    "{sightings:?} refresh ({pass}): mine {} recurring clusters in {mined_in:?}, \
+                     resolve {} in {:?}",
+                    mined.len(),
+                    fixes.len(),
+                    t.elapsed()
+                );
+            }
+            let top = &mined[..mined.len().min(CLUSTER_TABLE_CAP)];
+            if busiest.is_none() {
+                let mut per: HashMap<&str, usize> = HashMap::new();
+                for s in top.iter().flat_map(|m| &m.sightings) {
+                    if let Some(p) = s.project.as_deref() {
+                        *per.entry(p).or_default() += 1;
+                    }
+                }
+                busiest = per
+                    .into_iter()
+                    .max_by_key(|(p, n)| (*n, *p))
+                    .map(|(p, _)| p.to_string());
+            }
+            let generic = |ms: &[Mined]| ms.iter().filter(|m| !is_specific(&m.signature)).count();
+            eprintln!(
+                "stored top {}: {} fail is_specific ({:.1}%), {} of the top 30",
+                top.len(),
+                generic(top),
+                100.0 * generic(top) as f64 / top.len().max(1) as f64,
+                generic(&top[..top.len().min(30)])
+            );
+            let sightings: usize = top.iter().map(|m| m.sightings.len()).sum();
+            let named = top
+                .iter()
+                .flat_map(|m| &m.sightings)
+                .filter(|s| !s.files.is_empty())
+                .count();
+            let messages: i64 = top.iter().map(|m| m.cluster.count).sum();
+            eprintln!(
+                "{messages} sightings over {sightings} (session, cluster) pairs, {named} naming a file"
+            );
+            let fixes = resolve(&conn, top).unwrap();
+            let specific_fixes: Vec<&BTreeMap<String, Resolution>> = fixes
+                .iter()
+                .filter(|(s, _)| is_specific(s))
+                .map(|(_, p)| p)
+                .collect();
+            let fixed_projects: HashSet<&String> =
+                specific_fixes.iter().flat_map(|p| p.keys()).collect();
+            eprintln!(
+                "resolve: {} clusters with a fix ({} project fixes), {} of them specific, \
+                 in {} projects",
+                fixes.len(),
+                fixes.values().map(BTreeMap::len).sum::<usize>(),
+                specific_fixes.len(),
+                fixed_projects.len()
+            );
+            for (i, m) in top.iter().take(30).enumerate() {
+                eprintln!(
+                    "{:>3} {:>6} {:>5} {} {}",
+                    i + 1,
+                    m.cluster.count,
+                    m.cluster.threads,
+                    if is_specific(&m.signature) { "S" } else { "-" },
+                    cap_chars(&m.signature, 110)
+                );
+            }
+        }
+        let stored = load_fixes(&conn);
+        eprintln!(
+            "stored fixes: {} signatures, {} specific",
+            stored.len(),
+            stored.keys().filter(|s| is_specific(s)).count()
+        );
+        // Harvested memory lives in `callimachus-notes:<project>` threads, which hold facts,
+        // not messages: nothing there to mine.
+        let notes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages m JOIN threads t ON t.id = m.thread_id
+                 WHERE t.external_id LIKE 'callimachus-notes:%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        eprintln!("messages in harvested-memory threads: {notes}");
+        if let Some(project) = busiest {
+            for pass in ["first", "warm"] {
+                let t = std::time::Instant::now();
+                let n = recurring_issues_matching(
+                    &conn,
+                    Some(&project),
+                    ProjectMatch::Exact,
+                    since,
+                    CLUSTER_TABLE_CAP,
+                )
+                .unwrap()
+                .len();
+                eprintln!(
+                    "scoped read of the busiest project ({pass}): {n} clusters in {:?}",
+                    t.elapsed()
+                );
+            }
+        }
+
+        // The line rules, over each arm's candidates.
+        for arm in [Arm::TopLevel, Arm::Subagents] {
+            let (sql, args) = candidates_sql(&conn, None, ProjectMatch::Exact, since, arm);
+            let refs: Vec<&dyn ToSql> = args.iter().map(|b| b.as_ref()).collect();
+            let mut stmt = conn.prepare(&sql).unwrap();
+            let mut rows = stmt.query(refs.as_slice()).unwrap();
+            let mut dropped: BTreeMap<&str, HashMap<String, usize>> = BTreeMap::new();
+            let (mut marked, mut candidates, mut headers) = (0usize, 0usize, 0usize);
+            let mut exceptions: HashMap<String, usize> = HashMap::new();
+            let mut extract = std::time::Duration::ZERO;
+            while let Some(row) = rows.next().unwrap() {
+                let text: String = row.get(0).unwrap();
+                candidates += 1;
+                for raw in text.lines() {
+                    let line = raw.trim();
+                    if starts_with_ci(line, TRACEBACK_HEADER) && !behind_gutter(raw) {
+                        headers += 1;
+                    }
+                    if line.len() < 6 || line.len() > 400 || !is_error_line(line) {
+                        continue;
+                    }
+                    marked += 1;
+                    let rule = if behind_gutter(raw) {
+                        "gutter"
+                    } else if reads_as_code(line) {
+                        "code"
+                    } else {
+                        continue;
+                    };
+                    *dropped
+                        .entry(rule)
+                        .or_default()
+                        .entry(normalize(line))
+                        .or_default() += 1;
+                }
+                let t = std::time::Instant::now();
+                let found = extract_errors_with_files(&text);
+                extract += t.elapsed();
+                // Lines with no marker of their own come from the traceback rule.
+                for (line, _) in found.iter().filter(|(l, _)| !is_error_line(l)) {
+                    *exceptions.entry(normalize(line)).or_default() += 1;
+                }
+            }
+            eprintln!(
+                "{arm:?}: {candidates} candidate rows, extraction {extract:?}; \
+                 {marked} error-marked lines; {headers} traceback headers"
+            );
+            let mut exc: Vec<(&String, &usize)> = exceptions.iter().collect();
+            exc.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+            eprintln!(
+                "  traceback rule: {} exception lines with no marker, {} signatures",
+                exc.iter().map(|e| *e.1).sum::<usize>(),
+                exc.len()
+            );
+            for (sig, n) in exc.iter().take(10) {
+                eprintln!("  {n:>5} {}", cap_chars(sig, 100));
+            }
+            for (rule, sigs) in &dropped {
+                let mut sigs: Vec<(&String, &usize)> = sigs.iter().collect();
+                sigs.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+                let lines: usize = sigs.iter().map(|s| *s.1).sum();
+                let specific: usize = sigs.iter().filter(|s| is_specific(s.0)).map(|s| *s.1).sum();
+                eprintln!(
+                    "  rule {rule}: drops {lines} lines ({specific} of them is_specific), {} \
+                     signatures",
+                    sigs.len()
+                );
+                for (sig, n) in sigs.iter().take(25) {
+                    eprintln!(
+                        "  {n:>5} {} {}",
+                        if is_specific(sig) { "S" } else { "-" },
+                        cap_chars(sig, 100)
+                    );
+                }
+            }
+        }
+    }
+
+    /// Whether the recorded fixes hold, on a real index, read-only: the number a rule that
+    /// the error stopped (a quiet period, several sessions) must beat before a playbook is
+    /// memory again. Over the stored clusters with a fix, and over those that name their
+    /// error (each has a playbook gotcha): the fix commit (its earliest `committed_at`)
+    /// within 48 h after the last sighting; seen again after it; seen over more than 30 and
+    /// 100 days; seen in one session only; a fix at least 7 and 30 days old with no sighting
+    /// since. Counts only, never a signature, path or subject. A measurement: it asserts
+    /// nothing.
+    ///
+    /// CALLIMACHUS_GROUNDING_DB=<an APFS clone of index.db> cargo test -p callimachus-core \
+    ///   real_playbook_fixes_gate -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn real_playbook_fixes_gate() {
+        let Ok(path) = std::env::var("CALLIMACHUS_GROUNDING_DB") else {
+            eprintln!("set CALLIMACHUS_GROUNDING_DB to an index clone");
+            return;
+        };
+        let conn = crate::db::open_readonly(std::path::Path::new(&path)).unwrap();
+        if !crate::db::has_table(&conn, "issue_clusters") {
+            eprintln!("no issue_clusters table: an index from before 0034");
+            return;
+        }
+        const DAY: i64 = 86_400;
+        let now = chrono::Utc::now().timestamp();
+        // (signature, first_seen, last_seen, threads, the fix commit's time)
+        type Row = (String, i64, i64, i64, Option<i64>);
+        let rows: Vec<Row> = conn
+            .prepare(
+                "SELECT c.signature, c.first_seen, c.last_seen, c.threads,
+                        (SELECT MIN(tc.committed_at) FROM thread_commits tc
+                         WHERE tc.sha = c.resolved_sha)
+                 FROM issue_clusters c WHERE c.resolved_sha IS NOT NULL",
+            )
+            .unwrap()
+            .query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        for (label, specific_only) in [
+            ("resolved clusters", false),
+            ("naming their error (a playbook each)", true),
+        ] {
+            let set: Vec<&Row> = rows
+                .iter()
+                .filter(|r| !specific_only || is_specific(&r.0))
+                .collect();
+            let n = |p: &dyn Fn(&Row) -> bool| set.iter().filter(|r| p(r)).count();
+            let quiet_for =
+                |days: i64| n(&|r: &Row| r.4.is_some_and(|at| now - at >= days * DAY && r.2 <= at));
+            eprintln!("{label}: {}", set.len());
+            eprintln!(
+                "  fix commit not in thread_commits: {}",
+                n(&|r: &Row| r.4.is_none())
+            );
+            eprintln!(
+                "  fix within 48 h after the last sighting: {}",
+                n(&|r: &Row| r.4.is_some_and(|at| at >= r.2 && at - r.2 <= 2 * DAY))
+            );
+            eprintln!(
+                "  seen again after the fix: {}",
+                n(&|r: &Row| r.4.is_some_and(|at| at < r.2))
+            );
+            eprintln!(
+                "  seen over more than 30 days: {}, more than 100: {}",
+                n(&|r: &Row| r.2 - r.1 > 30 * DAY),
+                n(&|r: &Row| r.2 - r.1 > 100 * DAY)
+            );
+            eprintln!("  seen in one session only: {}", n(&|r: &Row| r.3 <= 1));
+            eprintln!(
+                "  fix at least 7 days old with no sighting since: {}, at least 30: {}",
+                quiet_for(7),
+                quiet_for(30)
+            );
+        }
+    }
+
     /// An idle machine (no batch since the refresh) keeps serving the table past the ten
     /// minutes, up to a day of window drift; a batch after the refresh makes it stale again.
     #[test]
@@ -2458,6 +3638,646 @@ mod tests {
         let got = recurring_issues(&conn, None, now - CLUSTER_WINDOW_SECS, 10).unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].example, "error: linker failed");
+    }
+
+    /// File content read with a line-number gutter and source lines that only name an
+    /// error variable are not errors. Each case is a synthetic line of the shape that
+    /// recurred on a real index; quoted `=>`, `?` and `:` inside a real message stay errors.
+    #[test]
+    fn read_gutters_and_code_lines_are_not_errors() {
+        let read = "     1\tconst x = 1;\n\
+                    \x20   12\terror: error instanceof Error ? error.message : String(error),\n\
+                    \x20  131\t   130\t      setFailure(`could not save: ${e instanceof Error ? e.message : e}`);\n\
+                    \x20   40\u{2192}TypeError: this line is in a file that was read\n\
+                    \x20    7\tTraceback (most recent call last):";
+        assert!(
+            extract_errors(read).is_empty(),
+            "{:?}",
+            extract_errors(read)
+        );
+
+        for code in [
+            "error: err instanceof Error ? err.message : err",
+            "onError: (error: Error) => toast.error(error.message),",
+            "onError: (error: unknown) =>",
+            "onError: (error) => {",
+            "error: {",
+            "error: { code: \"forbidden\", message: \"Accept the terms first\" },",
+            "+      error: { code: \"too_large\", message: \"Request too large\" },",
+            "const status = error: ok ? 200 : 500",
+            "} catch (error) {",
+            "\"errors\": [",
+            "return { error: {",
+            "fn main() -> Result<(), Box<dyn std::error::Error>> {",
+            "json({ error: e.message, details: {",
+            // `error::` is a path, not a marker.
+            "the embedder returns EmbedError::Init when the model is missing",
+            "let e = io::Error::new(io::ErrorKind::Other, msg)",
+            // A script's command, read without a gutter, not what it prints.
+            "echo \"::error::the release tag is missing\"",
+            "echo \"error: the release tag is missing\" >&2",
+            "printf 'error: %s\\n' \"$msg\"",
+            // The same command in a diff, a `set -x` trace, a workflow step and a prompt.
+            "+          echo \"Error: version mismatch\" >&2",
+            "+ echo 'error: missing env'",
+            "run: echo \"error: tag missing\" && exit 1",
+            "+      - run: echo \"error: tag missing\" && exit 1",
+            "$ echo \"error: the release tag is missing\"",
+            // pytest's verbose status line names a test, no error.
+            "tests/test_parser.py::TestParseError::test_empty FAILED",
+        ] {
+            assert!(extract_errors(code).is_empty(), "{code}");
+        }
+        // An `error::` that straddles the 64-char head: the `:` after it lies past the head.
+        let prose = "the embedder hands back a typed failure, for example ";
+        for prefix in [prose.to_string(), "\u{2501}".repeat(53)] {
+            let path = format!("{prefix}EmbedError::Init when the model is missing");
+            let (at, _) = path.char_indices().nth(64).unwrap();
+            assert!(path[..at].ends_with("EmbedError:"), "{path}");
+            assert!(extract_errors(&path).is_empty(), "{path}");
+        }
+
+        for real in [
+            "src/a.ts(3,5): error TS2322: Type '(e: Event) => void' is not assignable to type 'string'.",
+            "error: expected one of `=>`, `@`, `if`, or `|`, found `:`",
+            "error: can't find crate for `serde` (is it installed?)",
+            "TypeError: Cannot read properties of undefined (reading 'map')",
+            "error[E0277]: the `?` operator can only be used in a function that returns `Result`",
+            "Error: ENOENT: no such file or directory, open 'config.json'",
+            // A message that prints its payload on the next lines.
+            "MCP error -32602: Input validation error: Invalid arguments for tool lookup: [",
+            "Error: the upload was rejected with body: {",
+            // Node's print of an error object without its stack.
+            "[Error: EACCES: permission denied, open '/etc/x'] {",
+            "[Error: SQLITE_ERROR: no such table: users] {",
+            // The same behind Node's REPL and as a logged object's key.
+            "Uncaught [Error: boom: bad] {",
+            "  error: [Error: ENOENT: no such file or directory, open 'a.json'] {",
+            "error[E0308]: mismatched types",
+            "foo::Error: bad input",
+            "echo: write error: Broken pipe",
+            // pytest's summary, whose long node id pushes the exception past the head.
+            "FAILED tests/test_parser.py::TestParseError::test_empty - ValueError: empty input",
+        ] {
+            assert_eq!(extract_errors(real), [real.trim()], "{real}");
+        }
+        assert!(behind_gutter("  1234567\tx") && behind_gutter("9\u{2192}x"));
+        assert!(!behind_gutter("12345678\tx") && !behind_gutter("\t12\tx"));
+        assert!(!behind_gutter("     12 error: counted by uniq -c"));
+    }
+
+    /// A Python traceback counts once, as its exception line, filed under the innermost
+    /// frame's file; the header and the frames (whose source lines can carry a marker, like
+    /// `except KeyError:`) never count. A block that ends without an exception line, a bare
+    /// exception name and a header behind a log prefix add nothing.
+    #[test]
+    fn a_traceback_counts_as_its_exception_line() {
+        let text = "Running the import\n\
+                    Traceback (most recent call last):\n\
+                    \x20 File \"/srv/app/cli.py\", line 9, in <module>\n\
+                    \x20   main()\n\
+                    \x20 File \"/srv/app/loader.py\", line 41, in load\n\
+                    \x20   except KeyError: raise\n\
+                    \x20          ^^^^^^^^\n\
+                    KeyError: 'user_id'\n\
+                    \n\
+                    During handling of the above exception, another exception occurred:\n\
+                    \n\
+                    Traceback (most recent call last):\n\
+                    \x20 File \"/srv/app/net.py\", line 3, in fetch\n\
+                    \x20   conn.request()\n\
+                    http.client.InvalidURL: nonnumeric port: 'eighty'\n\
+                    done";
+        let found = extract_errors_with_files(text);
+        let lines: Vec<&str> = found.iter().map(|(l, _)| l.as_str()).collect();
+        assert_eq!(
+            lines,
+            [
+                "KeyError: 'user_id'",
+                "http.client.InvalidURL: nonnumeric port: 'eighty'"
+            ]
+        );
+        assert_eq!(found[0].1[0], "/srv/app/loader.py", "{:?}", found[0].1);
+        assert_eq!(found[1].1[0], "/srv/app/net.py", "{:?}", found[1].1);
+
+        // Indented as a whole (a log, a code block): the block is read relative to its header.
+        let indented = "    Traceback (most recent call last):\n\
+                        \x20     File \"a.py\", line 1, in <module>\n\
+                        \x20   json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)";
+        assert_eq!(
+            extract_errors(indented),
+            ["json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)"]
+        );
+        for nothing in [
+            // Cut off before its exception line (a head and tail join, a killed run).
+            "Traceback (most recent call last):\n  File \"a.py\", line 1, in <module>\n",
+            // A bare name says no more than the header did.
+            "Traceback (most recent call last):\n  File \"t.py\", line 2, in test\nAssertionError",
+            // Behind a log prefix the block cannot be followed; the header alone is no error.
+            "[2026-01-02 10:00:00] Traceback (most recent call last):",
+            // Cut off inside its frames, then a server's log line or a status line: not the
+            // exception line, though capitalized and followed by `: `.
+            "Traceback (most recent call last):\n  File \"/srv/app/main.py\", line 4, in run\n\
+             INFO:     Application shutdown complete.",
+            "Traceback (most recent call last):\n  File \"/srv/app/main.py\", line 4, in run\n\
+             Status: 404",
+            "Traceback (most recent call last):\n  File \"/srv/app/main.py\", line 4, in run\n\
+             Warning: the config file is older than the lock file",
+        ] {
+            assert!(extract_errors(nothing).is_empty(), "{nothing}");
+        }
+        for exception in [
+            "re.error: missing ), unterminated subpattern",
+            "Exception: the importer gave up",
+            "UserWarning: the field is deprecated",
+            "ExceptionGroup: unhandled errors in a TaskGroup (1 sub-exception)",
+            "jinja2.exceptions.TemplateNotFound: index.html",
+            "subprocess.TimeoutExpired: Command '['make']' timed out after 5 seconds",
+            "pydantic_core._pydantic_core.ValidationError: 1 validation error for User",
+        ] {
+            assert!(is_python_exception(exception), "{exception}");
+        }
+        for other in [
+            "During handling: of the above",
+            "note: run with `RUST_BACKTRACE=1`",
+            "INFO: started",
+            "Status: 404",
+            "Warning: x",
+            "Result: ok",
+            "App.Status: ok",
+        ] {
+            assert!(!is_python_exception(other), "{other}");
+        }
+    }
+
+    /// An exception raised inside the standard library or a package is filed under the
+    /// session's own frames, innermost first, which a session can edit; the library's own
+    /// file only when no frame is the session's.
+    #[test]
+    fn a_traceback_is_filed_under_the_sessions_own_frames() {
+        let text = "Traceback (most recent call last):\n\
+                    \x20 File \"/srv/app/cli.py\", line 9, in <module>\n\
+                    \x20   main()\n\
+                    \x20 File \"/srv/app/load.py\", line 12, in main\n\
+                    \x20   json.loads(raw)\n\
+                    \x20 File \"/usr/lib/python3.12/json/__init__.py\", line 346, in loads\n\
+                    \x20   return _default_decoder.decode(s)\n\
+                    \x20 File \"/srv/app/.venv/lib/python3.12/site-packages/x/y.py\", line 3, in f\n\
+                    \x20   raise\n\
+                    json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)";
+        let found = extract_errors_with_files(text);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].1[..2], ["/srv/app/load.py", "/srv/app/cli.py"]);
+
+        let only_library = "Traceback (most recent call last):\n\
+                            \x20 File \"<frozen runpy>\", line 198, in _run_module_as_main\n\
+                            \x20 File \"C:\\Python312\\Lib\\json\\decoder.py\", line 355, in raw_decode\n\
+                            json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)";
+        let found = extract_errors_with_files(only_library);
+        assert_eq!(found[0].1[0], "C:\\Python312\\Lib\\json\\decoder.py");
+
+        // A recursion error prints a frame per call; the innermost are kept.
+        let mut deep = String::from("Traceback (most recent call last):\n");
+        for i in 0..1_000 {
+            deep.push_str(&format!(
+                "  File \"/srv/app/m{i}.py\", line 1, in f\n    f()\n"
+            ));
+        }
+        deep.push_str("RecursionError: maximum recursion depth exceeded");
+        let found = extract_errors_with_files(&deep);
+        assert_eq!(found[0].1[0], "/srv/app/m999.py");
+        assert_eq!(found[0].1.len(), FILES_PER_ERROR);
+    }
+
+    /// A pytest run prints one failure twice, as the `E` line of its section and as the short
+    /// summary's `FAILED <node> - <message>`: it counts once, filed under the source file its
+    /// frames name and the test file of its node id, never under the run's timing. The same
+    /// holds for a summary pytest cut to the terminal width, and for a run that prints only
+    /// the summary.
+    #[test]
+    fn a_pytest_failure_counts_once_under_its_files() {
+        let run = |summary: &str| {
+            [
+                "=================================== FAILURES ===================================",
+                "_______________________________ test_empty_input _______________________________",
+                "",
+                "    def test_empty_input():",
+                ">       parse(\"\")",
+                "",
+                "tests/test_parse.py:5: ",
+                "_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ ",
+                "",
+                "    def parse(s):",
+                "        if not s:",
+                ">           raise ValueError(\"empty input\")",
+                "E           ValueError: empty input",
+                "",
+                "src/parse.py:3: ValueError",
+                "=========================== short test summary info ============================",
+                summary,
+                "========================= 1 failed, 1 passed in 0.03s ==========================",
+            ]
+            .join("\n")
+        };
+        for summary in [
+            "FAILED tests/test_parse.py::test_empty_input - ValueError: empty input",
+            "FAILED tests/test_parse.py::test_empty_input - ValueError: empty i...",
+        ] {
+            let found = extract_errors_with_files(&run(summary));
+            assert_eq!(found.len(), 1, "{found:?}");
+            assert_eq!(found[0].0, "E           ValueError: empty input");
+            assert_eq!(found[0].1, ["src/parse.py", "tests/test_parse.py"]);
+        }
+        let summary = "FAILED tests/test_parse.py::test_empty_input - ValueError: empty input";
+        assert_eq!(normalize(summary), "valueerror: empty input");
+        assert_eq!(normalize("E   ValueError: empty input"), normalize(summary));
+        let only = format!("{summary}\n1 failed, 1 passed in 0.03s");
+        assert_eq!(
+            extract_errors_with_files(&only),
+            [(summary.to_string(), vec!["tests/test_parse.py".to_string()])]
+        );
+
+        // Two failures whose messages share a start: the summary cut to that start could
+        // repeat either, so it files its test under neither, and both still count once.
+        let two = [
+            "=================================== FAILURES ===================================",
+            "_______________________________ test_empty_input _______________________________",
+            "",
+            ">       parse(\"\")",
+            "",
+            "tests/test_parse.py:5: ",
+            "_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ ",
+            ">           raise ValueError(\"invalid input: empty\")",
+            "E           ValueError: invalid input: empty",
+            "",
+            "src/parse.py:3: ValueError",
+            "___________________ TestHeaders.test_header_rejects_garbage ____________________",
+            "",
+            ">       read_header(b\"\")",
+            "",
+            "tests/test_header.py:9: ",
+            "_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ ",
+            ">           raise ValueError(\"invalid header bytes\")",
+            "E           ValueError: invalid header bytes",
+            "",
+            "src/header.py:7: ValueError",
+            "=========================== short test summary info ============================",
+            "FAILED tests/test_parse.py::test_empty_input - ValueError: invalid input: empty",
+            "FAILED tests/test_header.py::TestHeaders::test_header_rejects_garbage - ValueError: invalid...",
+            "============================== 2 failed in 0.05s ===============================",
+        ]
+        .join("\n");
+        let files = |v: &[&str]| v.iter().map(|f| f.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            extract_errors_with_files(&two),
+            [
+                (
+                    "E           ValueError: invalid input: empty".to_string(),
+                    files(&["src/parse.py", "tests/test_parse.py"])
+                ),
+                (
+                    "E           ValueError: invalid header bytes".to_string(),
+                    files(&["src/header.py"])
+                ),
+            ]
+        );
+        // `--tb=no` prints only the summaries, each cut: two failures stay two, even when one
+        // cut is a prefix of the other.
+        let (a, b) = (
+            "FAILED tests/test_parse.py::test_empty_input - ValueError: empty i...",
+            "FAILED tests/test_other.py::test_other_thing_long - ValueError: em...",
+        );
+        assert_eq!(
+            extract_errors_with_files(&format!("{a}\n{b}\n2 failed in 0.05s")),
+            [
+                (a.to_string(), files(&["tests/test_parse.py"])),
+                (b.to_string(), files(&["tests/test_other.py"])),
+            ]
+        );
+    }
+
+    /// Two threads of one Claude Code session on disk: the session and a subagent of it.
+    fn session_with_subagent(conn: &Connection, slug: &str) -> (i64, i64) {
+        let add = |ext: &str, sub: bool| {
+            conn.execute(
+                "INSERT INTO threads (source_id, external_id, title, project_path, project_key,
+                                      is_subagent)
+                 VALUES (1, ?1, 't', '/r/app', '/r/app', ?2)",
+                rusqlite::params![ext, sub],
+            )
+            .unwrap();
+            conn.last_insert_rowid()
+        };
+        (
+            add(&format!("{slug}.jsonl"), false),
+            add(&format!("{slug}/subagents/agent-a.jsonl"), true),
+        )
+    }
+
+    fn message_as(conn: &Connection, tid: i64, seq: i64, role: &str, text: &str, ts: i64) {
+        conn.execute(
+            "INSERT INTO messages (thread_id, seq, role, text, ts) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![tid, seq, role, text, ts],
+        )
+        .unwrap();
+    }
+
+    /// A subagent's tool output counts for its parent session (count, session list, the
+    /// session of the latest sighting and its project); its `user` turns, the orchestrator's
+    /// prompt, do not count; a subagent whose parent is not indexed counts on its own; and
+    /// Today's top-level reading leaves subagents out.
+    #[test]
+    fn subagent_tool_output_counts_for_its_parent_session() {
+        let conn = crate::db::test_support::TestIndex::new("issues_subagents");
+        let now = chrono::Utc::now().timestamp();
+        let (parent, sub) = session_with_subagent(&conn, "-r-app/s1");
+        let err = "error[E0425]: cannot find value `total` in this scope";
+        message_as(&conn, parent, 0, "tool", err, now - 300);
+        message_as(&conn, sub, 0, "tool", err, now - 200);
+        message_as(&conn, sub, 1, "user", err, now - 100);
+        let orphan = {
+            conn.execute(
+                "INSERT INTO threads (source_id, external_id, title, project_path, is_subagent)
+                 VALUES (1, '-r-app/gone/subagents/agent-b.jsonl', 't', '/r/other', 1)",
+                [],
+            )
+            .unwrap();
+            conn.last_insert_rowid()
+        };
+        let lonely = "error: linker `cc` not found in the toolchain";
+        message_as(&conn, orphan, 0, "tool", lonely, now - 50);
+        message_as(&conn, orphan, 1, "tool", lonely, now - 40);
+        // Another agent's subagents (OpenCode's, Gemini CLI's, Cursor's) have no parent
+        // mapping, so each would count as a session of its own: not mined.
+        let elsewhere = "error: the lockfile needs to be updated but --frozen was passed";
+        for (n, ext) in ["ses_child_a", "ses_child_b"].iter().enumerate() {
+            conn.execute(
+                "INSERT INTO threads (source_id, external_id, title, project_path, is_subagent)
+                 VALUES ((SELECT id FROM sources WHERE kind = 'cursor'), ?1, 't', '/r/app', 1)",
+                [ext],
+            )
+            .unwrap();
+            message_as(
+                &conn,
+                conn.last_insert_rowid(),
+                0,
+                "tool",
+                elsewhere,
+                now - 30 + n as i64,
+            );
+        }
+
+        let mined = mine(
+            &conn,
+            None,
+            ProjectMatch::Exact,
+            now - 3600,
+            10,
+            Sightings::All,
+        )
+        .unwrap();
+        assert!(
+            mined.iter().all(|m| m.cluster.example != elsewhere),
+            "{:?}",
+            mined.iter().map(|m| &m.cluster.example).collect::<Vec<_>>()
+        );
+        let of = |sig: &str| mined.iter().find(|m| m.cluster.example == sig).unwrap();
+        let c = &of(err).cluster;
+        assert_eq!((c.count, c.threads), (2, 1), "the user turn is not counted");
+        assert_eq!(c.thread_ids, vec![parent]);
+        assert_eq!((c.last_thread_id, c.last_seen), (parent, now - 200));
+        assert_eq!(of(err).sightings[0].project.as_deref(), Some("/r/app"));
+        let o = &of(lonely);
+        assert_eq!(o.cluster.thread_ids, vec![orphan]);
+        assert_eq!(o.sightings[0].project.as_deref(), Some("/r/other"));
+        // Scoped to a project, the subagent arm is scoped too.
+        let scoped =
+            recurring_issues_matching(&conn, Some("/r/app"), ProjectMatch::Exact, now - 3600, 10)
+                .unwrap();
+        assert_eq!(scoped.len(), 1, "{scoped:?}");
+
+        let top = recurring_issues_from(
+            &conn,
+            None,
+            ProjectMatch::Exact,
+            now - 3600,
+            10,
+            Sightings::TopLevel,
+        )
+        .unwrap();
+        assert!(top.is_empty(), "seen once at top level: {top:?}");
+    }
+
+    /// A subagent's final report comes back to its parent as a tool row that quotes its
+    /// output: that copy, and any later sighting in the parent, is no second sighting. A
+    /// parent that hit the error before its subagent counts both; two sessions that each
+    /// quote their subagent's error count once each. Today's top-level reading skips nothing.
+    #[test]
+    fn a_subagents_error_quoted_back_to_its_parent_counts_once() {
+        let conn = crate::db::test_support::TestIndex::new("issues_reports");
+        let now = chrono::Utc::now().timestamp();
+        let (p1, s1) = session_with_subagent(&conn, "-r-app/s1");
+        let quoted = "error[E0425]: cannot find value `total` in this scope";
+        message_as(&conn, s1, 0, "tool", quoted, now - 300);
+        let report = format!("The tests failed:\n{quoted}");
+        message_as(&conn, p1, 0, "tool", &report, now - 250);
+        message_as(&conn, p1, 1, "tool", quoted, now - 200);
+        let (p2, s2) = session_with_subagent(&conn, "-r-app/s2");
+        let first = "error[E0599]: no method named `frob` found for struct `Widget`";
+        message_as(&conn, p2, 0, "tool", first, now - 400);
+        message_as(&conn, s2, 0, "tool", first, now - 300);
+        message_as(&conn, p2, 1, "tool", first, now - 290);
+        let shared = "error: linker `cc` not found in the toolchain";
+        let (p3, s3) = session_with_subagent(&conn, "-r-app/s3");
+        let (p4, s4) = session_with_subagent(&conn, "-r-app/s4");
+        for (p, s, at) in [(p3, s3, now - 500), (p4, s4, now - 100)] {
+            message_as(&conn, s, 0, "tool", shared, at);
+            message_as(&conn, p, 0, "tool", shared, at + 30);
+        }
+
+        let read = |sightings| {
+            let mined = mine(&conn, None, ProjectMatch::Exact, now - 3600, 10, sightings);
+            mined.unwrap()
+        };
+        let all = read(Sightings::All);
+        let of = |mined: &[Mined], err: &str| {
+            let m = mined.iter().find(|m| m.cluster.example == err);
+            m.map(|m| (m.cluster.count, m.cluster.threads))
+        };
+        assert_eq!(of(&all, quoted), None, "one sighting, not listed");
+        assert_eq!(of(&all, first), Some((2, 1)));
+        assert_eq!(of(&all, shared), Some((2, 2)));
+        let c = &all
+            .iter()
+            .find(|m| m.cluster.example == shared)
+            .unwrap()
+            .cluster;
+        assert_eq!((c.last_thread_id, c.last_seen), (p4, now - 100));
+        assert_eq!(c.thread_ids, [p4, p3]);
+
+        let top = read(Sightings::TopLevel);
+        assert_eq!(of(&top, quoted), Some((2, 1)));
+        assert_eq!(of(&top, first), Some((2, 1)));
+        assert_eq!(of(&top, shared), Some((2, 2)));
+    }
+
+    /// The lists show only clusters that name their error; the table keeps the rest, and
+    /// `--all` lists them too. A fix stored for a signature that now reads as generic is no
+    /// playbook for the hook.
+    #[test]
+    fn lists_hold_specific_clusters_and_all_adds_the_rest() {
+        let conn = crate::db::test_support::TestIndex::new("issues_specific");
+        let now = chrono::Utc::now().timestamp();
+        let tid = app_thread(&conn, now - 60);
+        let specific = "error[E0599]: no method named `frob` found for struct `Widget`";
+        for (seq, text) in [
+            "error: process completed with exit code 1.",
+            "error: process completed with exit code 1.",
+            "error: run failed: command exited (1)",
+            "error: run failed: command exited (1)",
+            specific,
+            specific,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            add_msg(&conn, tid, seq as i64, text, now - 60);
+        }
+        assert_eq!(refresh_clusters_at(&conn, now).unwrap(), 3);
+        let since = now - CLUSTER_WINDOW_SECS;
+        let listed =
+            recurring_issues_with_fixes(&conn, None, ProjectMatch::Exact, since, 10).unwrap();
+        let examples: Vec<&str> = listed.iter().map(|i| i.cluster.example.as_str()).collect();
+        assert_eq!(examples, [specific]);
+        let all = listed_issues(&conn, None, ProjectMatch::Exact, since, 10, true).unwrap();
+        assert_eq!(all.len(), 3);
+        // Live (scoped) reads filter the same way, before the limit.
+        let scoped =
+            recurring_issues_with_fixes(&conn, Some("/r/app"), ProjectMatch::Exact, since, 1)
+                .unwrap();
+        assert_eq!(scoped[0].cluster.example, specific);
+
+        // A fix recorded for `patch does not apply` before it counted as generic.
+        let generic = normalize("error: src/a.rs: patch does not apply");
+        assert!(!is_specific(&generic));
+        conn.execute(
+            "INSERT INTO thread_commits
+                (thread_id, sha, short_sha, subject, committed_at, overlap, created_at)
+             VALUES (?1, 'abababababab', 'abababa', 'fix: rebase', ?2, 1, ?2)",
+            rusqlite::params![tid, now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO issue_clusters (signature, example, count, threads, first_seen,
+                last_seen, refreshed_at) VALUES (?1, ?1, 3, 1, 0, 0, 0)",
+            [&generic],
+        )
+        .unwrap();
+        let mut fixes = Fixes::new();
+        fixes.entry(generic.clone()).or_default().insert(
+            "/r/app".to_string(),
+            Resolution {
+                thread_id: tid,
+                sha: "abababababab".into(),
+                committed_at: now,
+            },
+        );
+        crate::knowledge::app_config::put(
+            &conn,
+            CLUSTER_FIXES,
+            &serde_json::to_string(&fixes).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            playbooks_for(&conn, std::slice::from_ref(&generic), "/r/app")
+                .unwrap()
+                .is_empty()
+        );
+
+        // Its gotcha, written back then, leaves project memory on the next refresh, unless
+        // the user pinned, edited or deleted (hid) one; a specific signature's stays, and so
+        // does one whose project key holds an `@`.
+        let sig_at =
+            normalize("npm error: no matching version found for react@latest in the registry");
+        assert!(sig_at.contains('@') && is_specific(&sig_at), "{sig_at}");
+        let add = |origin: &str, curated: &str| {
+            conn.execute(
+                &format!(
+                    "INSERT INTO facts (thread_id, kind, text, status, extractor, origin_ref,
+                                        created_at, {curated})
+                     VALUES (?1, 'gotcha', ?2, 'open', 'playbook', ?2, ?3, 1)"
+                ),
+                rusqlite::params![tid, origin, now],
+            )
+            .unwrap();
+        };
+        add(&playbook_ref(&generic, "/r/app"), "embedded");
+        for curated in ["pinned", "edited", "hidden"] {
+            add(&playbook_ref(&generic, &format!("/r/{curated}")), curated);
+        }
+        add(&playbook_ref(&sig_at, "/r/app"), "embedded");
+        add(&playbook_ref(&generic, "/r/x@2"), "embedded");
+        add(&playbook_ref(&sig_at, "/r/x@2"), "embedded");
+        refresh_clusters_at(&conn, now + 1).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT origin_ref FROM facts WHERE extractor = 'playbook' ORDER BY id")
+            .unwrap();
+        let left: Vec<String> = stmt
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let want: Vec<String> = ["/r/pinned", "/r/edited", "/r/hidden"]
+            .iter()
+            .map(|p| playbook_ref(&generic, p))
+            .chain([
+                playbook_ref(&sig_at, "/r/app"),
+                playbook_ref(&sig_at, "/r/x@2"),
+            ])
+            .collect();
+        assert_eq!(left, want);
+        assert_eq!(
+            playbook_signature(&playbook_ref(&sig_at, "/r/app")),
+            Some(sig_at.as_str())
+        );
+    }
+
+    /// Clusters a refresh mined with other extraction rules count as no refresh: readers
+    /// mine live and a refresh is due at once, and the next refresh serves again. A later
+    /// refresh by an older build (which does not stamp the rules) reads as stale too.
+    #[test]
+    fn clusters_mined_with_other_rules_are_mined_again() {
+        let conn = crate::db::test_support::TestIndex::new("issues_rules");
+        let now = chrono::Utc::now().timestamp();
+        let tid = app_thread(&conn, now - 60);
+        for seq in 0..2 {
+            add_msg(&conn, tid, seq, "fatal: bad object HEAD", now - 60);
+        }
+        refresh_clusters_at(&conn, now).unwrap();
+        assert!(refresh_state(&conn).is_some());
+        assert!(!clusters_due(&conn, now + 60, 300));
+        let since = now - CLUSTER_WINDOW_SECS;
+        assert!(stored_clusters(&conn, since, 10, now + 60).is_some());
+
+        for stale in ["1@{now}", "2@{earlier}", ""] {
+            let stamp = stale
+                .replace("{now}", &now.to_string())
+                .replace("{earlier}", &(now - 1).to_string());
+            crate::knowledge::app_config::put(&conn, CLUSTERS_EXTRACTION, &stamp).unwrap();
+            assert!(clusters_due(&conn, now + 60, 300), "{stamp}");
+            assert!(
+                stored_clusters(&conn, since, 10, now + 60).is_none(),
+                "{stamp}"
+            );
+        }
+        refresh_clusters_at(&conn, now + 60).unwrap();
+        assert!(!clusters_due(&conn, now + 120, 300));
+        assert_eq!(
+            crate::knowledge::app_config::get(&conn, CLUSTERS_EXTRACTION)
+                .unwrap()
+                .as_deref(),
+            Some(extraction_stamp(now + 60).as_str())
+        );
     }
 
     #[test]

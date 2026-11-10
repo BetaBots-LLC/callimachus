@@ -63,6 +63,7 @@ cargo fmt --check && cargo clippy --locked --workspace --lib --bins --tests -- -
 cargo test --locked --workspace
 cargo test -p callimachus-core -- --ignored real_claude_index --nocapture  # #[ignore] by name
 cargo test -p callimachus-core eval_memory_truth -- --ignored --nocapture  # recall eval (CONTRIBUTING.md)
+CALLIMACHUS_GROUNDING_DB=<clone>/index.db cargo test -p callimachus-core --lib -- --ignored real_playbook_fixes_gate --nocapture
 ```
 
 - fmt, clippy (`-D warnings`) and tests block CI (`RUST_TOOLCHAIN` in ci.yml pins Rust). All
@@ -74,6 +75,13 @@ cargo test -p callimachus-core eval_memory_truth -- --ignored --nocapture  # rec
   `apps/web` runs Biome as its `lint` script, so there it blocks.
 - `#[ignore]` tests use your real agent history (into temp DBs), the OS keychain, the `claude`
   CLI or a ~128 MB model download.
+- The measurement gates (`real_commit_link_precision`, `real_issue_clusters_gate`,
+  `real_playbook_fixes_gate`, `real_working_set_replay`, `real_todo_regate`,
+  `real_grounding_dry_run`) take an index through `CALLIMACHUS_GROUNDING_DB`: always an APFS
+  clone (Data safety below), never the real one (`real_todo_regate` migrates and writes it).
+  Some print text from your history (normalized error signatures, the first characters of a
+  TODO): keep their output out of the repo. A rule that claims a number says which gate
+  measured it; a gate that fails ships the measurement, not the behavior.
 - Browser-only UI work: `pnpm --filter callimachus dev` then http://localhost:1420/mock.html?view=settings&section=general (src/dev/mock-tauri.ts fakes every Tauri command with scenario URL params; never shipped).
 
 ## Data safety
@@ -170,7 +178,8 @@ env -u CLAUDE_CONFIG_DIR -u CODEX_HOME HOME="$S/home" CALLIMACHUS_DB="$S/index.d
 - `cli_contract::cal_json_schemas_match_the_checked_in_files` and
   `mcp_server::mcp_output_schemas_match_the_checked_in_files` rewrite `schemas/cal/*.v1.json`,
   `schemas/mcp/<tool>.json` and their copies under `apps/web/public/schemas/` when a shape
-  changes (commit them); `mcp_server::every_tool_answer_matches_its_output_schema` checks every
+  changes (commit them; a subcommand's schema, like `memory review`, also goes in
+  `cli_contract::SUBCOMMAND_SCHEMAS`); `mcp_server::every_tool_answer_matches_its_output_schema` checks every
   tool's structured content against its `output_schema`. Plain `--json` stays the bare,
   unversioned shape the released VS Code extension reads; only `--json-version 1` /
   `CAL_JSON_VERSION=1` gives the envelopes.
@@ -191,6 +200,8 @@ Every surface that injects project memory renders through `export::agent_memory_
 with an `export::MemoryBudget`: `HOOK` (SessionStart startup / clear, under Claude Code's 10k-char
 hook output cap), `COMPACT` (after compaction, snapshot carry), `AGENTS_FILE` (the managed
 AGENTS.md / CLAUDE.md block) and `MCP` (`project_memory`). Change sizes there, not at call sites.
+Those reads leave unpinned failure playbooks out in SQL (`knowledge::MemoryQuery::playbooks`,
+off by default); only the lists a person reads (the Projects page, `cal memory`) turn it on.
 MCP transcript tools take a `budget` (`TRANSCRIPT_BUDGET_*` in `mcp_server.rs`, default 24k).
 Hook events, matchers and timeouts are the `HookSpec` consts in `integration.rs` (the plugin's
 own SessionStart guard is `PLUGIN_ONLY_HOOKS` in its tests; GitHub Copilot and Cursor take flat
@@ -253,4 +264,9 @@ group; `callimachus-web` is ignored, so note site or policy changes in the `call
   process on a temp index), so no unit test reaches the machine's own data folder; the app
   crate's and `standalone`'s tests link core without that guard and must not run commands.
   Policy code takes injected probes (`is_macos_ephemeral_with`, `pick_cache_dir`).
+- Derived TODOs (checklists and markers, extractor `heuristic`; an agent's deferred-work lists,
+  `followup`) are written only through `knowledge::TodoDeriver`, which the indexer (full
+  replace and appended tail), the rebuild and the one-time re-judge share: it never deletes
+  or duplicates a TODO the user closed, pinned, hid or edited, and a thread with a reworded
+  TODO keeps its follow-ups as they are (`hand_curated`). Add no second derive path.
 - No em-dashes in prose (docs, changesets, comments, UI copy). Conventional Commits.

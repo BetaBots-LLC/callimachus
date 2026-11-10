@@ -1914,5 +1914,106 @@ mod tests {
         for (shape, n) in shapes.iter().take(30) {
             eprintln!("  {n:>4}  {shape}");
         }
+        // The distill prompt asks for decisions as rules (agent::DISTILL_SYSTEM). Stored facts
+        // keep the wording they were distilled with, so set CALLIMACHUS_PAST_TENSE_SINCE (unix
+        // seconds) to the day the prompt changed to see the share among newer distills.
+        let since: i64 = std::env::var("CALLIMACHUS_PAST_TENSE_SINCE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(i64::MAX);
+        let (mut all, mut all_log, mut new, mut new_log) = (0usize, 0usize, 0usize, 0usize);
+        for r in rows.iter().filter(|r| r.1 == "decision") {
+            let log = reads_as_change_log(&r.2);
+            all += 1;
+            all_log += usize::from(log);
+            if r.3 >= since {
+                new += 1;
+                new_log += usize::from(log);
+            }
+        }
+        eprintln!(
+            "decisions reading as change-log lines: {all_log} of {all} ({:.1}%); \
+             created since CALLIMACHUS_PAST_TENSE_SINCE: {new_log} of {new}",
+            100.0 * all_log as f64 / all.max(1) as f64
+        );
+    }
+
+    /// A decision written as a change-log line: it opens with a past-tense action verb
+    /// ("Fixed the layout shift by ...") instead of stating the rule ("Use X for Y"). `Set` is
+    /// left out: it is as often the imperative a rule opens with.
+    fn reads_as_change_log(text: &str) -> bool {
+        const VERBS: &[&str] = &[
+            "added",
+            "adopted",
+            "bumped",
+            "capped",
+            "changed",
+            "chose",
+            "consolidated",
+            "converted",
+            "created",
+            "decided",
+            "deferred",
+            "deleted",
+            "disabled",
+            "downgraded",
+            "dropped",
+            "enabled",
+            "exposed",
+            "extracted",
+            "fixed",
+            "implemented",
+            "installed",
+            "introduced",
+            "kept",
+            "lowered",
+            "made",
+            "merged",
+            "migrated",
+            "moved",
+            "patched",
+            "raised",
+            "refactored",
+            "removed",
+            "renamed",
+            "replaced",
+            "resolved",
+            "restructured",
+            "reverted",
+            "reworked",
+            "rewrote",
+            "simplified",
+            "split",
+            "standardized",
+            "switched",
+            "updated",
+            "upgraded",
+            "wired",
+            "wrapped",
+        ];
+        text.split_whitespace()
+            .next()
+            .map(|w| w.trim_matches(|c: char| !c.is_alphabetic()).to_lowercase())
+            .is_some_and(|w| VERBS.contains(&w.as_str()))
+    }
+
+    #[test]
+    fn change_log_lines_are_told_from_rules() {
+        assert!(reads_as_change_log(
+            "Fixed the layout shift by reserving the header height"
+        ));
+        assert!(reads_as_change_log(
+            "Removed the FORCE ROW LEVEL SECURITY line; it broke seeds"
+        ));
+        assert!(!reads_as_change_log(
+            "Use serde_json for the cache; bincode broke on reorders"
+        ));
+        assert!(!reads_as_change_log(
+            "Never store floats for money; invoices must add up"
+        ));
+        assert!(!reads_as_change_log(
+            "Set busy_timeout to 5000 ms on every connection"
+        ));
+        assert!(!reads_as_change_log(""));
     }
 }

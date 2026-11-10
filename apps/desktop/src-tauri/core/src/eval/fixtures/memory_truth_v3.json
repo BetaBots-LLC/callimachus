@@ -1,0 +1,302 @@
+{
+  "version": "memory_truth_v3",
+  "extends": "memory_truth_v2",
+  "note": "Adds three slices and changes nothing before it. search: 18 more paraphrases of v1's sessions (24 with v1's 6) and 10 off-topic long queries no session answers; both are scored apart from v1's search table, so its numbers and floors still hold. working_set: a project of its own, built in a separate index, where an old fact names a file the latest sessions edit.",
+  "search": [
+    {
+      "slice": "paraphrase",
+      "query": "how many seconds does the worker wait on the supplier product listing before it gives up",
+      "expect": ["ingest-1", "ingest-2"]
+    },
+    {
+      "slice": "paraphrase",
+      "query": "the supplier server answers unavailable for a moment while they deploy",
+      "expect": ["ingest-3"]
+    },
+    {
+      "slice": "paraphrase",
+      "query": "service fell over at boot after the variants of an enum were reordered",
+      "expect": ["cache-2"]
+    },
+    {
+      "slice": "paraphrase",
+      "query": "a storage encoding for saved entries that survives changes to the structs",
+      "expect": ["cache-3"]
+    },
+    {
+      "slice": "paraphrase",
+      "query": "reading the clock while drawing makes the first paint disagree",
+      "expect": ["dash-1"]
+    },
+    {
+      "slice": "paraphrase",
+      "query": "graphs blink whenever I come back to the window",
+      "expect": ["dash-2"]
+    },
+    {
+      "slice": "paraphrase",
+      "query": "show sales figures in the visitor's own regional style",
+      "expect": ["dash-3"]
+    },
+    {
+      "slice": "paraphrase",
+      "query": "removed items come back after a laptop reconnects from a long trip",
+      "expect": ["sync-4"]
+    },
+    {
+      "slice": "paraphrase",
+      "query": "two writers collide while someone types and the periodic upload runs",
+      "expect": ["sync-2"]
+    },
+    {
+      "slice": "paraphrase",
+      "query": "make the build pipeline take fewer minutes",
+      "expect": ["ci-1"]
+    },
+    {
+      "slice": "paraphrase",
+      "query": "how version labels are spelled for a public build",
+      "expect": ["ci-3"]
+    },
+    {
+      "slice": "paraphrase",
+      "query": "a stale credential sends the app into an endless rejection cycle",
+      "expect": ["auth-2"]
+    },
+    {
+      "slice": "paraphrase",
+      "query": "keeping long lived sign-in secrets safe if the database is stolen",
+      "expect": ["auth-1"]
+    },
+    {
+      "slice": "paraphrase",
+      "query": "matching word variants such as plurals and verb forms in text lookup",
+      "expect": ["search-1"]
+    },
+    {
+      "slice": "paraphrase",
+      "query": "splitting long texts into overlapping pieces before turning them into vectors",
+      "expect": ["search-2"]
+    },
+    {
+      "slice": "paraphrase",
+      "query": "merging two ranked lists without normalizing their scores",
+      "expect": ["search-3"]
+    },
+    {
+      "slice": "paraphrase",
+      "query": "a slow mail server freezes the purchase flow",
+      "expect": ["billing-3"]
+    },
+    {
+      "slice": "paraphrase",
+      "query": "the payment provider resent a notification and we billed the customer again",
+      "expect": ["billing-3"]
+    },
+    {
+      "slice": "off_topic",
+      "query": "how should the team schedule the quarterly offsite and book a venue for it",
+      "expect": []
+    },
+    {
+      "slice": "off_topic",
+      "query": "a good recipe for sourdough bread with rye flour and a long cold proof",
+      "expect": []
+    },
+    {
+      "slice": "off_topic",
+      "query": "which houseplants survive in a dark north facing apartment with little watering",
+      "expect": []
+    },
+    {
+      "slice": "off_topic",
+      "query": "tips for training a puppy to walk on a loose leash without pulling",
+      "expect": []
+    },
+    {
+      "slice": "off_topic",
+      "query": "the best stretches for lower back pain after sitting at a desk all day",
+      "expect": []
+    },
+    {
+      "slice": "off_topic",
+      "query": "plan a two week road trip through the national parks in the autumn",
+      "expect": []
+    },
+    {
+      "slice": "off_topic",
+      "query": "what should I pack for a winter hiking trip in the mountains",
+      "expect": []
+    },
+    {
+      "slice": "off_topic",
+      "query": "ideas for a vegetarian dinner party menu for eight guests",
+      "expect": []
+    },
+    {
+      "slice": "off_topic",
+      "query": "how to choose running shoes for flat feet and long distances",
+      "expect": []
+    },
+    {
+      "slice": "off_topic",
+      "query": "explain the rules of cricket and how a test match is scored",
+      "expect": []
+    }
+  ],
+  "working_set": {
+    "project": "/eval/ledger-core",
+    "branch": "feat/posting",
+    "sessions": [
+      {
+        "id": "ledger-1",
+        "date": "2026-08-01",
+        "branch": "main",
+        "title": "Posting model",
+        "edits": ["crates/ledger/src/posting.rs"],
+        "decisions": [
+          {
+            "id": "L1",
+            "text": "Postings are immutable once committed; a correction is a reversing entry written by `src/posting.rs`"
+          }
+        ],
+        "gotchas": [
+          {
+            "id": "LG1",
+            "text": "The account ids in `tests/fixtures/accounts.json` are shared by every ledger test; add accounts, never renumber them"
+          }
+        ]
+      },
+      {
+        "id": "ledger-2",
+        "date": "2026-08-02",
+        "branch": "main",
+        "title": "Balances",
+        "edits": ["crates/ledger/src/balance.rs"],
+        "decisions": [
+          {
+            "id": "L2",
+            "text": "Balances are derived from postings on read in `src/balance.rs`; nothing stores a running balance"
+          }
+        ],
+        "gotchas": []
+      },
+      {
+        "id": "ledger-3",
+        "date": "2026-08-03",
+        "branch": "main",
+        "title": "Accounts table",
+        "edits": ["crates/ledger/migrations/0007_accounts.sql"],
+        "decisions": [
+          {
+            "id": "L3",
+            "text": "Account codes are unique per book, enforced by the index in `migrations/0007_accounts.sql`"
+          }
+        ],
+        "gotchas": []
+      },
+      {
+        "id": "ledger-4",
+        "date": "2026-08-04",
+        "branch": "main",
+        "title": "Module layout",
+        "edits": [],
+        "decisions": [
+          {
+            "id": "L4",
+            "text": "Keep every `mod.rs` to re-exports only; logic lives in named files"
+          }
+        ],
+        "gotchas": []
+      },
+      {
+        "id": "ledger-5",
+        "date": "2026-08-05",
+        "branch": "main",
+        "title": "Money type",
+        "edits": [],
+        "decisions": [{ "id": "L5", "text": "Amounts are i64 minor units with an ISO 4217 code; never floats" }],
+        "gotchas": [{ "id": "LG5", "text": "rust_decimal is only for display rounding; it never reaches storage" }]
+      },
+      {
+        "id": "ledger-6",
+        "date": "2026-08-06",
+        "branch": "main",
+        "title": "Dates",
+        "edits": [],
+        "decisions": [{ "id": "L6", "text": "Booking dates are chrono NaiveDate in the book's timezone, never a timestamp" }],
+        "gotchas": [{ "id": "LG6", "text": "Month-end close runs at local midnight of the book, not UTC" }]
+      },
+      {
+        "id": "ledger-7",
+        "date": "2026-08-07",
+        "branch": "main",
+        "title": "Errors",
+        "edits": [],
+        "decisions": [{ "id": "L7", "text": "Library errors are thiserror enums; anyhow only in the CLI binary" }],
+        "gotchas": [{ "id": "LG7", "text": "LedgerError::Unbalanced carries both sides, so logs never need a second query" }]
+      },
+      {
+        "id": "ledger-8",
+        "date": "2026-08-08",
+        "branch": "main",
+        "title": "Storage",
+        "edits": [],
+        "decisions": [{ "id": "L8", "text": "Storage is Postgres through sqlx with compile-time checked queries" }],
+        "gotchas": [{ "id": "LG8", "text": "SQLX_OFFLINE=true is required in CI because the runner has no database" }]
+      },
+      {
+        "id": "ledger-9",
+        "date": "2026-08-09",
+        "branch": "main",
+        "title": "Imports",
+        "edits": [],
+        "decisions": [{ "id": "L9", "text": "Bank statement imports are idempotent on the statement line hash" }],
+        "gotchas": [{ "id": "LG9", "text": "CAMT.053 files repeat the opening balance on every page" }]
+      },
+      {
+        "id": "ledger-10",
+        "date": "2026-08-10",
+        "branch": "main",
+        "title": "API",
+        "edits": [],
+        "decisions": [{ "id": "L10", "text": "The HTTP API is axum with one router per bounded context" }],
+        "gotchas": [{ "id": "LG10", "text": "tower-http's TimeoutLayer must sit outside the auth layer" }]
+      },
+      {
+        "id": "ledger-11",
+        "date": "2026-08-11",
+        "branch": "feat/posting",
+        "title": "Balance cache",
+        "edits": ["crates/ledger/src/balance.rs"],
+        "decisions": [{ "id": "L11", "text": "Reports read balances through a materialized view refreshed nightly" }],
+        "gotchas": [{ "id": "LG11", "text": "REFRESH MATERIALIZED VIEW CONCURRENTLY needs a unique index" }]
+      },
+      {
+        "id": "ledger-12",
+        "date": "2026-08-12",
+        "branch": "main",
+        "title": "Reports",
+        "edits": ["crates/ledger/src/report.rs"],
+        "decisions": [{ "id": "L12", "text": "Report rows stream as CSV; nothing builds a whole report in memory" }],
+        "gotchas": [{ "id": "LG12", "text": "Excel opens the CSV export correctly only with a UTF-8 BOM" }]
+      },
+      {
+        "id": "ledger-13",
+        "date": "2026-08-13",
+        "branch": "feat/posting",
+        "title": "Reversals",
+        "edits": [
+          "crates/ledger/src/posting.rs",
+          "crates/ledger/src/balance.rs",
+          "crates/ledger/src/mod.rs",
+          "crates/ledger/tests/fixtures/accounts.json"
+        ],
+        "decisions": [{ "id": "L13", "text": "Reversal entries link to the posting they reverse by its id" }],
+        "gotchas": [{ "id": "LG13", "text": "A reversal of a reversal is refused; post a new entry instead" }]
+      }
+    ],
+    "expect_in": ["L1", "L2", "LG1"],
+    "expect_out": ["L3", "L4"]
+  }
+}

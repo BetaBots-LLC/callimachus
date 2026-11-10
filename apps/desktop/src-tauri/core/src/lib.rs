@@ -61,10 +61,23 @@
 //!   `project: "*"`) from it while the refresh is under 10 minutes old
 //!   ([`issues::CLUSTERS_FRESH_SECS`]), or up to a day old when nothing was indexed since
 //!   ([`issues::CLUSTERS_IDLE_SECS`]); a scoped call mines live. Readers of `issue_clusters`
-//!   filter on `refreshed_at = app_config issues.clusters_refreshed_at`. Rows the latest
+//!   filter on `refreshed_at = app_config issues.clusters_refreshed_at`, and treat the table
+//!   as never refreshed unless `issues.clusters_extraction` is `<extraction version>@<that
+//!   time>` (a change of extraction rules re-mines once, on the next refresh). A Claude Code
+//!   subagent's tool output counts for its parent session (`indexer::subagent_parents`), and
+//!   the parent's later sighting of the same error is taken for its report quoted back;
+//!   the listings (`cal issues`, `cal audit-pr`, MCP, the report, Today, the Project page)
+//!   leave out clusters that fail `is_specific`, which the table keeps (`cal issues --all`),
+//!   and a refresh deletes the uncurated playbook gotchas of such signatures. An unpinned
+//!   playbook takes no slot in memory handed to an agent or written to a file (the hooks, the
+//!   AGENTS.md block, MCP `project_memory`, the distiller's context;
+//!   [`knowledge::MemoryQuery::playbooks`]); the Project page and `cal memory` list it after
+//!   the other gotchas, and `recurring_issues` and the error-playbook hook cite it. Rows the latest
 //!   refresh did not see are kept with their `resolved_*` columns: an unresolved one is pruned
 //!   once its `last_seen` falls out of the 180-day window, a resolved one is kept
-//!   indefinitely (`PRUNE_CLUSTERS_SQL`). `resolved_thread_id` / `resolved_sha` hold the fix
+//!   indefinitely (`PRUNE_CLUSTERS_SQL`) unless the current line rules reject its example,
+//!   which drops its fix and uncurated playbook gotchas. `resolved_thread_id` /
+//!   `resolved_sha` hold the fix
 //!   an unscoped read shows; each project's own fix lives in `app_config`
 //!   `issues.cluster_fixes` (JSON, signature then project key) and the stored clusters'
 //!   thread ids in `issues.cluster_threads`, because phase 2 adds no migration. The refresh is split into [`issues::clusters_due`],

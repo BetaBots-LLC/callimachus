@@ -1416,6 +1416,11 @@ fn lenient_links<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<DistillLi
 /// those come from the free heuristic tier. The facts land in every future session's
 /// context for the repo, so the prompt asks for few, durable, repo-specific items; the
 /// repository reaches the model through pack_thread's `project=` envelope attribute.
+/// Decisions are asked for as rules with their reason after a semicolon: 227 of 660 stored
+/// LLM decisions (34%) on a real index (2026-11-09) open with a past-tense action verb, a
+/// change-log line ("Fixed the layout shift by...") an agent cannot apply as a constraint.
+/// Only new distills show the change: `knowledge::grounding`'s `real_grounding_dry_run`
+/// prints the share, and the share since a date (`CALLIMACHUS_PAST_TENSE_SINCE`).
 const DISTILL_SYSTEM: &str = "You distill one AI coding-agent session into durable project \
 knowledge for the developer. The <reference_thread> tag's project attribute names the \
 repository. Output ONLY a single JSON object (no prose, no markdown code fences) of exactly \
@@ -1423,7 +1428,9 @@ this shape:\n\
 {\"summary\": string, \"decisions\": string[], \"gotchas\": string[]}\n\
 - summary: 1-2 sentences on what the session did and the outcome.\n\
 - decisions: at most 3 durable technical decisions about THIS repository (architecture, \
-libraries, conventions, data formats), each one terse sentence with the reason.\n\
+libraries, conventions, data formats), each one terse sentence phrased as the rule that holds \
+going forward (\"Use X for Y\", \"Never Z\"), never as what the session did (\"Added X\", \
+\"Fixed Y\"), with the reason after a semicolon.\n\
 - gotchas: at most 3 non-obvious pitfalls or constraints of THIS repository that a future \
 session would otherwise hit, one sentence each.\n\
 Leave out anything ephemeral or task-local (one-off commands, current branch or PR status, \
@@ -2229,10 +2236,37 @@ mod tests {
             "\"retires\"",
             "session_started",
             "data",
+            // Decisions as rules that hold going forward, the reason kept after a semicolon.
+            "phrased as the rule that holds going forward",
+            "never as what the session did",
+            "with the reason after a semicolon",
         ] {
             assert!(DISTILL_SYSTEM.contains(needle), "{needle}");
         }
+        assert!(!DISTILL_SYSTEM.contains("each one terse sentence with the reason."));
         assert!(DISTILL_SYSTEM.starts_with("You distill one AI coding-agent session into durable"));
+    }
+
+    /// The rule wording sits mid-prompt, so the opening `is_app_prompt` compares is the one
+    /// the builds before it persisted: their CLI sessions are still recognized and purged.
+    #[test]
+    fn the_rules_wording_keeps_the_prompt_opening() {
+        let before_rules = "You distill one AI coding-agent session into durable project \
+            knowledge for the developer. The <reference_thread> tag's project attribute names \
+            the repository. Output ONLY a single JSON object";
+        assert!(is_app_prompt(before_rules));
+        let head: String = DISTILL_SYSTEM.chars().take(60).collect();
+        assert!(before_rules.starts_with(&head), "{head}");
+        // One line per bullet: the decisions bullet stays a single `- decisions:` line.
+        let bullet = DISTILL_SYSTEM
+            .lines()
+            .find(|l| l.starts_with("- decisions:"))
+            .unwrap();
+        assert!(bullet.contains("\"Use X for Y\", \"Never Z\""), "{bullet}");
+        assert!(
+            bullet.ends_with("with the reason after a semicolon."),
+            "{bullet}"
+        );
     }
 
     #[test]

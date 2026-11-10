@@ -565,8 +565,9 @@ fn recurring_errors(
 }
 
 /// The cluster's stored example when tool output carried it (the sighting the cluster keeps:
-/// its latest, in `last_thread_id` at `last_seen`). `instr` reads only the few rows of that
-/// one (thread, ts) pair, through `idx_messages_thread_ts`.
+/// its latest, at `last_seen` in a thread of the session `last_thread_id`, which is the
+/// parent session of a subagent's sighting). `instr` reads only the few rows of one
+/// (thread, ts) pair, through `idx_messages_thread_ts`.
 const EXAMPLE_FROM_TOOL_SQL: &str = "SELECT 1 FROM messages m
      WHERE m.thread_id = ?1 AND m.ts = ?2 AND m.role = 'tool' AND instr(m.text, ?3) > 0
      LIMIT 1";
@@ -580,11 +581,15 @@ const TOOL_TEXT_TAIL: i64 = 2_000;
 /// newest tool row since `from` with a line of the same signature. None when only user turns
 /// carry it.
 fn tool_example(conn: &Connection, c: &issues::IssueCluster, from: i64) -> Result<Option<String>> {
-    let from_tool = conn
-        .prepare_cached(EXAMPLE_FROM_TOOL_SQL)?
-        .exists(rusqlite::params![c.last_thread_id, c.last_seen, c.example])?;
-    if from_tool {
-        return Ok(Some(c.example.clone()));
+    // Mining files a subagent's sighting under its parent session, so looking in that one
+    // thread alone missed every such cluster and paid for the FTS fallback below, which can
+    // miss it too.
+    let threads = crate::indexer::session_thread_ids(conn, c.last_thread_id)?;
+    let mut stmt = conn.prepare_cached(EXAMPLE_FROM_TOOL_SQL)?;
+    for thread in threads {
+        if stmt.exists(rusqlite::params![thread, c.last_seen, c.example])? {
+            return Ok(Some(c.example.clone()));
+        }
     }
     let signature = issues::normalize(&c.example);
     let Some(query) = signature_match(&signature) else {
@@ -1935,6 +1940,39 @@ mod tests {
             !md.contains("/Users/me") && !md.contains("secretive"),
             "{md}"
         );
+    }
+
+    /// A cluster whose newest sighting is a subagent's tool row names the parent session:
+    /// its example comes from that row by the fast path. Read from `NOW`, the FTS fallback
+    /// has no row to find it in.
+    #[test]
+    fn a_subagents_sighting_is_found_by_the_fast_path() {
+        let conn = temp_db("subagent_example");
+        let sid = source(&conn, "claude_code");
+        let thread = |ext: &str, subagent: bool| {
+            conn.execute(
+                "INSERT INTO threads (source_id, external_id, title, project_path, project_key,
+                                      is_subagent)
+                 VALUES (?1, ?2, 't', '/r/app', '/r/app', ?3)",
+                rusqlite::params![sid, ext, subagent],
+            )
+            .unwrap();
+            conn.last_insert_rowid()
+        };
+        let parent = thread("-r-app/s1.jsonl", false);
+        let subagent = thread("-r-app/s1/subagents/agent-a.jsonl", true);
+        let err = "error[E0425]: cannot find value `total` in this scope";
+        for (tid, ts) in [(parent, NOW - 2 * DAY), (subagent, NOW - DAY)] {
+            conn.execute(
+                "INSERT INTO messages (thread_id, seq, role, text, ts) VALUES (?1, 0, 'tool', ?2, ?3)",
+                rusqlite::params![tid, err, ts],
+            )
+            .unwrap();
+        }
+        let found = issues::recurring_issues(&conn, None, NOW - 30 * DAY, 10).unwrap();
+        let c = found.iter().find(|c| c.example == err).expect("mined");
+        assert_eq!((c.last_thread_id, c.last_seen), (parent, NOW - DAY));
+        assert_eq!(tool_example(&conn, c, NOW).unwrap().as_deref(), Some(err));
     }
 
     #[test]

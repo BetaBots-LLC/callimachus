@@ -517,7 +517,8 @@ async fn coach_overview(pool: tauri::State<'_, db::ReadPool>) -> AppResult<searc
 }
 
 /// Recurring errors mined across all sessions in the last 180 days (most frequent first),
-/// each with the commit that fixed it once one is known (in this project, when scoped).
+/// each with the commit that fixed it once one is known (in this project, when scoped). Only
+/// those that name their error, as `cal issues` lists them.
 #[tauri::command]
 async fn recurring_issues(
     pool: tauri::State<'_, db::ReadPool>,
@@ -525,7 +526,13 @@ async fn recurring_issues(
 ) -> AppResult<Vec<issues::Issue>> {
     read_blocking(&pool, move |conn| {
         let since = chrono::Utc::now().timestamp() - 180 * 86_400;
-        let clusters = issues::recurring_issues_cached(conn, project.as_deref(), since, 30)?;
+        let ranked = issues::recurring_issues_cached(
+            conn,
+            project.as_deref(),
+            since,
+            issues::CLUSTER_TABLE_CAP,
+        )?;
+        let clusters = issues::specific_clusters(ranked, 30);
         // Read live, after the cache: a fix lands without changing the thread set the
         // cache key follows (a refresh resolves it minutes after the commit is linked).
         Ok(issues::with_fixes(
@@ -1571,6 +1578,40 @@ async fn unlink_facts(
     in_edit_order(&app, write).await
 }
 
+/// The user restores a replaced fact (the Replaced list's and Today's Undo): every
+/// replacement link onto it is undone in one transaction, so a fact two sessions replaced
+/// needs one Undo, and the links stay undone. Returns how many were undone.
+#[tauri::command]
+async fn restore_fact(app: AppHandle, fact_id: i64) -> AppResult<usize> {
+    let write = write_retry_async(&app, move |conn| {
+        knowledge::restore_fact(conn, fact_id, chrono::Utc::now().timestamp())
+    });
+    in_edit_order(&app, write).await
+}
+
+/// The user keeps a recorded or replaced fact on Today's "Memory to review" (Keep): it stays
+/// off that list and `cal memory review` from now on. `other_id` is the replacing fact of a
+/// replaced one. A flag or a dispute is kept by settling it (`resolve_fact_flags`,
+/// `unlink_facts`).
+#[tauri::command]
+async fn keep_review_item(
+    app: AppHandle,
+    reason: today::ReviewReason,
+    fact_id: i64,
+    other_id: Option<i64>,
+) -> AppResult<()> {
+    let write = write_retry_async(&app, move |conn| {
+        today::keep_review_item(
+            conn,
+            reason,
+            fact_id,
+            other_id,
+            chrono::Utc::now().timestamp(),
+        )
+    });
+    in_edit_order(&app, write).await
+}
+
 /// The user keeps a flagged fact: its stale / wrong flags are resolved (kept as history) and
 /// it returns to injected memory. Returns how many flags were resolved.
 #[tauri::command]
@@ -1757,6 +1798,8 @@ async fn project_memory(
                 per_kind: 60,
                 history: true,
                 coverage: true,
+                // The user reads and curates this list: playbooks stay, after the gotchas.
+                playbooks: true,
                 ..Default::default()
             },
         )
@@ -4374,6 +4417,8 @@ pub fn run() {
             hide_fact,
             link_facts,
             unlink_facts,
+            restore_fact,
+            keep_review_item,
             resolve_fact_flags,
             set_todo_done,
             remember,

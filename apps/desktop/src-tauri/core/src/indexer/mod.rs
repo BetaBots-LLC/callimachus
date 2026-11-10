@@ -481,19 +481,25 @@ pub fn session_thread_ids(conn: &Connection, thread_id: i64) -> Result<Vec<i64>>
     else {
         return Ok(out);
     };
-    let Some(stem) = external_id
-        .strip_suffix(".jsonl")
-        .filter(|s| !s.contains("/subagents/"))
-    else {
+    let Some((lo, hi)) = subagent_id_range(&external_id) else {
         return Ok(out);
     };
-    // `/` + 1 is `0`: every id under `<stem>/subagents/` and nothing after it.
-    let (lo, hi) = (format!("{stem}/subagents/"), format!("{stem}/subagents0"));
     let mut stmt = conn.prepare_cached(SUBAGENTS_OF_SQL)?;
     for id in stmt.query_map(params![source_id, lo, hi], |r| r.get::<_, i64>(0))? {
         out.push(id?);
     }
     Ok(out)
+}
+
+/// The `external_id` range `[lo, hi)` holding the subagent transcripts of the session whose
+/// `external_id` this is (see [`session_thread_ids`]); None for a thread that has none by
+/// construction (not a `.jsonl` session, or itself a subagent transcript).
+pub(crate) fn subagent_id_range(external_id: &str) -> Option<(String, String)> {
+    let stem = external_id
+        .strip_suffix(".jsonl")
+        .filter(|s| !s.contains("/subagents/"))?;
+    // `/` + 1 is `0`: every id under `<stem>/subagents/` and nothing after it.
+    Some((format!("{stem}/subagents/"), format!("{stem}/subagents0")))
 }
 
 /// The subagent transcripts of one session (see [`session_thread_ids`]).
@@ -526,6 +532,26 @@ pub fn parent_session_id(conn: &Connection, thread_id: i64) -> Result<i64> {
         .optional()?
         .unwrap_or(thread_id))
 }
+
+/// Every subagent transcript's parent session at once, as `subagent -> parent` thread ids
+/// ([`parent_session_id`] answers for one): what cost reporting folds a subagent's spend
+/// into and issue mining files a subagent's errors under. A subagent whose parent is not
+/// indexed is left out, so it stays on its own.
+pub(crate) fn subagent_parents(conn: &Connection) -> Result<std::collections::HashMap<i64, i64>> {
+    let mut stmt = conn.prepare_cached(SUBAGENT_PARENTS_SQL)?;
+    let pairs = stmt
+        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(pairs)
+}
+
+/// Each Claude Code subagent transcript's parent: `<slug>/<session>.jsonl` for
+/// `<slug>/<session>/subagents/.../agent-<id>.jsonl`, matched on the unique
+/// (source, external id) index.
+pub(crate) const SUBAGENT_PARENTS_SQL: &str = "SELECT c.id, p.id FROM threads c
+     JOIN threads p ON p.source_id = c.source_id
+      AND p.external_id = substr(c.external_id, 1, instr(c.external_id, '/subagents/') - 1) || '.jsonl'
+     WHERE c.is_subagent = 1 AND instr(c.external_id, '/subagents/') > 0";
 
 /// Resolve the numeric source id for a source kind (rows are seeded by migration).
 pub fn source_id(conn: &Connection, kind: &str) -> Result<i64> {
@@ -1025,86 +1051,26 @@ fn derive_todos(
     if is_subagent {
         return Ok(());
     }
-    const MAX_TODOS_PER_THREAD: usize = 25;
-    // Keep CURATED todos (done / dismissed / pinned) so closing one survives re-index;
-    // re-derive only the open, untouched ones.
-    // Full replace re-derives open heuristic todos from scratch; an append keeps the
-    // existing ones (the `seen` seed below dedups) and scans only the new tail.
-    // A re-derived TODO keeps the uid it had, so a full re-index does not mint new facts.
-    let uids = if appended {
-        std::collections::HashMap::new()
-    } else {
-        crate::knowledge::take_open_heuristic_todos(tx, thread_id)?
-    };
-    let edited = if appended {
-        std::collections::HashSet::new()
-    } else {
-        crate::knowledge::edited_todo_seqs(tx, thread_id)?
-    };
-    // An append whose tail has no user/assistant text has nothing to scan: skip the seeds.
-    if !inserted
+    // An append whose tail has no user/assistant text has nothing to scan: skip the seeds
+    // (a full replace still takes the open rows, as the thread may have lost its messages).
+    let scans = inserted
         .iter()
-        .any(|m| m.role == "user" || m.role == "assistant")
-    {
+        .any(|m| m.role == "user" || m.role == "assistant");
+    if appended && !scans {
         return Ok(());
     }
-    let mut fstmt = tx.prepare(crate::knowledge::INSERT_HEURISTIC_TODO_SQL)?;
-    let mut seen = std::collections::HashSet::new();
-    // Seed with kept curated todos so we don't re-add an open copy of a closed one.
-    {
-        let mut kept =
-            tx.prepare("SELECT text FROM facts WHERE thread_id = ?1 AND extractor = 'heuristic'")?;
-        for t in kept
-            .query_map([thread_id], |r| r.get::<_, String>(0))?
-            .flatten()
-        {
-            seen.insert(t.to_ascii_lowercase());
-        }
-    }
-    // The cap is a per-thread TOTAL; on an append the existing open todos weren't deleted,
-    // so they still count toward it, so seed the counter instead of starting at 0.
-    let mut count: usize = if appended {
-        tx.query_row(
-            "SELECT COUNT(*) FROM facts WHERE thread_id = ?1
-                AND extractor = 'heuristic' AND status = 'open'",
-            [thread_id],
-            |r| r.get::<_, i64>(0),
-        )? as usize
-    } else {
-        0
-    };
-    'outer: for m in inserted {
+    // Keep CURATED todos (done / dismissed / pinned / edited) so closing one survives a
+    // re-index; a full replace re-derives only the open, untouched ones (each keeping the uid
+    // it had, so a full re-index does not mint new facts), an append scans only the new tail
+    // (where a deferred-work list still deletes an earlier list's open follow-ups, unless the
+    // user reworded one of the thread's TODOs: `TodoDeriver` then leaves follow-ups alone).
+    let mut derive = crate::knowledge::TodoDeriver::start(tx, thread_id, !appended, now)?;
+    // Every message is read: a later deferred-work list replaces the earlier ones.
+    for m in inserted {
         if m.role != "user" && m.role != "assistant" {
             continue;
         }
-        for todo in crate::knowledge::extract_todos(m.text) {
-            if count >= MAX_TODOS_PER_THREAD {
-                break 'outer;
-            }
-            let lower = todo.to_ascii_lowercase();
-            if edited.contains(&m.seq) && !uids.contains_key(&lower) {
-                // The user reworded the TODO this message raised (see `edited_todo_seqs`).
-                seen.insert(lower);
-                continue;
-            }
-            if seen.insert(lower.clone()) {
-                let uid = uids
-                    .get(&lower)
-                    .cloned()
-                    .unwrap_or_else(crate::knowledge::new_fact_uid);
-                // Stamped with the source message's time, not index time, so a
-                // re-index of old history doesn't make old TODOs look new.
-                fstmt.execute(params![
-                    thread_id,
-                    todo,
-                    m.id,
-                    crate::knowledge::todo_created_at(m.ts, now),
-                    m.seq,
-                    uid
-                ])?;
-                count += 1;
-            }
-        }
+        derive.message(m.id, m.role == "assistant", m.text, m.ts, m.seq)?;
     }
     Ok(())
 }

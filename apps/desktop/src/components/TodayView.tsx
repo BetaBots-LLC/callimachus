@@ -2,6 +2,7 @@ import { type KeyboardEvent, useEffect, useId, useState } from "react";
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertTriangle,
+  Brain,
   Check,
   CircleDot,
   Copy,
@@ -10,7 +11,7 @@ import {
   TerminalSquare,
   X,
 } from "lucide-react";
-import { api, SOURCE_LABELS, type Today, type TodayThread } from "../lib/api";
+import { api, type ReviewItem, SOURCE_LABELS, type Today, type TodayThread } from "../lib/api";
 import { copyText } from "../lib/clipboard";
 import {
   baseName,
@@ -19,10 +20,12 @@ import {
   formatTime,
   snapshotEventText,
 } from "../lib/format";
+import { invalidateDomain } from "../lib/keys";
 import { CAN_LAUNCH_CLI_FALLBACK } from "../lib/platform";
 import { AGGREGATE_STALE_MS, queryClient } from "../lib/queryClient";
 import { errorText, notify } from "../lib/toast";
 import { useUi } from "../store/ui";
+import { factDate } from "./project/FactTruth";
 import { openProjectSection } from "./project/sections";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
@@ -30,8 +33,8 @@ import { Loading } from "./Loading";
 
 /**
  * Today: what happened since the app was last opened, grouped by repo, with the commits
- * each session produced and what came up along the way (new TODOs, errors seen again,
- * snapshots). Built from the index alone; nothing here calls an LLM.
+ * each session produced and what came up along the way (memory to review, new TODOs, errors
+ * seen again, snapshots). Built from the index alone; nothing here calls an LLM.
  */
 
 type Range = "open" | "24h" | "7d";
@@ -71,7 +74,50 @@ if (typeof document !== "undefined") {
 // The range picked this session, kept across tab switches (the view unmounts).
 let sessionRange: Range = "open";
 
-type Panel = "todos" | "issues" | "snapshots";
+// Review items the user settled (`reviewKey`), hidden until a Today load that leaves them out
+// lands: a load that started before the write committed still lists them. Every action is
+// stored too (Keep on a recorded or replaced fact through `keep_review_item`), so the backend
+// leaves a settled item out, and a key the fresh list lacks is dropped (`forgetSettled`).
+// The key names the fact, not the flag: kept for good, a fact flagged again after a Keep
+// stayed off Today for as long as the webview lived (days, with close-to-tray).
+const keptReview = new Set<string>();
+const reviewKey = (i: ReviewItem) => `${i.reason}:${i.factId}:${i.other?.id ?? ""}`;
+const toReview = (report: Today) =>
+  (report.memoryReview ?? []).filter((i) => !keptReview.has(reviewKey(i)));
+function forgetSettled(report: Today) {
+  const listed = new Set((report.memoryReview ?? []).map(reviewKey));
+  for (const key of keptReview) if (!listed.has(key)) keptReview.delete(key);
+}
+
+/** Drop a settled review item from every cached Today window, so the strip, the panel and the
+ *  empty state update together instead of after the refetch (which also links commits, for
+ *  up to 2 s, and may fail). */
+function dropReviewItem(key: string) {
+  queryClient.setQueriesData<Today>({ queryKey: ["today"] }, (d) =>
+    d?.memoryReview
+      ? { ...d, memoryReview: d.memoryReview.filter((i) => reviewKey(i) !== key) }
+      : d,
+  );
+}
+
+/** Where focus goes when a settled review row unmounts with the button that held it (focus
+ *  fell to <body>), as MemorySection's focusFact does: the next row's first button, else the
+ *  previous row's, else a strip button that stays, else the heading. Null when focus is
+ *  elsewhere on the page: a user who moved on keeps their place. */
+function focusAfterReview(listId: string, key: string): HTMLElement | null {
+  const list = document.getElementById(listId);
+  const active = document.activeElement;
+  if (active && active !== document.body && !list?.contains(active)) return null;
+  const row = list?.querySelector(`[data-review-key="${CSS.escape(key)}"]`);
+  const sibling = row?.nextElementSibling ?? row?.previousElementSibling;
+  return (
+    sibling?.querySelector<HTMLElement>("button:not(:disabled)") ??
+    document.querySelector<HTMLElement>("[data-panel]:not([data-panel='memory'])") ??
+    document.querySelector<HTMLElement>("[data-today-heading]")
+  );
+}
+
+type Panel = "memory" | "todos" | "issues" | "snapshots";
 
 export function TodayView() {
   const [range, setRangeState] = useState<Range>(sessionRange);
@@ -86,6 +132,7 @@ export function TodayView() {
       const since = range === "open" ? lastOpenSince : Math.floor(Date.now() / 1000) - secs;
       const data = await api.today(since);
       if (range === "open" && lastOpenSince === null) lastOpenSince = data.since;
+      forgetSettled(data);
       return data;
     },
     // Watcher writes mark it stale (AGGREGATE_KEYS); a revisit then refreshes it.
@@ -132,6 +179,7 @@ export function TodayView() {
   const since = formatSince(data.since);
   const nothing =
     sessions === 0 &&
+    toReview(data).length === 0 &&
     data.newTodos.length === 0 &&
     data.issuesSeenAgain.length === 0 &&
     data.snapshots.length === 0;
@@ -149,7 +197,13 @@ export function TodayView() {
         <ReportCard />
         <header className="flex flex-wrap items-center gap-x-4 gap-y-3 pb-5">
           <div className="min-w-0 flex-1">
-            <h1 className="text-lg font-semibold tracking-tight text-balance">Since {since}</h1>
+            <h1
+              data-today-heading
+              tabIndex={-1}
+              className="text-lg font-semibold tracking-tight text-balance outline-none"
+            >
+              Since {since}
+            </h1>
             {!nothing && (
               <p className="text-sm text-muted-foreground tabular-nums">
                 {plural(sessions, "session")} in {plural(data.groups.length, "repo")}
@@ -241,6 +295,7 @@ function ReportCard() {
 }
 
 function panelCount(report: Today, panel: Panel): number {
+  if (panel === "memory") return toReview(report).length;
   if (panel === "todos") return report.newTodos.length;
   if (panel === "issues") return report.issuesSeenAgain.length;
   return report.snapshots.length;
@@ -354,7 +409,18 @@ function Strip({
   onToggle: (p: Panel | null) => void;
   panelId: string;
 }) {
-  const items: { id: Panel; n: number; label: string; icon: typeof CircleDot }[] = [
+  const review = toReview(report).length;
+  // The backend lists at most 50 and counts the rest: "50+ facts to review".
+  const moreReview = (report.memoryReviewMore ?? 0) > 0;
+  type Item = { id: Panel; n: number; more?: boolean; label: string; icon: typeof CircleDot };
+  const items: Item[] = [
+    {
+      id: "memory" as const,
+      n: review,
+      more: moreReview,
+      label: review === 1 && !moreReview ? "fact to review" : "facts to review",
+      icon: Brain,
+    },
     {
       id: "todos" as const,
       n: report.newTodos.length,
@@ -377,17 +443,22 @@ function Strip({
   if (items.length === 0) return null;
   return (
     <div className="flex flex-wrap gap-2 pb-3">
-      {items.map(({ id, n, label, icon: Icon }) => (
+      {items.map(({ id, n, more, label, icon: Icon }) => (
         <Button
           key={id}
+          data-panel={id}
           size="sm"
           variant={panel === id ? "secondary" : "outline"}
           aria-expanded={panel === id}
           aria-controls={panel === id ? panelId : undefined}
           onClick={() => onToggle(panel === id ? null : id)}
         >
-          <Icon className={cn(id === "issues" && "text-amber-600 dark:text-amber-400")} />
-          <span className="tabular-nums">{n}</span> {label}
+          <Icon
+            className={cn(
+              (id === "issues" || id === "memory") && "text-amber-600 dark:text-amber-400",
+            )}
+          />
+          <span className="tabular-nums">{more ? `${n}+` : n}</span> {label}
         </Button>
       ))}
     </div>
@@ -396,6 +467,7 @@ function Strip({
 
 function StripPanel({ id, panel, report }: { id: string; panel: Panel; report: Today }) {
   const openThread = useUi((s) => s.openThread);
+  if (panel === "memory") return <MemoryReviewPanel id={id} items={toReview(report)} />;
   // The repo's key, never the stored path: a worktree session's snapshot stores the
   // worktree path, which is no key, so the Project page opened on it (and remembered it as
   // Search's scope) matched nothing.
@@ -470,6 +542,156 @@ function StripPanel({ id, panel, report }: { id: string; panel: Panel; report: T
             </li>
           );
         })}
+    </ul>
+  );
+}
+
+/** Why a fact is listed, in words: "Flagged stale by an agent", "Replaced by an agent". */
+function reviewHeadline(item: ReviewItem): string {
+  const who =
+    item.source === "agent"
+      ? "an agent"
+      : item.source === "distill"
+        ? "a memory pass"
+        : item.source === "repo"
+          ? "a repo import"
+          : item.source === "review"
+            ? "a conflict review"
+            : "you";
+  switch (item.reason) {
+    case "flagged":
+      return `Flagged ${item.flag ?? "stale"} by ${who}`;
+    case "disputed":
+      return "Disputed";
+    case "replaced":
+      return `Replaced by ${who}`;
+    default:
+      return `Recorded by ${who}`;
+  }
+}
+
+/**
+ * Memory to review: what agents and memory passes did to project memory that nobody looked
+ * at, each with the actions that settle it. Keep clears a flag, keeps both sides of a
+ * dispute, or accepts a recorded fact or a replacement; Undo restores a replaced fact (every
+ * replacement of it); Hide drops the fact from memory. The text opens the project's Memory
+ * section, where the full history is.
+ */
+type ReviewAction = "keep" | "undo" | "hide";
+
+function MemoryReviewPanel({ id, items }: { id: string; items: ReviewItem[] }) {
+  const act = useMutation({
+    mutationFn: async ({ item, action }: { item: ReviewItem; action: ReviewAction }) => {
+      if (action === "hide") return api.hideFact(item.factId, true);
+      if (action === "undo") return api.restoreFact(item.factId);
+      if (item.reason === "flagged") return api.resolveFactFlags(item.factId);
+      if (item.reason === "disputed" && item.other) {
+        return api.unlinkFacts(item.other.id, item.factId, "contradicts");
+      }
+      if (item.reason === "recorded" || item.reason === "replaced") {
+        return api.keepReviewItem(item.reason, item.factId, item.other?.id);
+      }
+    },
+    onSuccess: (_r, { item }) => {
+      const key = reviewKey(item);
+      // Picked while the row is still mounted; the target's own row (or the strip button,
+      // or the heading) stays mounted through the re-render, so it can take focus now.
+      const next = focusAfterReview(id, key);
+      keptReview.add(key);
+      dropReviewItem(key);
+      next?.focus();
+      void invalidateDomain("memory", { project: item.project });
+    },
+    onError: (e) => notify.error("Couldn't update memory", { description: errorText(e) }),
+  });
+  const busy = (item: ReviewItem) =>
+    act.isPending && act.variables && reviewKey(act.variables.item) === reviewKey(item);
+  return (
+    <ul
+      id={id}
+      aria-label="Memory to review"
+      className="mb-5 divide-y overflow-hidden rounded-lg border"
+    >
+      {items.map((item) => {
+        const button = (action: ReviewAction, label: string, title: string) => (
+          <Button
+            size="xs"
+            variant={action === "hide" ? "ghost" : "outline"}
+            title={title}
+            disabled={busy(item)}
+            onClick={() => act.mutate({ item, action })}
+          >
+            {label}
+          </Button>
+        );
+        return (
+          <li
+            key={reviewKey(item)}
+            data-review-key={reviewKey(item)}
+            className="flex items-start gap-3 px-3 py-2"
+          >
+            <button
+              type="button"
+              className="min-w-0 flex-1 cursor-pointer rounded-sm text-left outline-none focus-visible:ring-2 focus-visible:ring-ring/60 disabled:cursor-default"
+              disabled={!item.project}
+              onClick={() => item.project && openProjectSection(item.project, "memory")}
+              title={item.project ? "Open the project's memory" : undefined}
+            >
+              <span className="block text-sm">{item.text}</span>
+              <span className="mt-0.5 block text-xs text-muted-foreground">
+                {reviewHeadline(item)}
+                {item.at > 0 && ` on ${factDate(item.at)}`}
+                {item.project && ` · ${baseName(item.project)}`}
+                {item.reason === "flagged" &&
+                  // An unpinned playbook or subagent fact: memory never injects it, flagged
+                  // or kept.
+                  (item.injectable === false
+                    ? " · not part of injected memory either way"
+                    : item.trusted
+                      ? " · pinned or edited, so it stays in memory"
+                      : " · left out of memory until you choose")}
+              </span>
+              {item.note && (
+                <span className="mt-0.5 block text-xs text-muted-foreground">
+                  Reason: <span className="text-foreground">{item.note}</span>
+                </span>
+              )}
+              {item.other && (
+                <span className="mt-0.5 block text-xs text-muted-foreground">
+                  {item.reason === "disputed" ? "Disputed by" : "Replaced by"}:{" "}
+                  <span className="text-foreground">{item.other.text}</span>
+                </span>
+              )}
+            </button>
+            <div className="flex shrink-0 gap-1">
+              {item.reason === "flagged" && (
+                <>
+                  {button("keep", "Keep", "It still holds: clear the flag")}
+                  {button("hide", "Hide", "Hide from memory")}
+                </>
+              )}
+              {item.reason === "disputed" && (
+                <>
+                  {button("keep", "Keep both", "They don't conflict: drop the dispute")}
+                  {button("hide", "Hide", "Hide this one from memory; the other stays")}
+                </>
+              )}
+              {item.reason === "replaced" && (
+                <>
+                  {button("undo", "Undo", "Restore it: undo every replacement of it")}
+                  {button("keep", "Keep", "The replacement stands")}
+                </>
+              )}
+              {item.reason === "recorded" && (
+                <>
+                  {button("keep", "Keep", "It belongs in memory")}
+                  {button("hide", "Hide", "Hide from memory")}
+                </>
+              )}
+            </div>
+          </li>
+        );
+      })}
     </ul>
   );
 }
