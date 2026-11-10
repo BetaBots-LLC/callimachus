@@ -13,6 +13,7 @@ import {
   type RepoPublishPlan,
 } from "../../lib/api";
 import { shortPath } from "../../lib/format";
+import { invalidateDomain, MEMORY_WRITE_KEY } from "../../lib/keys";
 import { useEmbedStatus, useIndexRewriting } from "../../lib/queries";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -126,12 +127,15 @@ export function MemorySection({ project }: { project: string }) {
   // resyncs on settle. (Writes go through the app's single writer; a failure here means
   // a real backend error, which we now show instead of silently freezing.)
   const memKey = ["project_memory", project] as const;
-  const refreshMem = () =>
-    Promise.all([qc.invalidateQueries({ queryKey: memKey }), refreshAgentView()]);
+  // Every view of the memory: a hidden or edited TODO also leaves Projects' TODO list and
+  // Today's "new TODOs" strip.
+  const refreshMem = () => invalidateDomain("memory", { project });
   const [curationError, setCurationError] = useState<string | null>(null);
 
   function optimistic<V>(mapFor: (v: V) => (facts: MemoryFact[]) => MemoryFact[]) {
     return {
+      // Holds the live refresh off this list until the write settles (lib/keys.ts).
+      mutationKey: MEMORY_WRITE_KEY,
       onMutate: async (v: V): Promise<{ prev?: ProjectMemory }> => {
         setCurationError(null);
         await qc.cancelQueries({ queryKey: memKey });
@@ -481,14 +485,12 @@ export function MemorySection({ project }: { project: string }) {
 /** Write-back: record a decision or gotcha for the project by hand. Saved pinned (the
  *  user's own words are trusted), so it ranks first and survives a re-distill. */
 function RememberForm({ project, onClose }: { project: string; onClose: () => void }) {
-  const qc = useQueryClient();
   const [kind, setKind] = useState<"decision" | "gotcha">("decision");
   const [text, setText] = useState("");
   const save = useMutation({
     mutationFn: () => api.remember(project, kind, text.trim()),
     onSuccess: () => {
-      void qc.invalidateQueries({ queryKey: ["project_memory", project] });
-      void qc.invalidateQueries({ queryKey: ["agent_view", project] });
+      void invalidateDomain("memory", { project });
       onClose();
     },
   });

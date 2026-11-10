@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use crate::knowledge::{ClosestSession, DistillCoverage, RecallOutcome};
 use crate::{context, embed, search, snapshot};
 use rmcp::handler::server::router::prompt::PromptRouter;
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -58,10 +59,6 @@ const SNAPSHOTS_DEFAULT: u32 = 20;
 const SNAPSHOTS_MAX: u32 = 50;
 /// check_decision is a guard, not a browse: a handful of on-topic decisions is the useful set.
 const CHECK_DECISION_K: usize = 8;
-/// Past sessions offered when recall finds nothing in an undistilled scope, and the cap on
-/// each one's snippet: enough to pick one to open, small enough to stay a pointer.
-const CLOSEST_SESSIONS: usize = 3;
-const CLOSEST_SNIPPET_CHARS: usize = 240;
 
 /// Default transcript budget for get_thread / load_snapshot (~6k tokens). Half the desktop
 /// app's DEFAULT_BUDGET_CHARS: an agent can ask for more, but most recall needs the gist.
@@ -450,18 +447,10 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
-/// Distillation coverage of a scope, over the threads worth distilling
-/// (`knowledge::DISTILLABLE`).
-#[derive(Debug, Clone, Copy, Serialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-struct DistillCoverage {
-    distilled_threads: i64,
-    threads: i64,
-}
-
 /// recall_* / check_decision when nothing matched in a scope that holds no decision or gotcha
-/// at all and is not fully distilled. A hit list is a bare JSON array; this object is the one
-/// other shape those tools return, so a caller can tell "never distilled" from "no match".
+/// at all and is not fully distilled ([`crate::knowledge::RecallOutcome::Thin`]). A hit list
+/// is a bare JSON array; this object is the one other shape those tools return, so a caller
+/// can tell "never distilled" from "no match".
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ThinMemory {
@@ -470,14 +459,6 @@ struct ThinMemory {
     coverage: DistillCoverage,
     closest_sessions: Vec<ClosestSession>,
     hint: String,
-}
-
-#[derive(Debug, Serialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-struct ClosestSession {
-    id: i64,
-    title: Option<String>,
-    snippet: String,
 }
 
 /// search_threads / search_current_project with zero hits.
@@ -662,6 +643,20 @@ mod out {
         closest_sessions: Option<Vec<ClosestSession>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         hint: Option<String>,
+    }
+
+    /// check_decision: [`Facts`], plus `noDecision` on a guard answer: true when no hit
+    /// restates or reverses the proposal (`match: close`), so the hits listed, if any, are
+    /// only related and nothing was decided on it yet.
+    #[derive(JsonSchema)]
+    #[serde(rename_all = "camelCase")]
+    pub struct Guard {
+        #[serde(flatten)]
+        facts: Facts,
+        // Never null: absent on the thin-memory object and a notice, a boolean otherwise.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[schemars(with = "bool")]
+        no_decision: Option<bool>,
     }
 
     #[derive(JsonSchema)]
@@ -1244,8 +1239,8 @@ impl Callimachus {
     }
 
     #[tool(
-        description = "Contradiction guard: pass a decision you are about to make as `proposal`. Returns prior decisions with date and status; superseded ones name what replaced them. Empty means no conflict. On a live conflict, ask the user.",
-        output_schema = output_schema::<out::Facts>(),
+        description = "Contradiction guard: pass a decision you are about to make as `proposal`. Returns prior decisions with date and status; superseded ones name their replacement. noDecision: not decided yet. Live conflict: ask the user.",
+        output_schema = output_schema::<out::Guard>(),
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn check_decision(
@@ -1255,27 +1250,22 @@ impl Callimachus {
         if let Some(notice) = self.empty_index_notice()? {
             return Ok(notice);
         }
-        let Some(qv) = embed::embed_query(&self.embedder, &args.proposal).map_err(internal)? else {
-            return self.no_vector_result(&args.proposal, args.project.as_deref());
-        };
-        let hits = {
+        let qv = embed::embed_query(&self.embedder, &args.proposal).map_err(internal)?;
+        let outcome = {
             let conn = self.lock()?;
-            crate::knowledge::check_contradiction(
+            crate::knowledge::check_or_fallback(
                 &conn,
-                &qv,
+                &args.proposal,
+                qv.as_deref(),
                 args.project.as_deref(),
                 CHECK_DECISION_K,
             )
             .map_err(internal)?
         };
-        if hits.is_empty() {
-            if let Some(thin) =
-                self.thin_memory(&args.proposal, args.project.as_deref(), Some(&qv))?
-            {
-                return json_result(&thin);
-            }
+        match outcome {
+            RecallOutcome::Hits { hits } => guard_result(&hits),
+            other => fallback_result(other, args.project.as_deref()),
         }
-        guard_result(&hits)
     }
 
     #[tool(
@@ -1856,20 +1846,20 @@ impl Callimachus {
     }
 
     /// Shared recall path for the recall_decisions/recall_gotchas tools: embed the query,
-    /// then run the SQL KNN over `vec_facts`.
+    /// then run the SQL KNN over `vec_facts`, or the fallback when nothing comes back
+    /// ([`crate::knowledge::recall_or_fallback`]).
     fn recall_facts(&self, args: RecallArgs, kind: &str) -> Result<CallToolResult, ErrorData> {
         if let Some(notice) = self.empty_index_notice()? {
             return Ok(notice);
         }
-        let Some(qv) = embed::embed_query(&self.embedder, &args.query).map_err(internal)? else {
-            return self.no_vector_result(&args.query, args.project.as_deref());
-        };
+        let qv = embed::embed_query(&self.embedder, &args.query).map_err(internal)?;
         let limit = clamp_limit(args.limit, RECALL_DEFAULT, RECALL_MAX);
-        let hits = {
+        let outcome = {
             let conn = self.lock()?;
-            crate::knowledge::recall(
+            crate::knowledge::recall_or_fallback(
                 &conn,
-                &qv,
+                &args.query,
+                qv.as_deref(),
                 kind,
                 args.project.as_deref(),
                 limit as usize,
@@ -1877,86 +1867,26 @@ impl Callimachus {
             )
             .map_err(internal)?
         };
-        if hits.is_empty() {
-            if let Some(thin) = self.thin_memory(&args.query, args.project.as_deref(), Some(&qv))? {
-                return json_result(&thin);
-            }
+        match outcome {
+            RecallOutcome::Hits { hits } => list_result("facts", &hits),
+            other => fallback_result(other, args.project.as_deref()),
         }
-        list_result("facts", &hits)
     }
 
-    /// recall_* / check_decision without a query vector. Without the cached model (this
-    /// server never downloads it, so the standalone npm server often has none) a scope with no
-    /// facts still gets its closest sessions by keyword search; with facts, the notice says
-    /// semantic recall is unavailable rather than letting an empty list read as "no conflict".
-    fn no_vector_result(
-        &self,
-        query: &str,
-        project: Option<&str>,
-    ) -> Result<CallToolResult, ErrorData> {
-        if !embed::model_is_cached() {
-            if let Some(thin) = self.thin_memory(query, project, None)? {
-                return json_result(&thin);
-            }
-        }
-        no_query_vector("facts")
-    }
-
-    /// The empty-state answer for recall_* and check_decision: when nothing matched in a scope
-    /// that holds no decision or gotcha at all and has undistilled threads, an empty list
-    /// reads as "never decided" when it means "never distilled" (117 of ~21,300 threads on the
-    /// author's index). Returns the coverage and the closest sessions by search instead.
-    /// Returns None whenever the scope has any decision or gotcha (an active repo always has
-    /// threads waiting, so a coverage test alone would replace every "no conflict" answer of
-    /// check_decision with leads that read like conflicts), when every distillable thread is
-    /// distilled, or when there are none, so an empty list stays meaningful.
+    /// The empty-state answer for recall_* and check_decision in a scope that holds no
+    /// decision or gotcha and has undistilled threads ([`crate::knowledge::fallback::thin_memory`]),
+    /// as this server shapes it.
+    #[cfg(test)]
     fn thin_memory(
         &self,
         query: &str,
         project: Option<&str>,
         qv: Option<&[f32]>,
     ) -> Result<Option<ThinMemory>, ErrorData> {
-        let project = project.map(str::trim).filter(|p| !p.is_empty());
         let conn = self.lock()?;
-        if scope_has_knowledge(&conn, project).map_err(internal)? {
-            return Ok(None);
-        }
-        let coverage = distill_coverage(&conn, project).map_err(internal)?;
-        if coverage.threads == 0 || coverage.distilled_threads >= coverage.threads {
-            return Ok(None);
-        }
-        let distill_on =
-            crate::knowledge::app_config::get_flag(&conn, "knowledge.enabled").map_err(internal)?;
-        let filters = search::SearchFilters {
-            project: project.map(str::to_string),
-            limit: Some(CLOSEST_SESSIONS as u32 * SEARCH_HITS_PER_THREAD),
-            ..Default::default()
-        };
-        // The caller already embedded the query, so the semantic arm costs one KNN; without a
-        // vector (model not on this machine) this is the keyword search alone.
-        let hits = match qv {
-            Some(v) => search::hybrid_vec(&conn, query, Some(v), &filters),
-            None => search::search(&conn, query, &filters),
-        }
-        .map_err(internal)?;
-        let closest_sessions = group_by_thread(hits, CLOSEST_SESSIONS)
-            .into_iter()
-            .map(|m| ClosestSession {
-                id: m.thread_id,
-                title: m.title,
-                snippet: m
-                    .snippets
-                    .first()
-                    .map(|s| clip_chars(s, CLOSEST_SNIPPET_CHARS))
-                    .unwrap_or_default(),
-            })
-            .collect();
-        Ok(Some(ThinMemory {
-            facts: Vec::new(),
-            coverage,
-            closest_sessions,
-            hint: thin_memory_hint(project.is_some(), coverage, distill_on),
-        }))
+        let thin =
+            crate::knowledge::fallback::thin_memory(&conn, query, qv, project).map_err(internal)?;
+        Ok(thin.and_then(|t| thin_memory_of(t, project)))
     }
 
     /// A search tool's result: the grouped threads, or on zero hits an object that says what
@@ -2034,6 +1964,57 @@ fn no_query_vector(key: &str) -> Result<CallToolResult, ErrorData> {
     } else {
         Ok(notice_result(SEMANTIC_UNAVAILABLE_NOTICE.to_string()))
     }
+}
+
+/// recall_* / check_decision when the outcome is not a hit list: the [`ThinMemory`] object
+/// for an undistilled scope, and without the model the [`SEMANTIC_UNAVAILABLE_NOTICE`] (still
+/// the `{"notice": ...}` shape) followed by the closest sessions by keyword, the leads `cal`
+/// prints in the same state.
+fn fallback_result(
+    outcome: RecallOutcome,
+    project: Option<&str>,
+) -> Result<CallToolResult, ErrorData> {
+    match outcome {
+        RecallOutcome::Hits { hits } => list_result("facts", &hits),
+        RecallOutcome::Thin { .. } => match thin_memory_of(outcome, project) {
+            Some(thin) => json_result(&thin),
+            None => list_result("facts", &[] as &[serde_json::Value]),
+        },
+        RecallOutcome::NoModel { sessions } => {
+            let mut text = SEMANTIC_UNAVAILABLE_NOTICE.to_string();
+            if !sessions.is_empty() {
+                text.push_str("\n\nClosest past sessions by keyword (open one with get_thread):");
+                for s in &sessions {
+                    text.push_str(&format!(
+                        "\n- [thread {}] {}: {}",
+                        s.id,
+                        s.title.as_deref().unwrap_or("(untitled)"),
+                        s.snippet
+                    ));
+                }
+            }
+            Ok(notice_result(text))
+        }
+    }
+}
+
+/// A [`RecallOutcome::Thin`] as this server's [`ThinMemory`] shape, with its hint.
+fn thin_memory_of(outcome: RecallOutcome, project: Option<&str>) -> Option<ThinMemory> {
+    let RecallOutcome::Thin {
+        coverage,
+        sessions,
+        distill_on,
+    } = outcome
+    else {
+        return None;
+    };
+    let scoped = project.is_some_and(|p| !p.trim().is_empty());
+    Some(ThinMemory {
+        facts: Vec::new(),
+        coverage,
+        closest_sessions: sessions,
+        hint: thin_memory_hint(scoped, coverage, distill_on),
+    })
 }
 
 /// A plain-text tool result, scrubbed of credential-shaped text, with no structured content
@@ -2169,22 +2150,34 @@ fn list_result<T: Serialize + ?Sized>(key: &str, items: &T) -> Result<CallToolRe
 /// entry per hit naming its date, status and `[thread N]`, plus what replaced it, what
 /// disputes it and what it replaces. The text is what a client without structured content
 /// reads, and the status is the point: the best match for "go back to X" is X itself,
-/// superseded, which a bare similarity-ranked list would present as settled.
+/// superseded, which a bare similarity-ranked list would present as settled. `noDecision`
+/// says no hit restates or reverses the proposal ([`crate::knowledge::guard_no_decision`]).
 fn guard_result(hits: &[crate::knowledge::RecallHit]) -> Result<CallToolResult, ErrorData> {
-    let structured = json!({ "facts": redacted_value(hits)? });
+    let structured = json!({
+        "facts": redacted_value(hits)?,
+        "noDecision": crate::knowledge::guard_no_decision(hits),
+    });
     Ok(with_structured(text_result(guard_text(hits)), structured))
 }
 
 fn guard_text(hits: &[crate::knowledge::RecallHit]) -> String {
-    use crate::knowledge::{fact_date, FactStatus, GuardMatch};
+    use crate::knowledge::{fact_date, FactStatus, GuardMatch, NO_DECISION_YET};
     if hits.is_empty() {
-        return "No prior decision on this: no conflict.".into();
+        return format!("{NO_DECISION_YET} Nothing settled conflicts with it.");
     }
     let thread = |t: Option<i64>| t.map(|t| format!(", [thread {t}]")).unwrap_or_default();
-    let mut out = String::from(
-        "Prior decisions on this proposal. Superseded ones are history (what replaced them \
-         holds); between two live ones the newer wins; ask the user about disputed ones.\n",
-    );
+    let mut out = if crate::knowledge::guard_no_decision(hits) {
+        // Only related hits: the topic came up before, this question was not decided.
+        format!(
+            "{NO_DECISION_YET} Related decisions, for context only (none restates or reverses \
+             the proposal):\n"
+        )
+    } else {
+        String::from(
+            "Prior decisions on this proposal. Superseded ones are history (what replaced them \
+             holds); between two live ones the newer wins; ask the user about disputed ones.\n",
+        )
+    };
     for h in hits {
         let strength = match h.match_strength {
             Some(GuardMatch::Close) => "close",
@@ -2795,56 +2788,6 @@ fn project_key_or_cwd(project: Option<String>) -> String {
     }
 }
 
-/// `s` cut to at most `max` chars, ending in an ellipsis when it was cut.
-fn clip_chars(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
-    out.push('…');
-    out
-}
-
-/// Distillation coverage for a recall scope: a project-path substring (the recall tools'
-/// `project`, matched the way `knowledge::recall` matches it) or every project. Runs only on
-/// an empty recall; a scan of the threads table, about 2 ms on a 21,289-thread index.
-fn distill_coverage(conn: &Connection, project: Option<&str>) -> anyhow::Result<DistillCoverage> {
-    let distillable = crate::knowledge::DISTILLABLE;
-    let base = format!(
-        "SELECT COUNT(*), COALESCE(SUM(knowledge_extracted = 1), 0) FROM threads
-         WHERE {distillable}"
-    );
-    let row = |r: &rusqlite::Row| {
-        Ok(DistillCoverage {
-            threads: r.get(0)?,
-            distilled_threads: r.get(1)?,
-        })
-    };
-    Ok(match project {
-        Some(p) => conn.query_row(
-            &format!("{base} AND COALESCE(project_key, project_path) LIKE ?1"),
-            [format!("%{p}%")],
-            row,
-        )?,
-        None => conn.query_row(&base, [], row)?,
-    })
-}
-
-/// Whether a recall scope (matched like `distill_coverage`) holds any visible decision or
-/// gotcha. Runs only on an empty recall; an EXISTS that stops at the first fact.
-fn scope_has_knowledge(conn: &Connection, project: Option<&str>) -> anyhow::Result<bool> {
-    let base = "SELECT EXISTS(SELECT 1 FROM facts f JOIN threads t ON t.id = f.thread_id
-         WHERE f.kind IN ('decision', 'gotcha') AND f.hidden = 0";
-    Ok(match project {
-        Some(p) => conn.query_row(
-            &format!("{base} AND COALESCE(t.project_key, t.project_path) LIKE ?1)"),
-            [format!("%{p}%")],
-            |r| r.get(0),
-        )?,
-        None => conn.query_row(&format!("{base})"), [], |r| r.get(0))?,
-    })
-}
-
 /// The thin-memory hint. It names the scope it measured ("this project" only when the call
 /// was scoped: an unscoped count covers every repo), and asks to turn distillation on only
 /// when it is off; with it on, the backlog is draining and the advice would be wrong.
@@ -2879,11 +2822,12 @@ fn search_coverage(
     }
     let mut args: Vec<String> = Vec::new();
     if let Some(p) = filters.project.as_deref().filter(|p| !p.is_empty()) {
-        args.push(format!("%{p}%"));
-        sql.push_str(&format!(
-            " AND COALESCE(t.project_key, t.project_path) LIKE ?{}",
-            args.len()
-        ));
+        // Scoped as the search it describes scoped (`_` and `%` literal in a fragment).
+        let scope = crate::scope::ProjectScope::with_match(p, filters.project_match);
+        args.extend(scope.value());
+        if let Some(cond) = scope.condition_at("t", args.len()) {
+            sql.push_str(&format!(" AND {cond}"));
+        }
     }
     if !filters.sources.is_empty() {
         let first = args.len() + 1;
@@ -3239,17 +3183,9 @@ mod tests {
         }
     }
 
-    /// A fresh, migrated temp DB with no threads.
+    /// A fresh, migrated temp DB with no threads, removed when the test ends.
     fn empty_db() -> Connection {
-        let p = std::env::temp_dir().join(format!(
-            "calli_mcp_{}_{}.db",
-            std::process::id(),
-            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        for ext in ["db", "db-wal", "db-shm"] {
-            let _ = std::fs::remove_file(p.with_extension(ext));
-        }
-        crate::db::open(&p).unwrap()
+        crate::db::test_support::TestIndex::new("mcp").into_connection()
     }
 
     fn seed(conn: &mut Connection, external_id: &str, title: &str, messages: Vec<ParsedMessage>) {
@@ -4077,15 +4013,6 @@ mod tests {
             .is_none());
     }
 
-    #[test]
-    fn closest_session_snippets_are_capped() {
-        let long = "é".repeat(500);
-        let clipped = clip_chars(&long, CLOSEST_SNIPPET_CHARS);
-        assert_eq!(clipped.chars().count(), CLOSEST_SNIPPET_CHARS);
-        assert!(clipped.ends_with('…'));
-        assert_eq!(clip_chars("short", CLOSEST_SNIPPET_CHARS), "short");
-    }
-
     #[tokio::test]
     async fn empty_project_memory_shows_coverage_and_recent_sessions() {
         let mut conn = empty_db();
@@ -4707,10 +4634,94 @@ mod tests {
             .as_str()
             .unwrap()
             .starts_with("use JSON"));
+        assert_eq!(structured["noDecision"], false, "a close hit is a decision");
         let srv = Callimachus::new(empty_db());
         assert_matches_schema(&srv, "check_decision", &res);
-        assert_matches_schema(&srv, "check_decision", &guard_result(&[]).unwrap());
-        assert!(text_of(&guard_result(&[]).unwrap()).contains("no conflict"));
+        let empty = guard_result(&[]).unwrap();
+        assert_matches_schema(&srv, "check_decision", &empty);
+        assert!(
+            text_of(&empty).starts_with(crate::knowledge::NO_DECISION_YET),
+            "{}",
+            text_of(&empty)
+        );
+        assert_eq!(empty.structured_content.unwrap()["noDecision"], true);
+    }
+
+    /// Without the model, recall_* and check_decision keep their notice (the same shape) and
+    /// add the closest sessions by keyword, the leads `cal` and the app show in that state.
+    #[test]
+    fn no_model_notice_lists_keyword_sessions() {
+        let res = fallback_result(
+            RecallOutcome::NoModel {
+                sessions: vec![ClosestSession {
+                    id: 7,
+                    title: Some("postgres plan".into()),
+                    snippet: "user: move the index to postgres".into(),
+                }],
+            },
+            Some("/proj/app"),
+        )
+        .unwrap();
+        let text = text_of(&res);
+        assert!(text.starts_with(SEMANTIC_UNAVAILABLE_NOTICE), "{text}");
+        assert!(
+            text.contains("\n- [thread 7] postgres plan: user: move the index to postgres"),
+            "{text}"
+        );
+        assert_eq!(
+            res.structured_content.clone().unwrap()["notice"],
+            text.as_str()
+        );
+        let srv = Callimachus::new(empty_db());
+        for tool in ["recall_decisions", "recall_gotchas", "check_decision"] {
+            assert_matches_schema(&srv, tool, &res);
+        }
+        // Nothing matched by keyword either: the notice alone, as before.
+        let bare = fallback_result(RecallOutcome::NoModel { sessions: vec![] }, None).unwrap();
+        assert_eq!(text_of(&bare), SEMANTIC_UNAVAILABLE_NOTICE);
+    }
+
+    /// Only related hits: the answer leads with "No decision on this yet." and says the hits
+    /// are context, so an agent does not read a same-topic decision as the settled answer.
+    #[test]
+    fn check_decision_says_no_decision_before_related_hits() {
+        let conn = empty_db();
+        let ta = truth_thread(&conn, "A", OCT_1);
+        let q = unit(0, None);
+        // A cosine between GUARD_RELATED and GUARD_CLOSE with the query.
+        let sim = (crate::knowledge::GUARD_RELATED + crate::knowledge::GUARD_CLOSE) / 2.0;
+        let x = (1.0 / sim.powi(2) - 1.0).sqrt();
+        let fid = truth_fact(
+            &conn,
+            ta,
+            "refresh tokens live for 30 days",
+            Some(&unit(0, Some((1, x)))),
+        );
+        let hits =
+            crate::knowledge::check_contradiction(&conn, &q, Some("/proj/app"), CHECK_DECISION_K)
+                .unwrap();
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        let res = guard_result(&hits).unwrap();
+        let text = text_of(&res);
+        assert!(
+            text.starts_with(crate::knowledge::NO_DECISION_YET),
+            "{text}"
+        );
+        assert!(
+            text.contains("Related decisions, for context only"),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "- [current] refresh tokens live for 30 days (fact {fid}, decided 2026-10-01, \
+                 [thread {ta}], related match)"
+            )),
+            "{text}"
+        );
+        let structured = res.structured_content.clone().unwrap();
+        assert_eq!(structured["noDecision"], true);
+        assert_eq!(structured["facts"][0]["match"], "related");
+        assert_matches_schema(&Callimachus::new(empty_db()), "check_decision", &res);
     }
 
     /// The project memory JSON carries each fact's date and status, and what it replaced (ids
@@ -5749,15 +5760,8 @@ mod tests {
     }
     /// A migrated index file at a fresh temp path, with its schema version moved by `shift`
     /// (positive: newer than this binary, negative: older), as an update would leave it.
-    fn index_at_schema(shift: i32) -> PathBuf {
-        let p = std::env::temp_dir().join(format!(
-            "calli_mcp_skew_{}_{}.db",
-            std::process::id(),
-            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        for ext in ["db", "db-wal", "db-shm"] {
-            let _ = std::fs::remove_file(p.with_extension(ext));
-        }
+    fn index_at_schema(shift: i32) -> crate::db::test_support::TestPath {
+        let p = crate::db::test_support::TestPath::new("mcp_skew");
         let conn = crate::db::open(&p).unwrap();
         let v: i32 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))

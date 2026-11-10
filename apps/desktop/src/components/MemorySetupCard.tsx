@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { create } from "zustand";
 import { ListChecks, Sparkles } from "lucide-react";
 import { api, PROVIDERS, type MemoryEngine } from "../lib/api";
+import { invalidateDomain } from "../lib/keys";
 import { errorText, notify } from "../lib/toast";
 import { useChecklist } from "../store/checklist";
 import { useUi } from "../store/ui";
@@ -163,15 +164,8 @@ export function MemorySetupCard({
       api.enableMemory(v.engine.id, v.model),
     onSuccess: (next, { engine }) => {
       qc.setQueryData(["knowledge_config"], next);
-      for (const key of [
-        "knowledge_config",
-        "memory_setup",
-        "auto_distill_budget",
-        "distill_status",
-        "projects",
-        "project_memory",
-      ])
-        void qc.invalidateQueries({ queryKey: [key] });
+      for (const domain of ["memorySettings", "projects", "memory"] as const)
+        void invalidateDomain(domain);
       notify.success("Memory is on", {
         description: `Distilling recent sessions with ${engineLabel(engine)} in the background. Change the engine in Settings > AI engine.`,
       });

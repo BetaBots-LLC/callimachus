@@ -1,0 +1,76 @@
+{
+  "version": "memory_truth_v2",
+  "extends": "memory_truth_v1",
+  "cross_project": [
+    {
+      "project": "/eval/billing-api",
+      "proposal": "Access tokens expire after 15 minutes",
+      "decided_in": "/eval/auth-gateway"
+    },
+    {
+      "project": "/eval/ingest-worker",
+      "proposal": "Serialize the cached entries with bincode because it is fast",
+      "decided_in": "/eval/cache-service"
+    },
+    {
+      "project": "/eval/billing-api",
+      "proposal": "Retry failed webhook deliveries 3 times with exponential backoff",
+      "decided_in": "/eval/ingest-worker"
+    },
+    {
+      "project": "/eval/cache-service",
+      "proposal": "Run a background sync every 15 minutes",
+      "decided_in": "/eval/mobile-sync"
+    },
+    {
+      "project": "/eval/search-indexer",
+      "proposal": "Run the test suite on 4 parallel jobs",
+      "decided_in": "/eval/ci-pipeline"
+    },
+    {
+      "project": "/eval/mobile-sync",
+      "proposal": "Use TanStack Query for all server state",
+      "decided_in": "/eval/web-dashboard"
+    },
+    {
+      "project": "/eval/web-dashboard",
+      "proposal": "Store money as integer cents, never as floats",
+      "decided_in": "/eval/billing-api"
+    },
+    {
+      "project": "/eval/mobile-sync",
+      "proposal": "Use SQLite FTS5 with the porter tokenizer for search",
+      "decided_in": "/eval/search-indexer"
+    },
+    {
+      "project": "/eval/ingest-worker",
+      "proposal": "Chunk documents at 512 tokens with overlap before embedding them",
+      "decided_in": "/eval/search-indexer"
+    },
+    {
+      "project": "/eval/auth-gateway",
+      "proposal": "Set the HTTP client timeout to 15 seconds",
+      "decided_in": "/eval/ingest-worker"
+    },
+    {
+      "project": "/eval/auth-gateway",
+      "proposal": "Cache entries expire after 24 hours",
+      "decided_in": "/eval/cache-service"
+    },
+    {
+      "project": "/eval/billing-api",
+      "proposal": "Tag releases as vMAJOR.MINOR.PATCH and publish from the tag",
+      "decided_in": "/eval/ci-pipeline"
+    },
+    {
+      "project": "/eval/cache-service",
+      "proposal": "Resolve write conflicts with last-write-wins on updated_at",
+      "decided_in": "/eval/mobile-sync"
+    },
+    {
+      "project": "/eval/ci-pipeline",
+      "proposal": "Log with the tracing crate at info level",
+      "decided_in": "/eval/ingest-worker"
+    }
+  ]
+}

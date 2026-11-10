@@ -706,11 +706,13 @@ pub(crate) const EXPORT_LINKS_SQL: &str =
 pub(crate) const EDITED_PATHS_SQL: &str =
     "SELECT DISTINCT path FROM file_edits WHERE thread_id = ?1 AND op IN ('edit', 'write')";
 
-/// A thread's most used model. A probe of one thread's rows (an index led by thread_id), not
-/// a walk of the partial `idx_messages_model` over every model in the index: the unary `+`
-/// keeps the planner off it.
+/// A thread's most used model, index-only from 0026's covering `idx_messages_usage`
+/// (thread_id, model, ...; rows with a model only), already in GROUP BY order. It used a
+/// unary `+model` to stay off 0022's partial (model) index, which also kept it off this
+/// partial index (its WHERE term no longer matched), so it read every row of the thread
+/// through the table. 0036 dropped that index.
 pub(crate) const THREAD_MODEL_SQL: &str = "SELECT model FROM messages
-     WHERE thread_id = ?1 AND +model IS NOT NULL AND model NOT LIKE '<%'
+     WHERE thread_id = ?1 AND model IS NOT NULL AND model NOT LIKE '<%'
      GROUP BY model ORDER BY COUNT(*) DESC, model LIMIT 1";
 
 /// Build one Agent Trace record per (session, linked commit) in `project` whose commit
@@ -1558,15 +1560,28 @@ mod tests {
     fn export_lookups_use_their_indexes() {
         let conn = temp_db();
         let p = plan(&conn, THREAD_MODEL_SQL);
-        // Either (thread_id, ...) index serves it: the plan probes one thread's rows.
+        // One thread's rows, from the covering usage index alone, already grouped (the
+        // ORDER BY COUNT(*) still sorts the handful of groups).
         assert!(
-            p.contains("SEARCH messages USING") && p.contains("(thread_id=?)"),
+            p.contains("SEARCH messages USING COVERING INDEX idx_messages_usage (thread_id=?"),
             "{p}"
         );
         assert!(
-            !p.contains("SCAN messages") && !p.contains("idx_messages_model"),
+            !p.contains("SCAN messages") && !p.contains("TEMP B-TREE FOR GROUP BY"),
             "{p}"
         );
+        // A pooled reader can still meet an index from before 0036, which has 0022's
+        // (model) index: the thread probe still wins.
+        conn.execute_batch(
+            "CREATE INDEX idx_messages_model ON messages (model) WHERE model IS NOT NULL",
+        )
+        .unwrap();
+        let p = plan(&conn, THREAD_MODEL_SQL);
+        assert!(
+            p.contains("SEARCH messages USING COVERING INDEX idx_messages_usage (thread_id=?"),
+            "{p}"
+        );
+        conn.execute_batch("DROP INDEX idx_messages_model").unwrap();
         let p = plan(&conn, EDITED_PATHS_SQL);
         assert!(p.contains("idx_file_edits_thread (thread_id=?)"), "{p}");
         let p = plan(&conn, EXPORT_LINKS_SQL);

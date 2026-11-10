@@ -262,7 +262,7 @@ fn vacuum_over(conn: &Connection, min_bytes: u64) -> Result<VacuumReport> {
 /// WAL frames, frames checkpointed): busy, or fewer frames copied than the WAL holds,
 /// means a reader held it back. Not in WAL mode (an in-memory test db) reads as -1 frames,
 /// which is complete: there is nothing to fold back.
-fn checkpoint_truncate(conn: &Connection) -> Result<bool> {
+pub(crate) fn checkpoint_truncate(conn: &Connection) -> Result<bool> {
     let (busy, log, done): (i64, i64, i64) =
         conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?))
@@ -493,55 +493,139 @@ pub fn sweep_orphan_vectors(conn: &Connection) -> Result<usize> {
 /// Compact `vec_chunks` once live vectors fill less than this share of its slots.
 const VEC_COMPACT_OCCUPANCY: f64 = 0.7;
 
-/// What one [`compact_vec_chunks`] rebuild did.
+/// What one [`rebuild_vec_chunks`] did.
 #[derive(Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct VecCompaction {
+pub struct VecRebuild {
     pub vectors: i64,
     pub chunks_before: i64,
     pub chunks_after: i64,
+    /// The table had the old shape and now has the subagent partition (migration 0036).
+    pub partitioned: bool,
+    /// How long the IMMEDIATE transaction held the write lock, in milliseconds.
+    pub held_ms: u64,
 }
 
-/// Rebuild `vec_chunks` without the holes deletes leave in it, keeping every rowid.
+/// Rebuild `vec_chunks` into the partitioned shape (`embed::PARTITIONED_VEC_CHUNKS_SQL`),
+/// keeping every rowid: once on an index from before 0036, and afterwards whenever deletes
+/// have left it mostly holes. Returns `None` when neither applies.
 ///
-/// vec0 (0.1.9) stores vectors in fixed 1024-slot chunks and only ever appends to the
-/// newest one, so a deleted vector's slot is never reused; only a chunk that empties
-/// completely is freed. Migration 0029's tool-vector purge left a 4.7 GB index at 56%
-/// occupancy (205 chunks for 117k vectors), and KNN reads and ranks every slot of every
-/// chunk. Rebuilt, it fit in 115 chunks, and a k=500 KNN went from 165 ms to 106 ms.
+/// Partition: each vector goes into its thread's `subagent` partition, read from
+/// `threads.is_subagent` (a vector whose message is gone lands in 0; the orphan sweep and
+/// the search's join drop it anyway), so a default search's KNN reads the main partition
+/// only (see `embed::semantic_search_scoped`). A rebuild of an already partitioned table
+/// also refreshes each vector's partition from its thread.
 ///
-/// Does nothing (returns `None`) unless occupancy is under [`VEC_COMPACT_OCCUPANCY`] and the
-/// rebuild would free at least one chunk, so it is cheap to call after every embedding
-/// build. Otherwise it holds the write lock for one IMMEDIATE transaction (4-9 s for 117k
-/// vectors, depending on how warm the cache is), so run it from a background job, never
-/// from a migration a hook might run. vec0 can't be renamed, so the vectors go through a
-/// scratch table in the main database (TEMP would sit in RAM under temp_store = MEMORY).
+/// Holes: vec0 (0.1.9) stores vectors in fixed 1024-slot chunks and only ever appends to
+/// the newest one (per partition), so a deleted vector's slot is never reused; only a chunk
+/// that empties completely is freed. Migration 0029's tool-vector purge left a 4.7 GB index
+/// at 56% occupancy (205 chunks for 117k vectors), and KNN reads and ranks every slot of
+/// every chunk. Rebuilt, it fit in 115 chunks, and a k=500 KNN went from 165 ms to 106 ms.
+/// This only runs below [`VEC_COMPACT_OCCUPANCY`] when it frees a chunk, so it is cheap to
+/// call after every embedding build.
+///
+/// Holds the write lock for one IMMEDIATE transaction, so run it from a background job
+/// holding the semantic build's flag, never from a migration, a hook or the MCP server.
+/// vec0 can't be renamed, so the vectors go through a scratch table in the main database
+/// (TEMP would sit in RAM under temp_store = MEMORY). Refuses (an error) when the index's
+/// volume has less than [`REBUILD_SPACE_FACTOR`] times the vector table free.
+///
+/// The transaction dirties the scratch copy and the new table (about twice the vector
+/// table), so it runs with a page cache that holds them ([`rebuild_cache_kib`]): with the
+/// connection's usual 64 MiB, SQLite spilled dirty pages to the WAL and read them back, and
+/// vec0 re-reads its chunk blobs on every insert. On a 324k-vector index (626 MB of
+/// vectors) the lock was held 38-58 s at 64 MiB, 17 s at 512 MiB and 8 s at 1 GiB. The
+/// cache only grows as pages are touched and goes back to its old size afterwards.
+///
+/// A write on another app connection gives up after `db::BUSY_TIMEOUT` (15 s; sidecars
+/// wait 60 s), so the hold is kept short: the rebuild first reads what the copy reads
+/// without a lock ([`warm_vec_pages`]), and copies the WAL back after COMMIT, not inside
+/// it. On fresh clones of that index (cold OS cache, M2 Ultra) the lock was held 11-12 s
+/// without the warm-up and 9-10 s after it (4.4 s of unlocked reads); the checkpoint then
+/// took 6-7.5 s more, unlocked. Counted with the checkpoint, as before, it read 16-19 s.
 ///
 /// It returns no disk space; the file grows. The scratch copy is written before the old
-/// chunks are dropped, so it lands at the end of the file (+229 MB on that index), and the
-/// old chunks and the scratch table then become free pages inside the file (~366 MB there).
-/// Later writes reuse them; only a VACUUM (Shrink index / Reclaim space) gives them back to
-/// the disk. What the rebuild buys is a faster KNN, not a smaller file.
+/// chunks are dropped, so it lands at the end of the file, and the old chunks and the
+/// scratch table then become free pages inside the file. Later writes reuse them; only a
+/// VACUUM (Shrink index / Reclaim space) gives them back to the disk.
 ///
-/// The table is recreated from its own stored CREATE statement. Triggers that reference
+/// The table is recreated from the canonical statement. Triggers that reference
 /// `vec_chunks` (0025's owner map) survive the DROP / CREATE, and the rowid sequence is
 /// carried over so a later insert never reuses the rowid of a vector deleted before the
 /// rebuild.
-pub fn compact_vec_chunks(conn: &mut Connection) -> Result<Option<VecCompaction>> {
-    if !vec_chunks_fragmented(conn)? {
+pub fn rebuild_vec_chunks(conn: &mut Connection) -> Result<Option<VecRebuild>> {
+    rebuild_vec_chunks_with(conn, volume_space)
+}
+
+/// [`rebuild_vec_chunks`] with the free-space probe passed in (tests make it refuse).
+fn rebuild_vec_chunks_with(
+    conn: &mut Connection,
+    probe: impl Fn(&Path) -> Option<VolumeSpace>,
+) -> Result<Option<VecRebuild>> {
+    if !vec_rebuild_due(conn)? {
         return Ok(None);
     }
-    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    // Re-check under the write lock: another writer may have changed the table meanwhile.
-    if !vec_chunks_fragmented(&tx)? {
-        return Ok(None);
+    let vec_bytes = vec_table_bytes(conn)?;
+    check_rebuild_space(conn, vec_bytes, probe)?;
+    let cache_before: i64 = conn.query_row("PRAGMA cache_size", [], |r| r.get(0))?;
+    let autocheckpoint_before: i64 =
+        conn.query_row("PRAGMA wal_autocheckpoint", [], |r| r.get(0))?;
+    conn.pragma_update(None, "cache_size", -rebuild_cache_kib(vec_bytes))?;
+    // Not inside COMMIT: SQLite runs the automatic checkpoint at the end of the COMMIT
+    // statement, after the write lock is released, so `held_ms` would count copying the
+    // whole WAL back as lock time. Copied below instead, still without the lock.
+    conn.pragma_update(None, "wal_autocheckpoint", 0)?;
+    warm_vec_pages(conn);
+    let out = rebuild_vec_chunks_locked(conn);
+    let _ = conn.pragma_update(None, "wal_autocheckpoint", autocheckpoint_before);
+    if matches!(out, Ok(Some(_))) {
+        // PASSIVE blocks no reader or writer. Here, not in the next connection to commit,
+        // whose write would wait for it.
+        let _ = conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);");
     }
-    let chunks_before = count_vec_chunk_rows(&tx)?;
-    let create: String = tx.query_row(
-        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'vec_chunks'",
+    let _ = conn.pragma_update(None, "cache_size", cache_before);
+    let _ = conn.execute_batch("PRAGMA shrink_memory;");
+    out
+}
+
+/// Read every page the rebuild's copy will read (each vector and its message id, the
+/// subagent threads' messages, the owner map) without a lock: in WAL mode a reader blocks
+/// no writer. The transaction then finds them in memory instead of reading them under the
+/// write lock. Best effort: a failure here only leaves the cache cold.
+fn warm_vec_pages(conn: &Connection) {
+    let _ = conn.query_row(
+        &format!(
+            "SELECT COUNT(*), SUM(length(v.embedding)),
+                    SUM(v.message_id IN ({SUBAGENT_MESSAGES_SQL}))
+             FROM vec_chunks v"
+        ),
         [],
-        |r| r.get(0),
-    )?;
+        |r| r.get::<_, i64>(0),
+    );
+    let _ = conn.query_row(
+        "SELECT SUM(chunk_rowid), SUM(message_id) FROM vec_chunk_owner NOT INDEXED",
+        [],
+        |r| r.get::<_, Option<i64>>(0),
+    );
+}
+
+/// Page cache for a rebuild of a `vec_bytes` vector table, in KiB: the scratch copy and
+/// the new table, plus the usual 64 MiB, capped at 1 GiB (a bigger index spills the rest).
+fn rebuild_cache_kib(vec_bytes: u64) -> i64 {
+    const CAP_KIB: u64 = 1 << 20;
+    ((vec_bytes / 1024).saturating_mul(2) + 65_536).min(CAP_KIB) as i64
+}
+
+/// [`rebuild_vec_chunks`] past its checks: the one IMMEDIATE transaction.
+fn rebuild_vec_chunks_locked(conn: &mut Connection) -> Result<Option<VecRebuild>> {
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let locked = std::time::Instant::now();
+    // Re-check under the write lock: another writer may have rebuilt it meanwhile.
+    if !vec_rebuild_due(&tx)? {
+        return Ok(None);
+    }
+    let was_partitioned = crate::embed::vec_partitioned(&tx);
+    let chunks_before = count_vec_chunk_rows(&tx)?;
     let seq: Option<i64> = tx
         .query_row(
             "SELECT seq FROM sqlite_sequence WHERE name = 'vec_chunks_rowids'",
@@ -549,19 +633,33 @@ pub fn compact_vec_chunks(conn: &mut Connection) -> Result<Option<VecCompaction>
             |r| r.get(0),
         )
         .optional()?;
-    tx.execute_batch(
+    // Each vector keeps its `gen`; one from before the partition gets the current one. (No
+    // NULL can reach the NOT NULL columns: vec0 refuses a NULL message id or gen, and `IN`
+    // over a non-NULL value and a NULL-free set is never NULL.)
+    let gen = if was_partitioned {
+        "v.gen".to_string()
+    } else {
+        crate::embed::VEC_GEN.to_string()
+    };
+    tx.execute_batch(&format!(
         "DROP TABLE IF EXISTS vec_compact_scratch;
          CREATE TABLE vec_compact_scratch (
-             rid INTEGER PRIMARY KEY, message_id INTEGER, embedding BLOB NOT NULL
+             rid INTEGER PRIMARY KEY, message_id INTEGER, subagent INTEGER NOT NULL,
+             gen INTEGER NOT NULL, embedding BLOB NOT NULL
          );
-         INSERT INTO vec_compact_scratch (rid, message_id, embedding)
-             SELECT rowid, message_id, embedding FROM vec_chunks;
-         DROP TABLE vec_chunks;",
-    )?;
-    tx.execute_batch(&create)?;
+         INSERT INTO vec_compact_scratch (rid, message_id, subagent, gen, embedding)
+             SELECT v.rowid, v.message_id, v.message_id IN ({SUBAGENT_MESSAGES_SQL}), {gen},
+                    v.embedding
+             FROM vec_chunks v;
+         DROP TABLE vec_chunks;"
+    ))?;
+    tx.execute_batch(crate::embed::PARTITIONED_VEC_CHUNKS_SQL)?;
+    // One partition after the other: each partition's chunks then sit together in the file,
+    // and vec0 fills each partition's newest chunk before it starts another.
     let vectors = tx.execute(
-        "INSERT INTO vec_chunks (rowid, message_id, embedding)
-         SELECT rid, message_id, embedding FROM vec_compact_scratch ORDER BY rid",
+        "INSERT INTO vec_chunks (rowid, message_id, subagent, gen, embedding)
+         SELECT rid, message_id, subagent, gen, embedding FROM vec_compact_scratch
+         ORDER BY subagent, rid",
         [],
     )? as i64;
     // Leave the owner map exact: no owner row for a vector that is gone (its rowid must
@@ -588,18 +686,90 @@ pub fn compact_vec_chunks(conn: &mut Connection) -> Result<Option<VecCompaction>
     }
     let chunks_after = count_vec_chunk_rows(&tx)?;
     tx.commit()?;
-    Ok(Some(VecCompaction {
+    Ok(Some(VecRebuild {
         vectors,
         chunks_before,
         chunks_after,
+        partitioned: !was_partitioned,
+        held_ms: locked.elapsed().as_millis() as u64,
     }))
+}
+
+/// Every message of a subagent thread, for the rebuild's partition column. Read once into
+/// an in-memory set from the threads' (thread_id, seq) index: a lookup of each vector's
+/// message row instead made 324k random reads of the multi-GB messages table (25-30 s of
+/// the write-lock hold on the measured index, against 3-10 s for the whole copy this way).
+pub(crate) const SUBAGENT_MESSAGES_SQL: &str = "SELECT m.id FROM threads t
+     JOIN messages m ON m.thread_id = t.id WHERE t.is_subagent = 1";
+
+/// Free space a vector rebuild needs on the index's volume, as a multiple of the vector
+/// table. Measured on a 324k-vector index (626 MB of vectors): the transaction wrote the
+/// scratch copy and the new table through the WAL (1,127 MB at commit), and the checkpoint
+/// then grew the file by the scratch copy (618 MB), about 2.8 times the table at the peak.
+pub const REBUILD_SPACE_FACTOR: u64 = 3;
+
+/// Refuse a rebuild that could fill the disk (see [`REBUILD_SPACE_FACTOR`]), asking `probe`
+/// ([`volume_space`]) about the index's folder. Skipped when free space can't be
+/// determined, or for an in-memory database.
+fn check_rebuild_space(
+    conn: &Connection,
+    vec_bytes: u64,
+    probe: impl Fn(&Path) -> Option<VolumeSpace>,
+) -> Result<()> {
+    let Some(db_dir) = conn
+        .path()
+        .filter(|p| !p.is_empty())
+        .and_then(|p| Path::new(p).parent().map(Path::to_path_buf))
+    else {
+        return Ok(());
+    };
+    let Some(vol) = probe(&db_dir) else {
+        return Ok(());
+    };
+    let need = rebuild_space_needed(vec_bytes);
+    if vol.available < need {
+        let mb = |b: u64| b / 1_048_576;
+        bail!(
+            "not enough free disk space to rebuild the semantic index: it needs about {} MB \
+             free on {} but only {} MB is available",
+            mb(need),
+            vol.mount,
+            mb(vol.available)
+        );
+    }
+    Ok(())
+}
+
+/// Free bytes a rebuild of a `vec_bytes` vector table needs on the index's volume.
+fn rebuild_space_needed(vec_bytes: u64) -> u64 {
+    vec_bytes.saturating_mul(REBUILD_SPACE_FACTOR)
+}
+
+/// Bytes the vector table holds: every slot of every chunk (`size` per chunk) at 384
+/// float32s, plus the per-vector rowid and metadata rows (about 40 bytes each). Two small
+/// b-tree reads, not a scan of the vectors: 626 MB on the measured 324k-vector index, where
+/// dbstat counted 626 MB for the vec0 shadow tables.
+pub fn vec_table_bytes(conn: &Connection) -> Result<u64> {
+    let slots: i64 = conn.query_row(
+        "SELECT COALESCE(SUM(size), 0) FROM vec_chunks_chunks",
+        [],
+        |r| r.get(0),
+    )?;
+    let live: i64 = conn.query_row("SELECT COUNT(*) FROM vec_chunks_rowids", [], |r| r.get(0))?;
+    Ok(slots.max(0) as u64 * (crate::embed::DIM as u64 * 4) + live.max(0) as u64 * 40)
 }
 
 fn count_vec_chunk_rows(conn: &Connection) -> Result<i64> {
     Ok(conn.query_row("SELECT COUNT(*) FROM vec_chunks_chunks", [], |r| r.get(0))?)
 }
 
-/// Whether a [`compact_vec_chunks`] rebuild is worth its write lock.
+/// Whether [`rebuild_vec_chunks`] has work: the table predates the partition, or it is
+/// fragmented enough to be worth the write lock.
+pub fn vec_rebuild_due(conn: &Connection) -> Result<bool> {
+    Ok(!crate::embed::vec_partitioned(conn) || vec_chunks_fragmented(conn)?)
+}
+
+/// Whether a compaction is worth its write lock.
 fn vec_chunks_fragmented(conn: &Connection) -> Result<bool> {
     // `size` is each chunk's slot capacity; the rowids shadow table holds one row per live
     // vector. Both are small b-tree counts, not a scan of the vectors.
@@ -609,15 +779,28 @@ fn vec_chunks_fragmented(conn: &Connection) -> Result<bool> {
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
     let live: i64 = conn.query_row("SELECT COUNT(*) FROM vec_chunks_rowids", [], |r| r.get(0))?;
-    Ok(worth_compacting(live, chunks, slots))
+    // Each partition keeps its own partly filled newest chunk.
+    let partitions: i64 = if crate::embed::vec_partitioned(conn) {
+        conn.query_row(
+            "SELECT COUNT(DISTINCT partition00) FROM vec_chunks_chunks",
+            [],
+            |r| r.get(0),
+        )?
+    } else {
+        1
+    };
+    Ok(worth_compacting(live, chunks, slots, partitions))
 }
 
-fn worth_compacting(live: i64, chunks: i64, slots: i64) -> bool {
+/// A rebuild frees at least one chunk and the table is under [`VEC_COMPACT_OCCUPANCY`].
+/// `partitions`: each one needs its own partly filled chunk, so a dense table of P
+/// partitions can hold up to P - 1 chunks more than one partition would.
+fn worth_compacting(live: i64, chunks: i64, slots: i64, partitions: i64) -> bool {
     if chunks == 0 || slots == 0 {
         return false;
     }
     let per_chunk = slots / chunks;
-    let needed = (live + per_chunk - 1) / per_chunk;
+    let needed = (live + per_chunk - 1) / per_chunk + (partitions - 1).max(0);
     chunks > needed && (live as f64) < VEC_COMPACT_OCCUPANCY * slots as f64
 }
 
@@ -1039,18 +1222,7 @@ mod tests {
     use crate::indexer::{source_id, upsert_thread, ParsedMessage, ParsedThread};
 
     fn temp_db() -> Connection {
-        // Unique per test: tests in this module run in parallel.
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static N: AtomicU32 = AtomicU32::new(0);
-        let p = std::env::temp_dir().join(format!(
-            "calli_cleanup_{}_{}.db",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ));
-        for ext in ["db", "db-wal", "db-shm"] {
-            let _ = std::fs::remove_file(p.with_extension(ext));
-        }
-        crate::db::open(&p).unwrap()
+        crate::db::test_support::TestIndex::new("cleanup").into_connection()
     }
 
     fn msg(role: &str, text: &str) -> ParsedMessage {
@@ -1458,20 +1630,27 @@ mod tests {
 
     #[test]
     fn compaction_threshold() {
-        assert!(!worth_compacting(0, 0, 0), "no vectors yet");
+        assert!(!worth_compacting(0, 0, 0, 1), "no vectors yet");
         assert!(
-            !worth_compacting(10, 1, 1024),
+            !worth_compacting(10, 1, 1024, 1),
             "one sparse chunk frees nothing"
         );
-        assert!(!worth_compacting(1500, 2, 2048), "73% full");
+        assert!(!worth_compacting(1500, 2, 2048, 1), "73% full");
         assert!(
-            worth_compacting(114_811, 205, 205 * 1024),
+            worth_compacting(114_811, 205, 205 * 1024, 1),
             "the 0029-purged index"
         );
         assert!(
-            !worth_compacting(113 * 1024 - 5, 113, 113 * 1024),
+            !worth_compacting(113 * 1024 - 5, 113, 113 * 1024, 1),
             "dense after a rebuild"
         );
+        // Two partitions, each with its own partly filled newest chunk: one vector in each
+        // is two chunks at 0.1% occupancy, and rebuilding would only produce the same two.
+        assert!(!worth_compacting(2, 2, 2048, 2), "one chunk per partition");
+        assert!(worth_compacting(2, 3, 3072, 2), "a third chunk is a hole");
+        // The measured index after its partition: 136,522 main and 187,250 subagent vectors
+        // in 134 + 183 chunks.
+        assert!(!worth_compacting(323_772, 317, 317 * 1024, 2), "dense");
     }
 
     #[test]
@@ -1518,8 +1697,12 @@ mod tests {
         }
         let chunks = |c: &Connection| count(c, "SELECT COUNT(*) FROM vec_chunks_chunks");
         assert_eq!(chunks(&conn), 3);
+        assert!(
+            rebuild_vec_chunks(&mut conn).unwrap().unwrap().partitioned,
+            "the old shape is partitioned first"
+        );
         assert_eq!(
-            compact_vec_chunks(&mut conn).unwrap(),
+            rebuild_vec_chunks(&mut conn).unwrap(),
             None,
             "dense: nothing to do"
         );
@@ -1539,17 +1722,19 @@ mod tests {
         assert_eq!(chunks(&conn), 3, "vec0 never reuses the holes");
         let top_rowid = rows.last().unwrap().1;
 
-        let report = compact_vec_chunks(&mut conn).unwrap().expect("fragmented");
+        let report = rebuild_vec_chunks(&mut conn).unwrap().expect("fragmented");
         assert_eq!(
             report,
-            VecCompaction {
+            VecRebuild {
                 vectors: kept.len() as i64,
                 chunks_before: 3,
                 chunks_after: 1,
+                partitioned: false,
+                held_ms: report.held_ms,
             }
         );
         assert_eq!(chunks(&conn), 1);
-        assert_eq!(compact_vec_chunks(&mut conn).unwrap(), None, "dense again");
+        assert_eq!(rebuild_vec_chunks(&mut conn).unwrap(), None, "dense again");
         assert_eq!(
             count(
                 &conn,
@@ -1600,11 +1785,495 @@ mod tests {
         );
         // A new vector gets a rowid no deleted vector ever had.
         conn.execute(
-            "INSERT INTO vec_chunks (message_id, embedding) VALUES (?1, ?2)",
+            "INSERT INTO vec_chunks (message_id, subagent, gen, embedding) VALUES (?1, 0, 1, ?2)",
             params![kept[1].0, blob(9999)],
         )
         .unwrap();
         assert!(conn.last_insert_rowid() > top_rowid);
+    }
+
+    /// The 0036 partition rebuild keeps each vector's rowid, message and embedding, files
+    /// it under its thread's subagent flag, leaves the owner map exact and carries the rowid
+    /// sequence over, on a table that also has holes.
+    #[test]
+    fn partition_rebuild_keeps_rowids_owners_and_sequence() {
+        let mut conn = temp_db();
+        let blob = |i: usize| -> Vec<u8> {
+            let mut v = vec![0.0_f32; 384];
+            v[i % 384] = 1.0;
+            v[(i / 384) % 384] += 0.25;
+            v.iter().flat_map(|f| f.to_le_bytes()).collect()
+        };
+        let mut rows = Vec::new(); // (message_id, chunk_rowid, i, subagent)
+        for (t, subagent) in [(0, false), (1, true), (2, false)] {
+            conn.execute(
+                "INSERT INTO threads (source_id, external_id, title, is_subagent)
+                 VALUES (1, ?1, 't', ?2)",
+                params![format!("p{t}"), subagent],
+            )
+            .unwrap();
+            let tid = conn.last_insert_rowid();
+            let tx = conn.transaction().unwrap();
+            for i in 0..700_usize {
+                let n = t * 700 + i;
+                tx.execute(
+                    "INSERT INTO messages (thread_id, seq, role, text, embedded)
+                     VALUES (?1, ?2, 'user', 'v', 1)",
+                    params![tid, i as i64],
+                )
+                .unwrap();
+                let mid = tx.last_insert_rowid();
+                tx.execute(
+                    "INSERT INTO vec_chunks (message_id, embedding) VALUES (?1, ?2)",
+                    params![mid, blob(n)],
+                )
+                .unwrap();
+                let rid = tx.last_insert_rowid();
+                tx.execute(
+                    "INSERT INTO vec_chunk_owner (chunk_rowid, message_id) VALUES (?1, ?2)",
+                    params![rid, mid],
+                )
+                .unwrap();
+                rows.push((mid, rid, n, subagent));
+            }
+            tx.commit().unwrap();
+        }
+        // Holes, and the newest vector gone, so only the sequence remembers its rowid.
+        let top_rowid = rows.last().unwrap().1;
+        for (mid, _, n, _) in &rows {
+            if n % 5 == 0 || *n == rows.len() - 1 {
+                conn.execute("DELETE FROM messages WHERE id = ?1", [mid])
+                    .unwrap();
+            }
+        }
+        let kept: Vec<_> = rows
+            .iter()
+            .filter(|r| r.2 % 5 != 0 && r.2 != rows.len() - 1)
+            .copied()
+            .collect();
+        assert!(vec_rebuild_due(&conn).unwrap(), "the old shape");
+
+        let report = rebuild_vec_chunks(&mut conn).unwrap().expect("partitioned");
+        assert!(report.partitioned);
+        assert_eq!(report.vectors, kept.len() as i64);
+        assert!(crate::embed::vec_partitioned(&conn));
+        assert!(!vec_rebuild_due(&conn).unwrap(), "dense, partitioned: done");
+        // 1,119 main and 560 subagent vectors: two main chunks and one subagent chunk.
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM vec_chunks_chunks"), 3);
+        for (mid, rid, n, subagent) in &kept {
+            let (m, part, e): (i64, i64, Vec<u8>) = conn
+                .query_row(
+                    "SELECT message_id, subagent, embedding FROM vec_chunks WHERE rowid = ?1",
+                    [rid],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!((m, part, e), (*mid, i64::from(*subagent), blob(*n)));
+        }
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM vec_chunk_owner"),
+            kept.len() as i64
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'vec_compact_scratch'"
+            ),
+            0
+        );
+        // The owner-map triggers still delete by rowid.
+        conn.execute("DELETE FROM messages WHERE id = ?1", [kept[0].0])
+            .unwrap();
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM vec_chunks"),
+            kept.len() as i64 - 1
+        );
+        // The deleted newest vector's rowid is never handed out again.
+        conn.execute(
+            "INSERT INTO vec_chunks (message_id, subagent, gen, embedding) VALUES (?1, 0, 1, ?2)",
+            params![kept[1].0, blob(9999)],
+        )
+        .unwrap();
+        assert!(conn.last_insert_rowid() > top_rowid);
+    }
+
+    /// Twelve messages of one main thread, each with a one-hot vector in the old (0004)
+    /// table: (message id, vector blob) per message.
+    fn old_shape_vectors(conn: &Connection, ext: &str) -> Vec<(i64, Vec<u8>)> {
+        conn.execute(
+            "INSERT INTO threads (source_id, external_id, title) VALUES (1, ?1, 't')",
+            [ext],
+        )
+        .unwrap();
+        let tid = conn.last_insert_rowid();
+        (0..12_i64)
+            .map(|i| {
+                conn.execute(
+                    "INSERT INTO messages (thread_id, seq, role, text, embedded)
+                     VALUES (?1, ?2, 'user', 'v', 1)",
+                    params![tid, i],
+                )
+                .unwrap();
+                let mid = conn.last_insert_rowid();
+                let mut v = vec![0.0_f32; 384];
+                v[i as usize] = 1.0;
+                let blob: Vec<u8> = v.iter().flat_map(|f| f.to_le_bytes()).collect();
+                conn.execute(
+                    "INSERT INTO vec_chunks (message_id, embedding) VALUES (?1, ?2)",
+                    params![mid, blob],
+                )
+                .unwrap();
+                (mid, blob)
+            })
+            .collect()
+    }
+
+    /// A process from before 0036 that still has the index open when the table is rebuilt
+    /// goes on running its old INSERT (it never looks at the schema version again). vec0
+    /// takes an insert without the partition key: a NULL partition no default search reads,
+    /// in a 1.5 MB chunk of its own per vector. The new shape's mandatory `gen` makes that
+    /// statement fail and store nothing, while the same process's KNN (which names no new
+    /// column) still answers.
+    #[test]
+    fn an_older_writer_cannot_store_into_the_partitioned_table() {
+        let mut conn = temp_db();
+        let rows = old_shape_vectors(&conn, "old-writer");
+        assert!(rebuild_vec_chunks(&mut conn).unwrap().unwrap().partitioned);
+        let chunks = count(&conn, "SELECT COUNT(*) FROM vec_chunks_chunks");
+        let vectors = count(&conn, "SELECT COUNT(*) FROM vec_chunks_rowids");
+        assert_eq!(vectors, rows.len() as i64);
+        let (mid, blob) = &rows[0];
+
+        // The statement every release before 0036 stores vectors with.
+        let old = conn
+            .execute(
+                "INSERT INTO vec_chunks (message_id, embedding) VALUES (?1, ?2)",
+                params![mid, blob],
+            )
+            .unwrap_err();
+        assert!(old.to_string().contains("gen"), "{old}");
+        // Knowing the partition is not enough either.
+        assert!(conn
+            .execute(
+                "INSERT INTO vec_chunks (message_id, subagent, embedding) VALUES (?1, 0, ?2)",
+                params![mid, blob],
+            )
+            .is_err());
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM vec_chunks_chunks"),
+            chunks,
+            "no chunk was started for the refused vectors"
+        );
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM vec_chunks_rowids"),
+            vectors
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM vec_chunks_chunks WHERE partition00 IS NULL"
+            ),
+            0
+        );
+
+        // An older reader's KNN, with no partition constraint, reads the new table.
+        let hits: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM (SELECT message_id FROM vec_chunks
+                                       WHERE embedding MATCH ?1 AND k = 3)",
+                [blob],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(hits, 3);
+    }
+
+    /// Only the canonical statement counts as partitioned. A table with the partition key
+    /// but no `gen` (no release wrote one) is rebuilt once more, and a vector that sat in
+    /// its NULL partition comes back under its thread's partition with the current `gen`. A
+    /// later compaction carries each vector's own `gen` over.
+    #[test]
+    fn a_partitioned_table_without_gen_is_rebuilt() {
+        let mut conn = temp_db();
+        let rows = old_shape_vectors(&conn, "no-gen");
+        conn.execute_batch(
+            "DELETE FROM vec_chunk_owner;
+             DROP TABLE vec_chunks;
+             CREATE VIRTUAL TABLE vec_chunks USING vec0(
+                 message_id integer,
+                 subagent integer partition key,
+                 embedding float[384] distance_metric=cosine
+             );",
+        )
+        .unwrap();
+        for (i, (mid, blob)) in rows.iter().enumerate() {
+            // The first one as an old writer would have stored it: no partition at all.
+            let sql = if i == 0 {
+                "INSERT INTO vec_chunks (message_id, embedding) VALUES (?1, ?2)"
+            } else {
+                "INSERT INTO vec_chunks (message_id, subagent, embedding) VALUES (?1, 0, ?2)"
+            };
+            conn.execute(sql, params![mid, blob]).unwrap();
+        }
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM vec_chunks_chunks WHERE partition00 IS NULL"
+            ),
+            1
+        );
+        assert!(!crate::embed::vec_partitioned(&conn));
+        assert!(vec_rebuild_due(&conn).unwrap());
+
+        let report = rebuild_vec_chunks(&mut conn).unwrap().expect("not current");
+        assert!(report.partitioned);
+        assert_eq!(report.vectors, rows.len() as i64);
+        assert!(crate::embed::vec_partitioned(&conn));
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM vec_chunks WHERE subagent = 0 AND gen = 1"
+            ),
+            rows.len() as i64
+        );
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM vec_chunks_chunks"), 1);
+
+        // A compaction keeps a vector's own gen: one stored with another generation, then
+        // enough vectors to start a second chunk, all but the last deleted again, which
+        // leaves 14 vectors in two chunks.
+        conn.execute(
+            "INSERT INTO vec_chunks (message_id, subagent, gen, embedding) VALUES (?1, 0, 7, ?2)",
+            params![rows[0].0, rows[0].1],
+        )
+        .unwrap();
+        let kept = conn.last_insert_rowid();
+        let mut last = kept;
+        for n in 0..1100 {
+            let (mid, blob) = &rows[1 + n % 11];
+            conn.execute(
+                "INSERT INTO vec_chunks (message_id, subagent, gen, embedding)
+                 VALUES (?1, 0, 1, ?2)",
+                params![mid, blob],
+            )
+            .unwrap();
+            last = conn.last_insert_rowid();
+        }
+        conn.execute(
+            "DELETE FROM vec_chunks WHERE rowid > ?1 AND rowid < ?2",
+            [kept, last],
+        )
+        .unwrap();
+        let report = rebuild_vec_chunks(&mut conn).unwrap().expect("fragmented");
+        assert!(!report.partitioned, "a compaction, not a partition");
+        assert_eq!(
+            (report.vectors, report.chunks_before, report.chunks_after),
+            (14, 2, 1)
+        );
+        assert_eq!(
+            count(
+                &conn,
+                &format!("SELECT gen FROM vec_chunks WHERE rowid = {kept}")
+            ),
+            7
+        );
+    }
+
+    /// Too little free disk: the rebuild refuses before it writes anything, and the table
+    /// keeps its shape and every vector. Exactly enough room is enough, and a volume that
+    /// can't be measured (or an in-memory database) doesn't stop it.
+    #[test]
+    fn rebuild_refuses_without_room_on_the_volume() {
+        let mut conn = temp_db();
+        conn.execute(
+            "INSERT INTO threads (source_id, external_id, title) VALUES (1, 'room', 't')",
+            [],
+        )
+        .unwrap();
+        let tid = conn.last_insert_rowid();
+        for i in 0..20_i64 {
+            conn.execute(
+                "INSERT INTO messages (thread_id, seq, role, text, embedded)
+                 VALUES (?1, ?2, 'user', 'v', 1)",
+                params![tid, i],
+            )
+            .unwrap();
+            let mid = conn.last_insert_rowid();
+            let mut v = vec![0.0_f32; 384];
+            v[i as usize] = 1.0;
+            let blob: Vec<u8> = v.iter().flat_map(|f| f.to_le_bytes()).collect();
+            conn.execute(
+                "INSERT INTO vec_chunks (message_id, embedding) VALUES (?1, ?2)",
+                params![mid, blob],
+            )
+            .unwrap();
+        }
+        let dir = Path::new(conn.path().unwrap())
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let need = rebuild_space_needed(vec_table_bytes(&conn).unwrap());
+        assert!(need > 0);
+        let room = |available: u64| {
+            let dir = dir.clone();
+            move |probed: &Path| {
+                assert_eq!(probed, dir, "the index's own volume");
+                Some(VolumeSpace {
+                    mount: "/Volumes/Index".into(),
+                    available,
+                })
+            }
+        };
+        let err = rebuild_vec_chunks_with(&mut conn, room(need - 1)).unwrap_err();
+        assert!(
+            err.to_string().contains("not enough free disk space"),
+            "{err}"
+        );
+        assert!(!crate::embed::vec_partitioned(&conn), "nothing rewritten");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM vec_chunks"), 20);
+
+        assert!(check_rebuild_space(&conn, u64::MAX, |_| None).is_ok());
+        let memory = Connection::open_in_memory().unwrap();
+        assert!(
+            check_rebuild_space(&memory, u64::MAX, |_| -> Option<VolumeSpace> {
+                panic!("no volume to probe")
+            })
+            .is_ok()
+        );
+
+        let report = rebuild_vec_chunks_with(&mut conn, room(need))
+            .unwrap()
+            .expect("room enough");
+        assert!(report.partitioned);
+        assert_eq!(report.vectors, 20);
+    }
+
+    /// Times the 0036 partition rebuild on a real index and reports how the files grow.
+    /// REWRITES the index it is given: only an APFS clone, never the live one.
+    /// `CALLIMACHUS_DB=<clone>/index.db CALLIMACHUS_REBUILD_CLONE=1 cargo test --release -p
+    /// callimachus-core --lib -- --ignored real_index_partition_rebuild --nocapture`; with
+    /// `CALLIMACHUS_REBUILD_COLD=1` it skips the warm-up read, for the before figure (use a
+    /// fresh clone each run: a clone's pages are not in the OS cache yet).
+    #[test]
+    #[ignore]
+    fn real_index_partition_rebuild() {
+        let db = std::env::var_os("CALLIMACHUS_DB").expect("CALLIMACHUS_DB = a cloned index");
+        let db = PathBuf::from(db);
+        // CALLIMACHUS_DB is what default_index_path returns, so compare with the app's folder.
+        let live = dirs::data_local_dir()
+            .or_else(dirs::home_dir)
+            .unwrap()
+            .join("dev.shaller.callimachus");
+        assert!(
+            !db.starts_with(&live),
+            "point CALLIMACHUS_DB at a clone, not {}",
+            live.display()
+        );
+        assert_eq!(
+            std::env::var("CALLIMACHUS_REBUILD_CLONE").as_deref(),
+            Ok("1"),
+            "set CALLIMACHUS_REBUILD_CLONE=1 to rewrite {}",
+            db.display()
+        );
+        let size = |p: &Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+        let wal = PathBuf::from(format!("{}-wal", db.display()));
+        let mb = |b: u64| b as f64 / 1_048_576.0;
+        let opened = std::time::Instant::now();
+        let mut conn = crate::db::open(&db).unwrap();
+        println!("open (with any pending migrations): {:?}", opened.elapsed());
+        let _ = checkpoint_truncate(&conn);
+        let (file0, vec_bytes) = (size(&db), vec_table_bytes(&conn).unwrap());
+        let clock = crate::jobclock::JobClock::start();
+        // `rebuild_vec_chunks` past its due and space checks, with the warm-up and the
+        // checkpoint timed apart.
+        conn.pragma_update(None, "cache_size", -rebuild_cache_kib(vec_bytes))
+            .unwrap();
+        conn.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+        let warm = std::time::Instant::now();
+        if std::env::var("CALLIMACHUS_REBUILD_COLD").as_deref() != Ok("1") {
+            warm_vec_pages(&conn);
+        }
+        println!(
+            "warm-up read (no lock): {:.1} s",
+            warm.elapsed().as_secs_f64()
+        );
+        let report = rebuild_vec_chunks_locked(&mut conn).unwrap();
+        let held = clock.wall();
+        let (file1, wal1) = (size(&db), size(&wal));
+        let passive = std::time::Instant::now();
+        conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")
+            .unwrap();
+        println!(
+            "PASSIVE checkpoint (no lock): {:.1} s",
+            passive.elapsed().as_secs_f64()
+        );
+        let complete = checkpoint_truncate(&conn).unwrap_or(false);
+        println!(
+            "{report:?}\nrebuild (one IMMEDIATE transaction, the write-lock hold): {}\n\
+             vector table {:.0} MB; file {:.0} -> {:.0} MB right after commit, WAL {:.0} MB; \
+             after a TRUNCATE checkpoint ({complete}): file {:.0} MB, freelist {:.0} MB",
+            clock.process_summary(),
+            mb(vec_bytes),
+            mb(file0),
+            mb(file1),
+            mb(wal1),
+            mb(size(&db)),
+            mb(reclaimable_over(&conn, 0).unwrap().bytes),
+        );
+        println!(
+            "warm-up and rebuild {:.1} s; write lock held {:.1} s",
+            held.as_secs_f64(),
+            report.map_or(0, |r| r.held_ms) as f64 / 1000.0
+        );
+    }
+
+    #[test]
+    fn rebuild_needs_three_times_the_vector_table_free() {
+        // The measured index: 626 MB of vectors, 1,745 MB of WAL and file growth at the peak.
+        let vec_bytes = 626 * 1_048_576;
+        assert_eq!(rebuild_space_needed(vec_bytes), 1878 * 1_048_576);
+        assert_eq!(rebuild_space_needed(0), 0);
+        let conn = temp_db();
+        assert_eq!(vec_table_bytes(&conn).unwrap(), 0);
+        // Its page cache holds both copies on that index, and stays bounded above it.
+        assert_eq!(rebuild_cache_kib(0), 65_536);
+        assert_eq!(rebuild_cache_kib(200 * 1_048_576), 2 * 200 * 1024 + 65_536);
+        assert_eq!(rebuild_cache_kib(vec_bytes), 1 << 20);
+        assert_eq!(rebuild_cache_kib(u64::MAX), 1 << 20);
+    }
+
+    /// The rebuild's partition lookup reads the subagent threads' messages from an index,
+    /// never the messages table, and leaves the connection's page cache and automatic
+    /// checkpoint as it found them.
+    #[test]
+    fn rebuild_reads_subagent_messages_from_an_index() {
+        let mut conn = temp_db();
+        let plan: Vec<String> = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {SUBAGENT_MESSAGES_SQL}"))
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|l| l.starts_with("SEARCH m USING COVERING INDEX")),
+            "{plan:?}"
+        );
+        assert!(!plan.iter().any(|l| l.starts_with("SCAN m")), "{plan:?}");
+        let pragmas = |c: &Connection| -> (i64, i64) {
+            let get = |p: &str| -> i64 {
+                c.query_row(&format!("PRAGMA {p}"), [], |r| r.get(0))
+                    .unwrap()
+            };
+            (get("cache_size"), get("wal_autocheckpoint"))
+        };
+        let before = pragmas(&conn);
+        assert!(rebuild_vec_chunks(&mut conn).unwrap().unwrap().partitioned);
+        assert_eq!(
+            pragmas(&conn),
+            before,
+            "page cache and autocheckpoint restored"
+        );
     }
 
     #[test]

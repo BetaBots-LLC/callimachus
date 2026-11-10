@@ -4,6 +4,7 @@ import { useDebouncedCallback } from "@tanstack/react-pacer";
 import { Check, ChevronRight } from "lucide-react";
 import { api, type CoachFact, type ProjectInfo, SOURCE_LABELS, type TodoFact } from "../../lib/api";
 import { AGGREGATE_STALE_MS } from "../../lib/queryClient";
+import { invalidateDomain, MEMORY_WRITE_KEY } from "../../lib/keys";
 import { baseName, shortPath } from "../../lib/format";
 import { errorText } from "../../lib/toast";
 import { Badge } from "@/components/ui/badge";
@@ -134,6 +135,7 @@ function TodoList() {
   });
   // Drop the TODO at once and roll back if the write fails, so the check feels instant.
   const markDone = useMutation({
+    mutationKey: MEMORY_WRITE_KEY,
     mutationFn: (id: number) => api.setTodoDone(id, true),
     onMutate: async (id: number) => {
       const key = ["open_todos", committed];
@@ -150,12 +152,8 @@ function TodoList() {
     onError: (_e, _id, ctx) => {
       if (ctx?.prev) qc.setQueryData(ctx.key, ctx.prev);
     },
-    onSettled: () => {
-      void qc.invalidateQueries({ queryKey: ["open_todos"] });
-      void qc.invalidateQueries({ queryKey: ["project_memory"] });
-      // Today's "new TODOs" strip, which would keep the closed one until its stale window.
-      void qc.invalidateQueries({ queryKey: ["today"] });
-    },
+    // Every view of the memory, Today's "new TODOs" strip included.
+    onSettled: () => invalidateDomain("memory"),
   });
 
   const rows = todos.data ?? [];

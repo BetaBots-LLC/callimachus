@@ -1,0 +1,33 @@
+-- 0036: vectors that know whose they are.
+--
+-- The vector rewrite itself is NOT here. `vec_chunks` gets a `subagent integer partition
+-- key` column so a default search (main threads only) scans the main partition instead of
+-- a global top-k that subagent vectors crowd out (58% of 324k vectors on a measured index,
+-- where 1 to 2 of 5 queries got 0 main-thread semantic hits). Rewriting every vector holds
+-- the write lock for seconds (9-12 s there) and needs about three times the vector table
+-- free on disk, so `cleanup::rebuild_vec_chunks` does it from a background job (the app's and
+-- `cal watch`'s watcher after the launch catch-up, any semantic build before it starts,
+-- `cal embed`), never from a migration a hook or the MCP server could run. Until then the
+-- table keeps its old shape and every reader and writer handles both
+-- (`embed::vec_partitioned`).
+--
+-- The version bump is what this migration is for: an older `cal embed`, `cal watch` or app
+-- refuses an index at this version instead of inserting vectors without the partition
+-- column, which would land in a NULL partition that no KNN scans (and would cost vec0 a new
+-- 1024-slot chunk per insert, since a NULL partition value never matches its latest chunk).
+-- A process that already had the index open never reads the version again, so the rebuilt
+-- table also has a mandatory `gen integer` column: vec0 refuses the old two-column INSERT
+-- (NULL in an INTEGER metadata column), and that process stores no vectors until it is
+-- restarted (`embed::PARTITIONED_VEC_CHUNKS_SQL`). Its searches keep working.
+--
+-- From this version `messages.embedded` also takes 2 (`embed::EMBEDDED_NO_VECTOR`): done,
+-- with no vector (blank text, harness boilerplate, failed inference). 0025's triggers fire
+-- only on 1, so deleting such a message never runs the unmapped fallback's full vec0 scan.
+-- Rows already at 1 keep it (a measured index had none without a vector).
+
+-- 0022's partial (model) index: nothing reads it any more. Spend and the usage backfill go
+-- through 0026's covering (thread_id, model, ...) index, and trace's per-thread model lookup
+-- needed a `+model` hint only to stay off this one. Every insert of an assistant row paid to
+-- maintain it (16 MB on the measured index). Dropping it frees its pages and reads only
+-- the index itself, so the migration stays scan-free.
+DROP INDEX IF EXISTS idx_messages_model;

@@ -99,6 +99,10 @@ pub static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
         // 0035: fact truth: fact_links (supersedes / contradicts between two facts, by uid)
         // and fact_signals (reaffirmed / stale / wrong on one fact).
         M::up(include_str!("../../../migrations/0035_fact_truth.sql")),
+        // 0036: the version bump that keeps older embedders off a partitioned vec_chunks
+        // (the rebuild itself is `cleanup::rebuild_vec_chunks`), and drops 0022's unused
+        // (model) index.
+        M::up(include_str!("../../../migrations/0036_vec_partition.sql")),
     ])
 });
 
@@ -109,8 +113,9 @@ pub static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
 /// (0032 is one ALTER ADD COLUMN and a partial index over `facts`; 0033 one row in `sources`;
 /// 0034 backfills `facts` (2k rows), creates empty tables and indexes `threads`: opening a
 /// copy of that index at 0032 ran 0033 and 0034 in 0.4 s cold; 0035 only creates two empty
-/// tables and their indexes). Add a migration here only when it touches no large table.
-pub const SCAN_FREE_MIGRATIONS: &[usize] = &[32, 33, 34, 35];
+/// tables and their indexes; 0036 drops one 16 MB index, reading only that index's pages).
+/// Add a migration here only when it touches no large table.
+pub const SCAN_FREE_MIGRATIONS: &[usize] = &[32, 33, 34, 35, 36];
 
 /// Whether every migration after `applied` (the index's `user_version`) up to `latest` is in
 /// [`SCAN_FREE_MIGRATIONS`].
@@ -129,6 +134,7 @@ mod tests {
         assert!(pending_are_scan_free(31, 33), "so is 0033");
         assert!(pending_are_scan_free(31, 34), "and 0034");
         assert!(pending_are_scan_free(34, 35), "and 0035");
+        assert!(pending_are_scan_free(35, 36), "and 0036");
         assert!(
             !pending_are_scan_free(30, 32),
             "0031 builds indexes on messages"
@@ -145,14 +151,12 @@ mod tests {
         );
     }
 
+    use crate::db::test_support::{TestIndex, TestPath};
+
     static N: AtomicU32 = AtomicU32::new(0);
 
-    fn temp_path() -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "calli_mig_{}_{}.db",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ))
+    fn temp_path() -> TestPath {
+        TestPath::new("mig")
     }
 
     /// A fresh install must apply every embedded migration cleanly and land on an
@@ -164,9 +168,6 @@ mod tests {
     #[test]
     fn fresh_db_migrates_then_validates() {
         let p = temp_path();
-        for ext in ["db", "db-wal", "db-shm"] {
-            let _ = std::fs::remove_file(p.with_extension(ext));
-        }
         let conn = crate::db::open(&p).expect("fresh DB should migrate cleanly");
         assert!(
             matches!(
@@ -185,26 +186,19 @@ mod tests {
 
     use rusqlite::{params, Connection};
 
-    fn fresh_db() -> Connection {
-        let p = temp_path();
-        for ext in ["db", "db-wal", "db-shm"] {
-            let _ = std::fs::remove_file(p.with_extension(ext));
-        }
-        crate::db::open(&p).expect("open + migrate")
+    fn fresh_db() -> TestIndex {
+        TestIndex::new("mig")
     }
 
     /// Open a raw connection at `version` (vec0 registered, FKs on), for upgrade tests.
-    fn db_at_version(version: usize) -> Connection {
+    fn db_at_version(version: usize) -> TestIndex {
         // db::open registers the vec0 auto-extension for every later connection.
         let _ = fresh_db();
         let p = temp_path();
-        for ext in ["db", "db-wal", "db-shm"] {
-            let _ = std::fs::remove_file(p.with_extension(ext));
-        }
         let mut conn = Connection::open(&p).unwrap();
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
         MIGRATIONS.to_version(&mut conn, version).unwrap();
-        conn
+        TestIndex::adopt(conn, p)
     }
 
     fn vec_blob(hot: usize) -> Vec<u8> {

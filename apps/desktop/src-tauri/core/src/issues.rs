@@ -564,17 +564,6 @@ fn unscoped_fix<'a>(
         })
 }
 
-/// Whether a stored project key is in a read's scope, as [`crate::search::project_condition`]
-/// matches it: exactly, or as SQLite's `LIKE '%p%'` does (ASCII case-insensitive).
-fn project_in_scope(key: &str, project: &str, mode: ProjectMatch) -> bool {
-    match mode {
-        ProjectMatch::Exact => key == project,
-        ProjectMatch::Substring => key
-            .to_ascii_lowercase()
-            .contains(&project.to_ascii_lowercase()),
-    }
-}
-
 /// Most `git show` runs one refresh makes for commits not seen before (cached after, see
 /// [`COMMIT_FILES`]). On a 21k-thread index the first refresh showed 100 commits in about
 /// 1.3 s of a 1.6 s resolve; a whole refresh takes 0.8 s once they are cached, so later ones
@@ -1102,6 +1091,8 @@ pub fn with_fixes(
     mode: ProjectMatch,
 ) -> Vec<Issue> {
     let project = project.filter(|p| !p.is_empty());
+    // A fix's stored project key is in scope as the SQL scope selects it.
+    let scope = project.map(|p| crate::scope::ProjectScope::with_match(p, mode));
     let fixes = load_fixes(conn);
     let mut detail = (!fixes.is_empty())
         .then(|| conn.prepare(FIX_DETAIL_SQL).ok())
@@ -1113,10 +1104,10 @@ pub fn with_fixes(
         .into_iter()
         .map(|cluster| {
             let signature = normalize(&cluster.example);
-            let chosen = fixes.get(&signature).and_then(|per_project| match project {
-                Some(p) => per_project
+            let chosen = fixes.get(&signature).and_then(|per_project| match &scope {
+                Some(scope) => per_project
                     .iter()
-                    .filter(|(key, _)| project_in_scope(key, p, mode))
+                    .filter(|(key, _)| scope.matches(key))
                     .max_by_key(|(_, fix)| (fix.committed_at, fix.thread_id)),
                 None => {
                     let latest: Option<String> = project_of.as_mut().and_then(|stmt| {

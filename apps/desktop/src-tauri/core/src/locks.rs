@@ -7,8 +7,13 @@
 //! skip while it is live. `cal index` holds `<index>.index.lock` for its pass, so the Claude
 //! Code plugin's SessionStart guard (`cal index --if-stale`) never starts a second pass while
 //! one runs (when the last one finished is `jobs::LAST_PASS_AT` in the index, stamped at its
-//! end, not this file's mtime, which a pass that died at once also set). The locks are named
-//! after the index file, not its directory:
+//! end, not this file's mtime, which a pass that died at once also set). A semantic build
+//! holds `<index>.embed.lock` (`cal embed`, and the app's or `cal watch`'s builds), so two
+//! processes never embed the same backlog side by side. The app holds `<index>.rewrite.lock`
+//! while Shrink index / Reclaim space rewrites the whole file, and `cal index`, `cal watch`,
+//! `cal embed` and `cal distill --auto` refuse to start under it: the job flags that keep a
+//! VACUUM away from writers are per process. The locks are named after the index file, not
+//! its directory:
 //! `pnpm desktop:dev` keeps `index.dev.db` next to the installed app's `index.db`, and a
 //! shared directory lock made `cal watch` on one index refuse because of an app on the other.
 //!
@@ -35,6 +40,12 @@ pub const DISTILL_LOCK: &str = "distill.lock";
 /// Held by `cal index` for its pass (run by hand, or in the background by the plugin's
 /// SessionStart guard).
 pub const INDEX_LOCK: &str = "index.lock";
+/// Held by a semantic-index build for its whole run: `cal embed`, or a build the app or
+/// `cal watch` started (a Build click, a background top-up).
+pub const EMBED_LOCK: &str = "embed.lock";
+/// Held by the app while Shrink index / Reclaim space rewrites the whole file
+/// (`jobs::claim_rewrite` until `jobs::release_rewrite`).
+pub const REWRITE_LOCK: &str = "rewrite.lock";
 
 /// A lock this process holds until it drops (or exits).
 #[derive(Debug)]

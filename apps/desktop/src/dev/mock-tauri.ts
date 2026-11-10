@@ -2461,8 +2461,8 @@ const handlers: Record<string, Handler> = {
   },
   thread_knowledge: threadKnowledge,
   distill_thread: () => sleep(900).then(threadKnowledge),
-  recall_decisions: () => [],
-  recall_gotchas: () => [],
+  recall_decisions: () => ({ kind: "hits", hits: [] }),
+  recall_gotchas: () => ({ kind: "hits", hits: [] }),
   ask_history: async () => {
     await sleep(900);
     // Like the backend: memory has to be on, since Ask runs on the memory engine.

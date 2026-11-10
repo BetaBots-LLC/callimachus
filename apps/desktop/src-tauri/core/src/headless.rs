@@ -12,12 +12,16 @@
 //!   holds `distill.lock` for its drain, which the app's and `cal watch`'s auto-distill
 //!   kicks skip while it is live: two drains would distill the same threads and spend the
 //!   daily allowance twice.
-//! - `cal index` and `cal embed` do not yield: the job flags that order the app's own jobs
-//!   live in each process. Alongside a reindex or the watcher they only repeat work (a scan
-//!   skips unchanged files, a vector batch is stored only for messages still pending), but
-//!   a Shrink index or Reclaim space in the app holds the write lock for the whole rewrite,
-//!   so a file or batch that waits past the busy timeout fails: run the command again after
-//!   it finishes. Two `cal index` passes never overlap (`index.lock`).
+//! - `cal index` and `cal embed` run alongside the app's reindex and watcher, where they
+//!   only repeat work (a scan skips unchanged files, a vector batch is stored only for
+//!   messages still pending): the job flags that order the app's own jobs live in each
+//!   process. What they must not meet is a whole-file rewrite, so each refuses to start
+//!   while a Shrink index or Reclaim space holds `rewrite.lock`, and the app refuses a
+//!   rewrite while either holds `index.lock` or `embed.lock` (`jobs::cal_writer_running`).
+//!   `cal embed` also refuses while another build holds `embed.lock` (the app's Build, a
+//!   background top-up or the one-time vector rebuild by the app or `cal watch`): two
+//!   builds would embed the same backlog twice. Two `cal index` passes never overlap
+//!   (`index.lock`).
 //! - `cal index --if-stale` is the Claude Code plugin's SessionStart guard: it starts a
 //!   `cal index` in the background only when nothing else keeps the index fresh, and like
 //!   every hook it prints nothing, exits 0 and never creates the index. Its pass upgrades
@@ -294,18 +298,7 @@ pub fn cmd_index(args: &[String]) -> anyhow::Result<()> {
             "unknown argument '{a}' for `cal index` (it takes none, or {INDEX_IF_STALE}). Run `cal help`."
         );
     }
-    let index = db::default_index_path();
-    // A second pass alongside would only repeat the first one's work; the lock also stops
-    // the plugin's guard from starting one while this runs. The guard reads "indexed
-    // recently" from `jobs::LAST_PASS_AT`, which the pass stamps when it finishes.
-    let _lock = match locks::acquire(&index, locks::INDEX_LOCK)? {
-        locks::Acquire::Acquired(lock) => lock,
-        locks::Acquire::Held(pid) => anyhow::bail!(
-            "cal index is already running{} for this index (the Claude Code plugin starts one in \
-             the background at session start); it finishes on its own",
-            locks::pid_note(pid)
-        ),
-    };
+    let _lock = claim_index_lock(&db::default_index_path())?;
     let started = Instant::now();
     let host = open_host(HostOptions {
         readers: false,
@@ -344,6 +337,38 @@ pub fn cmd_index(args: &[String]) -> anyhow::Result<()> {
             "{} error{} while indexing; the [index] lines above name each file or source",
             r.errors,
             if r.errors == 1 { "" } else { "s" }
+        );
+    }
+    Ok(())
+}
+
+/// `cal index`'s locks: index.lock, then no whole-file rewrite running.
+fn claim_index_lock(index: &std::path::Path) -> anyhow::Result<locks::ProcessLock> {
+    // A second pass alongside would only repeat the first one's work; the lock also stops
+    // the plugin's guard from starting one while this runs. The guard reads "indexed
+    // recently" from `jobs::LAST_PASS_AT`, which the pass stamps when it finishes.
+    let lock = match locks::acquire(index, locks::INDEX_LOCK)? {
+        locks::Acquire::Acquired(lock) => lock,
+        locks::Acquire::Held(pid) => anyhow::bail!(
+            "cal index is already running{} for this index (the Claude Code plugin starts one in \
+             the background at session start); it finishes on its own",
+            locks::pid_note(pid)
+        ),
+    };
+    refuse_during_rewrite(index, "index")?;
+    Ok(lock)
+}
+
+/// Refuse to start `cal <what>` while the app rewrites the whole index file (Shrink index or
+/// Reclaim space hold rewrite.lock): the VACUUM holds the write lock for the whole rewrite,
+/// so this process's writes would wait out the busy timeout and fail, or make the rewrite
+/// fail. Call it holding the command's own lock: the app takes rewrite.lock and then checks
+/// those, so the two sides can both refuse but never both run.
+fn refuse_during_rewrite(index: &std::path::Path, what: &str) -> anyhow::Result<()> {
+    if let Some(pid) = locks::holder(index, locks::REWRITE_LOCK) {
+        anyhow::bail!(
+            "the Callimachus app is rewriting the index{} (Shrink index or Reclaim space); run cal {what} again when it finishes",
+            locks::pid_note(pid)
         );
     }
     Ok(())
@@ -630,21 +655,7 @@ fn open_index_log(index: &std::path::Path, header: &str) -> Option<std::fs::File
 pub fn cmd_watch(args: &[String]) -> anyhow::Result<()> {
     no_args("watch", args)?;
     let index = db::default_index_path();
-    // Ours first, then theirs: the app takes gui.lock and then checks watch.lock, so two
-    // starting at once can both refuse but never both watch.
-    let _lock = match locks::acquire(&index, locks::WATCH_LOCK)? {
-        locks::Acquire::Acquired(lock) => lock,
-        locks::Acquire::Held(pid) => anyhow::bail!(
-            "cal watch is already running{} for this index",
-            locks::pid_note(pid)
-        ),
-    };
-    if let Some(pid) = locks::holder(&index, locks::GUI_LOCK) {
-        anyhow::bail!(
-            "the Callimachus app is running{} and keeps the index fresh itself; quit it to use cal watch",
-            locks::pid_note(pid)
-        );
-    }
+    let _lock = claim_watch_lock(&index)?;
     let runtime = tokio::runtime::Runtime::new()?;
     let host = open_host(HostOptions {
         readers: true,
@@ -678,6 +689,29 @@ pub fn cmd_watch(args: &[String]) -> anyhow::Result<()> {
     }
 }
 
+/// `cal watch`'s locks: watch.lock, then no app and no whole-file rewrite running.
+fn claim_watch_lock(index: &std::path::Path) -> anyhow::Result<locks::ProcessLock> {
+    // Ours first, then theirs: the app takes gui.lock and then checks watch.lock, so two
+    // starting at once can both refuse but never both watch.
+    let lock = match locks::acquire(index, locks::WATCH_LOCK)? {
+        locks::Acquire::Acquired(lock) => lock,
+        locks::Acquire::Held(pid) => anyhow::bail!(
+            "cal watch is already running{} for this index",
+            locks::pid_note(pid)
+        ),
+    };
+    if let Some(pid) = locks::holder(index, locks::GUI_LOCK) {
+        anyhow::bail!(
+            "the Callimachus app is running{} and keeps the index fresh itself; quit it to use cal watch",
+            locks::pid_note(pid)
+        );
+    }
+    // Only the app rewrites, and gui.lock above already refuses while it runs; checked
+    // anyway (one probe) so every `cal` writer honors rewrite.lock, whoever takes it.
+    refuse_during_rewrite(index, "watch")?;
+    Ok(lock)
+}
+
 /// `cal watch`'s exit code when the index's schema moved past this binary: distinct from
 /// 1 (an error), so a login item or a supervisor can restart on it after an update.
 const WATCH_EXIT_SCHEMA_MOVED: i32 = 3;
@@ -700,9 +734,11 @@ pub fn cmd_embed(args: &[String]) -> anyhow::Result<()> {
     }
     // Before anything downloads the model or creates an index: with no threads there is
     // nothing to embed, and the 128 MB download would be for nothing.
-    if !db::default_index_path().exists() {
+    let index = db::default_index_path();
+    if !index.exists() {
         anyhow::bail!("nothing to embed yet; run `cal index` first");
     }
+    let _lock = claim_embed_lock(&index)?;
     let started = Instant::now();
     let host = open_host(HostOptions {
         readers: false,
@@ -732,6 +768,25 @@ pub fn cmd_embed(args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `cal embed`'s locks: embed.lock, then no whole-file rewrite running. Without them a Shrink
+/// index or Reclaim space in the app could start under a build that runs for an hour, and
+/// the app's own builds (a Build click, the watcher's top-ups) would embed the same backlog
+/// alongside; they skip while this holds embed.lock.
+fn claim_embed_lock(index: &std::path::Path) -> anyhow::Result<locks::ProcessLock> {
+    // "Try again", not "it finishes on its own": the holder may be a background top-up of
+    // the app or `cal watch`, capped at 2,000 messages (`AUTO_EMBED_MAX_MESSAGES`), which
+    // leaves the rest of a large backlog to the next `cal embed`.
+    let lock = match locks::acquire(index, locks::EMBED_LOCK)? {
+        locks::Acquire::Acquired(lock) => lock,
+        locks::Acquire::Held(pid) => anyhow::bail!(
+            "a semantic-index build is already running{} for this index (another cal embed, a Build in the app, or a background top-up by the app or cal watch); try again when it finishes",
+            locks::pid_note(pid)
+        ),
+    };
+    refuse_during_rewrite(index, "embed")?;
+    Ok(lock)
+}
+
 /// `cal distill --auto`: one drain of the auto-distill worklist (threads active in the last
 /// 30 days, idle for 30 minutes and not distilled yet) under the daily cap, with the engine
 /// and the auto-distill switch saved in Settings. Refuses while the app or `cal watch` runs
@@ -743,27 +798,7 @@ pub fn cmd_distill_auto(args: &[String]) -> anyhow::Result<()> {
     if !index.exists() {
         anyhow::bail!("no index yet; run `cal index` first");
     }
-    // Ours first, then theirs, as `cal watch` does: the app and `cal watch` hold their lock
-    // from startup and check this one before each auto-distill kick.
-    let _lock = match locks::acquire(&index, locks::DISTILL_LOCK)? {
-        locks::Acquire::Acquired(lock) => lock,
-        locks::Acquire::Held(pid) => anyhow::bail!(
-            "cal distill --auto is already running{} for this index",
-            locks::pid_note(pid)
-        ),
-    };
-    if let Some(pid) = locks::holder(&index, locks::GUI_LOCK) {
-        anyhow::bail!(
-            "the Callimachus app is running{} and distills on its own; use Build memory there, or quit it first",
-            locks::pid_note(pid)
-        );
-    }
-    if let Some(pid) = locks::holder(&index, locks::WATCH_LOCK) {
-        anyhow::bail!(
-            "cal watch is running{} and distills on its own when auto-distill is on; stop it first",
-            locks::pid_note(pid)
-        );
-    }
+    let _lock = claim_distill_lock(&index)?;
     let runtime = tokio::runtime::Runtime::new()?;
     let host = open_host(HostOptions {
         readers: true,
@@ -827,6 +862,34 @@ pub fn cmd_distill_auto(args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `cal distill --auto`'s locks: distill.lock, then no app, `cal watch` or whole-file rewrite
+/// running.
+fn claim_distill_lock(index: &std::path::Path) -> anyhow::Result<locks::ProcessLock> {
+    // Ours first, then theirs, as `cal watch` does: the app and `cal watch` hold their lock
+    // from startup and check this one before each auto-distill kick.
+    let lock = match locks::acquire(index, locks::DISTILL_LOCK)? {
+        locks::Acquire::Acquired(lock) => lock,
+        locks::Acquire::Held(pid) => anyhow::bail!(
+            "cal distill --auto is already running{} for this index",
+            locks::pid_note(pid)
+        ),
+    };
+    if let Some(pid) = locks::holder(index, locks::GUI_LOCK) {
+        anyhow::bail!(
+            "the Callimachus app is running{} and distills on its own; use Build memory there, or quit it first",
+            locks::pid_note(pid)
+        );
+    }
+    if let Some(pid) = locks::holder(index, locks::WATCH_LOCK) {
+        anyhow::bail!(
+            "cal watch is running{} and distills on its own when auto-distill is on; stop it first",
+            locks::pid_note(pid)
+        );
+    }
+    refuse_during_rewrite(index, "distill --auto")?;
+    Ok(lock)
+}
+
 /// Whether a `cal distill --auto` drain should start.
 #[derive(Debug, PartialEq, Eq)]
 enum DrainGate {
@@ -864,11 +927,10 @@ fn drain_gate(conn: &rusqlite::Connection, now: i64) -> anyhow::Result<DrainGate
 mod tests {
     use super::*;
 
-    fn temp_index(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("calli_headless_{tag}_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir.join("index.db")
+    /// `index.db` in a fresh temp dir of its own (lock files and the index log sit next to
+    /// it), removed on drop.
+    fn temp_index(tag: &str) -> db::test_support::TestDir {
+        db::test_support::TestDir::new(&format!("headless_{tag}"))
     }
 
     fn host_on(path: &std::path::Path, rt: &tokio::runtime::Runtime) -> Arc<CliHost> {
@@ -976,6 +1038,69 @@ mod tests {
         }
         conn.pragma_update(None, "user_version", version).unwrap();
         assert_eq!(gate(&path), run);
+    }
+
+    /// A child another test thread is spawning can hold a dropped lock until it execs.
+    const FREED: std::time::Duration = std::time::Duration::from_secs(5);
+
+    type Claim = fn(&std::path::Path) -> anyhow::Result<locks::ProcessLock>;
+
+    /// Each `cal` writer's own lock and claim.
+    const CLAIMS: [(&str, Claim); 4] = [
+        (locks::INDEX_LOCK, claim_index_lock),
+        (locks::WATCH_LOCK, claim_watch_lock),
+        (locks::EMBED_LOCK, claim_embed_lock),
+        (locks::DISTILL_LOCK, claim_distill_lock),
+    ];
+
+    /// `cal index`, `cal watch`, `cal embed` and `cal distill --auto` refuse to start while
+    /// the app rewrites the whole index (rewrite.lock), and give their own lock back.
+    #[test]
+    fn cal_writers_refuse_while_the_app_rewrites_the_index() {
+        let path = temp_index("rewrite_lock");
+        for (name, claim) in CLAIMS {
+            let lock = claim(&path).unwrap_or_else(|e| panic!("{name}: {e:#}"));
+            assert!(locks::holder(&path, name).is_some(), "{name} is held");
+            drop(lock);
+            assert!(locks::wait_until_free(&path, name, FREED), "{name}");
+        }
+        let locks::Acquire::Acquired(rewrite) = locks::acquire(&path, locks::REWRITE_LOCK).unwrap()
+        else {
+            panic!("rewrite.lock is free");
+        };
+        for (name, claim) in CLAIMS {
+            let why = claim(&path).expect_err(name).to_string();
+            assert!(why.contains("is rewriting the index"), "{name}: {why}");
+            assert!(
+                locks::wait_until_free(&path, name, FREED),
+                "{name} given back"
+            );
+        }
+        drop(rewrite);
+    }
+
+    /// `cal embed` refuses while another semantic build holds embed.lock (a second `cal
+    /// embed`, or the app's or `cal watch`'s build), naming the holder.
+    #[test]
+    fn cal_embed_refuses_while_another_build_holds_embed_lock() {
+        let path = temp_index("embed_lock");
+        let locks::Acquire::Acquired(other) = locks::acquire(&path, locks::EMBED_LOCK).unwrap()
+        else {
+            panic!("embed.lock is free");
+        };
+        let why = claim_embed_lock(&path).expect_err("held").to_string();
+        assert!(why.contains("already running"), "{why}");
+        // A capped background top-up never finishes the backlog this run asked for.
+        assert!(why.ends_with("try again when it finishes"), "{why}");
+        if cfg!(unix) {
+            assert!(
+                why.contains(&format!("(pid {})", std::process::id())),
+                "{why}"
+            );
+        }
+        drop(other);
+        assert!(locks::wait_until_free(&path, locks::EMBED_LOCK, FREED));
+        let _ours = claim_embed_lock(&path).expect("free again");
     }
 
     /// The guard's freshness read is one row by app_config's primary key, not a scan: it runs

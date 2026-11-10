@@ -123,6 +123,9 @@ pub mod memtrim;
 pub mod agent;
 // The compaction anchor: a session's own prompts, re-injected by `cal hook` after compaction.
 pub mod anchor;
+// `real_index_bench`: timings and query plans on a copy of a real index (CONTRIBUTING.md).
+#[cfg(test)]
+mod bench;
 pub mod error;
 pub mod indexer;
 pub mod secrets;
@@ -148,7 +151,7 @@ pub mod jobs;
 pub mod knowledge;
 // Local-only counts of what the hooks and MCP server did; never telemetry (module docs).
 pub mod ledger;
-// gui.lock / watch.lock: which process keeps the index fresh.
+// The cross-process locks: who keeps the index fresh, builds vectors or rewrites the file.
 pub mod locks;
 pub mod mcp_server;
 // The first-run checklist's saved answers; GUI only.
@@ -157,6 +160,8 @@ pub mod onboarding;
 pub mod report;
 #[cfg(test)]
 pub(crate) mod schema_check;
+// How a `project` argument selects threads, in SQL and in Rust (`ProjectScope`).
+pub mod scope;
 pub mod search;
 pub mod snapshot;
 pub mod today;

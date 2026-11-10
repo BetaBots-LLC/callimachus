@@ -10,7 +10,8 @@ and PR checks; this file is what an agent needs on top of that.
     search, embed, knowledge, export, context, the integrations, `cli_core` (cal),
     `mcp_server`, `jobs` (index / embed / distill / compact / harvest orchestration behind a
     `JobHost: EventSink` and `JobFlags`), `headless` (`cal index` / `watch` / `embed` /
-    `distill --auto`) and `locks` (`<index>.gui.lock` / `<index>.watch.lock` / `<index>.distill.lock`). It cannot name
+    `distill --auto`) and `locks` (`<index>.gui.lock` / `<index>.watch.lock` / `<index>.distill.lock`
+    / `<index>.index.lock` / `<index>.embed.lock` / `<index>.rewrite.lock`). It cannot name
     telemetry.
     Its build.rs stamps the app crate's version as `CALLIMACHUS_VERSION` (core stays 0.0.0).
     The graph tables from 0034 (`facts.uid` / `source_seq`, `projects`, `file_edits`,
@@ -106,9 +107,18 @@ env -u CLAUDE_CONFIG_DIR -u CODEX_HOME HOME="$S/home" CALLIMACHUS_DB="$S/index.d
 ## Migrations
 
 - Add `src-tauri/migrations/00NN_<name>.sql` (the directory stays there, not under `core/`)
-  with the next number (0036) and register it in `core/src/db/migrations.rs`. Never edit a
-  committed migration (0001-0035): `rusqlite_migration` tracks only `user_version`, so an
+  with the next number (0037) and register it in `core/src/db/migrations.rs`. Never edit a
+  committed migration (0001-0036): `rusqlite_migration` tracks only `user_version`, so an
   edited file never re-runs on an index that already applied it.
+- A rewrite of a large table is a background job, not a migration: 0036 only bumps the
+  version, and `cleanup::rebuild_vec_chunks` adds `vec_chunks`' `subagent` partition key later
+  (the watcher after its catch-up, any semantic build before it starts), so code meets both
+  shapes (`embed::vec_partitioned`; a new index starts in the old one). The version check
+  only stops a process that opens the index afterwards: when a rewrite changes what a writer
+  must send, make the old statement fail in the new shape (the mandatory `gen` column of
+  `embed::PARTITIONED_VEC_CHUNKS_SQL`) instead of trusting every old process to be gone. Since 0036
+  `messages.embedded` is 0 pending, 1 has vectors, 2 done without one
+  (`embed::EMBEDDED_NO_VECTOR`): test `> 0` for done.
 - An upgrade runs in whichever process opens the index first and holds the write lock, so time
   it on a large index (`db::migrate` pre-reads big files sequentially first, unless every pending
   migration is in `SCAN_FREE_MIGRATIONS`: list one there only when it touches no large table).
@@ -168,8 +178,12 @@ the npm launcher's `cal` with no app running, else it logs why to `index.db.inde
 `cal`, hooks and the MCP server never download the model (`embed::Embedder::cached_only`); the
 one exception is `cal embed` without `--no-download`. `cal watch` refuses while the app holds
 `index.db.gui.lock`, the app's watcher waits while `cal watch` holds `index.db.watch.lock`, and
-nobody starts an auto-distill round while `index.db.distill.lock` is held, and two `cal index`
-passes never overlap (`index.db.index.lock`) (`locks`, one set of
+nobody starts an auto-distill round while `index.db.distill.lock` is held, two `cal index`
+passes never overlap (`index.db.index.lock`), two semantic builds never run side by side
+(`index.db.embed.lock`: `cal embed` refuses, the app's and `cal watch`'s builds skip), and
+Shrink index / Reclaim space hold `index.db.rewrite.lock`, under which `cal index`, `watch`,
+`embed` and `distill --auto` refuse to start (a rewrite refuses while any of their locks is
+held) (`locks`, one set of
 lock files per index file). Text that leaves the machine (LLM prompts, MCP results, exports)
 goes through `context::redact_secrets`.
 
@@ -196,5 +210,6 @@ group; `callimachus-web` is ignored, so note site or policy changes in the `call
   freezes the window. GUI diagnostics use `app_log!` (`callimachus.log` next to the index).
 - Comments say why: the constraint, the measured number, the bug that motivated the code.
 - Tests sit next to the code in `#[cfg(test)] mod tests`, on temp-file DBs opened with
-  `db::open`. Policy code takes injected probes (`is_macos_ephemeral_with`, `pick_cache_dir`).
+  `db::open` (new ones through `db::test_support::TestIndex`, which removes its files).
+  Policy code takes injected probes (`is_macos_ephemeral_with`, `pick_cache_dir`).
 - No em-dashes in prose (docs, changesets, comments, UI copy). Conventional Commits.
