@@ -128,6 +128,101 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
 
+    /// Every committed migration file and its `integration::fnv1a64` over the file with CRLF
+    /// read as LF (`.gitattributes` keeps them LF; the strip covers a checkout made before
+    /// that rule). A new migration is pinned here once it is committed.
+    const FROZEN_MIGRATIONS: &[(&str, u64)] = &[
+        ("0001_init.sql", 0x01dc6fa5ccd298e3),
+        ("0002_subagent.sql", 0x430c3c6fddf389eb),
+        ("0003_embeddings.sql", 0xbd357815f5396f88),
+        ("0004_vec0.sql", 0x5e214c60f63a85a4),
+        ("0005_gemini.sql", 0x87b3f525977159c6),
+        ("0006_more_sources.sql", 0x098149fbce2ab39d),
+        ("0007_cline_forks.sql", 0xcda3d3eb952f0d4f),
+        ("0008_embed_flag.sql", 0x643f284576c63bc5),
+        ("0009_thread_bytes.sql", 0xad01c31f90bc1010),
+        ("0010_stars_tags.sql", 0xc3075f26b0af8408),
+        ("0011_knowledge.sql", 0xf866e225684446e0),
+        ("0012_knowledge_llm.sql", 0xed0acb773842c4c8),
+        ("0013_file_mentions.sql", 0x9b4d648c4c5e817c),
+        ("0014_perf.sql", 0x7f33618160347cdb),
+        ("0015_fact_curation.sql", 0xa0a0e031fe2acda7),
+        ("0016_project_key.sql", 0x50e5e4073ea5cca1),
+        ("0017_messages_ts.sql", 0x8895cbd7b91d7a23),
+        ("0018_distillable_count.sql", 0x5c1bb9a7cf91c4f2),
+        ("0019_snapshots.sql", 0xd639c32fceef2199),
+        ("0020_decision_rationale.sql", 0x35aa05529c39fc28),
+        ("0021_thread_commits.sql", 0xd8816cbb98899e45),
+        ("0022_message_usage.sql", 0xcd88178a1559be95),
+        ("0023_thread_commits_sha_idx.sql", 0x0a71e005e6536029),
+        ("0024_copilot.sql", 0xb3f5d895d86a74da),
+        ("0025_vec_chunk_owner.sql", 0xac4eea6b7caad8a4),
+        ("0026_embed_count_index.sql", 0x76e35461d5754ef2),
+        ("0027_deleted_threads.sql", 0x5649e421327fdb39),
+        ("0028_claude_forward_slash_ids.sql", 0x3ec741907d05d6c7),
+        ("0029_embed_prose_only.sql", 0x9783b8de2ed9cbe1),
+        ("0030_gemini_forward_slash_ids.sql", 0xd7ac1c829cac253b),
+        ("0031_messages_cover_indexes.sql", 0x5c12a13aa78ad4e9),
+        ("0032_fact_origin_ref.sql", 0x8b57360dfa78357e),
+        ("0033_copilot_cli.sql", 0xe3057aff04244ccd),
+        ("0034_identity_and_graph.sql", 0x9d1bc26ddb6f3099),
+        ("0035_fact_truth.sql", 0xd10bab483515b606),
+        ("0036_vec_partition.sql", 0xefd79cb616c3e54f),
+    ];
+
+    /// "Never edit a committed migration", enforced: `rusqlite_migration` tracks only
+    /// `user_version`, so an index that already applied a migration never sees an edit to it,
+    /// and that index and a fresh one quietly end up with different schemas.
+    #[test]
+    fn migration_files_are_frozen() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../migrations");
+        let mut on_disk: Vec<(String, u64)> = std::fs::read_dir(&dir)
+            .expect("the migrations folder")
+            .flatten()
+            .filter_map(|e| {
+                let name = e.file_name().to_str()?.to_string();
+                name.ends_with(".sql").then_some(name)
+            })
+            .map(|name| {
+                let text = std::fs::read(dir.join(&name)).unwrap();
+                let lf = String::from_utf8_lossy(&text).replace("\r\n", "\n");
+                let hash = crate::integration::fnv1a64(lf.as_bytes());
+                (name, hash)
+            })
+            .collect();
+        on_disk.sort();
+        let next = on_disk.len() + 1;
+        for (name, hash) in &on_disk {
+            match FROZEN_MIGRATIONS.iter().find(|(n, _)| n == name) {
+                Some((_, pinned)) => assert_eq!(
+                    hash, pinned,
+                    "migrations/{name} changed after it was committed. An index that already \
+                     applied it never re-runs it: restore the file and add migration {next:04} \
+                     with the change instead"
+                ),
+                None => panic!(
+                    "migrations/{name} is not pinned: add (\"{name}\", {hash:#018x}) to \
+                     FROZEN_MIGRATIONS with it (re-pin it while it is unreleased; once it \
+                     ships, it never changes)"
+                ),
+            }
+        }
+        for (name, _) in FROZEN_MIGRATIONS {
+            assert!(
+                on_disk.iter().any(|(n, _)| n == name),
+                "migrations/{name} is gone: a committed migration is never renamed or removed"
+            );
+        }
+        let registered = MIGRATIONS
+            .pending_migrations(&rusqlite::Connection::open_in_memory().unwrap())
+            .unwrap() as usize;
+        assert_eq!(
+            registered,
+            on_disk.len(),
+            "every file is registered in MIGRATIONS"
+        );
+    }
+
     #[test]
     fn scan_free_pending_skips_the_preread() {
         assert!(pending_are_scan_free(31, 32), "0032 alone is cheap");

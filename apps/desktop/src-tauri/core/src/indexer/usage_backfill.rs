@@ -66,12 +66,12 @@ pub fn backfill_usage_once(
     db: &crate::db::Db,
     pause: &dyn Fn() -> bool,
 ) -> anyhow::Result<Option<UsageBackfillReport>> {
-    let lock = || db.0.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"));
-    if crate::knowledge::app_config::get_flag(&*lock()?, BACKFILL_DONE)? {
+    let lock = || crate::db::lock_conn(&db.0);
+    if crate::knowledge::app_config::get_flag(&lock(), BACKFILL_DONE)? {
         return Ok(None);
     }
     let report = backfill_usage(db, pause, &Roots::from_home())?;
-    mark_usage_backfilled(&*lock()?)?;
+    mark_usage_backfilled(&lock())?;
     Ok(Some(report))
 }
 
@@ -223,9 +223,9 @@ pub fn backfill_usage(
     pause: &dyn Fn() -> bool,
     roots: &Roots,
 ) -> anyhow::Result<UsageBackfillReport> {
-    let lock = || db.0.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"));
+    let lock = || crate::db::lock_conn(&db.0);
     let started = Instant::now();
-    let (threads, files) = candidates(&*lock()?, roots)?;
+    let (threads, files) = candidates(&lock(), roots)?;
     let mut report = UsageBackfillReport {
         threads: threads.len(),
         ..Default::default()
@@ -256,7 +256,7 @@ pub fn backfill_usage(
             if parsed.usage.is_empty() {
                 continue; // a session that spent nothing the transcript recorded
             }
-            let stored = stored_texts(&*lock()?, *thread_id)?;
+            let stored = stored_texts(&lock(), *thread_id)?;
             match place_usage(&parsed, &stored) {
                 Some(usage) => batch.push(Planned {
                     thread_id: *thread_id,
@@ -267,7 +267,7 @@ pub fn backfill_usage(
             }
         }
         if !batch.is_empty() {
-            let mut conn = lock()?;
+            let mut conn = lock();
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             for p in &batch {
                 if write_planned(&tx, p)? {

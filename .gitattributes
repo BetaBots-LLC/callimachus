@@ -3,3 +3,6 @@
 # into CRLF.
 schemas/**/*.json text eol=lf
 apps/web/public/schemas/**/*.json text eol=lf
+# Committed migrations are pinned by hash (`db::migrations::tests::migration_files_are_frozen`)
+# and embedded with include_str!, so a CRLF checkout must not change their bytes.
+apps/desktop/src-tauri/migrations/*.sql text eol=lf

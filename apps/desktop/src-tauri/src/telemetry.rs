@@ -1940,6 +1940,140 @@ mod tests {
         }
     }
 
+    /// The app crate's half of core's `invariants::egress_is_confined`: the only network
+    /// clients here are this module's PostHog client and the updater, both in SECURITY.md's
+    /// "What the app sends over the network". The standalone `cal` / `callimachus-mcp` entry
+    /// points must stay client-free.
+    #[test]
+    fn app_egress_is_confined() {
+        const NETWORK: &[&str] = &[
+            "reqwest::",
+            "genai::Client",
+            "ureq::",
+            "hyper::",
+            "std::net",
+            "tokio::net",
+            "TcpStream",
+            "UdpSocket",
+            "TcpListener",
+            "tauri_plugin_updater",
+            "tauri_plugin_http",
+            "tauri_plugin_websocket",
+            "Command::new(\"curl\"",
+            "Command::new(\"wget\"",
+        ];
+        const EGRESS: &[(&str, &str)] = &[
+            ("src/telemetry.rs", "reqwest::"),
+            ("src/lib.rs", "tauri_plugin_updater"),
+        ];
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let files = [
+            "src/lib.rs",
+            "src/main.rs",
+            "src/telemetry.rs",
+            "standalone/src/cli.rs",
+            "standalone/src/mcp.rs",
+        ];
+        let mut seen = std::collections::BTreeSet::new();
+        for file in files {
+            let text =
+                std::fs::read_to_string(root.join(file)).unwrap_or_else(|e| panic!("{file}: {e}"));
+            let code = shipped_code(&text);
+            for needle in NETWORK {
+                if code.contains(needle) {
+                    assert!(
+                        EGRESS.contains(&(file, *needle)),
+                        "{file} uses `{needle}`, a network client outside the reviewed egress \
+                         paths. Everything that leaves the machine is listed in SECURITY.md \
+                         (\"What the app sends over the network\"); if this one is meant to, \
+                         describe it there and add it to EGRESS here"
+                    );
+                    seen.insert((file, *needle));
+                }
+            }
+        }
+        for pair in EGRESS {
+            assert!(
+                seen.contains(pair),
+                "EGRESS lists {pair:?}, which is gone: remove it here and from SECURITY.md"
+            );
+        }
+        // Only `.rs` files count: a Finder `.DS_Store` or an editor swap file next to them is
+        // not a new source file.
+        let mut found = std::collections::BTreeSet::new();
+        rs_files_under(root, "src", &mut found);
+        rs_files_under(root, "standalone/src", &mut found);
+        assert_eq!(
+            found,
+            files.iter().map(|f| f.to_string()).collect(),
+            "a new or renamed source file: list it in `files`"
+        );
+    }
+
+    /// Shipped code only: the lines before the file's `#[cfg(test)] mod tests` (this test
+    /// names every client), without comment lines. Matched line by line rather than as one
+    /// "...]\nmod tests" string, so a CRLF checkout (`core.autocrlf` on Windows, where no eol
+    /// rule covers `*.rs`) still finds the test module.
+    fn shipped_code(text: &str) -> String {
+        let mut code = Vec::new();
+        let mut after_cfg_test = false;
+        for line in text.lines() {
+            let t = line.trim();
+            if after_cfg_test && t == "mod tests {" {
+                break;
+            }
+            after_cfg_test = t == "#[cfg(test)]";
+            if !t.starts_with("//") {
+                code.push(line);
+            }
+        }
+        code.join("\n")
+    }
+
+    /// Every Rust source under `root/dir` (subfolders too, a new module tree among them), as
+    /// a path relative to `root` with '/' separators.
+    fn rs_files_under(
+        root: &std::path::Path,
+        dir: &str,
+        out: &mut std::collections::BTreeSet<String>,
+    ) {
+        for entry in std::fs::read_dir(root.join(dir)).unwrap().flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let rel = format!("{dir}/{name}");
+            if entry.path().is_dir() {
+                rs_files_under(root, &rel, out);
+            } else if is_rust_source(&name) {
+                out.insert(rel);
+            }
+        }
+    }
+
+    /// A `.rs` file, but not an editor's lock or backup of one (Emacs leaves `.#lib.rs` and
+    /// `#lib.rs#`; Vim's `.lib.rs.swp` and Finder's `.DS_Store` fail the extension check).
+    fn is_rust_source(name: &str) -> bool {
+        name.ends_with(".rs") && !name.starts_with(['.', '#'])
+    }
+
+    #[test]
+    fn the_egress_scan_cuts_tests_in_a_crlf_checkout_and_counts_only_rust_files() {
+        let src = "use a::b;\r\n// reqwest:: named in a comment\r\nfn f() {}\r\n#[cfg(test)]\r\nmod tests {\r\n    use reqwest::Client;\r\n}\r\n";
+        let code = shipped_code(src);
+        assert!(!code.contains("reqwest"), "{code}");
+        assert!(code.contains("fn f() {}"));
+        for name in ["lib.rs", "main.rs"] {
+            assert!(is_rust_source(name), "{name}");
+        }
+        for name in [
+            ".DS_Store",
+            ".lib.rs.swp",
+            ".#lib.rs",
+            "#lib.rs#",
+            "lib.rs~",
+        ] {
+            assert!(!is_rust_source(name), "{name}");
+        }
+    }
+
     /// Every registered source kind is on the allowlist, else its events report "other". The
     /// half of `indexer::tests::the_source_registry_matches_the_schema_and_telemetry` that
     /// needs this module, which the core crate cannot see.

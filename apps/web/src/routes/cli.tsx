@@ -110,6 +110,8 @@ function CliPage() {
               "cal agents",
               "# what a new agent session in this repo gets injected, or why it gets nothing",
               "cal hook --explain",
+              "# what decides whether it all works here, ready to paste into a bug report",
+              "cal doctor",
             ]}
           />
         </div>
@@ -130,8 +132,8 @@ function CliPage() {
           For a contract you can build on, pass <code className="font-mono">--json-version 1</code>{" "}
           (or set <code className="font-mono">CAL_JSON_VERSION=1</code> beside{" "}
           <code className="font-mono">--json</code>). Then search, recent, related, cat, stats,
-          memory, decisions, gotchas, commits, why, trace, cost, report, issues, and audit-pr open
-          with <code className="font-mono">schema_version</code>, a list comes under{" "}
+          memory, decisions, gotchas, commits, why, trace, cost, report, issues, audit-pr, and
+          doctor open with <code className="font-mono">schema_version</code>, a list comes under{" "}
           <code className="font-mono">results</code>, and each shape has a published JSON Schema at{" "}
           <code className="font-mono">/schemas/cal/&lt;command&gt;.v1.json</code>, such as{" "}
           <a href="/schemas/cal/search.v1.json" className="text-link hover:underline">
@@ -140,6 +142,13 @@ function CliPage() {
           . New fields can appear within a version; a removed or changed one gets a new version.
           Plain <code className="font-mono">--json</code>, and every other command's JSON, keeps its
           unversioned shape, which may change in a future major release.
+        </p>
+        <p className="mt-4 max-w-[60ch] leading-relaxed text-muted-foreground">
+          Something not working? <code className="font-mono">cal doctor</code> reports the index and
+          its schema, the locks next to it, each agent's hooks and MCP entry, the hooks that gave up
+          in the last week and why, and whether each agent's transcripts still parse. It changes
+          nothing, shows your home folder as <code className="font-mono">~</code>, and holds no
+          project text, so it can go straight into a bug report.
         </p>
         <p className="mt-4 max-w-[60ch] leading-relaxed text-muted-foreground">
           No desktop app on this machine? <code className="font-mono">cal index</code> builds the
@@ -151,7 +160,10 @@ function CliPage() {
           daily cap with the memory engine you turned on in the app's Settings, so it needs the app
           once; after that it runs with the app closed. Only one process watches an index:{" "}
           <code className="font-mono">cal watch</code> won't start while the app is open, and the
-          app leaves live indexing to a running <code className="font-mono">cal watch</code>.
+          app leaves live indexing to a running <code className="font-mono">cal watch</code>.{" "}
+          <code className="font-mono">cal backup</code> saves a copy of the index in the snapshots
+          folder next to it (a free clone on APFS, a full copy elsewhere), or with{" "}
+          <code className="font-mono">--to DIR</code> wherever you like.
         </p>
         <p className="mt-4 max-w-[60ch] leading-relaxed text-muted-foreground">
           <code className="font-mono">cal commits</code> infers, entirely on-device, which git

@@ -29,7 +29,9 @@ serde_json = { version = "1", features = ["preserve_order"] }
 # 0.25 matches the copy tauri pulls in for the app, so the graph carries one fewer toml_edit.
 toml_edit = "0.25"
 # Canonical store: bundled SQLite (FTS5 is compiled into the bundled amalgamation).
-rusqlite = { version = "0.40", features = ["bundled", "functions"] }
+# `backup`: the online backup API behind `cal backup`'s full copy (no new crate; a feature of
+# the same build, so Cargo.lock does not change).
+rusqlite = { version = "0.40", features = ["bundled", "functions", "backup"] }
 rusqlite_migration = "2.6"
 chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1"

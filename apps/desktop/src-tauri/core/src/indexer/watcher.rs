@@ -832,15 +832,19 @@ fn reindex(
     work: Pending,
 ) -> Option<super::IndexReport> {
     let run = |conn: &mut Connection| -> anyhow::Result<super::IndexReport> {
-        // Claude Code: index just the transcripts that changed (a debounced batch during
-        // an active session names one or two files out of thousands).
-        if kind == super::claude::KIND && !work.full {
-            return super::claude::index_paths(conn, &work.paths);
-        }
-        match scanner_for(kind) {
-            Some(scan) => scan(conn, &mut || {}),
-            None => Ok(super::IndexReport::default()),
-        }
+        // What it parsed is counted per attempt (`parse_health`); a failed attempt records
+        // nothing, so a retry does not count the same lines twice.
+        super::scan_counted(conn, kind, work.full, |conn| {
+            // Claude Code: index just the transcripts that changed (a debounced batch during
+            // an active session names one or two files out of thousands).
+            if kind == super::claude::KIND && !work.full {
+                return super::claude::index_paths(conn, &work.paths);
+            }
+            match scanner_for(kind) {
+                Some(scan) => scan(conn, &mut || {}),
+                None => Ok(super::IndexReport::default()),
+            }
+        })
     };
     // The watcher is a SECOND writer (alongside the app's shared connection). If it
     // loses a write-lock race past busy_timeout, retry instead of silently dropping

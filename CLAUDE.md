@@ -11,7 +11,10 @@ and PR checks; this file is what an agent needs on top of that.
     `mcp_server`, `jobs` (index / embed / distill / compact / harvest orchestration behind a
     `JobHost: EventSink` and `JobFlags`), `headless` (`cal index` / `watch` / `embed` /
     `distill --auto`) and `locks` (`<index>.gui.lock` / `<index>.watch.lock` / `<index>.distill.lock`
-    / `<index>.index.lock` / `<index>.embed.lock` / `<index>.rewrite.lock`). It cannot name
+    / `<index>.index.lock` / `<index>.embed.lock` / `<index>.rewrite.lock`), `backup` (index
+    snapshots in `<index dir>/snapshots/`, `cal backup`, the restore the startup error screen
+    offers for a damaged index) and `doctor` (`cal doctor` and the app's Copy diagnostics: one
+    read-only report of what decides whether Callimachus works on a machine). It cannot name
     telemetry.
     Its build.rs stamps the app crate's version as `CALLIMACHUS_VERSION` (core stays 0.0.0).
     The graph tables from 0034 (`facts.uid` / `source_seq`, `projects`, `file_edits`,
@@ -91,6 +94,18 @@ which holds the user's whole history and their Settings (`app_config`).
   `search` and the other queries open read-only; `cal memory publish` reads the index
   read-only but writes `.callimachus/memory/` into the checkout it runs in, so never run it in
   this repo to test it.
+- A writable open (`db::open_with`) chmods the index, `-wal` and `-shm` to 0600 when wider, and
+  one with pending migrations first clones the index into `snapshots/<UTC>-pre-migration-<id>/`
+  next to it (macOS, `backup::pre_migration_locked`; `<id>` is the index's `backup.index_id`,
+  and automatic removals touch only the live index's snapshots); the app's minute tick takes a
+  weekly one after `PRAGMA quick_check`. `cal backup` writes there too, a writer of its own: it holds the
+  index's write lock for the clone (no write, no checkpoint on close) and never migrates. Every
+  open outside the running app (`db::open_with`, `db::open_sidecar_current_with`,
+  `db::open_readonly`, `backup::open_live`) refuses an index a restore left halfway through its
+  swap (`backup::refuse_interrupted_restore`): the new `-wal` even a read-only open can make
+  hides that state. Test
+  snapshots, restores and modes only on `db::test_support::TestDir` folders or an APFS clone,
+  and every delete or move in `backup` names its files exactly (see the module docs).
 - A dev app launch also runs `integration::refresh_installed`, which can rewrite the installed
   skill and re-point dangling hooks, MCP entries and the `cal` link at the dev binary.
 - Smoke-test built binaries on an APFS clone with a throwaway HOME (never `cargo` or `pnpm`
@@ -107,9 +122,10 @@ env -u CLAUDE_CONFIG_DIR -u CODEX_HOME HOME="$S/home" CALLIMACHUS_DB="$S/index.d
 ## Migrations
 
 - Add `src-tauri/migrations/00NN_<name>.sql` (the directory stays there, not under `core/`)
-  with the next number (0037) and register it in `core/src/db/migrations.rs`. Never edit a
-  committed migration (0001-0036): `rusqlite_migration` tracks only `user_version`, so an
-  edited file never re-runs on an index that already applied it.
+  with the next number (0037), register it in `core/src/db/migrations.rs` and pin its hash in
+  `FROZEN_MIGRATIONS` there (`migration_files_are_frozen` prints it). Never edit a committed
+  migration (0001-0036): `rusqlite_migration` tracks only `user_version`, so an edited file
+  never re-runs on an index that already applied it, and that test fails on the edit.
 - A rewrite of a large table is a background job, not a migration: 0036 only bumps the
   version, and `cleanup::rebuild_vec_chunks` adds `vec_chunks`' `subagent` partition key later
   (the watcher after its catch-up, any semantic build before it starts), so code meets both
@@ -158,6 +174,16 @@ env -u CLAUDE_CONFIG_DIR -u CODEX_HOME HOME="$S/home" CALLIMACHUS_DB="$S/index.d
   tool's structured content against its `output_schema`. Plain `--json` stays the bare,
   unversioned shape the released VS Code extension reads; only `--json-version 1` /
   `CAL_JSON_VERSION=1` gives the envelopes.
+- `cli_core::every_reader_runs_on_older_schemas`: the hooks (all but `index --if-stale`,
+  which only starts a detached `cal index`), the read-only `cal` commands (`doctor` and
+  `backup` too) and every MCP tool, on an index one and two schemas behind, must answer (a
+  writer hook may stay quiet instead) and leave the file byte for byte as it was. A new reader that names a newer
+  table without a `db::has_table` probe, or opens with a migrating call, fails here.
+- `invariants::egress_is_confined` and `stdout_is_confined` (core) and
+  `telemetry::app_egress_is_confined` (app) scan the sources: a network client outside the
+  modules SECURITY.md lists, or a new source file in the app crate, fails until it is on
+  their lists. Core denies `clippy::print_stdout` (stdout is the MCP server's protocol
+  stream): only `cli_core` and `headless` print, everything else returns text or logs.
 
 ## Hooks and memory budgets
 
@@ -175,6 +201,10 @@ on a payload with `cursor_version` (`cli_core::is_cursor_payload`). Hook command
 never create an index and never migrate one themselves (`index --if-stale` starts a detached
 `cal index` only on a non-empty index; that pass upgrades the schema only when it runs from
 the npm launcher's `cal` with no app running, else it logs why to `index.db.index.log`);
+a hook that gives up leaves one `hook_skipped` line in `ledger.skips.jsonl` next to the
+index with its class (`ledger::SkipClass`, never project text; only when the index already
+exists; never in `ledger.jsonl`, whose lines an older app's rollup deletes when it cannot
+parse them), which `cal doctor` counts;
 `cal`, hooks and the MCP server never download the model (`embed::Embedder::cached_only`); the
 one exception is `cal embed` without `--no-download`. `cal watch` refuses while the app holds
 `index.db.gui.lock`, the app's watcher waits while `cal watch` holds `index.db.watch.lock`, and
@@ -208,8 +238,19 @@ group; `callimachus-web` is ignored, so note site or policy changes in the `call
 - Tauri commands that touch SQLite, files, git, the keychain or the model are `async` and hand
   the work to `blocking` / `read_blocking` (lib.rs); a sync command runs on the main thread and
   freezes the window. GUI diagnostics use `app_log!` (`callimachus.log` next to the index).
+- Lock a shared connection (`db::Db`, the MCP server's) with `db::lock_conn` / `try_lock_conn`,
+  never a bare `.lock()`: they survive a panic under an earlier guard and roll back what it
+  left open.
+- An indexer counts what it reads through `indexer::common` (`count_line`, `count_malformed`,
+  `count_skipped`, `begin_file` / `count_file`), type names and counts only: the parse canary
+  (`indexer::parse_health`) compares each pass with the source's own history and warns in
+  Settings > Index and `cal doctor` when an agent's format moves.
 - Comments say why: the constraint, the measured number, the bug that motivated the code.
 - Tests sit next to the code in `#[cfg(test)] mod tests`, on temp-file DBs opened with
-  `db::open` (new ones through `db::test_support::TestIndex`, which removes its files).
+  `db::open` (new ones through `db::test_support::TestIndex`, which removes its files). In
+  core's unit tests `db::default_index_path()` names a path that never exists unless the test
+  runs inside `db::test_support::with_default_index` (how a whole `cal` command runs in
+  process on a temp index), so no unit test reaches the machine's own data folder; the app
+  crate's and `standalone`'s tests link core without that guard and must not run commands.
   Policy code takes injected probes (`is_macos_ephemeral_with`, `pick_cache_dir`).
 - No em-dashes in prose (docs, changesets, comments, UI copy). Conventional Commits.

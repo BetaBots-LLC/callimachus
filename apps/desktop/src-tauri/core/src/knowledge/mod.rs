@@ -344,10 +344,10 @@ pub(crate) fn edited_todo_seqs(
 /// older build wiped every heuristic row up front, which was harmless only while turning
 /// knowledge off had already cleared them).
 pub fn backfill_todos(db: &crate::db::Db, now: i64, pause: &dyn Fn() -> bool) -> Result<()> {
-    let lock = || db.0.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"));
+    let lock = || crate::db::lock_conn(&db.0);
 
     let thread_ids: Vec<i64> = {
-        let conn = lock()?;
+        let conn = lock();
         // Subagent threads get no heuristic TODOs (see rebuild_thread_todos).
         let mut stmt = conn.prepare("SELECT id FROM threads WHERE is_subagent = 0 ORDER BY id")?;
         let ids: Vec<i64> = stmt
@@ -361,7 +361,7 @@ pub fn backfill_todos(db: &crate::db::Db, now: i64, pause: &dyn Fn() -> bool) ->
         while pause() {
             std::thread::sleep(BACKFILL_PAUSE_POLL);
         }
-        let mut conn = lock()?;
+        let mut conn = lock();
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let started = std::time::Instant::now();
         let end = (next + BACKFILL_BATCH).min(thread_ids.len());
@@ -403,12 +403,12 @@ pub fn mark_todos_backfilled(conn: &Connection) -> Result<()> {
 /// completion record, so an app quit in the middle of it left later threads without TODOs.
 /// Returns whether the backfill ran.
 pub fn backfill_todos_once(db: &crate::db::Db, now: i64, pause: &dyn Fn() -> bool) -> Result<bool> {
-    let lock = || db.0.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"));
-    if app_config::get_flag(&*lock()?, TODOS_BACKFILLED)? {
+    let lock = || crate::db::lock_conn(&db.0);
+    if app_config::get_flag(&lock(), TODOS_BACKFILLED)? {
         return Ok(false);
     }
     backfill_todos(db, now, pause)?;
-    app_config::put_flag(&*lock()?, TODOS_BACKFILLED, true)?;
+    app_config::put_flag(&lock(), TODOS_BACKFILLED, true)?;
     Ok(true)
 }
 

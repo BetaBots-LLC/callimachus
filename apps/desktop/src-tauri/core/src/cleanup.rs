@@ -244,6 +244,12 @@ fn vacuum_over(conn: &Connection, min_bytes: u64) -> Result<VacuumReport> {
     // nothing: the freed pages simply stay on the freelist for reuse).
     let _ = conn.pragma_update(None, "temp_store", "MEMORY");
     res?;
+    // Every page moved, so each automatic snapshot (an APFS clone that shared those pages)
+    // now costs a full copy of the index on disk: drop them, and let the weekly tick take a
+    // fresh, free one after its integrity check.
+    if let Some(path) = &db_path {
+        crate::backup::after_rewrite(conn, path);
+    }
     // VACUUM in WAL mode leaves a WAL about the size of the database; fold it back now
     // instead of waiting for an autocheckpoint, so the disk space actually comes back. The
     // main file shrinks only here, so "freed" is measured after it. A reader holding an
@@ -348,6 +354,13 @@ fn check_free_space(db_dir: &Path, temp_dir: &Path, live: u64) -> Result<()> {
 struct VolumeSpace {
     mount: String,
     available: u64,
+}
+
+/// Bytes this user may still write on the volume holding `dir`, or None when the platform
+/// cannot say. For `backup`, whose snapshots must not crowd a nearly full disk, and for
+/// `cal doctor`.
+pub fn free_bytes(dir: &Path) -> Option<u64> {
+    volume_space(dir).map(|v| v.available)
 }
 
 /// Free space on the volume holding `dir`, via POSIX `df -Pk` (no extra dependency).

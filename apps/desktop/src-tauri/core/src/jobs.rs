@@ -76,10 +76,11 @@ fn writer(host: &dyn JobHost) -> &db::Db {
         .expect("the index is open before any job runs")
 }
 
-/// Same as the app's `lock` but anyhow-typed, for background helpers.
+/// Same as the app's `lock` but anyhow-typed, for background helpers. Never fails: a panic
+/// under an earlier guard is recovered from ([`db::lock_conn`]); the `Result` keeps the
+/// callers' `?`.
 pub fn lock_anyhow(db: &db::Db) -> anyhow::Result<std::sync::MutexGuard<'_, rusqlite::Connection>> {
-    db.0.lock()
-        .map_err(|e| anyhow::anyhow!("db lock poisoned: {e}"))
+    Ok(db::lock_conn(&db.0))
 }
 
 /// The first line of a distill error, capped, for the thread's stored error.
@@ -310,6 +311,41 @@ pub fn wait_for_embed_yield(flags: &JobFlags) -> bool {
     true
 }
 
+/// The app's weekly index snapshot, from its once-a-minute tick (`JobHost::minute_tick`):
+/// when one is due ([`crate::backup::weekly_due`]: a week since the last, a day since the
+/// last integrity check) and no job holds the writer, run [`crate::backup::run_weekly`] on a
+/// thread of its own. Expired snapshots of this index are retired on every tick (one
+/// directory listing, the index's identity read on the pooled reader), and so are staged
+/// copies a day-old interrupted restore left. Only the app: `cal watch` and `cal index` leave
+/// snapshots to the app and `cal backup`.
+pub fn snapshot_tick(host: &dyn JobHost) {
+    static RUNNING: AtomicBool = AtomicBool::new(false);
+    let index = db::default_index_path();
+    let now = chrono::Utc::now().timestamp();
+    if RUNNING.load(Ordering::SeqCst) || writer_job_running(host.flags()) {
+        return;
+    }
+    crate::backup::remove_stale_staged(&index, now);
+    let Some(conn) = host.readers().and_then(|pool| pool.0.get().ok()) else {
+        return;
+    };
+    crate::backup::prune(&index, crate::backup::index_id(&conn).as_deref(), now);
+    let due = crate::backup::weekly_due(&conn, now);
+    drop(conn);
+    if !due || RUNNING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let spawned = std::thread::Builder::new()
+        .name("weekly-snapshot".into())
+        .spawn(move || {
+            let _ = crate::backup::run_weekly(&index, now);
+            RUNNING.store(false, Ordering::SeqCst);
+        });
+    if spawned.is_err() {
+        RUNNING.store(false, Ordering::SeqCst);
+    }
+}
+
 /// Whether a job that holds the write lock for long stretches is running: a reindex (or the
 /// watcher's catch-up), a semantic build, or a whole-file rewrite. Distill waits for these.
 pub fn writer_job_running(flags: &JobFlags) -> bool {
@@ -523,7 +559,7 @@ pub fn index_source(
     let scan =
         indexer::scanner_for(kind).ok_or_else(|| anyhow::anyhow!("unknown source kind: {kind}"))?;
     let mut conn = db::open(&db::default_index_path())?;
-    scan(&mut conn, &mut || {})
+    indexer::scan_counted(&mut conn, kind, true, |conn| scan(conn, &mut || {}))
 }
 
 /// Releases a writer job's claim and then kicks auto-distill when it drops, on return or
@@ -563,6 +599,10 @@ async fn claim_rewrite_at(flags: &JobFlags, index: &std::path::Path) -> anyhow::
     let Some(job) = JobGuard::try_acquire(&flags.compact.0) else {
         anyhow::bail!("{ALREADY}");
     };
+    // A weekly integrity check holds a read transaction for about a minute, which would keep
+    // the VACUUM's closing checkpoint from giving the space back: stop it (it runs again
+    // later, and the rewrite drops the snapshots it guards anyway).
+    crate::backup::interrupt_check();
     // Then rewrite.lock, before looking at the `cal` locks: each `cal` writer takes its own
     // lock and then checks this one, so the two sides can both refuse but never both run.
     // A lock file that cannot be opened (another user's) leaves the rewrite as it was
@@ -1007,7 +1047,7 @@ pub fn run_embed_build(host: &Host, running: JobGuard, trigger: EmbedTrigger) {
 /// build, a distill drain); it refills on demand. Skipped if the writer is busy.
 pub fn shrink_writer(host: &dyn JobHost) {
     if let Some(db) = host.writer() {
-        if let Ok(conn) = db.0.try_lock() {
+        if let Some(conn) = db::try_lock_conn(&db.0) {
             db::shrink_memory(&conn);
         }
     }
@@ -1157,7 +1197,7 @@ fn start_vec_rebuild(host: &Host) -> bool {
 fn top_up_size(host: &dyn JobHost) -> i64 {
     let sql = top_up_size_sql();
     host.writer()
-        .and_then(|db| db.0.lock().ok())
+        .map(|db| db::lock_conn(&db.0))
         .and_then(|conn| {
             conn.query_row(&sql, [AUTO_EMBED_MAX_MESSAGES], |r| r.get(0))
                 .ok()
@@ -1176,7 +1216,7 @@ fn top_up_size_sql() -> String {
 /// cached schema lookup, no vector read).
 fn vec_partition_pending(host: &dyn JobHost) -> bool {
     host.writer()
-        .and_then(|db| db.0.lock().ok())
+        .map(|db| db::lock_conn(&db.0))
         .is_some_and(|conn| !embed::vec_partitioned(&conn))
 }
 
@@ -1246,6 +1286,13 @@ fn finish_embed_build(conn: &mut rusqlite::Connection, rebuild: bool) -> bool {
         None => true,
         Some(Ok(Some(c))) => {
             rebuilt = true;
+            if c.partitioned {
+                // The one-time 0036 rebuild rewrote about twice the vector table, which the
+                // pre-upgrade snapshot (an APFS clone) now holds alone: it has served.
+                if let Some(path) = conn.path().filter(|p| !p.is_empty()) {
+                    crate::backup::after_partition(conn, std::path::Path::new(path));
+                }
+            }
             let held = Duration::from_millis(c.held_ms);
             app_log!(
                 "[embed] {} {} vectors into {} chunks (was {}), write lock held {:.1} s{}",
@@ -1357,10 +1404,6 @@ fn owes_full_build(end: EmbedEnd, reported: bool, user_requested: bool) -> bool 
     }
 }
 
-/// `embed:error` when the shared writer's mutex is poisoned (a panic while holding it).
-const WRITER_GONE: &str =
-    "the semantic build stopped: the index connection failed; restart and try again";
-
 /// The body of the embedding job (see `start_embed_build`), on the build's own `embedder`.
 /// Returns when the queue is empty, a background pass is done (its cap, a Build click, a
 /// cancel), the model is unavailable, or the build had to stop; the caller does the cleanup.
@@ -1432,10 +1475,7 @@ fn run_embed_job(
 
     // Snapshot totals ONCE; then increment a running counter per batch so progress
     // events carry counts without re-running COUNT(*) scans under the lock.
-    let (mut done, total) = match db.0.lock() {
-        Ok(conn) => embed::embed_progress(&conn).unwrap_or((0, 0)),
-        Err(_) => (0, 0),
-    };
+    let (mut done, total) = embed::embed_progress(&db::lock_conn(&db.0)).unwrap_or((0, 0));
     job.done.store(done, Ordering::Relaxed);
     job.total.store(total, Ordering::Relaxed);
     let progress = |done: i64| {
@@ -1463,10 +1503,7 @@ fn run_embed_job(
         //    reports, so a Build click (and `cal embed`'s exit code) learns the build did
         //    not finish instead of reading the `embed:done` that follows as "up to date".
         let rows = {
-            let Ok(conn) = db.0.lock() else {
-                report(WRITER_GONE.to_string());
-                break;
-            };
+            let conn = db::lock_conn(&db.0);
             match embed::pending_batch(&conn, BATCH) {
                 Ok(r) => r,
                 Err(e) => {
@@ -1489,10 +1526,7 @@ fn run_embed_job(
         let known = if hits.is_empty() {
             std::collections::HashMap::new()
         } else {
-            match db.0.lock() {
-                Ok(conn) => memo.read_vectors(&conn, &hits),
-                Err(_) => std::collections::HashMap::new(),
-            }
+            memo.read_vectors(&db::lock_conn(&db.0), &hits)
         };
         let batch = match embed::embed_rows_with(embedder, &rows, &known) {
             Ok(b) => b,
@@ -1530,8 +1564,7 @@ fn run_embed_job(
         let mut stored = false;
         for _ in 0..10 {
             let res = {
-                // A poisoned mutex: the next pass's claim above reports and stops.
-                let Ok(mut conn) = db.0.lock() else { break };
+                let mut conn = db::lock_conn(&db.0);
                 embed::store_batch(&mut conn, &ids, &batch.owners, &batch.vecs)
             };
             match res {
@@ -2262,7 +2295,7 @@ fn claim_auto_distill_round(host: &dyn JobHost) -> Option<(JobGuard, Vec<i64>)> 
     let job = JobGuard::try_acquire(&host.flags().distill.0)?; // a distill is already running
     let ids = (|| {
         let db = host.writer()?;
-        let conn = db.0.lock().ok()?;
+        let conn = db::lock_conn(&db.0);
         let cfg = knowledge::get_config(&conn).ok()?;
         if !cfg.enabled || !cfg.auto_distill {
             return None;

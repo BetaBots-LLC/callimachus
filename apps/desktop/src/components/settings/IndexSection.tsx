@@ -8,7 +8,7 @@ import {
   useQuery,
   useQueryClient,
 } from "@tanstack/react-query";
-import { ChevronLeft, ChevronRight } from "lucide-react";
+import { ChevronLeft, ChevronRight, TriangleAlert } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Progress } from "@/components/ui/progress";
@@ -29,7 +29,15 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { useAppForm } from "@/lib/form";
-import { api, type CleanupRow, type CompactSummary, SOURCE_LABELS } from "../../lib/api";
+import {
+  api,
+  type CleanupRow,
+  type CompactSummary,
+  type IndexSnapshot,
+  type ParseDrift,
+  SOURCE_LABELS,
+  type SnapshotStatus,
+} from "../../lib/api";
 import { formatTime } from "../../lib/format";
 import {
   anyJobRunning,
@@ -81,6 +89,28 @@ function fmtBytes(n: number): string {
   return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+/** Bytes as MB, or GB once that reads better (snapshots of a large index). */
+function fmtSize(n: number): string {
+  return n >= 1024 ** 3 ? `${(n / 1024 ** 3).toFixed(1)} GB` : fmtBytes(n);
+}
+
+const SNAPSHOT_KIND: Record<IndexSnapshot["reason"], string> = {
+  weekly: "Weekly",
+  "pre-migration": "Before an upgrade",
+  manual: "cal backup",
+};
+
+/** "Weekly, Nov 8 · Before an upgrade, Nov 5 · Weekly of an earlier index, Oct 19", newest
+ *  first. */
+function snapshotList(s: SnapshotStatus): string {
+  return s.snapshots
+    .map(
+      (x) =>
+        `${SNAPSHOT_KIND[x.reason]}${x.otherIndex ? " of an earlier index" : ""}, ${formatTime(x.takenAt)}`,
+    )
+    .join(" · ");
+}
+
 /** "Saved 30 MB.", saying when the file itself has not shrunk (yet): Shrink index only
  *  rewrites the file once Reclaim space's 50 MB / 1% rule is met. */
 function savedNote(s: CompactSummary): string {
@@ -90,6 +120,61 @@ function savedNote(s: CompactSummary): string {
   }
   if (s.vacuum?.pending) return `${saved}; the file shrinks shortly.`;
   return `${saved}.`;
+}
+
+/** The index's snapshots: what is kept and what it costs on disk. Restoring one is the
+ *  startup screen's job (a damaged index), so this row only reports. */
+function SnapshotsRow() {
+  const status = useQuery({
+    queryKey: ["index_snapshots"],
+    queryFn: api.indexSnapshots,
+    staleTime: 60_000,
+  });
+  const s = status.data;
+  const earlier = s?.snapshots.some((x) => x.otherIndex) ?? false;
+  return (
+    <SettingRow
+      title="Index snapshots"
+      description={
+        s && !s.automatic
+          ? "Copies of the index that cal backup saves next to it. If the index is ever damaged, Callimachus offers to restore the newest one when it starts."
+          : "A copy of the index before each upgrade, and once a week after an integrity check. If the index is ever damaged, Callimachus offers to restore the newest one when it starts."
+      }
+    >
+      {s && s.snapshots.length > 0 && (
+        <Note>
+          {snapshotList(s)}.{" "}
+          {s.bytesOnDisk != null
+            ? `They use ${fmtSize(s.bytesOnDisk)} of disk, which grows as the index changes; Shrink index and Reclaim space remove ${earlier ? "this index's" : "the"} automatic ones.`
+            : `They take ${fmtSize(s.snapshots.reduce((n, x) => n + x.bytes, 0))} of disk.`}{" "}
+          {earlier &&
+            "Those of an earlier index hold its history and are never removed automatically. "}
+          In <code className="font-mono">{s.folder}</code>.
+        </Note>
+      )}
+      {s && s.snapshots.length === 0 && s.automatic && (
+        <Note>None yet: the first is taken while the app is idle, after an integrity check.</Note>
+      )}
+      {s && !s.automatic && (
+        <Note>
+          The index can't be copied for free here (that needs a Mac with the index on an APFS disk),
+          so no snapshots are taken automatically.{" "}
+          <code className="font-mono">cal backup --to &lt;folder&gt;</code> saves a full copy.
+        </Note>
+      )}
+      {s?.lastCheck && !s.lastCheck.ok && (
+        <InlineError>
+          {/* `at` 0: a failed result carried across Shrink index / Reclaim space, no date. */}
+          {s.lastCheck.at > 0
+            ? `The last integrity check (${formatTime(s.lastCheck.at)}) found problems`
+            : "An earlier integrity check found problems"}{" "}
+          in the index file, so no new snapshot was taken and the existing ones were kept.{" "}
+          <code className="font-mono">cal doctor --quick-check</code> shows what it found;
+          callimachus.log next to the index has it too.
+        </InlineError>
+      )}
+    </SettingRow>
+  );
 }
 
 /** The history index and the semantic index behind search, and the disk space the history
@@ -102,6 +187,7 @@ export function IndexSection() {
         description="The index behind search, and the space your history takes on disk."
       />
       <div className="space-y-8">
+        <ParseDriftWarnings />
         <SettingsGroup aria-label="Search index">
           <ReindexRow />
           <SemanticIndexRow />
@@ -110,6 +196,67 @@ export function IndexSection() {
       </div>
     </>
   );
+}
+
+/** The parse canary (`indexer::parse_health`): an agent whose last indexing pass read like a
+ *  changed transcript format. Its unreadable messages are not indexed, and once the agent's
+ *  own cleanup deletes the originals they are gone, so this says so until it is dismissed (for
+ *  30 days of the same change) or a full pass reads the source clean again. */
+function ParseDriftWarnings() {
+  const queryClient = useQueryClient();
+  const drifts = useQuery({ queryKey: ["parse_drifts"], queryFn: api.parseDrifts });
+  const dismiss = useMutation({
+    mutationFn: api.dismissParseDrift,
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["parse_drifts"] }),
+    onError: (e) => notify.error("Couldn't dismiss the warning", { description: errorText(e) }),
+  });
+  if (!drifts.data?.length) return null;
+  return (
+    <SettingsGroup aria-label="Transcript format warnings">
+      {drifts.data.map((d) => (
+        <SettingRow
+          key={d.source}
+          title={
+            <span className="inline-flex items-center gap-1.5 text-amber-700 dark:text-amber-400">
+              <TriangleAlert aria-hidden="true" className="size-3.5 shrink-0" />
+              {SOURCE_LABELS[d.source] ?? d.source} may have changed its transcript format
+            </span>
+          }
+          description={driftText(d)}
+          control={
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={dismiss.isPending}
+              onClick={() => dismiss.mutate(d.source)}
+            >
+              Dismiss
+            </Button>
+          }
+        />
+      ))}
+    </SettingsGroup>
+  );
+}
+
+/** What the drifting pass saw, and what to do about it. */
+function driftText(d: ParseDrift): string {
+  const parts: string[] = [];
+  if (d.byShare) {
+    const pct = (n: number) => `${Math.round(n * 100)}%`;
+    parts.push(
+      `In the indexing pass at ${formatTime(d.at)}, ${pct(d.share)} of the records it read were of a kind Callimachus does not know or could not parse (usually ${pct(d.baseline)})${d.kinds.length ? `: ${d.kinds.join(", ")}` : ""}.`,
+    );
+  }
+  if (d.byZeroFiles) {
+    parts.push(
+      `${d.zeroFiles} of the ${d.files} files it read held no message Callimachus could index.`,
+    );
+  }
+  parts.push(
+    "Those messages are not in the index, and the agent may delete the originals later. Update Callimachus, or report it with the diagnostics from Settings > General.",
+  );
+  return parts.join(" ");
 }
 
 /** A full reindex, the same start as the palette's "Reindex history" (useReindex), so the
@@ -376,6 +523,11 @@ function StorageGroup() {
   const reclaiming = useIsMutating({ mutationKey: VACUUM_KEY }) > 0;
   // The shared header stats (refetched on index changes) carry the index's free pages.
   const reclaimable = useQuery({ queryKey: ["db_stats"], queryFn: api.dbStats }).data?.reclaimable;
+  // A snapshot is a copy of the index as it was: threads deleted here stay in the ones
+  // taken earlier (and come back with a restore), so the confirmation says so.
+  const snapshotsKept =
+    (useQuery({ queryKey: ["index_snapshots"], queryFn: api.indexSnapshots, staleTime: 60_000 })
+      .data?.snapshots.length ?? 0) > 0;
   // Unknown (an older backend): leave it enabled, the backend applies the same rule.
   const nothingToReclaim = reclaimable != null && !reclaimable.worthwhile;
   // A rewrite must not overlap another rewrite, or a reindex / semantic build / distill
@@ -451,6 +603,8 @@ function StorageGroup() {
           </Note>
         )}
       </SettingRow>
+
+      <SnapshotsRow />
 
       <SettingRow
         title="Reclaim disk space"
@@ -625,7 +779,11 @@ function StorageGroup() {
               <div className="flex items-center justify-between gap-2">
                 <Note>
                   {confirming
-                    ? `Delete ${sel.length} permanently? This can't be undone.`
+                    ? `Delete ${sel.length} permanently? This can't be undone.${
+                        snapshotsKept
+                          ? " Index snapshots taken earlier still hold them until they are replaced; Reclaim space removes the automatic ones."
+                          : ""
+                      }`
                     : sel.length > 0
                       ? `${sel.length} selected · ${fmtBytes(bytes)}`
                       : "Nothing selected"}

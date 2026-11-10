@@ -1259,7 +1259,7 @@ const SHIPPED_SKILL_HASHES: &[u64] = &[
 ];
 
 /// Stable across builds and platforms, unlike `DefaultHasher`. Only identifies known texts.
-fn fnv1a64(bytes: &[u8]) -> u64 {
+pub(crate) fn fnv1a64(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, b| {
         (h ^ u64::from(*b)).wrapping_mul(0x0000_0100_0000_01b3)
     })
@@ -3573,9 +3573,272 @@ fn uninstall_all_agent_hooks(exe: &Path) -> Result<()> {
     combine_errors(errors)
 }
 
+// ---------------------------------------------------------------------------------------------
+// What is installed, for `cal doctor` (read-only)
+// ---------------------------------------------------------------------------------------------
+
+/// One Callimachus hook found in an agent's hooks file.
+#[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct FoundHook {
+    pub event: String,
+    /// The `cal` subcommand it runs (`hook --for codex`, `session-end`, ...).
+    pub subcommand: String,
+    /// The binary it runs, as written in the file.
+    pub exe: String,
+    /// Whether that binary exists. A hook whose binary is gone fails (or, guarded, stays
+    /// silent) at every session start.
+    pub exe_exists: bool,
+}
+
+/// The `callimachus` MCP entry of an agent's config.
+#[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct FoundMcp {
+    /// `app` (the app run with `--mcp`), `npx` (the npm launcher), `binary` (a
+    /// `callimachus-mcp` binary) or `other`.
+    pub kind: String,
+    /// The command it runs (for `npx`, the package with its pinned version, if any).
+    pub command: String,
+    /// Whether an absolute command exists; None for a command looked up on PATH.
+    pub exe_exists: Option<bool>,
+    /// The version it runs, when it can be read without running it: the npx pin, or the
+    /// app bundle's version on macOS.
+    pub version: Option<String>,
+}
+
+/// One agent's Callimachus setup on this machine.
+#[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSetup {
+    /// `claude`, `codex`, `gemini`, `copilot` or `cursor`.
+    pub agent: String,
+    /// The agent's config dir exists.
+    pub present: bool,
+    pub hooks: Vec<FoundHook>,
+    pub mcp: Option<FoundMcp>,
+    /// Claude Code only: the Callimachus plugin is enabled, so its own hooks and MCP server
+    /// (not listed here) run instead of the app's.
+    pub plugin: bool,
+}
+
+/// Every agent's Callimachus hooks and MCP entry, read from their config files and never
+/// written: the part of `cal doctor` that answers "is my agent wired to this install?". A
+/// config that is missing or unreadable reads as nothing installed.
+pub fn installed_setup() -> Vec<AgentSetup> {
+    let mut out = Vec::new();
+    let settings = settings_path().ok().and_then(|p| read_json_lenient(&p));
+    out.push(AgentSetup {
+        agent: "claude".into(),
+        present: claude_config_dir().is_ok_and(|d| d.is_dir()),
+        hooks: settings.as_ref().map(found_hooks).unwrap_or_default(),
+        mcp: claude_config_path()
+            .ok()
+            .and_then(|p| read_json_lenient(&p))
+            .and_then(|v| found_mcp_json(&v)),
+        plugin: settings.as_ref().is_some_and(plugin_enabled_in),
+    });
+    let mcp_by_agent: Vec<(&'static str, Option<FoundMcp>)> = agent_targets()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|a| {
+            let found = match a.fmt {
+                Fmt::Json => read_json_lenient(&a.config).and_then(|v| found_mcp_json(&v)),
+                Fmt::Toml => std::fs::read_to_string(&a.config)
+                    .ok()
+                    .and_then(|s| s.parse::<toml_edit::DocumentMut>().ok())
+                    .and_then(|doc| found_mcp_toml(&doc)),
+            };
+            (a.id, found)
+        })
+        .collect();
+    for t in hook_targets().unwrap_or_default() {
+        out.push(AgentSetup {
+            agent: t.id.into(),
+            present: t.dir.is_dir(),
+            hooks: read_json_lenient(&t.file)
+                .as_ref()
+                .map(found_hooks)
+                .unwrap_or_default(),
+            mcp: mcp_by_agent
+                .iter()
+                .find(|(id, _)| *id == t.id)
+                .and_then(|(_, m)| m.clone()),
+            plugin: false,
+        });
+    }
+    out
+}
+
+/// The Callimachus hooks in a hooks document (grouped or flat), in file order: a command of
+/// our shape whose binary is a `cal` or names Callimachus, as [`is_our_hook`] reads them
+/// without a reference binary.
+fn found_hooks(v: &Value) -> Vec<FoundHook> {
+    let Some(events) = v.get("hooks").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (event, entries) in events {
+        let commands = entries.as_array().into_iter().flatten().flat_map(|g| {
+            std::iter::once(g).chain(
+                g.get("hooks")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten(),
+            )
+        });
+        for cmd in commands.filter_map(|h| h.get("command").and_then(Value::as_str)) {
+            let Some(sub) = our_hook_subcommand(cmd) else {
+                continue;
+            };
+            let Some(exe) = hook_target(cmd, !cfg!(windows))
+                .filter(|t| is_cal_name(t) || mentions_callimachus(t))
+            else {
+                continue;
+            };
+            out.push(FoundHook {
+                event: event.clone(),
+                subcommand: sub.to_string(),
+                exe_exists: exe.exists(),
+                exe: exe.display().to_string(),
+            });
+        }
+    }
+    out
+}
+
+/// `mcpServers.callimachus` of a JSON config.
+fn found_mcp_json(v: &Value) -> Option<FoundMcp> {
+    let entry = v.get("mcpServers")?.get(MCP_NAME)?;
+    let command = entry.get("command").and_then(Value::as_str)?;
+    let args: Vec<&str> = entry
+        .get("args")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    Some(found_mcp(command, &args))
+}
+
+/// `[mcp_servers.callimachus]` of Codex's `config.toml`.
+fn found_mcp_toml(doc: &toml_edit::DocumentMut) -> Option<FoundMcp> {
+    let entry = doc.get("mcp_servers")?.get(MCP_NAME)?;
+    let command = entry.get("command")?.as_str()?;
+    let args: Vec<&str> = entry
+        .get("args")
+        .and_then(|a| a.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    Some(found_mcp(command, &args))
+}
+
+/// Classify an MCP entry. Only the binary and the npm package are kept: the other args and the
+/// `env` block can carry anything the user put there.
+fn found_mcp(command: &str, args: &[&str]) -> FoundMcp {
+    let path = Path::new(command);
+    let exe_exists = path.is_absolute().then(|| path.exists());
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if stem == "npx" || stem == "bunx" || stem == "pnpx" {
+        let package = args
+            .iter()
+            .find(|a| a.starts_with("callimachus-mcp"))
+            .copied()
+            .unwrap_or("?");
+        let version = package.strip_prefix("callimachus-mcp@").map(str::to_string);
+        return FoundMcp {
+            kind: "npx".into(),
+            command: format!("{stem} {package}"),
+            exe_exists: None,
+            version,
+        };
+    }
+    let kind = if args == ["--mcp"] {
+        "app"
+    } else if stem == "callimachus-mcp" {
+        "binary"
+    } else {
+        "other"
+    };
+    FoundMcp {
+        kind: kind.into(),
+        command: command.to_string(),
+        exe_exists,
+        version: if kind == "app" {
+            bundle_version(path)
+        } else {
+            None
+        },
+    }
+}
+
+/// The version of the macOS app bundle `exe` runs from (`Contents/Info.plist`'s
+/// `CFBundleShortVersionString`), read as text; None anywhere else.
+fn bundle_version(exe: &Path) -> Option<String> {
+    let plist = exe.parent()?.parent()?.join("Info.plist");
+    let text = std::fs::read_to_string(plist).ok()?;
+    let after = text.split("<key>CFBundleShortVersionString</key>").nth(1)?;
+    let value = after.split("<string>").nth(1)?.split("</string>").next()?;
+    let value = value.trim();
+    (!value.is_empty() && value.len() <= 32 && !value.contains('<')).then(|| value.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `cal doctor` reads our hooks out of grouped (Claude, Codex, Gemini) and flat (Copilot,
+    /// Cursor) hooks files, says whether each binary exists, and leaves a user's own hooks out.
+    #[test]
+    fn doctor_finds_our_hooks_in_both_layouts() {
+        let grouped = json!({"hooks": {
+            "SessionStart": [{"hooks": [
+                {"type": "command", "command": "\"/gone/Callimachus.app/Contents/MacOS/callimachus\" hook"},
+                {"type": "command", "command": "\"/opt/tool\" hook"}
+            ]}],
+            "SessionEnd": [{"hooks": [{"type": "command",
+                "command": "[ ! -x \"/home/me/.local/bin/cal\" ] || \"/home/me/.local/bin/cal\" session-end"}]}]
+        }});
+        let found = found_hooks(&grouped);
+        assert_eq!(
+            found.len(),
+            2,
+            "the user's /opt/tool hook is not ours: {found:?}"
+        );
+        assert_eq!(found[0].event, "SessionStart");
+        assert_eq!(found[0].subcommand, "hook");
+        assert!(!found[0].exe_exists);
+        assert_eq!(found[1].subcommand, "session-end");
+
+        let flat = json!({"version": 1, "hooks": {"sessionStart": [
+            {"command": "\"/x/callimachus\" hook --for cursor", "timeout": 10}]}});
+        let found = found_hooks(&flat);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].subcommand, "hook --for cursor");
+    }
+
+    /// The MCP entry's kind and version, without its other args or env.
+    #[test]
+    fn doctor_classifies_mcp_entries() {
+        let npx = found_mcp_json(&json!({"mcpServers": {"callimachus": {
+            "command": "npx", "args": ["-y", "callimachus-mcp@0.12.1"],
+            "env": {"TOKEN": "x"}}}}))
+        .unwrap();
+        assert_eq!(npx.kind, "npx");
+        assert_eq!(npx.command, "npx callimachus-mcp@0.12.1");
+        assert_eq!(npx.version.as_deref(), Some("0.12.1"));
+        let app = found_mcp("/gone/callimachus", &["--mcp"]);
+        assert_eq!((app.kind.as_str(), app.exe_exists), ("app", Some(false)));
+        assert_eq!(found_mcp("/usr/bin/callimachus-mcp", &[]).kind, "binary");
+        assert_eq!(found_mcp("node", &["server.js"]).kind, "other");
+        let toml: toml_edit::DocumentMut =
+            "[mcp_servers.callimachus]\ncommand = \"/gone/callimachus\"\nargs = [\"--mcp\"]\n"
+                .parse()
+                .unwrap();
+        assert_eq!(found_mcp_toml(&toml).unwrap().kind, "app");
+    }
 
     /// A fresh temp dir per test (removed on drop), so tests never touch the real HOME.
     struct TempDir(PathBuf);

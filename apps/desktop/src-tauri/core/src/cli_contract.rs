@@ -1,4 +1,4 @@
-//! The versioned `cal --json` contract. The fifteen query outputs other tools read (the VS Code
+//! The versioned `cal --json` contract. The sixteen query outputs other tools read (the VS Code
 //! extension, PR auditors, scripts) come as these envelopes, each opening with
 //! `schema_version`, when the caller asks for a version: `--json-version 1`, or
 //! `CAL_JSON_VERSION=1` in the environment beside `--json`. Plain `--json` keeps printing the
@@ -243,6 +243,14 @@ pub fn schemas() -> Vec<CalSchema> {
              frequent recurring errors and their fixes, tasks asked again, project memory, the \
              files agents changed most and the value ledger. A section with no data is left out.",
         ),
+        schema::<Versioned<crate::doctor::Doctor>>(
+            "doctor",
+            "What decides whether Callimachus works on this machine: the index and its schema \
+             against this binary, the locks next to it, each agent's hooks and MCP entry, the \
+             model and vector table, Claude Code's retention, the hooks that gave up in the last \
+             seven days by class, and each source's parse health. Paths show the home folder as \
+             ~; no project text.",
+        ),
     ]
 }
 
@@ -394,7 +402,7 @@ mod tests {
     #[test]
     fn every_schema_is_published_under_its_command() {
         let names: Vec<_> = schemas().iter().map(|s| s.command).collect();
-        assert_eq!(names.len(), 15);
+        assert_eq!(names.len(), 16);
         for s in schemas() {
             assert!(
                 crate::cli_core::COMMANDS.contains(&s.command),

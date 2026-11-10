@@ -1845,6 +1845,32 @@ mod tests {
         assert!(windowed.ledger.is_none());
     }
 
+    /// Plain `cal report --json` is an unversioned shape: hooks that gave up (in the skips
+    /// file, or folded into the index by a rollup) leave it byte for byte as it was.
+    #[test]
+    fn hook_skips_leave_the_report_json_alone() {
+        let dir = crate::db::test_support::TestDir::new("report_skips");
+        let conn = crate::db::open(&dir).unwrap();
+        let mut s = Seed { conn: &conn, n: 0 };
+        let now = chrono::Utc::now().timestamp();
+        s.session("claude_code", "/r/app", now - 3 * DAY, 60, "x");
+        let path = ledger::path_for_conn(&conn).unwrap();
+        ledger::append_to(&path, ledger::Kind::Hook, "/r/app", now - 3 * DAY);
+        let json = |conn: &Connection| serde_json::to_string(&build(conn, None, now).unwrap());
+        let before = json(&conn).unwrap();
+        assert!(
+            before.contains(r#""counts":{"hook":1,"mcp":0,"recall":0,"digest":0,"playbook":0}"#)
+        );
+
+        let skips = ledger::skips_path_for(&dir).unwrap();
+        for at in [now - 2 * DAY, now] {
+            ledger::append_to(&skips, ledger::Kind::HookSkipped, "schema_behind hook", at);
+        }
+        assert_eq!(json(&conn).unwrap(), before, "skips in the file");
+        ledger::rollup(&conn).unwrap();
+        assert_eq!(json(&conn).unwrap(), before, "and folded by a rollup");
+    }
+
     #[test]
     fn unpriced_calls_alone_leave_spend_out() {
         let conn = temp_db("unpriced");

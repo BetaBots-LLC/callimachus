@@ -3,7 +3,7 @@
 //   http://localhost:1420/mock.html?view=settings&section=engine&theme=light
 // Params: theme, consent, memory (alias: knowledge), engines, agents, agenthooks, plugin, claude, keys,
 // update, jobs, semantic, searchMs, onboarding, ledger, chats, projectdata, lastproject, muted,
-// sections, today, scope, cliwatch, repomemory, report, truth, conflicts (see SCENARIO below). mock-entry.ts also reads view, section,
+// sections, today, scope, cliwatch, repomemory, report, truth, conflicts, drift (see SCENARIO below). mock-entry.ts also reads view, section,
 // chatmode=ask and ask=<question> (sends it on load). Dev-only.
 import type {
   AgentHooksStatus,
@@ -46,6 +46,7 @@ import type {
   SearchFilters,
   SearchHit,
   Snapshot,
+  SnapshotStatus,
   SourceKind,
   Spend,
   SpendBreakdown,
@@ -55,6 +56,8 @@ import type {
   ThreadSummary,
   Today,
   ValueLedger,
+  Diagnostics,
+  ParseDrift,
 } from "../lib/api";
 import type { TelemetryStatus } from "../lib/telemetry";
 
@@ -109,6 +112,10 @@ const SCENARIO = {
   keys: pick("keys", ["none", "some"] as const, "some"),
   update: pick("update", ["available", "fail", "none"] as const, "none"),
   jobs: pick("jobs", ["idle", "indexing"] as const, "idle"),
+  // Settings > Index & storage's snapshots row: a weekly and a pre-upgrade snapshot on a Mac
+  // (default), those plus a weekly one of an earlier index (`earlier`, after a fresh start),
+  // none yet, or a system without free clones (only `cal backup` makes one).
+  snapshots: pick("snapshots", ["some", "earlier", "none", "off"] as const, "some"),
   // What a hybrid search reports as `semanticSkipped`: the model is ready (null), still
   // loading, or not cached at all.
   semantic: pick(
@@ -122,6 +129,9 @@ const SCENARIO = {
   // The Stats value card: a week of hook and MCP activity with 312 sessions Claude Code
   // deleted (default), a fresh install with nothing yet, or retention already at a year.
   ledger: pick("ledger", ["active", "empty", "kept"] as const, "active"),
+  // Settings > Index's format-change warning: none (default), or Claude Code's last pass
+  // full of a record type the indexer does not know.
+  drift: pick("drift", ["none", "claude"] as const, "none"),
   // Chat's saved conversations: a few chats and one Ask answer (default), or none yet.
   chats: pick("chats", ["some", "none"] as const, "some"),
   // The Project page: `full` gives every section data; `empty` is a repo with sessions but
@@ -449,6 +459,56 @@ function valueLedger(): ValueLedger {
       canRestore: retention.previous !== null,
     },
   };
+}
+// The parse canary's open warnings (dismissing one removes it for the page's lifetime).
+let parseDrifts: ParseDrift[] =
+  SCENARIO.drift === "claude"
+    ? [
+        {
+          source: "claude_code",
+          at: Math.floor(Date.now() / 1000) - 3600,
+          share: 0.62,
+          baseline: 0.01,
+          malformed: 0,
+          kinds: ["assistant-v2", "user-v2"],
+          files: 14,
+          zeroFiles: 11,
+          byShare: true,
+          byZeroFiles: true,
+          dismissed: false,
+        },
+      ]
+    : [];
+// `cal doctor`'s report as the app's Copy diagnostics gets it.
+function diagnostics(): Diagnostics {
+  const problems =
+    SCENARIO.drift === "claude"
+      ? [
+          "claude_code's transcripts may have changed format: 62% of records unknown or malformed in a pass (usually 1%); unknown types: assistant-v2, user-v2.",
+        ]
+      : [];
+  const text = [
+    "Callimachus 0.12.1 on macos aarch64",
+    "",
+    "index      ~/Library/Application Support/dev.shaller.callimachus/index.db",
+    "           5.0 GB on disk, 212.4 GB free; schema 36 (current, this binary writes 36)",
+    "           21480 threads; last full pass 2026-11-09 14:02 UTC",
+    "locks      held: gui (pid 4242)",
+    "model      on disk",
+    "vectors    partitioned (0036 shape)",
+    "cal        ~/.local/bin/cal -> /Applications/Callimachus.app/Contents/MacOS/callimachus",
+    "",
+    "agents",
+    "  claude   hooks SessionStart (hook), PreCompact (snapshot-hook), SessionEnd (session-end); MCP app /Applications/Callimachus.app/Contents/MacOS/callimachus (0.12.1)",
+    "",
+    "retention  Claude Code deletes transcripts after 30 days (default); 312 indexed sessions exist only in the index",
+    "hooks      no hook gave up in the last 7 days",
+    "",
+    problems.length ? "problems" : "no problems found",
+    ...problems.map((p) => `  - ${p}`),
+    "",
+  ].join("\n");
+  return { text, report: { version: "0.12.1", platform: "macos aarch64", problems } };
 }
 // Two imported facts, the two claude-memory rows projectMemory shows.
 const harvest: HarvestSettings = { claudeMemory: true, importedFacts: 2 };
@@ -2187,6 +2247,50 @@ const handlers: Record<string, Handler> = {
     freeBytes += ids.size * 30_000_000;
     return ids.size;
   },
+  index_snapshots: (): SnapshotStatus => {
+    const earlier = SCENARIO.snapshots === "earlier";
+    const some = SCENARIO.snapshots === "some" || earlier;
+    const own: SnapshotStatus["snapshots"] = [
+      {
+        name: "20261108T031500Z-weekly-3f9c2a1e",
+        takenAt: NOW - 2 * 86_400,
+        reason: "weekly",
+        bytes: 5_375_000_000,
+        privateBytes: 212_000_000,
+        otherIndex: false,
+      },
+      {
+        name: "20261105T091200Z-pre-migration-3f9c2a1e",
+        takenAt: NOW - 5 * 86_400,
+        reason: "pre-migration",
+        bytes: 5_340_000_000,
+        privateBytes: 1_480_000_000,
+        otherIndex: false,
+      },
+    ];
+    // The damaged index's last weekly snapshot: no longer shared with anything, a full copy.
+    const old: SnapshotStatus["snapshots"] = [
+      {
+        name: "20261019T020000Z-weekly-b71d04c8",
+        takenAt: NOW - 21 * 86_400,
+        reason: "weekly",
+        bytes: 5_120_000_000,
+        privateBytes: 5_120_000_000,
+        otherIndex: true,
+      },
+    ];
+    return {
+      automatic: SCENARIO.snapshots !== "off",
+      folder: "~/Library/Application Support/dev.shaller.callimachus/snapshots",
+      snapshots: some ? [...own, ...(earlier ? old : [])] : [],
+      bytesOnDisk: some
+        ? 1_692_000_000 + (earlier ? 5_120_000_000 : 0)
+        : SCENARIO.snapshots === "none"
+          ? 0
+          : null,
+      lastCheck: some ? { at: NOW - 2 * 86_400, ok: true, ms: 66_000 } : null,
+    };
+  },
   vacuum_db: async () => {
     const before = dbStats().reclaimable;
     if (!before?.worthwhile)
@@ -2442,6 +2546,12 @@ const handlers: Record<string, Handler> = {
     return null;
   },
   value_ledger: () => valueLedger(),
+  diagnostics: () => sleep(400).then(() => diagnostics()),
+  parse_drifts: () => parseDrifts.map((d) => ({ ...d, kinds: [...d.kinds] })),
+  dismiss_parse_drift: (a) => {
+    parseDrifts = parseDrifts.filter((d) => d.source !== a.source);
+    return null;
+  },
   // As lib.rs: remembers the replaced value once; setting it back is the restore.
   set_claude_cleanup_days: (a) => {
     const days = typeof a.days === "number" ? a.days : null;

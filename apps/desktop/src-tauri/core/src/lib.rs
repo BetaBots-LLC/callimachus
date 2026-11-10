@@ -114,6 +114,11 @@
 //!   (read-only connections never migrate) treat every fact as current
 //!   ([`knowledge::has_truth_tables`]).
 
+// stdout is the MCP server's JSON-RPC stream: a stray `println!` in code the server reaches
+// (db, search, knowledge, jobs) would corrupt it. Only `cal` prints (`cli_core`, `headless`);
+// test reports may (`allow-print-in-tests` in clippy.toml). See also `invariants`.
+#![deny(clippy::print_stdout)]
+
 // First, so `app_log!` is in scope for every module declared after it.
 #[macro_use]
 pub mod applog;
@@ -123,6 +128,8 @@ pub mod memtrim;
 pub mod agent;
 // The compaction anchor: a session's own prompts, re-injected by `cal hook` after compaction.
 pub mod anchor;
+// Index snapshots (before upgrades, weekly), `cal backup`, and the restore of a damaged index.
+pub mod backup;
 // `real_index_bench`: timings and query plans on a copy of a real index (CONTRIBUTING.md).
 #[cfg(test)]
 mod bench;
@@ -133,10 +140,13 @@ pub mod secrets;
 pub mod cleanup;
 // The versioned `cal --json` shapes and their JSON Schemas (`schemas/cal/`).
 pub mod cli_contract;
+#[allow(clippy::print_stdout)]
 pub mod cli_core;
 pub mod context;
 pub mod cost;
 pub mod db;
+// `cal doctor` and the app's Copy diagnostics: read-only, redacted, home shown as `~`.
+pub mod doctor;
 pub mod embed;
 // The memory-truth eval and GUARD_CLOSE calibration: tests only, the heavy ones `#[ignore]`.
 #[cfg(test)]
@@ -144,8 +154,12 @@ mod eval;
 pub mod export;
 pub mod gitlink;
 // `cal index` / `watch` / `embed` / `distill --auto`: the jobs without the app.
+#[allow(clippy::print_stdout)]
 pub mod headless;
 pub mod integration;
+// Source scans: network clients only on the reviewed egress paths, stdout only for `cal`.
+#[cfg(test)]
+mod invariants;
 pub mod issues;
 pub mod jobs;
 pub mod knowledge;
@@ -156,6 +170,9 @@ pub mod locks;
 pub mod mcp_server;
 // The first-run checklist's saved answers; GUI only.
 pub mod onboarding;
+// Seeded property tests of redaction, control stripping, fence escaping and the budgets.
+#[cfg(test)]
+mod property_tests;
 // "Your agents, so far": `cal report` and the app's Report view.
 pub mod report;
 #[cfg(test)]

@@ -1,4 +1,4 @@
-import { useId } from "react";
+import { useId, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Toggle } from "@base-ui/react/toggle";
 import { ToggleGroup } from "@base-ui/react/toggle-group";
@@ -6,6 +6,7 @@ import { Monitor, Moon, Sun } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { api } from "../../lib/api";
+import { copyAsyncText } from "../../lib/clipboard";
 import { track } from "../../lib/telemetry";
 import { errorText, notify } from "../../lib/toast";
 import { useChecklist } from "../../store/checklist";
@@ -34,6 +35,9 @@ export function GeneralSection() {
         </SettingsGroup>
         <SettingsGroup title="Privacy">
           <TelemetryRow />
+        </SettingsGroup>
+        <SettingsGroup title="Support">
+          <DiagnosticsRow />
         </SettingsGroup>
       </div>
     </>
@@ -126,6 +130,44 @@ function ChecklistRow() {
         </Button>
       }
     />
+  );
+}
+
+/** Copies `cal doctor`'s report as plain text, as the CLI prints it: the bug report form's
+ *  field wraps what is pasted in its own code block (`render: text`), and a fence of ours
+ *  inside it would close that block at once. Started straight from the click: WebKit allows
+ *  clipboard writes only during the gesture, so the report goes to the clipboard as a
+ *  promise (lib/clipboard). */
+function DiagnosticsRow() {
+  const [state, setState] = useState<"idle" | "copying" | "copied">("idle");
+  const [error, setError] = useState<string | null>(null);
+  const copy = () => {
+    if (state === "copying") return;
+    setError(null);
+    setState("copying");
+    copyAsyncText(() => api.diagnostics().then((d) => d.text)).then(
+      () => {
+        setState("copied");
+        setTimeout(() => setState("idle"), 1500);
+      },
+      (e) => {
+        setState("idle");
+        setError(`Couldn't copy the diagnostics: ${errorText(e)}`);
+      },
+    );
+  };
+  return (
+    <SettingRow
+      title="Diagnostics"
+      description="The report cal doctor prints: the index and its schema, each agent's hooks and MCP entry, hooks that gave up this week and parsing health. Paste it into a bug report. Paths show your home folder as ~, and it holds no project text or prompts."
+      control={
+        <Button size="sm" variant="outline" onClick={copy} disabled={state === "copying"}>
+          {state === "copied" ? "Copied" : state === "copying" ? "Copying..." : "Copy diagnostics"}
+        </Button>
+      }
+    >
+      {error && <InlineError>{error}</InlineError>}
+    </SettingRow>
   );
 }
 

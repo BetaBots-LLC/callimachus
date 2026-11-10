@@ -185,8 +185,8 @@ struct HostOptions {
 /// waits out an upgrade another process is running instead of failing.
 fn open_host(opts: HostOptions) -> anyhow::Result<Arc<CliHost>> {
     let path = db::default_index_path();
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        db::create_private_dir(dir)?;
     }
     let conn = db::open_sidecar(&path)?;
     // Relocated Claude / Codex data roots saved in Settings, as the app's startup loads them.
@@ -208,17 +208,13 @@ fn open_host(opts: HostOptions) -> anyhow::Result<Arc<CliHost>> {
     }))
 }
 
-/// Whether the index holds no threads yet (true also when it cannot be read).
+/// Whether the index holds no threads yet (true also when it cannot be read). Locks through
+/// [`db::lock_conn`] like every other connection site: a poisoned mutex read as "empty" would
+/// let [`mark_fresh_index`] mark the TODO and usage backfills done on a full index.
 fn index_is_empty(host: &CliHost) -> bool {
-    host.db
-        .0
-        .lock()
-        .ok()
-        .and_then(|c| {
-            c.query_row("SELECT NOT EXISTS(SELECT 1 FROM threads)", [], |r| {
-                r.get::<_, bool>(0)
-            })
-            .ok()
+    db::lock_conn(&host.db.0)
+        .query_row("SELECT NOT EXISTS(SELECT 1 FROM threads)", [], |r| {
+            r.get::<_, bool>(0)
         })
         .unwrap_or(true)
 }
@@ -229,10 +225,9 @@ fn index_is_empty(host: &CliHost) -> bool {
 /// watcher (the app's or `cal watch`'s) later ran that full backfill over the whole new
 /// corpus; the app's onboarding avoids it by starting its watcher before the first import.
 fn mark_fresh_index(host: &CliHost) {
-    if let Ok(conn) = host.db.0.lock() {
-        let _ = knowledge::mark_todos_backfilled(&conn);
-        let _ = indexer::usage_backfill::mark_usage_backfilled(&conn);
-    }
+    let conn = db::lock_conn(&host.db.0);
+    let _ = knowledge::mark_todos_backfilled(&conn);
+    let _ = indexer::usage_backfill::mark_usage_backfilled(&conn);
 }
 
 fn no_args(cmd: &str, args: &[String]) -> anyhow::Result<()> {
@@ -259,9 +254,7 @@ fn index_once(host: &Arc<CliHost>) -> anyhow::Result<indexer::IndexReport> {
 /// plugin's `--if-stale` guard runs no watcher. Never fails the command: the pass already
 /// landed.
 fn graph_upkeep(host: &CliHost, pass_started: i64) {
-    if let Ok(conn) = host.db.0.lock() {
-        jobs::graph_upkeep_after_pass(&conn, pass_started);
-    }
+    jobs::graph_upkeep_after_pass(&db::lock_conn(&host.db.0), pass_started);
     match indexer::file_edits::backfill_file_edits_once(&host.db, &|| false) {
         Ok(Some(r)) => note(&format!(
             "filled file edits for {} older sessions ({} rows)",
@@ -332,6 +325,9 @@ pub fn cmd_index(args: &[String]) -> anyhow::Result<()> {
         started.elapsed().as_secs_f64()
     );
     graph_upkeep(&host, pass_started);
+    // A machine without the app has no idle tick: retire a pre-upgrade snapshot of this index
+    // past its 7 days here (a directory listing when there is none).
+    crate::backup::prune_read_only(&db::default_index_path(), chrono::Utc::now().timestamp());
     if r.errors > 0 {
         anyhow::bail!(
             "{} error{} while indexing; the [index] lines above name each file or source",
@@ -632,12 +628,16 @@ fn open_index_log(index: &std::path::Path, header: &str) -> Option<std::fs::File
             .open(&path);
     }
     // Append, not truncate: two sessions starting at once can both pass the gate, and the
-    // second pass's "already running" line must not wipe the first one's output.
-    let mut file = std::fs::OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open(&path)
-        .ok()?;
+    // second pass's "already running" line must not wipe the first one's output. Owner-only
+    // when this creates it: a pass's output names projects and files.
+    let mut options = std::fs::OpenOptions::new();
+    options.append(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&path).ok()?;
     writeln!(
         file,
         "--- {} {header}",
@@ -945,6 +945,46 @@ mod tests {
         })
     }
 
+    /// A panic under the writer's guard must not make a full index read as empty: that
+    /// answer marks the TODO and usage backfills done (`mark_fresh_index`), so they would
+    /// never run on it.
+    #[test]
+    fn a_poisoned_writer_still_reads_a_full_index_as_full() {
+        let path = temp_index("poisoned_empty");
+        let mut conn = db::open(&path).unwrap();
+        let sid = indexer::source_id(&conn, "claude_code").unwrap();
+        indexer::upsert_thread(
+            &mut conn,
+            sid,
+            &indexer::ParsedThread {
+                external_id: "t".into(),
+                messages: vec![indexer::ParsedMessage {
+                    role: "user".into(),
+                    text: "hello".into(),
+                    tool_name: None,
+                    ts: Some(1),
+                }],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let host = CliHost {
+            flags: JobFlags::default(),
+            db: db::Db(Mutex::new(conn)),
+            readers: None,
+            embedder: embed::Embedder::cached_only(),
+            runtime: None,
+            kicks_auto_distill: false,
+            progress: Mutex::new(Progress::default()),
+        };
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = host.db.0.lock().unwrap();
+            panic!("a job panics under the writer's guard");
+        }));
+        assert!(host.db.0.is_poisoned());
+        assert!(!index_is_empty(&host), "one thread is indexed");
+    }
+
     /// The plugin's SessionStart guard starts a pass only for an existing, non-empty index
     /// whose last full pass finished more than an hour ago, with no app, `cal watch` or other
     /// pass keeping it fresh.
@@ -1174,6 +1214,18 @@ mod tests {
         writeln!(ours, "our pass").unwrap();
         let text = std::fs::read_to_string(&log).unwrap();
         assert!(text.ends_with("their pass\nour pass\n"), "{text}");
+    }
+
+    /// The index log names projects and files: owner-only when this creates it.
+    #[cfg(unix)]
+    #[test]
+    fn the_index_log_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = temp_index("index_log_mode");
+        drop(open_index_log(&path, "first").unwrap());
+        let log = locks::lock_path(&path, INDEX_LOG);
+        let mode = std::fs::metadata(&log).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 
     /// The background pass never holds up the session: the spawn returns while the child

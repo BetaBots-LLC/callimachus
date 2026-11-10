@@ -11,10 +11,13 @@
 //!
 //! Path verified against cline/cline task-history docs.
 
-use super::common::{join_text_parts, push_message, read_json, truncate_title};
+use super::common::{
+    begin_file, count_file, count_line, count_malformed, count_skipped, join_text_parts,
+    push_message, read_json, truncate_title, uncounted,
+};
 use super::{
-    file_change_state, set_file_state, source_id, upsert_thread, IndexReport, ParsedMessage,
-    ParsedThread,
+    file_change_state, file_state, set_file_state, source_id, unreadable_key, upsert_thread,
+    IndexReport, ParsedMessage, ParsedThread,
 };
 use anyhow::{Context, Result};
 use rusqlite::Connection;
@@ -125,14 +128,28 @@ fn index_task(
     let created_at = task_id.parse::<i64>().ok().map(|ms| ms / 1000);
     let project_path = read_cwd(&dir.join("task_metadata.json"));
 
-    let thread = parse_history(
-        &history,
-        &format!("{editor}/{task_id}"),
-        created_at,
-        if mtime > 0 { Some(mtime) } else { created_at },
-        project_path,
-    )
-    .with_context(|| format!("parsing {path_str}"))?;
+    // A history that is not JSON (a write cut short) gets no stamp, so every pass reads it
+    // again: the parse canary counts it once per change, not once per pass.
+    let unreadable = unreadable_key(&path_str);
+    let counted = file_state(conn, &unreadable)? == Some((mtime, size));
+    let parse = || {
+        parse_history(
+            &history,
+            &format!("{editor}/{task_id}"),
+            created_at,
+            if mtime > 0 { Some(mtime) } else { created_at },
+            project_path,
+        )
+    };
+    let thread = match if counted { uncounted(parse) } else { parse() } {
+        Ok(thread) => thread,
+        Err(e) => {
+            if !counted && e.downcast_ref::<serde_json::Error>().is_some() {
+                set_file_state(conn, &unreadable, kind, mtime, size)?;
+            }
+            return Err(e).with_context(|| format!("parsing {path_str}"));
+        }
+    };
     let n = if let Some(t) = thread {
         upsert_thread(conn, sid, &t)?
     } else {
@@ -150,18 +167,36 @@ pub fn parse_history(
     updated_at: Option<i64>,
     project_path: Option<String>,
 ) -> Result<Option<ParsedThread>> {
-    let root: Value = serde_json::from_str(&fs::read_to_string(path)?)?;
+    let root: Value = match serde_json::from_str(&fs::read_to_string(path)?) {
+        Ok(v) => v,
+        Err(e) => {
+            count_malformed();
+            return Err(e.into());
+        }
+    };
+    let file = begin_file();
     let Some(msgs) = root.as_array() else {
+        // The whole document is one record of a shape this parser does not know, and a file
+        // that lost its messages: a format change that wraps the array (`{"messages": [..]}`)
+        // must reach the canary's counts, not vanish before them.
+        count_line();
+        count_skipped("history:", Some(super::claude::json_kind(Some(&root))), &[]);
+        count_file(file, 0);
         return Ok(None);
     };
 
     let mut messages: Vec<ParsedMessage> = Vec::new();
     let mut first_user: Option<String> = None;
     for m in msgs {
-        let role = match m.get("role").and_then(Value::as_str) {
+        count_line();
+        let role = m.get("role").and_then(Value::as_str);
+        let role = match role {
             Some("assistant") => "assistant",
             Some("user") => "user",
-            _ => continue,
+            _ => {
+                count_skipped("role:", role, &[]);
+                continue;
+            }
         };
         let before = messages.len();
         extract_blocks(&mut messages, role, m.get("content"), created_at);
@@ -174,6 +209,7 @@ pub fn parse_history(
         }
     }
 
+    count_file(file, messages.len());
     if messages.is_empty() {
         return Ok(None);
     }
@@ -223,11 +259,17 @@ fn extract_blocks(
                         let text = super::claude::cap_tool_text(text.trim());
                         push_message(out, "tool", &text, None, ts);
                     }
-                    _ => {}
+                    // Images and thinking are never indexed.
+                    other => count_skipped(
+                        "block:",
+                        other,
+                        &["image", "thinking", "redacted_thinking", "document"],
+                    ),
                 }
             }
         }
-        _ => {}
+        None | Some(Value::Null) => {}
+        other => count_skipped("content:", Some(super::claude::json_kind(other)), &[]),
     }
 }
 
@@ -256,6 +298,93 @@ mod tests {
         {"role":"assistant","content":[{"type":"text","text":"Sure, using FTS5"},{"type":"tool_use","name":"execute_command","input":{"command":"cargo build"}}]},
         {"role":"user","content":[{"type":"tool_result","content":"Finished dev profile"}]}
     ]"#;
+
+    /// The parse canary (Cline, Roo and Kilo share this parser): an invented block type and
+    /// an invented role are counted, images are not, and a history that is not JSON is a
+    /// malformed record.
+    #[test]
+    fn parse_counts_name_unknown_types_and_broken_files() {
+        let path = temp_path("cline_canary.json");
+        let text = HISTORY.replace(
+            r#"{"type":"text","text":"Sure, using FTS5"}"#,
+            r#"{"type":"image","source":{}},{"type":"hologram"},{"type":"text","text":"Sure"}"#,
+        );
+        let text = text.replacen('[', r#"[{"role":"narrator","content":"x"},"#, 1);
+        std::fs::write(&path, text).unwrap();
+        let (thread, stats) = crate::indexer::common::collect_parse_stats(|| {
+            parse_history(&path, "Code/1", None, None, None)
+                .unwrap()
+                .unwrap()
+        });
+        assert_eq!(thread.messages.len(), 4);
+        assert_eq!(stats.lines, 4);
+        assert_eq!(
+            stats.unknown_kinds,
+            std::collections::BTreeMap::from([
+                ("block:hologram".to_string(), 1),
+                ("role:narrator".to_string(), 1),
+            ])
+        );
+        std::fs::write(&path, "[{\"role\":").unwrap();
+        let (result, stats) = crate::indexer::common::collect_parse_stats(|| {
+            parse_history(&path, "Code/1", None, None, None)
+        });
+        assert!(result.is_err());
+        assert_eq!(stats.malformed_lines, 1);
+        // An update that wraps the array: the document is one unknown record and a file that
+        // lost its messages, so the canary sees it even when no message was ever counted.
+        std::fs::write(&path, format!(r#"{{"messages":{HISTORY}}}"#)).unwrap();
+        let (result, stats) = crate::indexer::common::collect_parse_stats(|| {
+            parse_history(&path, "Code/1", None, None, None)
+        });
+        let _ = std::fs::remove_file(&path);
+        assert!(result.unwrap().is_none());
+        assert_eq!((stats.lines, stats.unknown()), (1, 1));
+        assert_eq!(stats.unknown_kinds["history:object"], 1);
+        assert_eq!((stats.files, stats.files_with_zero_messages), (1, 1));
+        // An empty history is an empty file, not one that lost its messages.
+        let (_, stats) = crate::indexer::common::collect_parse_stats(|| {
+            std::fs::write(&path, "[]").unwrap();
+            let r = parse_history(&path, "Code/1", None, None, None);
+            let _ = std::fs::remove_file(&path);
+            r
+        });
+        assert_eq!((stats.files, stats.files_with_zero_messages), (1, 0));
+    }
+
+    /// A history that is not JSON gets no stamp and is read again on every pass; the parse
+    /// canary counts it once per change (see `unreadable_key`).
+    #[test]
+    fn a_broken_history_is_counted_once_per_change() {
+        let dir = crate::db::test_support::TestDir::new("cline_broken");
+        let task = dir.with_file_name("1700000000000");
+        std::fs::create_dir_all(&task).unwrap();
+        let history = task.join("api_conversation_history.json");
+        std::fs::write(&history, "[{\"role\":").unwrap();
+        let mut conn = crate::db::open(&dir).unwrap();
+        let sid = source_id(&conn, KIND).unwrap();
+        let pass = |conn: &mut Connection| {
+            let (result, stats) = crate::indexer::common::collect_parse_stats(|| {
+                index_task(conn, sid, KIND, "Code", &task)
+            });
+            assert!(
+                result.is_err(),
+                "still reported as a file that did not parse"
+            );
+            stats
+        };
+        assert_eq!(pass(&mut conn).malformed_lines, 1);
+        assert!(pass(&mut conn).is_empty(), "the same file: counted once");
+        assert_eq!(
+            file_state(&conn, &history.to_string_lossy()).unwrap(),
+            None,
+            "never recorded as indexed"
+        );
+        // Rewritten and still broken: a change, counted again.
+        std::fs::write(&history, "[{\"role\": \"user\", \"content\":").unwrap();
+        assert_eq!(pass(&mut conn).malformed_lines, 1);
+        assert!(pass(&mut conn).is_empty());
+    }
 
     #[test]
     fn parses_history() {

@@ -1,0 +1,3 @@
+# The core crate denies `clippy::print_stdout` (stdout is the MCP server's JSON-RPC stream);
+# the ignored real-data tests and benches print their reports there on purpose.
+allow-print-in-tests = true
