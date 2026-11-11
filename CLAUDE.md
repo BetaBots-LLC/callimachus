@@ -41,7 +41,11 @@ and PR checks; this file is what an agent needs on top of that.
   Adding an agent source: `core/src/indexer/README.md`.
 - `apps/desktop/src/`: React frontend; Tauri commands go through typed wrappers in `src/lib/api.ts`.
 - `apps/vscode/`: VS Code / Cursor extension; runs `cal ... --json` with `CAL_JSON_VERSION=1`
-  (`src/cal.ts`), a contract.
+  (`src/cal.ts`, the editor-free part in `src/calCore.ts`), a contract. Its Memory tree view
+  runs only `cal memory --json -n N` with no positional (the first one routes to `publish` /
+  `import` / `review`) and `cal issues <project>`, both checked by `assertReadOnlyCall` in
+  `src/memoryModel.ts`, plus `<bin> help` (`calHasCommand`'s probe in `src/cal.ts`, shared
+  with `cal why`) when the binary is the app under its own name, which that check never sees.
 - `apps/web/`: callimachus.app (TanStack Start). The privacy policy is `src/content/legal.ts`.
 - `schemas/cal/`, `schemas/mcp/`: the checked-in JSON Schemas of the versioned `cal --json-version 1`
   outputs and of each MCP tool's `output_schema` (copies under `apps/web/public/schemas/`).
@@ -50,7 +54,14 @@ and PR checks; this file is what an agent needs on top of that.
   While it is enabled the app installs only `cal` (`integration::claude_plugin_managed`).
 - `plugins/cursor/`: the Cursor plugin (catalog: `.cursor-plugin/marketplace.json`, which
   cursor.directory's parser also reads). Its hooks and the app's Cursor hooks can both run;
-  `cal hook --for cursor` claims each conversation once (`claim_cursor_injection`).
+  `cal hook --for cursor` claims each conversation once (`cli_core::claim_hook_run`).
+- `plugins/codex/`: the experimental Codex plugin (catalog: `.agents/plugins/marketplace.json`,
+  which Codex reads before `.claude-plugin/marketplace.json`). While it is enabled and in
+  Codex's plugin cache the app hands it the MCP entry once (`integration::codex_plugin_managed`;
+  the marker keeps the removed table to restore); both sets of hooks run, and then `hook` and
+  `snapshot-hook --for codex` claim their event for 5 s (`claim_hook_run` again; a second
+  clear or compaction within 5 s injects nothing; `session-end` needs no claim, its queue
+  entry is replaced).
 
 ## Commands
 
@@ -58,6 +69,7 @@ and PR checks; this file is what an agent needs on top of that.
 pnpm turbo run typecheck build lint                    # JS side, as CI runs it
 node --test packages/callimachus-mcp/test/*.test.mjs   # npm launcher
 node --test plugins/test/*.test.mjs                    # Claude Code plugin
+pnpm --filter callimachus-vscode test                  # VS Code extension (builds dist/ first)
 cd apps/desktop/src-tauri
 cargo fmt --check && cargo clippy --locked --workspace --lib --bins --tests -- -D warnings
 cargo test --locked --workspace
@@ -169,6 +181,11 @@ env -u CLAUDE_CONFIG_DIR -u CODEX_HOME HOME="$S/home" CALLIMACHUS_DB="$S/index.d
   `CURSOR_*` HookSpecs, its scripts probe `cal help` for a line ending ` or cursor` (keep that
   in `USAGE`), and its version and `npx` pin are the release; `plugins/test/cursor-plugin.test.mjs`
   also replays cursor.directory's parser over the repo.
+- `integration::codex_plugin_mirrors_the_app_install`: plugins/codex's skill is a byte copy,
+  its hooks match `CODEX_HOOKS` plus `PLUGIN_ONLY_HOOKS`, its scripts probe `cal help` for
+  `codex or cursor, one run per event` (keep that `cal hook` line in `USAGE`), and its
+  version, `npx` pin and catalog ref are the release; `plugins/test/codex-plugin.test.mjs`
+  replays Codex's manifest and marketplace rules.
 - `command_surface_tests` (lib.rs): `generate_handler!` matches the `invoke` calls in `api.ts`.
 - `telemetry::privacy_policy_names_every_event` (reads `legal.ts`),
   `sidecar_entry_points_never_touch_telemetry`, `every_source_is_on_the_telemetry_allowlist`, and
@@ -207,7 +224,10 @@ Hook events, matchers and timeouts are the `HookSpec` consts in `integration.rs`
 own SessionStart guard is `PLUGIN_ONLY_HOOKS` in its tests; GitHub Copilot and Cursor take flat
 entries, `HookLayout::Flat`). Cursor also runs the hooks in `~/.claude/settings.json`, so every
 Claude form (`hook`, `session-end`, `recall-now`, `recall-error`, `snapshot-hook`) stays silent
-on a payload with `cursor_version` (`cli_core::is_cursor_payload`). Hook commands (`hook`, `recall-error`,
+on a payload with `cursor_version` (`cli_core::is_cursor_payload`). Devin CLI loads those hooks
+too: `session-end`, `snapshot-hook`, `recall-now` and `recall-error` stay silent when
+`DEVIN_PROJECT_DIR` is set and the payload has no `transcript_path` (`cli_core::is_devin_hook`;
+`hook` is unchanged). Hook commands (`hook`, `recall-error`,
 `snapshot-hook`, `session-end`, `recall-now`, `index --if-stale`) exit 0 silently on any error,
 never create an index and never migrate one themselves (`index --if-stale` starts a detached
 `cal index` only on a non-empty index; that pass upgrades the schema only when it runs from

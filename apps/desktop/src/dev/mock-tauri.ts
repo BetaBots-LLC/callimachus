@@ -1,7 +1,7 @@
 // Browser-only fake of the Tauri runtime, so the UI runs (and can be screenshotted) without Rust.
 // Use: `pnpm --filter callimachus dev`, then open
 //   http://localhost:1420/mock.html?view=settings&section=engine&theme=light
-// Params: theme, consent, memory (alias: knowledge), engines, agents, agenthooks, plugin, claude, keys,
+// Params: theme, consent, memory (alias: knowledge), engines, agents, agenthooks, plugin, codexplugin, claude, keys,
 // update, jobs, semantic, searchMs, onboarding, ledger, chats, projectdata, lastproject, muted,
 // sections, today, review, scope, cliwatch, repomemory, report, truth, conflicts, drift (see SCENARIO below). mock-entry.ts also reads view, section,
 // chatmode=ask and ask=<question> (sends it on load). Dev-only.
@@ -108,6 +108,9 @@ const SCENARIO = {
   agenthooks: pick("agenthooks", ["off", "on", "blocked", "approve"] as const, "off"),
   // The Callimachus Claude Code plugin is enabled, so the app installs only `cal`.
   plugin: pick("plugin", ["on", "off"] as const, "off"),
+  // The Callimachus plugin for Codex runs Codex's MCP server instead of the app; its hooks run
+  // beside the app's.
+  codexplugin: pick("codexplugin", ["on", "off"] as const, "off"),
   // `absent`: no Claude Code config dir, so the checklist does not offer Claude Code.
   claude: pick("claude", ["present", "absent"] as const, "present"),
   keys: pick("keys", ["none", "some"] as const, "some"),
@@ -628,8 +631,9 @@ function agentList(mode: "connected" | "partial" | "none"): AgentIntegration[] {
       id: "codex",
       label: "Codex",
       present: true,
-      registered: mode !== "none",
+      registered: mode !== "none" && SCENARIO.codexplugin === "off",
       configPath: `${HOME}/.codex/config.toml`,
+      pluginManaged: SCENARIO.codexplugin === "on",
     },
     {
       id: "cursor",
@@ -2789,7 +2793,7 @@ const handlers: Record<string, Handler> = {
   },
   agent_integrations_status: () => agents.map((x) => ({ ...x })),
   install_agent_integrations: () => {
-    agents = agents.map((x) => ({ ...x, registered: x.present }));
+    agents = agents.map((x) => ({ ...x, registered: x.present && !x.pluginManaged }));
     return agents.map((x) => ({ ...x }));
   },
   uninstall_agent_integrations: () => {

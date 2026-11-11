@@ -1,0 +1,49 @@
+{
+  "description": "Callimachus memory hooks: inject the repo's memory at session start, clear and compaction, keep the index fresh when the desktop app is not running, snapshot the session before compaction, and queue an ended session for distillation. Each hook is a shell script in the plugin's scripts/ folder that runs the cal CLI at ~/.local/bin/cal and exits quietly when it is not installed.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${PLUGIN_ROOT}\"/scripts/hook.sh",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "startup|resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${PLUGIN_ROOT}\"/scripts/index.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${PLUGIN_ROOT}\"/scripts/snapshot-hook.sh",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${PLUGIN_ROOT}\"/scripts/session-end.sh",
+            "timeout": 3
+          }
+        ]
+      }
+    ]
+  }
+}

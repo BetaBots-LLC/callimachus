@@ -167,7 +167,8 @@ USAGE:
                                 Code SessionStart hook command; size-capped, ~7k chars),
                                 with a recent-sessions digest while it has no memory yet;
                                 after a compaction, a refresher plus the session's own
-                                prompts
+                                prompts; with --for codex or cursor, one run per event
+                                prints where the app's hook and the plugin's both run
   cal hook --explain [<path>]   show what a new session in the repo would get, or why
                                 the hook stays silent there
   cal hook --mute|--unmute [<path>]
@@ -1615,20 +1616,32 @@ fn cmd_hook(args: &[String]) -> anyhow::Result<()> {
         Some("--explain") => return cmd_hook_explain(&o, agent),
         _ => {}
     }
-    let payload = read_hook_payload();
-    if agent == HookAgent::Claude && payload.as_ref().is_some_and(is_cursor_payload) {
-        // Cursor runs this as a third-party Claude Code hook; see [`is_cursor_payload`].
-        return Ok(());
+    if let Some(out) = session_start_stdout(&o, agent, read_hook_payload().as_ref())? {
+        println!("{out}");
     }
-    let source = hook_source(payload.as_ref());
-    let cwd = hook_cwd(payload.as_ref());
+    Ok(())
+}
+
+/// What `cal hook` prints for `payload`, None for nothing: [`hook_outcome`] in the agent's
+/// envelope ([`hook_stdout`]), once this run won the event's claim where both the app's hook
+/// and a plugin's can run ([`claim_hook_run`]). Counts the injection in the value ledger.
+fn session_start_stdout(
+    o: &Opts,
+    agent: HookAgent,
+    payload: Option<&serde_json::Value>,
+) -> anyhow::Result<Option<String>> {
+    if agent == HookAgent::Claude && payload.is_some_and(is_cursor_payload) {
+        // Cursor runs this as a third-party Claude Code hook; see [`is_cursor_payload`].
+        return Ok(None);
+    }
+    let source = hook_source(payload);
+    let cwd = hook_cwd(payload);
     let project = if o.positional.is_empty() {
         knowledge::project_key(&cwd.to_string_lossy())
     } else {
         knowledge::project_key(&o.positional.join(" "))
     };
     let transcript = payload
-        .as_ref()
         .and_then(|v| v.get("transcript_path"))
         .and_then(|x| x.as_str())
         .filter(|s| !s.is_empty())
@@ -1642,29 +1655,41 @@ fn cmd_hook(args: &[String]) -> anyhow::Result<()> {
         max_chars: o.budget,
         transcript,
     };
-    if let HookOutcome::Print(text) = hook_outcome(&req, &db::default_index_path())? {
-        // Claimed only once there is something to print, so a run that stays silent never
-        // keeps the other hook source from injecting.
-        if agent == HookAgent::Cursor {
-            let session = payload.as_ref().and_then(cursor_conversation_id);
-            let now = std::time::SystemTime::now();
-            if recall_dir().is_some_and(|dir| !claim_cursor_injection(&dir, session, now)) {
-                return Ok(());
-            }
-        }
-        // Each piece is stripped before it is fence-escaped, where it is rendered; this catches
-        // whatever a future piece forgets, since the hook's text lands in the agent's context
-        // and its terminal. Stripping after escaping cannot revive a tag: the escaper reads
-        // through controls (`context::escape_fences`).
-        println!(
-            "{}",
-            hook_stdout(agent, &crate::context::strip_controls(&text))
-        );
-        if counts_as_session(source) {
-            ledger::append(hook_ledger_kind(&text), &project);
+    let HookOutcome::Print(text) = hook_outcome(&req, &db::default_index_path())? else {
+        return Ok(None);
+    };
+    // Claimed only once there is something to print, so a run that stays silent never keeps
+    // the other hook source from injecting. Codex fires SessionStart again for `clear` and
+    // `compact` in the same session, so its claim is per source, and taken only where the
+    // plugin can run a second hook ([`codex_plugin_on`]).
+    let claims = match agent {
+        HookAgent::Cursor => true,
+        HookAgent::Codex => codex_plugin_on(),
+        HookAgent::Claude | HookAgent::Gemini | HookAgent::Copilot => false,
+    };
+    if claims {
+        let event = match agent {
+            HookAgent::Codex => format!("hook-{source}"),
+            _ => "hook".to_string(),
+        };
+        // Cursor's conversation, or Codex's `session_id`, which this reads first.
+        let session = payload.and_then(cursor_conversation_id);
+        let now = std::time::SystemTime::now();
+        if recall_dir().is_some_and(|dir| !claim_hook_run(&dir, agent, &event, session, now)) {
+            return Ok(None);
         }
     }
-    Ok(())
+    if counts_as_session(source) {
+        ledger::append(hook_ledger_kind(&text), &project);
+    }
+    // Each piece is stripped before it is fence-escaped, where it is rendered; this catches
+    // whatever a future piece forgets, since the hook's text lands in the agent's context and
+    // its terminal. Stripping after escaping cannot revive a tag: the escaper reads through
+    // controls (`context::escape_fences`).
+    Ok(Some(hook_stdout(
+        agent,
+        &crate::context::strip_controls(&text),
+    )))
 }
 
 /// The payload's SessionStart `source`, in Claude Code's words. GitHub Copilot sends
@@ -1694,6 +1719,49 @@ fn hook_source(payload: Option<&serde_json::Value>) -> &str {
 /// Claude thread.
 fn is_cursor_payload(v: &serde_json::Value) -> bool {
     v.get("cursor_version").is_some()
+}
+
+/// The variable Devin CLI sets for every command hook, "automatically set to the project root
+/// directory" (docs.devin.ai/cli/extensibility/hooks/overview.md, "Command Hooks", read
+/// 2026-11-10, stable channel v3000.12.43).
+const DEVIN_PROJECT_DIR: &str = "DEVIN_PROJECT_DIR";
+
+/// A Claude-form hook that Devin CLI runs. Devin loads the hooks in `~/.claude/settings.json`
+/// (the same overview page, "Where Hooks Live": `.claude/` hooks load while
+/// `read_config_from.claude` is on, the default), and its payloads carry no vendor field and
+/// no `transcript_path` (only `hook_event_name`, `session_id`, `prompt_id` after the first
+/// prompt, and the event's own fields). Without this, `session-end` opened the index writable
+/// and queued `claude:<devin session id>`, an entry no Claude thread ever resolves, which held
+/// one of the 50 queue slots for a week.
+///
+/// Both halves are required: every Claude Code payload carries a `transcript_path`, so a
+/// `DEVIN_PROJECT_DIR` leaked into a Claude Code process started from a Devin shell can never
+/// silence its hooks. `cal hook` (SessionStart) is not guarded: what Devin does with a
+/// Claude-form hook's plain stdout is not documented.
+fn is_devin_hook(v: &serde_json::Value) -> bool {
+    is_devin_hook_with(v, devin_project_dir().as_deref())
+}
+
+/// [`is_devin_hook`] with the environment passed in.
+fn is_devin_hook_with(v: &serde_json::Value, devin_project_dir: Option<&std::ffi::OsStr>) -> bool {
+    devin_project_dir.is_some_and(|d| !d.is_empty())
+        && v.get("transcript_path")
+            .and_then(|x| x.as_str())
+            .is_none_or(str::is_empty)
+}
+
+/// `DEVIN_PROJECT_DIR` as this hook process sees it. A unit test never reads the real
+/// variable (a `cargo test` started from a Devin shell would silence every hook test): it
+/// sees what `tests::with_devin_env` sets on its thread, else nothing.
+fn devin_project_dir() -> Option<std::ffi::OsString> {
+    #[cfg(test)]
+    {
+        HOOK_TEST_DEVIN_DIR.with(|d| d.borrow().clone())
+    }
+    #[cfg(not(test))]
+    {
+        std::env::var_os(DEVIN_PROJECT_DIR)
+    }
 }
 
 /// The session id a hook payload names: `session_id` (Claude Code, Codex, Gemini CLI,
@@ -4038,9 +4106,11 @@ fn cmd_snapshot_hook(args: &[String]) -> anyhow::Result<()> {
 /// stop (dozens per workflow) and captured nothing of the subagent; the installer no longer
 /// registers it, so this ignores it from older installs. Cursor runs this hook on every
 /// preCompact as a third-party Claude hook ([`is_cursor_payload`]): its transcript is never a
-/// Claude thread, and opening the index writable would cost up to the 2 s lock wait.
+/// Claude thread, and opening the index writable would cost up to the 2 s lock wait. Devin
+/// CLI runs it too, since its v3000.11.92 PreCompact ([`is_devin_hook`]).
 fn claude_snapshot_wanted(v: &serde_json::Value) -> bool {
     !is_cursor_payload(v)
+        && !is_devin_hook(v)
         && v.get("hook_event_name").and_then(|x| x.as_str()) != Some("SubagentStop")
 }
 
@@ -4048,10 +4118,23 @@ fn claude_snapshot_wanted(v: &serde_json::Value) -> bool {
 /// Claude's, of the codex thread the payload's `transcript_path` (a
 /// `rollout-<timestamp>-<session id>.jsonl` file) or `session_id` names. Codex's PreCompact
 /// payload carries no compaction summary (only `trigger`), so there is none to store, and its
-/// plain stdout is ignored; it prints nothing anyway.
+/// plain stdout is ignored; it prints nothing anyway. When the app's hook and the Codex
+/// plugin's both run for one compaction, the second would build and write the same snapshot
+/// again and wait up to 2 s on the first's write lock, so where the plugin is on
+/// ([`codex_plugin_on`]) only the claim's winner acts ([`claim_hook_run`]).
 fn codex_snapshot_hook(v: &serde_json::Value) -> anyhow::Result<()> {
     let ids = codex_session_ids(v);
     if ids.is_empty() || !db::default_index_path().exists() {
+        return Ok(());
+    }
+    let (session, now) = (
+        ids.first().map(String::as_str),
+        std::time::SystemTime::now(),
+    );
+    let claimed = |dir: std::path::PathBuf| {
+        claim_hook_run(&dir, HookAgent::Codex, "snapshot-hook", session, now)
+    };
+    if codex_plugin_on() && !recall_dir().is_none_or(claimed) {
         return Ok(());
     }
     let conn = open_hook_db_write(std::time::Duration::from_secs(2))?;
@@ -4102,23 +4185,28 @@ fn is_uuid(s: &str) -> bool {
 /// ended at the front of the auto-distill queue (`knowledge::enqueue_distill_priority`), so
 /// its memory lands minutes after it ends instead of after the 30-minute idle wait. The app
 /// distills it (the watcher kicks a round once the transcript is indexed); this only writes
-/// one `app_config` row, and deletes the session's `recall-error` state file. SessionEnd has no `transcript_path` and a 1.5 s budget shared by
-/// every SessionEnd hook, so it waits at most 1 s for the lock, skips the write when memory
-/// is off, and exits 0 silently on anything else.
+/// one `app_config` row, and deletes the session's `recall-error` state file. Claude Code's
+/// SessionEnd payload carries the common `transcript_path` (code.claude.com/docs/en/hooks,
+/// "SessionEnd input"), which only the Devin guard reads ([`is_devin_hook`]): the session id is
+/// all the queue needs. SessionEnd hooks share a 1.5 s budget, so it waits at most 1 s for the
+/// lock, skips the write when memory is off, and exits 0 silently on anything else.
 ///
 /// `--for codex|gemini|copilot|cursor` is the same hook for Codex (SessionEnd: default
 /// timeout 1 s, max 3 s), Gemini CLI (SessionEnd is not awaited), GitHub Copilot (its
 /// camelCase payload names the session `sessionId`) and Cursor (fire and forget), queued as
 /// `<agent>:<session_id>`. Cursor's also removes the conversation's injection marker
-/// ([`claim_cursor_injection`]). It needs no claim of its own when both the app's hook and the
-/// Cursor plugin's run: queuing a session again moves the same entry to the front
+/// ([`claim_hook_run`]). It needs no claim of its own when both the app's hook and the Cursor
+/// or Codex plugin's run: queuing a session again moves the same entry to the front
 /// (`knowledge::enqueue_distill_priority` replaces it), so the second run leaves one entry.
 fn cmd_session_end(args: &[String]) -> anyhow::Result<()> {
     let (_, agent) = hook_args(args)?;
     let Some(v) = read_hook_payload() else {
         return Ok(());
     };
-    if agent == HookAgent::Claude && is_cursor_payload(&v) {
+    // Neither a Cursor chat nor a Devin session is a Claude thread: queuing one as
+    // `claude:<id>` left an entry that never resolves (and Devin's runs no recall-error
+    // state to forget).
+    if agent == HookAgent::Claude && (is_cursor_payload(&v) || is_devin_hook(&v)) {
         return Ok(());
     }
     // The session is over, so its `recall-error` dedupe state has no further use. Before the
@@ -4211,8 +4299,10 @@ fn cmd_recall_now(_args: &[String]) -> anyhow::Result<()> {
         return Ok(());
     };
     // Cursor maps this UserPromptSubmit hook to beforeSubmitPrompt, whose output can only
-    // block the prompt, never add context (cursor.com/docs/hooks).
-    if is_cursor_payload(&v) {
+    // block the prompt, never add context (cursor.com/docs/hooks). Devin's payload has no
+    // `cwd`, so the lookup would search every project, and Devin documents only a JSON
+    // `additionalContext` reply, not this plain text ([`is_devin_hook`]).
+    if is_cursor_payload(&v) || is_devin_hook(&v) {
         return Ok(());
     }
     let prompt = v
@@ -4331,6 +4421,13 @@ thread_local! {
     /// real home folder (`tests::with_hook_io`).
     static HOOK_TEST_IO: std::cell::RefCell<Option<(serde_json::Value, std::path::PathBuf)>> =
         const { std::cell::RefCell::new(None) };
+    /// A test's stand-in for the hook process's `DEVIN_PROJECT_DIR` ([`devin_project_dir`]).
+    static HOOK_TEST_DEVIN_DIR: std::cell::RefCell<Option<std::ffi::OsString>> =
+        const { std::cell::RefCell::new(None) };
+    /// A test's stand-in for the hook process's Codex home ([`codex_plugin_on`]); None reads
+    /// as no plugin, so no test meets the developer's own `~/.codex/config.toml`.
+    static HOOK_TEST_CODEX_HOME: std::cell::RefCell<Option<std::path::PathBuf>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// A session id reduced to characters safe in a file name; empty when none are left.
@@ -4423,8 +4520,8 @@ fn recall_error(
 ) -> anyhow::Result<Option<ErrorRecall>> {
     // Cursor runs Claude's PostToolUse hooks as third-party hooks; like every Claude form,
     // this one stays out of Cursor sessions ([`is_cursor_payload`]), whose tool output and
-    // session ids it was never written for.
-    if is_cursor_payload(v) {
+    // session ids it was never written for, and out of Devin's ([`is_devin_hook`]).
+    if is_cursor_payload(v) || is_devin_hook(v) {
         return Ok(None);
     }
     let errors = issues::extract_errors(&hook_tool_output(v));
@@ -4583,12 +4680,14 @@ fn save_error_recall_state(
     }
 }
 
-/// The per-session hook state files [`prune_hook_state`] ages out, by suffix. `recall-now`'s
-/// `<session>.json` is not one of them: its name carries no suffix to tell it from others.
-const PRUNED_HOOK_STATE_SUFFIXES: [&str; 2] = [ERROR_RECALL_SUFFIX, CURSOR_HOOK_SUFFIX];
+/// The per-session hook state files [`prune_hook_state`] ages out, by what their names hold:
+/// `recall-error` state and the claims of Cursor's and Codex's hooks ([`hook_claim_marker`]).
+/// `recall-now`'s `<session>.json` is not one of them: its name carries nothing to tell it
+/// from others.
+const PRUNED_HOOK_STATE_SUFFIXES: [&str; 3] = [ERROR_RECALL_SUFFIX, ".cursor-hook", ".codex-"];
 
-/// Remove `recall-error` state files (and temp files a killed run left) and Cursor injection
-/// markers last written more than [`ERROR_RECALL_STATE_TTL`] before `now`.
+/// Remove `recall-error` state files (and temp files a killed run left) and hook claims last
+/// written more than [`ERROR_RECALL_STATE_TTL`] before `now`.
 fn prune_hook_state(dir: &std::path::Path, now: std::time::SystemTime) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -4618,48 +4717,144 @@ fn forget_error_recall(dir: &std::path::Path, session: &str) {
     }
 }
 
-/// Suffix of the marker `cal hook --for cursor` claims for a conversation, beside the other
-/// per-session hook state.
-const CURSOR_HOOK_SUFFIX: &str = ".cursor-hook";
-
-/// The conversation's injection marker in `dir`. None for an id with no file-safe characters.
-fn cursor_hook_marker(dir: &std::path::Path, session: &str) -> Option<std::path::PathBuf> {
-    let safe = safe_session_name(session);
-    (!safe.is_empty()).then(|| dir.join(format!("{safe}{CURSOR_HOOK_SUFFIX}")))
+/// The marker in `dir` a run of `agent`'s hook `event` claims for `session`:
+/// `<session>.<agent>-<event>`, which for Cursor's `hook` is the `<conversation>.cursor-hook`
+/// released builds wrote. None for an id with no file-safe characters.
+fn hook_claim_marker(
+    dir: &std::path::Path,
+    agent: HookAgent,
+    event: &str,
+    session: &str,
+) -> Option<std::path::PathBuf> {
+    let (safe, event) = (safe_session_name(session), safe_session_name(event));
+    (!safe.is_empty()).then(|| dir.join(format!("{safe}.{}-{event}", agent.session_prefix())))
 }
 
-/// Whether this run may inject memory into Cursor conversation `session`: false only when
-/// another run already claimed it. Cursor runs every matching hook from every source (the
-/// app's `~/.cursor/hooks.json` entry and the Callimachus Cursor plugin's, cursor.com/docs/hooks
-/// "Configuration"), so a user with both would get the memory twice. The claim is an atomic
-/// `create_new` of a marker file, so of two concurrent runs exactly one wins and the other
-/// prints nothing. Without an id there is nothing to key on, and an I/O error other than
-/// "already exists" also lets the run print: one injection too many beats none for the user
-/// who has only one of the two hooks. Old markers go with the 7-day [`prune_hook_state`], and
-/// `cal session-end --for cursor` removes the conversation's own.
-fn claim_cursor_injection(
+/// How long a Codex hook's claim holds ([`claim_hook_run`]). The payloads of the app's run and
+/// the plugin's run of one event are identical, so time is all that tells them apart. The two
+/// start together (Codex runs an event's handlers concurrently: hooks/src/engine/dispatcher.rs
+/// at rust-v0.167.0) and a run takes tens of milliseconds, each hook's own timeout being 10 s,
+/// so they claim a few seconds apart at most: 5 s, and no longer, because the claim is taken
+/// while the plugin is enabled in `config.toml` whether or not Codex runs its hooks (they stay
+/// untrusted until the user approves them). What it costs: a second clear or compaction of one
+/// session within 5 seconds injects nothing (and a compaction's snapshot is skipped). At 30 s
+/// that silenced a second compaction where the app's hook ran alone.
+const CODEX_CLAIM_LAPSE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Whether the user's Codex turns the Callimachus plugin on in `<CODEX_HOME>/config.toml` and
+/// has it installed ([`crate::integration::codex_plugin_managed`]), so that once its hooks are
+/// trusted Codex runs a second Callimachus hook for every event. Only then does a Codex hook
+/// claim its event ([`claim_hook_run`]): with the app's hooks alone each run acts as it always
+/// did, and none writes a claim. Both runs read the same files, so they agree on whether to
+/// claim. Codex's trust in the plugin's hooks is not read: until the user trusts them, the
+/// claim costs only a second clear or compaction within [`CODEX_CLAIM_LAPSE`].
+fn codex_plugin_on() -> bool {
+    #[cfg(test)]
+    {
+        HOOK_TEST_CODEX_HOME
+            .with(|h| h.borrow().clone())
+            .is_some_and(|home| crate::integration::codex_plugin_enabled_at(&home))
+    }
+    #[cfg(not(test))]
+    {
+        crate::integration::codex_plugin_managed()
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's stand-in for the other run of a Codex hook, run once between this run's look
+    /// at a lapsed claim and its taking it ([`claim_hook_run`]).
+    static HOOK_TEST_BEFORE_TAKE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Whether this run of `agent`'s hook `event` may act for `session`: false only when another
+/// run already claimed it. Cursor and Codex run every matching hook from every source (the
+/// app's hooks file and the Callimachus plugin's: cursor.com/docs/hooks "Configuration";
+/// `discover_handlers` in Codex's hooks/src/engine/discovery.rs at rust-v0.167.0 adds a
+/// plugin's trusted hooks to those of `hooks.json`), so a user with both would get the memory
+/// twice. The claim is an atomic `create_new` of a marker file, so of two concurrent runs
+/// exactly one wins and the other does nothing. Without an id there is nothing to key on, and
+/// an I/O error other than "already exists" also lets the run act: one injection too many
+/// beats none for the user who has only one of the two hooks.
+///
+/// Cursor's claim holds for the conversation, whose sessionStart fires once; `cal session-end
+/// --for cursor` removes it. Codex fires SessionStart again for `clear` and `compact` in one
+/// session, so its callers key the event by source, and its claim lapses after
+/// [`CODEX_CLAIM_LAPSE`]: an older marker is taken away and claimed afresh. Taking it is a
+/// rename to a name of this run's own, never a removal by name: between this run's look at
+/// the marker and its removal, the other run could replace it with a fresh claim of its own
+/// and act, and removing that one let both act. A rename moves one file to one run; a fresh
+/// claim taken that way goes back. Of the two runs Codex starts for an event (the app's hook
+/// and the plugin's) exactly one acts; a third concurrent run could still claim in the
+/// moment a fresh claim is away. Old markers go with the 7-day [`prune_hook_state`].
+fn claim_hook_run(
     dir: &std::path::Path,
+    agent: HookAgent,
+    event: &str,
     session: Option<&str>,
     now: std::time::SystemTime,
 ) -> bool {
-    let Some(marker) = session.and_then(|s| cursor_hook_marker(dir, s)) else {
+    let Some(marker) = session.and_then(|s| hook_claim_marker(dir, agent, event, s)) else {
         return true;
     };
     let _ = std::fs::create_dir_all(dir);
     prune_hook_state(dir, now);
-    match std::fs::OpenOptions::new()
+    let claim = || match std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&marker)
     {
         Ok(_) => true,
         Err(e) => e.kind() != std::io::ErrorKind::AlreadyExists,
+    };
+    // The gap either way: after the clock steps back, a marker written "in the future" would
+    // otherwise hold until the clock caught up with it.
+    let stale = |path: &std::path::Path| {
+        std::fs::metadata(path)
+            .and_then(|m| m.modified())
+            .is_ok_and(|at| {
+                let gap = now.duration_since(at).unwrap_or_else(|e| e.duration());
+                gap > CODEX_CLAIM_LAPSE
+            })
+    };
+    if claim() {
+        return true;
+    }
+    if agent != HookAgent::Codex || !stale(&marker) {
+        return false;
+    }
+    #[cfg(test)]
+    {
+        if let Some(other_run) = HOOK_TEST_BEFORE_TAKE.with(|f| f.borrow_mut().take()) {
+            other_run();
+        }
+    }
+    let mut taken = marker.clone().into_os_string();
+    taken.push(format!(".{}", std::process::id()));
+    let taken = std::path::PathBuf::from(taken);
+    // NotFound: the other run took the stale marker first, and the new claim decides. Any
+    // other error (a folder no longer writable) would leave the marker in place for both runs,
+    // so this one acts.
+    match std::fs::rename(&marker, &taken) {
+        Ok(()) if stale(&taken) => {
+            let _ = std::fs::remove_file(&taken);
+            claim()
+        }
+        // The other run's fresh claim: it acted.
+        Ok(()) => {
+            let _ = std::fs::rename(&taken, &marker);
+            false
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => claim(),
+        Err(_) => true,
     }
 }
 
 /// Drop a finished Cursor conversation's injection marker (`cal session-end --for cursor`).
 fn forget_cursor_injection(dir: &std::path::Path, session: &str) {
-    if let Some(p) = cursor_hook_marker(dir, session) {
+    if let Some(p) = hook_claim_marker(dir, HookAgent::Cursor, "hook", session) {
         let _ = std::fs::remove_file(p);
     }
 }
@@ -6223,6 +6418,22 @@ mod tests {
                 .is_none(),
             "Cursor's third-party run of the Claude hook stays silent"
         );
+        // The same payload (no transcript_path, like every Devin one) with Devin's variable
+        // set: a session that would hear the playbook stays silent.
+        assert!(
+            with_devin_env(Some("/Users/me/repo"), || recall_error(
+                &payload(Some("s-devin")),
+                &index,
+                &state,
+                now
+            ))
+            .unwrap()
+            .is_none(),
+            "Devin's run of the Claude hook stays silent"
+        );
+        assert!(recall_error(&payload(Some("s-devin")), &index, &state, now)
+            .unwrap()
+            .is_some());
         assert!(recall_error(&payload(None), &index, &state, now)
             .unwrap()
             .is_none());
@@ -7384,29 +7595,163 @@ mod tests {
         assert_eq!(q.matches("\"cursor:cur-1\"").count(), 1, "{q}");
     }
 
-    /// `cal hook --for cursor` injects at most once per conversation when both the app's hook
-    /// and the Cursor plugin's run: the first claim wins (also under a race), a second run in
-    /// that conversation is silent, another conversation and a payload without an id still
-    /// inject, `session-end` frees the claim, and a week-old marker is pruned on a later claim.
+    /// Run `f` as a hook process whose environment holds `DEVIN_PROJECT_DIR=dir` (None:
+    /// unset), on this thread only: the process environment is shared by every test.
+    fn with_devin_env<R>(dir: Option<&str>, f: impl FnOnce() -> R) -> R {
+        let previous = HOOK_TEST_DEVIN_DIR.with(|d| d.replace(dir.map(std::ffi::OsString::from)));
+        let out = f();
+        HOOK_TEST_DEVIN_DIR.with(|d| *d.borrow_mut() = previous);
+        out
+    }
+
+    /// Devin CLI's payloads, from its documented examples and field lists
+    /// (docs.devin.ai/cli/extensibility/hooks/overview.md and lifecycle-hooks.md, read
+    /// 2026-11-10): `hook_event_name` and `session_id` always, `prompt_id` from the first
+    /// prompt on (none at SessionStart), the event's own fields, and never a `cwd` or a
+    /// `transcript_path`.
+    fn devin_payloads() -> [serde_json::Value; 4] {
+        let session = "3f8d1c2a-5b6e-4c7d-8e9f-0a1b2c3d4e5f";
+        [
+            serde_json::json!({
+                "hook_event_name": "SessionStart", "source": "startup", "session_id": session,
+            }),
+            serde_json::json!({
+                "hook_event_name": "UserPromptSubmit", "session_id": session,
+                "prompt_id": "prompt-1", "prompt": "rename the settings loader and its tests",
+            }),
+            serde_json::json!({
+                "hook_event_name": "PostToolUse", "session_id": session, "prompt_id": "prompt-1",
+                "tool_name": "exec", "tool_input": {},
+                "tool_response": { "success": false, "output": "", "error": "exit status 101" },
+            }),
+            serde_json::json!({
+                "hook_event_name": "SessionEnd", "session_id": session, "prompt_id": "prompt-2",
+                "reason": "other",
+            }),
+        ]
+    }
+
+    /// Only the variable AND a payload without a transcript mark a Devin run: a Claude Code
+    /// payload always names its transcript, so a `DEVIN_PROJECT_DIR` leaked into a Claude
+    /// Code process changes nothing.
     #[test]
-    fn cursor_hook_injects_once_per_conversation() {
-        let dir = temp_dir("cursor_hook_claim").join(".callimachus/recall");
+    fn devin_hooks_need_the_variable_and_no_transcript() {
+        assert_eq!(DEVIN_PROJECT_DIR, "DEVIN_PROJECT_DIR");
+        let dir = Some(std::ffi::OsStr::new("/Users/me/repo"));
+        for v in devin_payloads() {
+            assert!(is_devin_hook_with(&v, dir), "{v}");
+            assert!(!is_devin_hook_with(&v, None), "unset: not Devin: {v}");
+            assert!(!is_devin_hook_with(&v, Some(std::ffi::OsStr::new(""))));
+            assert!(!is_cursor_payload(&v));
+        }
+        let claude = serde_json::json!({
+            "hook_event_name": "SessionEnd", "session_id": "abc-123", "reason": "exit",
+            "cwd": "/Users/me/repo",
+            "transcript_path": "/Users/me/.claude/projects/-Users-me-repo/abc-123.jsonl",
+        });
+        assert!(!is_devin_hook_with(&claude, dir));
+        for empty in [serde_json::json!(null), serde_json::json!("")] {
+            let mut v = claude.clone();
+            v["transcript_path"] = empty;
+            assert!(is_devin_hook_with(&v, dir), "no usable transcript: {v}");
+        }
+        // The test seam: nothing set on this thread reads as unset, whatever the real
+        // environment of the test process holds.
+        assert_eq!(devin_project_dir(), None);
+        assert!(!is_devin_hook(&devin_payloads()[3]));
+        with_devin_env(Some("/Users/me/repo"), || {
+            assert!(is_devin_hook(&devin_payloads()[3]))
+        });
+    }
+
+    /// Under Devin the Claude forms of `session-end`, `snapshot-hook`, `recall-now` and
+    /// `recall-error` stop before the index: Devin's SessionEnd queues no `claude:<devin id>`
+    /// entry and nothing is written. Without the variable the same SessionEnd queues as it
+    /// always did, and a Claude Code payload is queued even with the variable leaked.
+    #[test]
+    fn claude_hooks_stay_silent_under_devin() {
+        let home = db::test_support::TestDir::new("devin_hooks");
+        let index: &std::path::Path = &home;
+        {
+            let conn = db::open(index).unwrap();
+            knowledge::app_config::put_flag(&conn, "knowledge.enabled", true).unwrap();
+            knowledge::set_auto_distill(&conn, true).unwrap();
+        }
+        let recall = index.with_file_name("recall");
+        let queue = || {
+            let conn = db::open_readonly(index).unwrap();
+            knowledge::app_config::get(&conn, knowledge::priority::PRIORITY_KEY).unwrap()
+        };
+        let [_, prompt, tool, end] = devin_payloads();
+        // Devin's PreCompact payload is not documented (only the v3000.11.92 changelog line
+        // adding the event); this is its common fields.
+        let compact = serde_json::json!({
+            "hook_event_name": "PreCompact", "session_id": end["session_id"].clone(),
+            "prompt_id": "prompt-2", "trigger": "auto",
+        });
+        db::test_support::with_default_index(index, || {
+            let before = index_fingerprint(index);
+            with_devin_env(Some("/Users/me/repo"), || {
+                for (payload, cmd) in [
+                    (&end, "session-end"),
+                    (&compact, "snapshot-hook"),
+                    (&prompt, "recall-now"),
+                    (&tool, "recall-error"),
+                ] {
+                    with_hook_io(payload.clone(), &recall, || run(&argv(&[cmd])))
+                        .unwrap_or_else(|e| panic!("{cmd}: {e:#}"));
+                }
+            });
+            assert_eq!(queue(), None, "no claude:<devin id> entry");
+            assert_eq!(index_fingerprint(index), before, "nothing written");
+
+            with_hook_io(end.clone(), &recall, || run(&argv(&["session-end"]))).unwrap();
+            let q = queue().unwrap();
+            assert!(
+                q.contains("\"claude:3f8d1c2a-5b6e-4c7d-8e9f-0a1b2c3d4e5f\""),
+                "without the variable: as before: {q}"
+            );
+
+            let claude = serde_json::json!({
+                "hook_event_name": "SessionEnd", "session_id": "claude-1", "reason": "exit",
+                "transcript_path": "/Users/me/.claude/projects/-Users-me-repo/claude-1.jsonl",
+            });
+            with_devin_env(Some("/Users/me/repo"), || {
+                with_hook_io(claude, &recall, || run(&argv(&["session-end"])))
+            })
+            .unwrap();
+            let q = queue().unwrap();
+            assert!(q.contains("\"claude:claude-1\""), "a leaked variable: {q}");
+        });
+    }
+
+    /// When both the app's hook and the plugin's run, one run acts. Cursor: the first claim of
+    /// a conversation wins (also under a race) for good, another conversation and a payload
+    /// without an id still inject, `session-end` frees the claim, and a week-old marker is
+    /// pruned on a later claim. Codex: the claim is per event (SessionStart's source,
+    /// PreCompact) and lapses after 5 s, so the session's next compaction acts again.
+    #[test]
+    fn hook_claims_let_one_run_act() {
+        let dir = temp_dir("hook_claim").join(".callimachus/recall");
         let now = std::time::SystemTime::now();
-        assert!(claim_cursor_injection(&dir, Some("conv-1"), now));
-        assert!(!claim_cursor_injection(&dir, Some("conv-1"), now));
-        assert!(claim_cursor_injection(&dir, Some("conv-2"), now));
-        assert!(claim_cursor_injection(&dir, None, now));
-        assert!(claim_cursor_injection(&dir, None, now));
+        let cursor = |id: Option<&str>, at: std::time::SystemTime| {
+            claim_hook_run(&dir, HookAgent::Cursor, "hook", id, at)
+        };
+        assert!(cursor(Some("conv-1"), now));
+        assert!(!cursor(Some("conv-1"), now));
+        assert!(cursor(Some("conv-2"), now));
+        assert!(cursor(None, now));
+        assert!(cursor(None, now));
         // An id with no file-safe characters has no marker to claim.
-        assert!(claim_cursor_injection(&dir, Some("///"), now));
-        assert!(claim_cursor_injection(&dir, Some("///"), now));
+        assert!(cursor(Some("///"), now));
+        assert!(cursor(Some("///"), now));
         assert!(dir.join("conv-1.cursor-hook").is_file());
 
-        let race = |id: &'static str| {
+        let race = |agent: HookAgent, event: &'static str, id: &'static str| {
             let handles: Vec<_> = (0..8)
                 .map(|_| {
                     let dir = dir.clone();
-                    std::thread::spawn(move || claim_cursor_injection(&dir, Some(id), now))
+                    std::thread::spawn(move || claim_hook_run(&dir, agent, event, Some(id), now))
                 })
                 .collect();
             handles
@@ -7415,7 +7760,8 @@ mod tests {
                 .filter(|won| *won)
                 .count()
         };
-        assert_eq!(race("conv-race"), 1, "exactly one concurrent run injects");
+        assert_eq!(race(HookAgent::Cursor, "hook", "conv-race"), 1);
+        assert_eq!(race(HookAgent::Codex, "hook-startup", "s-race"), 1);
 
         // Cursor names the conversation `session_id` at sessionStart; `conversation_id` too.
         let payload = serde_json::json!({ "conversation_id": "conv-3", "cursor_version": "2" });
@@ -7423,18 +7769,250 @@ mod tests {
         let payload = serde_json::json!({ "session_id": "s", "conversation_id": "c" });
         assert_eq!(cursor_conversation_id(&payload), Some("s"));
 
+        let sid = "019a2b3c-4d5e-7f60-8a1b-2c3d4e5f6a7b";
+        let codex = |event: &str, at: std::time::SystemTime| {
+            claim_hook_run(&dir, HookAgent::Codex, event, Some(sid), at)
+        };
+        let moments = std::time::Duration::from_secs(2);
+        let lapsed = CODEX_CLAIM_LAPSE + std::time::Duration::from_secs(1);
+        assert!(codex("hook-startup", now));
+        assert!(
+            !codex("hook-startup", now + moments),
+            "the other source's run"
+        );
+        assert!(codex("hook-compact", now), "another event of the session");
+        assert!(codex("snapshot-hook", now));
+        assert!(codex("hook-compact", now + lapsed), "the next compaction");
+        assert!(!codex("hook-compact", now), "and its other run");
+        // A second compaction 10 s after the first acts: the claim spans the two sources' runs
+        // of one event, not the session's next event (it held for 30 s, where the plugin's
+        // untrusted hooks left the app's alone and silent).
+        let ten = std::time::Duration::from_secs(10);
+        assert!(codex("snapshot-hook", now + ten), "a second compaction");
+        assert!(dir.join(format!("{sid}.codex-hook-startup")).is_file());
+        // After the clock steps back, a marker from "the future" lapses all the same.
+        assert!(codex("hook-clear", now));
+        assert!(!codex("hook-clear", now - moments));
+        assert!(codex("hook-clear", now - lapsed), "the clock stepped back");
+        // A stale marker this run cannot remove (the folder is no longer writable) lets it
+        // act instead of silencing both runs.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |m: u32| {
+                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(m)).unwrap()
+            };
+            mode(0o555);
+            let acted = codex("snapshot-hook", now + lapsed);
+            mode(0o755);
+            assert!(acted, "a stale claim that stays in place");
+        }
+        assert!(
+            !cursor(Some("conv-1"), now + lapsed),
+            "Cursor's claim does not lapse"
+        );
+
         forget_cursor_injection(&dir, "conv-1");
         assert!(!dir.join("conv-1.cursor-hook").exists());
-        assert!(claim_cursor_injection(&dir, Some("conv-1"), now));
+        assert!(cursor(Some("conv-1"), now));
 
         let later = now + ERROR_RECALL_STATE_TTL + std::time::Duration::from_secs(60);
-        assert!(claim_cursor_injection(&dir, Some("conv-4"), later));
-        assert!(
-            !dir.join("conv-2.cursor-hook").exists(),
-            "a week-old marker is pruned"
-        );
+        assert!(cursor(Some("conv-4"), later));
+        for pruned in [
+            "conv-2.cursor-hook".to_string(),
+            format!("{sid}.codex-hook-startup"),
+        ] {
+            assert!(!dir.join(pruned).exists(), "a week-old marker is pruned");
+        }
         assert!(dir.join("conv-4.cursor-hook").is_file());
         let _ = std::fs::remove_dir_all(dir.parent().unwrap().parent().unwrap());
+    }
+
+    /// Two runs of one Codex event that both find a lapsed claim: one acts. Here the other run
+    /// takes the lapsed claim and claims afresh between this run's look at it and its own
+    /// taking it, the interleaving Codex's concurrent handlers allow. Removing the lapsed
+    /// marker by name deleted that fresh claim instead, and both runs acted.
+    #[test]
+    fn a_lapsed_codex_claim_goes_to_one_run() {
+        let root = temp_dir("hook_claim_lapsed");
+        let dir = root.join(".callimachus/recall");
+        std::fs::create_dir_all(&dir).unwrap();
+        let sid = "019a2b3c-4d5e-7f60-8a1b-2c3d4e5f6a7b";
+        let marker = hook_claim_marker(&dir, HookAgent::Codex, "hook-compact", sid).unwrap();
+        let now = std::time::SystemTime::now();
+        std::fs::File::create(&marker)
+            .unwrap()
+            .set_modified(now - 2 * CODEX_CLAIM_LAPSE)
+            .unwrap();
+        let other = std::rc::Rc::new(std::cell::Cell::new(None));
+        let (d, o) = (dir.clone(), other.clone());
+        HOOK_TEST_BEFORE_TAKE.with(|f| {
+            *f.borrow_mut() = Some(Box::new(move || {
+                o.set(Some(claim_hook_run(
+                    &d,
+                    HookAgent::Codex,
+                    "hook-compact",
+                    Some(sid),
+                    now,
+                )))
+            }))
+        });
+        let this = claim_hook_run(&dir, HookAgent::Codex, "hook-compact", Some(sid), now);
+        assert_eq!(
+            other.get(),
+            Some(true),
+            "the other run takes the lapsed claim"
+        );
+        assert!(!this, "this one stays silent");
+        assert!(marker.is_file(), "the fresh claim stays");
+        assert!(!claim_hook_run(
+            &dir,
+            HookAgent::Codex,
+            "hook-compact",
+            Some(sid),
+            now
+        ));
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            names,
+            [marker.file_name().unwrap()],
+            "nothing else left behind"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Run `f` as a hook process whose Codex home is `home` ([`codex_plugin_on`]), on this
+    /// thread only.
+    fn with_codex_home<R>(home: &std::path::Path, f: impl FnOnce() -> R) -> R {
+        let previous = HOOK_TEST_CODEX_HOME.with(|h| h.replace(Some(home.to_path_buf())));
+        let out = f();
+        HOOK_TEST_CODEX_HOME.with(|h| *h.borrow_mut() = previous);
+        out
+    }
+
+    /// Without the Codex plugin every run of a Codex hook acts, as before the plugin existed:
+    /// the stdout bytes `cal hook --for codex` printed then, a fresh rolling snapshot each time,
+    /// and no claim written. Once the plugin is installed and on, Codex runs the app's hook
+    /// and the plugin's (trusted) one for every event: the first run does what a single run
+    /// always did, and the other source's run moments later prints nothing and leaves the first
+    /// snapshot alone (it used to build and write it again); `session-end`'s leaves the one
+    /// queue entry it always left. A compaction later in the session injects again.
+    #[test]
+    fn codex_hooks_act_once_when_both_sources_run() {
+        let home = db::test_support::TestDir::new("codex_twice");
+        let index: &std::path::Path = &home;
+        let recall = index.with_file_name("recall");
+        let codex_home = index.with_file_name("codex");
+        std::fs::create_dir_all(&codex_home).unwrap();
+        let session = "019a2b3c-4d5e-7f60-8a1b-2c3d4e5f6a7b";
+        let project = knowledge::project_key(HOOK_PROJ);
+        let tid = {
+            let mut conn = db::open(index).unwrap();
+            knowledge::app_config::put_flag(&conn, "knowledge.enabled", true).unwrap();
+            knowledge::set_auto_distill(&conn, true).unwrap();
+            let tid = dts::session(&mut conn, session, &project, "Ship it", 600, &["tag it"]);
+            let codex = crate::indexer::source_id(&conn, "codex").unwrap();
+            conn.execute(
+                "UPDATE threads SET source_id = ?1 WHERE id = ?2",
+                [codex, tid],
+            )
+            .unwrap();
+            dts::fact(&conn, tid, "decision", "Release from main only", "llm");
+            tid
+        };
+        // Codex's payloads: session_id, transcript_path (null here), cwd, hook_event_name and
+        // model, plus each event's own field (developers.openai.com/codex/hooks).
+        let payload = |event: &str, key: &str, value: &str| {
+            serde_json::json!({
+                "session_id": session, "transcript_path": null, "cwd": project,
+                "hook_event_name": event, "model": "gpt-5", key: value,
+            })
+        };
+        let start = |source: &str| payload("SessionStart", "source", source);
+        let o = parse(&[]).unwrap();
+        let snapshot = || -> (i64, Option<i64>) {
+            let sql = "SELECT COUNT(*), MAX(id) FROM snapshots WHERE thread_id = ?1";
+            let conn = db::open_readonly(index).unwrap();
+            conn.query_row(sql, [tid], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+        };
+        db::test_support::with_default_index(index, || {
+            let hook = |v: serde_json::Value| {
+                with_hook_io(v.clone(), &recall, || {
+                    session_start_stdout(&o, HookAgent::Codex, Some(&v)).unwrap()
+                })
+            };
+            let cwd = std::path::PathBuf::from(&project);
+            let before = |source: &str| {
+                let mut req = hook_req(source);
+                (req.agent, req.cwd, req.project) = (HookAgent::Codex, &cwd, &project);
+                let text = printed(hook_outcome(&req, index).unwrap());
+                hook_stdout(HookAgent::Codex, &crate::context::strip_controls(&text))
+            };
+            let compact = payload("PreCompact", "trigger", "auto");
+            let end = payload("SessionEnd", "reason", "exit");
+            let run_hook = |v: &serde_json::Value, cmd: &str| {
+                with_hook_io(v.clone(), &recall, || run(&argv(&[cmd, "--for", "codex"]))).unwrap()
+            };
+
+            // The app's hooks alone, and a config.toml without the plugin: nothing claims.
+            std::fs::write(codex_home.join("config.toml"), "model = \"gpt-5\"\n").unwrap();
+            with_codex_home(&codex_home, || {
+                for source in ["startup", "startup", "compact", "compact"] {
+                    assert_eq!(hook(start(source)), Some(before(source)), "{source}");
+                }
+                run_hook(&compact, "snapshot-hook");
+                let first = snapshot();
+                run_hook(&compact, "snapshot-hook");
+                let second = snapshot();
+                assert_eq!((first.0, second.0), (1, 1), "one rolling snapshot");
+                assert_ne!(second.1, first.1, "each run writes it afresh");
+            });
+            let claims = || {
+                std::fs::read_dir(&recall).map_or(0, |d| {
+                    d.flatten()
+                        .filter(|e| e.file_name().to_string_lossy().contains(".codex-"))
+                        .count()
+                })
+            };
+            assert_eq!(claims(), 0, "no claim is written without the plugin");
+
+            std::fs::write(
+                codex_home.join("config.toml"),
+                "[plugins.\"callimachus@callimachus\"]\nenabled = true\n",
+            )
+            .unwrap();
+            // Installed by Codex: <CODEX_HOME>/plugins/cache/<marketplace>/<plugin>/<version>/.
+            let package = codex_home.join("plugins/cache/callimachus/callimachus/0.12.0");
+            std::fs::create_dir_all(package.join(".codex-plugin")).unwrap();
+            std::fs::write(package.join(".codex-plugin/plugin.json"), "{}").unwrap();
+            with_codex_home(&codex_home, || {
+                assert_eq!(hook(start("startup")), Some(before("startup")));
+                assert_eq!(hook(start("startup")), None, "the other source's run");
+                assert_eq!(hook(start("compact")), Some(before("compact")));
+                assert_eq!(hook(start("compact")), None);
+
+                let earlier = snapshot();
+                run_hook(&compact, "snapshot-hook");
+                let first = snapshot();
+                assert_eq!(first.0, 1);
+                assert_ne!(first.1, earlier.1, "the first run snapshots");
+                run_hook(&compact, "snapshot-hook");
+                assert_eq!(snapshot(), first, "the second leaves it as it was");
+            });
+            assert_eq!(claims(), 3, "startup, compact and the snapshot");
+            for _ in 0..2 {
+                run_hook(&end, "session-end");
+            }
+            let conn = db::open_readonly(index).unwrap();
+            let q = knowledge::app_config::get(&conn, knowledge::priority::PRIORITY_KEY)
+                .unwrap()
+                .unwrap();
+            assert_eq!(q.matches(&format!("\"codex:{session}\"")).count(), 1, "{q}");
+        });
     }
 
     /// `--for` picks the protocol; an unknown agent is an error (a hook swallows it, so

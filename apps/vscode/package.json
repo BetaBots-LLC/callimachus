@@ -81,6 +81,12 @@
         "icon": "$(refresh)"
       },
       {
+        "command": "callimachus.refreshMemory",
+        "title": "Refresh Memory",
+        "category": "Callimachus",
+        "icon": "$(refresh)"
+      },
+      {
         "command": "callimachus.whyLine",
         "title": "Why This Line",
         "category": "Callimachus"
@@ -111,9 +117,50 @@
           "id": "callimachus.sidebar",
           "name": "History",
           "type": "webview"
+        },
+        {
+          "id": "callimachus.memory",
+          "name": "Memory"
         }
       ]
     },
+    "viewsWelcome": [
+      {
+        "view": "callimachus.memory",
+        "contents": "Open a folder to see what Callimachus remembers about its project: the decisions, gotchas and open TODOs of your past agent sessions there.",
+        "when": "callimachus.memoryState == noFolder"
+      },
+      {
+        "view": "callimachus.memory",
+        "contents": "The Callimachus cal CLI wasn't found. It comes with the Callimachus desktop app.\n[Download Callimachus](https://callimachus.app/download)\nIf cal is installed somewhere else, set callimachus.calPath in Settings, then refresh.\n[Refresh](command:callimachus.refreshMemory)",
+        "when": "callimachus.memoryState == missing"
+      },
+      {
+        "view": "callimachus.memory",
+        "contents": "There is no Callimachus index on this machine yet. Open the Callimachus app once to index your AI agent history, then refresh.\n[Download Callimachus](https://callimachus.app/download)\n[Refresh](command:callimachus.refreshMemory)",
+        "when": "callimachus.memoryState == noIndex"
+      },
+      {
+        "view": "callimachus.memory",
+        "contents": "The index is busy: an upgrade or a large cleanup may be running in the Callimachus app. Try again in a moment.\n[Refresh](command:callimachus.refreshMemory)",
+        "when": "callimachus.memoryState == busy"
+      },
+      {
+        "view": "callimachus.memory",
+        "contents": "The index is older than this cal, so it can't read the project's memory yet. Open the Callimachus app once to upgrade the index, then refresh.\n[Refresh](command:callimachus.refreshMemory)",
+        "when": "callimachus.memoryState == schemaBehind"
+      },
+      {
+        "view": "callimachus.memory",
+        "contents": "A restore of the index was interrupted before it finished, so cal won't open the index until the restore is done. Open the Callimachus app, which offers to finish it, then refresh.\n[Refresh](command:callimachus.refreshMemory)",
+        "when": "callimachus.memoryState == restoreInterrupted"
+      },
+      {
+        "view": "callimachus.memory",
+        "contents": "Nothing remembered for this folder's project yet. Its decisions, gotchas and open TODOs appear here once the Callimachus app has distilled sessions from it.\n[Refresh](command:callimachus.refreshMemory)",
+        "when": "callimachus.memoryState == empty"
+      }
+    ],
     "menus": {
       "editor/context": [
         {
@@ -136,6 +183,11 @@
         {
           "command": "callimachus.refreshRecent",
           "when": "view == callimachus.sidebar",
+          "group": "navigation"
+        },
+        {
+          "command": "callimachus.refreshMemory",
+          "when": "view == callimachus.memory",
           "group": "navigation"
         }
       ]
@@ -204,6 +256,7 @@
     "watch:webview": "vite build --watch --config vite.webview.config.ts",
     "watch": "pnpm run watch:webview & pnpm run watch:host",
     "typecheck": "tsc --noEmit -p ./ && tsc --noEmit -p tsconfig.webview.json",
+    "test": "pnpm run build:host && node --test test/*.test.mjs",
     "clean": "rm -rf dist media/webview.js media/webview.css media/assets",
     "vscode:prepublish": "pnpm run build",
     "package": "vsce package --no-dependencies -o callimachus-vscode.vsix",

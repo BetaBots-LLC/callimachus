@@ -1339,12 +1339,21 @@ pub fn set_file_state(
 /// a lock, falls back to an immutable open (ignores any hot WAL — we may miss the
 /// very latest uncommitted rows, which is fine for indexing).
 pub fn open_external_readonly(path: &Path) -> Result<Connection> {
+    open_external_readonly_mode(path).map(|(conn, _)| conn)
+}
+
+/// [`open_external_readonly`], also saying whether it took the `immutable=1` fallback
+/// (`true`). Such a connection reads the main file only: rows still in the `-wal` are
+/// invisible to it, so a WAL-mode source that records its file stamp after that pass would
+/// skip those rows until the file next changes (OpenCode, whose new turns sit in
+/// `opencode.db-wal` until a checkpoint).
+pub fn open_external_readonly_mode(path: &Path) -> Result<(Connection, bool)> {
     let ro = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI;
     if let Ok(conn) = Connection::open_with_flags(path, ro) {
         // A trivial query forces SQLite to actually touch the file now, so a lock
         // surfaces here (and we can fall back) rather than mid-scan.
         if conn.query_row("SELECT 1", [], |_| Ok(())).is_ok() {
-            return Ok(conn);
+            return Ok((conn, false));
         }
     }
     // Immutable fallback: file:<path>?immutable=1
@@ -1354,7 +1363,7 @@ pub fn open_external_readonly(path: &Path) -> Result<Connection> {
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
     )
     .with_context(|| format!("opening {} read-only", path.display()))?;
-    Ok(conn)
+    Ok((conn, true))
 }
 
 /// Read-only change check for a single-file source (Cursor/Goose DBs). Returns

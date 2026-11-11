@@ -20,6 +20,12 @@ Click the **Callimachus** icon in the Activity Bar to open the **History** panel
 
 Pick any result to open its full transcript as a rich tab, with one-click **Insert**, **Copy**, **Export**, and **Open in CLI** actions. Hover a row in the sidebar to insert or copy without opening it. **Export** writes a markdown note to your `callimachus.vaultPath` (or, if that's unset, opens it as an untitled document), and **Open in CLI** seeds the `callimachus.openCommand` agent with the thread's context.
 
+## Memory
+
+Below **History**, the **Memory** view lists what Callimachus remembers about the open folder's project: its **Decisions**, **Gotchas** and **Open TODOs**, the facts `cal memory` prints in that folder (a git worktree shows its main repository's memory), and its **Recurring errors** from `cal issues`, each with the commit that fixed it and its playbook once one is known. A fact shows when it was decided and which agent's session it came from, with an icon when it is pinned, disputed or flagged as stale or wrong; click a fact, an error or its fix to open the session it came from. Each group lists up to 40 facts, pinned ones first, then the newest, and its count reads `40+` when there may be more. The errors are mined when you expand that group, which can take several seconds on a large index. They need no distilling, so the group is there even before the project has any decisions. `cal issues` matches projects by path, so for `/work/app` the group also lists the errors of `/work/app-web` and of any repository inside that folder; it cannot tell them apart. In your home folder, a folder above it or a filesystem root, which hold every project, the view lists no recurring errors.
+
+The view only reads: pin, edit or hide facts in the desktop app. It shows the first workspace folder's project and asks again when you press its **Refresh** button (it does not watch files). When `cal` can't read the index (no `cal`, no index yet, the index is busy, older than your `cal`, or halfway through a restore) the view says what to do in the app instead.
+
 ## Ambient Recall
 
 The sidebar can also work *without* you searching. With **Ambient Recall** on, it watches what you're looking at — the current selection, the symbol under the cursor, or the nearest error — and surfaces past threads related to it (via `cal related`), so prior context finds you instead of the other way around. Toggle it with the **Callimachus: Toggle Ambient Recall** command or the `callimachus.ambientRecall` setting; tune its timing and volume with the `ambientRecall*` settings below.
@@ -42,6 +48,7 @@ It costs one background `cal why` per file version: asked when the file is shown
 | **Callimachus: Copy Thread Context** | Copy a thread's packed transcript to the clipboard. |
 | **Callimachus: Why This Line** | Show, in the sidebar, the commit that last changed the line under the cursor (`git blame`), the sessions that produced it, and their decisions and gotchas. Also in the editor's right-click menu. Uses `cal why`, so it needs a Callimachus that has it. |
 | **Callimachus: Toggle Ambient Recall** | Turn the sidebar's ambient-recall section on or off. |
+| **Callimachus: Refresh Memory** | Read the Memory view's project memory again (also its title-bar button). |
 
 There's also a **status-bar** button (`$(history) Callimachus`) that opens search.
 
@@ -63,6 +70,7 @@ There's also a **status-bar** button (`$(history) Callimachus`) that opens searc
 ```bash
 pnpm install          # from the monorepo root (pulls @types/vscode etc.)
 pnpm --filter callimachus-vscode build
+pnpm --filter callimachus-vscode test      # node --test over the vscode-free modules (calCore, memoryModel)
 # then press F5 in VS Code to launch an Extension Development Host
 pnpm --filter callimachus-vscode package   # build a .vsix with @vscode/vsce
 ```

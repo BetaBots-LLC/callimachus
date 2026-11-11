@@ -2,13 +2,15 @@
 // editor shares the exact same local index as the desktop app and MCP server.
 //
 // The primary UI is a React webview: a search/recent/stats sidebar in the
-// Callimachus Activity Bar container, and per-thread transcript tabs. The
+// Callimachus Activity Bar container, and per-thread transcript tabs. Below it, the
+// Memory tree view (./memoryView) lists the open folder's project memory. The
 // QuickPick commands below remain as Command Palette fallbacks.
 
 import * as vscode from "vscode";
 import { recentThreads, searchHits, showCalSetupPrompt, stripMarks } from "./cal";
 import { copyThreadById, insertThreadById } from "./actions";
 import { openThreadPanel } from "./threadPanel";
+import { MemoryView } from "./memoryView";
 import { SidebarProvider } from "./sidebarProvider";
 import { WhyGutter } from "./whyGutter";
 import type { SearchHit } from "./protocol";
@@ -170,6 +172,7 @@ function guard<A extends unknown[]>(
 export function activate(context: vscode.ExtensionContext): void {
   const { extensionUri } = context;
   const sidebar = new SidebarProvider(extensionUri);
+  const memory = new MemoryView();
 
   const status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 0);
   status.text = "$(history) Callimachus";
@@ -221,9 +224,11 @@ export function activate(context: vscode.ExtensionContext): void {
       guard((file: unknown, line: unknown) => whyLineAt(sidebar, file, line)),
     ),
     vscode.commands.registerCommand("callimachus.refreshRecent", () => sidebar.refresh()),
+    vscode.commands.registerCommand("callimachus.refreshMemory", () => memory.refresh()),
     vscode.commands.registerCommand(
       "callimachus.openThread",
-      guard((id: number) => openThreadPanel(extensionUri, id)),
+      // The Memory view passes the session's title too, for the tab.
+      guard((id: number, title?: string | null) => openThreadPanel(extensionUri, id, title)),
     ),
     vscode.commands.registerCommand("callimachus.toggleAmbientRecall", async () => {
       const cfg = vscode.workspace.getConfiguration("callimachus");
@@ -237,6 +242,7 @@ export function activate(context: vscode.ExtensionContext): void {
     }),
     // The provider owns the editor watcher; dispose it on shutdown.
     sidebar,
+    memory,
     // Gutter marks and hovers on lines a session wrote (callimachus.whyGutter / whyHover).
     new WhyGutter(extensionUri),
   );

@@ -571,6 +571,58 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// An OpenCode session stored without usage is re-read from `session_v2` when the DB holds
+    /// it there (on a DB with no V1 tables at all), and its per-step usage lands on its rows.
+    #[test]
+    fn opencode_v2_sessions_get_their_usage() {
+        use super::opencode::fixture::*;
+        let dir = scratch("oc_v2");
+        let db = db_at(&dir);
+        let oc = dir.join("opencode.db");
+        {
+            let c = Connection::open(&oc).unwrap();
+            c.execute_batch(V2_DDL).unwrap();
+            c.execute_batch(PARTS_DDL).unwrap();
+            session(&c, "ses_x", Some("V2"), None, None);
+            message(&c, "msg_1", "ses_x", 0, "user", user("hello v2"));
+            let step = assistant(serde_json::json!([]), Some(tokens(11, 3, 0, 0, 0)));
+            message(&c, "msg_2", "ses_x", 1, "assistant", step);
+            part(
+                &c,
+                "msg_2",
+                "ses_x",
+                0,
+                serde_json::json!({"type": "text", "text": "hi from v2"}),
+            );
+        }
+        {
+            let mut conn = db.0.lock().unwrap();
+            store_old(
+                &mut conn,
+                opencode::KIND,
+                "ses_x",
+                &oc,
+                vec![
+                    msg("user", "hello v2", None),
+                    msg("assistant", "hi from v2", None),
+                ],
+            );
+        }
+        let roots = Roots {
+            gemini: None,
+            qwen: None,
+        };
+        let r = backfill_usage(&db, &|| false, &roots).unwrap();
+        assert_eq!((r.threads, r.filled, r.missed), (1, 1, 0));
+        let conn = db.0.lock().unwrap();
+        assert_eq!(
+            usage_rows(&conn, "ses_x"),
+            vec![(1, "claude-sonnet-4-5".into(), 11)]
+        );
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Runs once: the flag set, a later call is a no-op; a fresh index is marked done.
     #[test]
     fn runs_once_and_a_fresh_index_skips_it() {

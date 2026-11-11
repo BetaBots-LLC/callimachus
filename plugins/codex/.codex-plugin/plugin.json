@@ -1,0 +1,30 @@
+{
+  "name": "callimachus",
+  "version": "0.12.2",
+  "description": "Recall your past AI coding sessions from a local index: the recall skill, the Callimachus MCP server, and hooks that inject each repo's memory when a Codex session starts, snapshot the session before compaction and queue it for distillation when it ends.",
+  "author": {
+    "name": "Ari Shaller",
+    "url": "https://callimachus.app"
+  },
+  "homepage": "https://callimachus.app",
+  "repository": "https://github.com/BetaBots-LLC/callimachus",
+  "license": "AGPL-3.0-or-later",
+  "keywords": ["memory", "recall", "history", "search", "mcp", "agents"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Callimachus",
+    "shortDescription": "Memory from your past AI coding sessions",
+    "longDescription": "Search and recall your Claude Code, Codex, Cursor and other agent sessions from a local index, check a plan against earlier decisions, and give each new Codex session its repo's memory. Everything stays on your machine.",
+    "developerName": "Ari Shaller",
+    "category": "Engineering",
+    "websiteURL": "https://callimachus.app",
+    "privacyPolicyURL": "https://callimachus.app/privacy",
+    "termsOfServiceURL": "https://callimachus.app/terms",
+    "defaultPrompt": [
+      "What did we already decide in this repo?",
+      "Have I fixed this error in an earlier session?",
+      "Find the session where I last worked on this file"
+    ],
+    "logo": "./assets/logo.png"
+  }
+}

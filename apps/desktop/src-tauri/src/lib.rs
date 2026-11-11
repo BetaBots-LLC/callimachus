@@ -83,6 +83,15 @@ impl jobs::JobHost for TauriHost {
             Ok(false) => {}
             Err(e) => app_log!("[integration] Claude Code plugin hand-over: {e:#}"),
         }
+        // The same for the Callimachus plugin for Codex and the app's Codex MCP entry.
+        match std::env::current_exe()
+            .map_err(anyhow::Error::from)
+            .and_then(|exe| integration::codex_plugin_handover_tick(&exe))
+        {
+            Ok(true) => app_log!("[integration] Codex plugin hand-over updated"),
+            Ok(false) => {}
+            Err(e) => app_log!("[integration] Codex plugin hand-over: {e:#}"),
+        }
         // The weekly index snapshot, when one is due and no job holds the writer.
         jobs::snapshot_tick(self);
     }

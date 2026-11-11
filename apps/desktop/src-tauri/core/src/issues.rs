@@ -231,7 +231,7 @@ fn behind_gutter(raw: &str) -> bool {
 /// An `echo` or `printf` command ([`is_print_command`]) is what a script or workflow file
 /// read without a gutter runs, not what it prints.
 fn reads_as_code(line: &str) -> bool {
-    if is_print_command(line) {
+    if is_print_command(line) || is_comment_line(line) {
         return true;
     }
     if let Some(rest) = line.strip_suffix(['{', '[']) {
@@ -292,6 +292,41 @@ fn is_print_command(line: &str) -> bool {
     let rest = rest.strip_prefix("$ ").unwrap_or(rest).trim_start();
     let rest = rest.strip_prefix("run: ").unwrap_or(rest).trim_start();
     rest.starts_with("echo ") || rest.starts_with("printf ")
+}
+
+/// Whether `line` is a `//` or `/*` comment, bare, as a diff's added or removed line, or behind
+/// the prefix grep and ripgrep print (`src/a.rs:3:    // ...`, a context line's
+/// `src/a.rs-4-    /* ...`, or `src/a.rs:// ...` without line numbers): source read through
+/// grep or a diff, not something that failed. On a large index one such line (`// ..., with
+/// one exception: it ...`) was a recurring "error" with 23 sightings, taken for its
+/// `exception:`. A `#` line is not judged: TAP and several test runners report on those. A
+/// compiler's `src/a.rs:3:5: error: ...` has no comment after its prefix and stays an error.
+fn is_comment_line(line: &str) -> bool {
+    let comment = |text: &str| {
+        let rest = text.trim_start_matches(['+', '-', ' ', '\t']);
+        rest.starts_with("//") || rest.starts_with("/*")
+    };
+    if comment(line) {
+        return true;
+    }
+    // Only a line with a comment marker in it goes on: this runs in the `recall-error` hook,
+    // and `file_token` allocates the name it finds.
+    if !(line.contains("//") || line.contains("/*")) {
+        return false;
+    }
+    // The prefix is a path, which holds no space, then the line number and the separator
+    // again (`:` on a match, `-` on a context line), or a bare `:` without line numbers.
+    let head = line.split([' ', '\t']).next().unwrap_or("");
+    head.match_indices([':', '-']).any(|(at, sep)| {
+        let rest = &line[at + 1..];
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        let text = match rest[digits..].strip_prefix(sep) {
+            Some(text) if digits > 0 => text,
+            _ if digits == 0 && sep == ":" => rest,
+            _ => return false,
+        };
+        comment(text) && file_token(&line[..at]).is_some()
+    })
 }
 
 /// The file of a traceback frame line (`File "/app/a.py", line 3, in f`), as written.
@@ -3657,6 +3692,14 @@ mod tests {
         );
 
         for code in [
+            "// installed for every agent, with one exception: the plugin owns its hooks",
+            "+    // error: the caller retries, so this is never fatal",
+            "/* fatal: kept for the old exit path */",
+            // The same read through grep or ripgrep: a match, a context line, no line numbers.
+            "src/a.rs:3:    // error: the caller retries, so this is never fatal",
+            "src/a.rs-4-    /* error: kept for the old exit path */",
+            "src/a.rs:// exception: only for the plugin",
+            "src/hook-claims.rs:12:// error: the plugin's run claims first",
             "error: err instanceof Error ? err.message : err",
             "onError: (error: Error) => toast.error(error.message),",
             "onError: (error: unknown) =>",
@@ -3699,6 +3742,8 @@ mod tests {
 
         for real in [
             "src/a.ts(3,5): error TS2322: Type '(e: Event) => void' is not assignable to type 'string'.",
+            // A compiler's location prefix, no comment after it (`//` in the message).
+            "src/a.rs:3:5: error: could not fetch https://example.com/index.json",
             "error: expected one of `=>`, `@`, `if`, or `|`, found `:`",
             "error: can't find crate for `serde` (is it installed?)",
             "TypeError: Cannot read properties of undefined (reading 'map')",

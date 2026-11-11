@@ -1,0 +1,31 @@
+{
+  "project": "/work/acme/app",
+  "decisions": [
+    {
+      "id": 101,
+      "threadId": 7,
+      "text": "Keep the local cache in SQLite with WAL mode.",
+      "title": "Pick a cache store",
+      "createdAt": 1767268800,
+      "pinned": true,
+      "extractor": "llm",
+      "originRef": null
+    }
+  ],
+  "gotchas": [
+    {
+      "id": 201,
+      "threadId": 10,
+      "text": "The test runner needs TZ=UTC.",
+      "title": null,
+      "createdAt": 1782820800,
+      "pinned": false,
+      "extractor": "llm",
+      "originRef": null
+    }
+  ],
+  "openTodos": [],
+  "threadCount": 42,
+  "distilledCount": 30,
+  "pendingCount": 12
+}

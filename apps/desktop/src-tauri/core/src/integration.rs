@@ -650,6 +650,242 @@ fn strip_base_hooks(obj: &mut Map<String, Value>, exe: &Path) {
 }
 
 // ---------------------------------------------------------------------------------------------
+// The Codex plugin
+// ---------------------------------------------------------------------------------------------
+//
+// plugins/codex, listed by .agents/plugins/marketplace.json, ships the app's Codex hooks and an
+// MCP server. Only the server is handed over. The app keeps its own hooks in
+// `<CODEX_HOME>/hooks.json` whether or not Codex runs the plugin's (it does once the user
+// trusts them in `/hooks`), and when both run, each Codex hook command acts once per event
+// (`cli_core::claim_hook_run`), so the app never needs to know what Codex trusts.
+
+/// Whether Codex's parsed `config.toml` turns the Callimachus plugin on: a
+/// `[plugins."callimachus@<marketplace>"]` table (any marketplace, as for Claude Code's
+/// [`plugin_enabled_in`]) whose `enabled` is true, or omitted while `[plugins._default]` does
+/// not set `enabled = false` (`PluginConfig` and `PluginsConfigToml::allows_plugin` in
+/// codex-rs/config/src/types.rs at tag rust-v0.167.0). A value that is not a boolean, which
+/// Codex refuses to load, counts as off. Only `<CODEX_HOME>/config.toml` is read: a trusted
+/// project's own `.codex/config.toml` can turn the plugin off there, which a user-level MCP
+/// entry cannot follow per project. The table alone is not enough: `installed(marketplace)`
+/// must find the plugins/codex package under that name ([`codex_plugin_installed`]).
+fn codex_plugin_enabled_in(doc: &toml_edit::DocumentMut, installed: impl Fn(&str) -> bool) -> bool {
+    let Some(plugins) = doc.get("plugins").and_then(toml_edit::Item::as_table_like) else {
+        return false;
+    };
+    let default_on = plugins
+        .get("_default")
+        .and_then(|d| d.get("enabled"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    plugins.iter().any(|(id, entry)| {
+        let Some((PLUGIN_NAME, marketplace)) = id.rsplit_once('@') else {
+            return false;
+        };
+        entry.as_table_like().is_some_and(|e| {
+            e.get("enabled")
+                .map_or(default_on, |v| v.as_bool() == Some(true))
+        }) && installed(marketplace)
+    })
+}
+
+/// Codex installed plugins/codex as `callimachus@<marketplace>`: one of its version folders
+/// in Codex's plugin cache holds the Codex manifest. Codex installs a plugin to
+/// `<CODEX_HOME>/plugins/cache/<marketplace>/<plugin>/<version>/` and an upgrade removes the
+/// other versions (`PLUGINS_CACHE_DIR` in core-plugin-common/src/installed.rs,
+/// `PluginStore::plugin_root` in core-plugins/src/store.rs, rust-v0.167.0; the plugins bundled
+/// with Codex sit there the same way). Codex also installs the Claude Code plugin under the
+/// same name from `.claude-plugin/marketplace.json` (a repository added before
+/// `.agents/plugins/marketplace.json` existed): its folder holds `.claude-plugin/plugin.json`,
+/// and its MCP server's `${CLAUDE_PLUGIN_ROOT}` path is one Codex leaves unexpanded
+/// (codex-mcp/src/plugin_config.rs), so that server cannot start and takes over nothing.
+fn codex_plugin_installed(codex_home: &Path, marketplace: &str) -> bool {
+    let root = codex_home
+        .join("plugins/cache")
+        .join(marketplace)
+        .join(PLUGIN_NAME);
+    std::fs::read_dir(root).is_ok_and(|versions| {
+        versions
+            .flatten()
+            .any(|v| v.path().join(".codex-plugin/plugin.json").is_file())
+    })
+}
+
+/// [`codex_plugin_enabled_in`] for `<codex_home>/config.toml`. A missing or unparseable file
+/// means off (Codex itself would not start on the latter).
+pub(crate) fn codex_plugin_enabled_at(codex_home: &Path) -> bool {
+    read_codex_config(&codex_home.join("config.toml"))
+        .ok()
+        .flatten()
+        .is_some_and(|doc| {
+            codex_plugin_enabled_in(&doc, |mp| codex_plugin_installed(codex_home, mp))
+        })
+}
+
+/// The user's Codex runs the Callimachus plugin, whose MCP server then stands in for the app's
+/// `[mcp_servers.callimachus]`: two servers of one name would list every tool twice. On every
+/// OS: the plugin's server is `npx`, which Codex also resolves on Windows
+/// (rmcp-client/src/program_resolver.rs at the tag). The Codex hook commands read it too: only
+/// then can a second hook run for one event (`cli_core::codex_plugin_on`).
+pub(crate) fn codex_plugin_managed() -> bool {
+    codex_home().is_ok_and(|home| codex_plugin_enabled_at(&home))
+}
+
+/// `<index dir>/codex-plugin-mcp`: the app removed its own `[mcp_servers.callimachus]` for the
+/// Codex plugin, so turning the plugin off puts back only an entry the app had installed. It
+/// holds the removed table as TOML ([`saved_mcp_toml`]); the first builds wrote it empty.
+const CODEX_PLUGIN_MARKER: &str = "codex-plugin-mcp";
+
+fn codex_plugin_marker_path() -> PathBuf {
+    crate::db::default_index_path()
+        .parent()
+        .map(|d| d.join(CODEX_PLUGIN_MARKER))
+        .unwrap_or_else(|| PathBuf::from(CODEX_PLUGIN_MARKER))
+}
+
+/// `[mcp_servers.callimachus]` in a parsed `config.toml` is an app registration (run with
+/// exactly `--mcp`, the shape [`register_mcp_toml`] writes).
+fn is_app_mcp_toml(doc: &toml_edit::DocumentMut) -> bool {
+    doc.get("mcp_servers")
+        .and_then(|s| s.get(MCP_NAME))
+        .and_then(|e| e.get("args"))
+        .and_then(|a| a.as_array())
+        .is_some_and(|a| a.len() == 1 && a.get(0).and_then(|v| v.as_str()) == Some("--mcp"))
+}
+
+fn read_codex_config(path: &Path) -> Result<Option<toml_edit::DocumentMut>> {
+    read_config(path)?
+        .map(|text| {
+            text.parse::<toml_edit::DocumentMut>()
+                .with_context(|| format!("{} is not valid TOML", path.display()))
+        })
+        .transpose()
+}
+
+/// While `plugin_on`, remove the app's own `[mcp_servers.callimachus]` from Codex's `config`,
+/// once: the removed table goes to `marker` first, so a removal cut short still restores, and
+/// while `marker` is there an entry that shows up in `config` is the user's (the app's line
+/// put back by hand, say, where the plugin's `npx` server cannot start) and stays. Once it is
+/// off, put the recorded table back with its `command` aimed at `exe`, keeping every key and
+/// subtable the user had added (an `enabled = false`, `env`, timeouts), when no entry is there
+/// again and Codex's home still exists, then drop the marker. An entry the user wrote by hand
+/// is theirs either way. Returns whether `config` changed.
+fn sync_codex_mcp_in(config: &Path, marker: &Path, exe: &Path, plugin_on: bool) -> Result<bool> {
+    if plugin_on {
+        if marker.exists() {
+            return Ok(false);
+        }
+        let Some(doc) = read_codex_config(config)?.filter(is_app_mcp_toml) else {
+            return Ok(false);
+        };
+        write_atomic(marker, saved_mcp_toml(&doc).as_bytes())?;
+        if let Err(e) = remove_mcp_toml(config) {
+            // The config is written atomically, so nothing was removed: drop the record, or
+            // the next sync would take the entry still there for the user's.
+            let _ = remove_if_exists(marker);
+            return Err(e);
+        }
+        return Ok(true);
+    }
+    if !marker.exists() {
+        return Ok(false);
+    }
+    let back = config.parent().is_some_and(Path::is_dir)
+        && read_codex_config(config)?.is_none_or(|doc| {
+            doc.get("mcp_servers")
+                .and_then(|s| s.get(MCP_NAME))
+                .is_none()
+        });
+    if back {
+        restore_mcp_toml(config, marker, exe)?;
+    }
+    remove_if_exists(marker)?;
+    Ok(back)
+}
+
+/// `doc`'s `[mcp_servers.callimachus]` as a TOML document of its own, for the marker.
+fn saved_mcp_toml(doc: &toml_edit::DocumentMut) -> String {
+    let mut saved = toml_edit::DocumentMut::new();
+    if let Some(entry) = doc.get("mcp_servers").and_then(|s| s.get(MCP_NAME)) {
+        let mut servers = toml_edit::Table::new();
+        servers.set_implicit(true);
+        servers.insert(MCP_NAME, entry.clone());
+        saved.insert("mcp_servers", toml_edit::Item::Table(servers));
+    }
+    saved.to_string()
+}
+
+/// Put the table [`saved_mcp_toml`] wrote to `marker` back into `config`, only its `command`
+/// re-pointed at `exe`; the plain registration when the marker holds none.
+fn restore_mcp_toml(config: &Path, marker: &Path, exe: &Path) -> Result<()> {
+    let saved = read_config(marker)?
+        .and_then(|text| text.parse::<toml_edit::DocumentMut>().ok())
+        .and_then(|mut doc| {
+            doc.get_mut("mcp_servers")?
+                .as_table_like_mut()?
+                .remove(MCP_NAME)
+        })
+        .filter(toml_edit::Item::is_table_like);
+    let Some(mut entry) = saved else {
+        return register_mcp_toml(config, exe);
+    };
+    // Positions from the marker's own document would sort the table among the config's first
+    // ones; without one it follows the table before it.
+    fn unplace(item: &mut toml_edit::Item) {
+        if let Some(table) = item.as_table_mut() {
+            table.set_position(None);
+            table.iter_mut().for_each(|(_, child)| unplace(child));
+        }
+    }
+    unplace(&mut entry);
+    if let Some(e) = entry.as_table_like_mut() {
+        e.insert(
+            "command",
+            toml_edit::value(exe.to_string_lossy().to_string()),
+        );
+    }
+    update_toml_file(config, true, |doc| {
+        let servers = doc
+            .entry("mcp_servers")
+            .or_insert(toml_edit::Item::Table(toml_edit::Table::new()))
+            .as_table_like_mut()
+            .ok_or_else(|| anyhow!("mcp_servers in {} is not a table", config.display()))?;
+        servers.insert(MCP_NAME, entry.clone());
+        Ok(())
+    })?;
+    Ok(())
+}
+
+/// Whether the Codex plugin was on at the last [`sync_codex_plugin`] in this process.
+static CODEX_PLUGIN_SYNCED: std::sync::Mutex<Option<bool>> = std::sync::Mutex::new(None);
+
+/// [`sync_codex_mcp_in`] for the user's Codex.
+fn sync_codex_plugin(exe: &Path, plugin_on: bool) -> Result<bool> {
+    if let Ok(mut last) = CODEX_PLUGIN_SYNCED.lock() {
+        *last = Some(plugin_on);
+    }
+    let config = codex_home()?.join("config.toml");
+    sync_codex_mcp_in(&config, &codex_plugin_marker_path(), exe, plugin_on)
+}
+
+/// The watcher's minute tick for the Codex plugin, as [`plugin_handover_tick`] is for Claude
+/// Code's: the user can install, enable or disable the plugin while the app runs. Syncs only
+/// when the answer changed since the last sync.
+pub fn codex_plugin_handover_tick(current_exe: &Path) -> Result<bool> {
+    let Ok(exe) = stable_app_exe(current_exe) else {
+        return Ok(false);
+    };
+    let on = codex_plugin_managed();
+    let unchanged = CODEX_PLUGIN_SYNCED
+        .lock()
+        .map(|last| *last == Some(on))
+        .unwrap_or(true);
+    if unchanged {
+        return Ok(false);
+    }
+    sync_codex_plugin(&exe, on)
+}
+
+// ---------------------------------------------------------------------------------------------
 // Install / uninstall / refresh
 // ---------------------------------------------------------------------------------------------
 
@@ -1127,9 +1363,16 @@ pub fn refresh_installed(current_exe: &Path) -> Result<bool> {
             claude_config_path().and_then(|c| refresh_mcp_json(&c, &exe)),
         );
     }
+    // The Codex plugin's server replaces the app's `[mcp_servers.callimachus]` the same way;
+    // its hooks run beside the app's (see "The Codex plugin").
+    let codex_plugin = codex_plugin_managed();
+    record("Codex plugin", sync_codex_plugin(&exe, codex_plugin));
     match agent_targets() {
         Ok(agents) => {
-            for agent in agents {
+            for agent in agents
+                .into_iter()
+                .filter(|a| !(codex_plugin && a.id == "codex"))
+            {
                 let result = match agent.fmt {
                     Fmt::Json => refresh_mcp_json(&agent.config, &exe),
                     Fmt::Toml => refresh_mcp_toml(&agent.config, &exe),
@@ -3071,6 +3314,9 @@ pub struct AgentIntegration {
     /// Our MCP server is registered in its config, pointing at this app.
     pub registered: bool,
     pub config_path: String,
+    /// Codex only: the Callimachus plugin for Codex runs the MCP server
+    /// ([`codex_plugin_managed`]), so the app registers none there.
+    pub plugin_managed: bool,
 }
 
 enum Fmt {
@@ -3125,6 +3371,7 @@ pub fn agent_status(app_exe: &Path) -> Vec<AgentIntegration> {
     let Ok(agents) = agent_targets() else {
         return Vec::new();
     };
+    let codex_plugin = codex_plugin_managed();
     agents
         .into_iter()
         .map(|a| {
@@ -3133,6 +3380,7 @@ pub fn agent_status(app_exe: &Path) -> Vec<AgentIntegration> {
                 Fmt::Toml => mcp_registered_toml(&a.config, &exe),
             };
             AgentIntegration {
+                plugin_managed: codex_plugin && a.id == "codex",
                 id: a.id.to_string(),
                 label: a.label.to_string(),
                 present: a.dir.is_dir(),
@@ -3146,12 +3394,19 @@ pub fn agent_status(app_exe: &Path) -> Vec<AgentIntegration> {
 /// Register the MCP server for every DETECTED agent (config dir exists). Never creates a config
 /// for an agent the user doesn't use. Refuses to run from a temporary location. Idempotent.
 /// Tries every agent, so one config it can't edit doesn't keep the others from being registered,
-/// then reports any failures.
+/// then reports any failures. Codex is left to the Callimachus plugin for Codex while it is on
+/// ([`codex_plugin_managed`]), and an app entry still there is handed over to it.
 pub fn install_agents(app_exe: &Path) -> Result<Vec<AgentIntegration>> {
     let exe = stable_app_exe(app_exe)?;
     let mut errors = Vec::new();
+    let codex_plugin = codex_plugin_managed();
+    if codex_plugin {
+        if let Err(e) = sync_codex_plugin(&exe, true) {
+            errors.push(format!("Codex: {e:#}"));
+        }
+    }
     for a in agent_targets()? {
-        if !a.dir.is_dir() {
+        if !a.dir.is_dir() || (codex_plugin && a.id == "codex") {
             continue;
         }
         let result = match a.fmt {
@@ -3178,6 +3433,10 @@ pub fn uninstall_agents() -> Result<()> {
         if let Err(e) = result {
             errors.push(format!("{}: {e:#}", a.label));
         }
+    }
+    // An entry the Codex plugin took over stays removed once the plugin is off.
+    if let Err(e) = remove_if_exists(&codex_plugin_marker_path()) {
+        errors.push(format!("Codex: {e:#}"));
     }
     combine_errors(errors)
 }
@@ -3617,8 +3876,10 @@ pub struct AgentSetup {
     pub present: bool,
     pub hooks: Vec<FoundHook>,
     pub mcp: Option<FoundMcp>,
-    /// Claude Code only: the Callimachus plugin is enabled, so its own hooks and MCP server
-    /// (not listed here) run instead of the app's.
+    /// The Callimachus plugin is enabled. Claude Code then runs its hooks and MCP server (not
+    /// listed here) instead of the app's. Codex runs its MCP server instead of the app's, and
+    /// its hooks (once trusted in `/hooks`) beside the app's, listed here: whichever runs first
+    /// in a session injects.
     pub plugin: bool,
 }
 
@@ -3664,7 +3925,7 @@ pub fn installed_setup() -> Vec<AgentSetup> {
                 .iter()
                 .find(|(id, _)| *id == t.id)
                 .and_then(|(_, m)| m.clone()),
-            plugin: false,
+            plugin: t.id == "codex" && codex_plugin_enabled_at(&t.dir),
         });
     }
     out
@@ -4496,53 +4757,18 @@ mod tests {
         layout: HookLayout::Grouped,
     }];
 
-    /// The repo's Claude Code plugin (plugins/claude-code) ships what `install()` would: the
-    /// bundled skill byte for byte, the base hooks with the same events, matchers, timeouts and
-    /// subcommands (as scripts that run the `cal` link the app installs, guarded like ours) plus
-    /// `PLUGIN_ONLY_HOOKS`, the MCP server under our name, and the app's version, which
-    /// sync-versions.mjs keeps in step.
-    #[test]
-    fn claude_plugin_mirrors_the_app_install() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../../plugins/claude-code");
-        let read = |rel: &str| {
-            std::fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"))
-        };
-        // The plugin's copy is the bundled text plus a fixed note on where `cal` lives (the
-        // app renders that note per machine instead); plugins/test pins the same suffix.
-        const PLUGIN_SKILL_SUFFIX: &str = "\n## With the Claude Code plugin\n\nThe `cal` CLI is \
-            `~/.local/bin/cal` (on Windows, `cal.exe` next to the Callimachus app). If a bare \
-            `cal` is not found or prints a calendar (the system `cal(1)` winning on PATH), call \
-            it by that full path. The MCP prompts' slash commands carry the plugin's prefix, \
-            for example `/mcp__plugin_callimachus_callimachus__recall`.\n";
-        assert_eq!(
-            read("skills/recall/SKILL.md"),
-            format!("{SKILL_MD}{PLUGIN_SKILL_SUFFIX}"),
-            "plugins/claude-code/skills/recall/SKILL.md is resources/recall/SKILL.md plus the \
-             plugin note"
-        );
-
-        // Anthropic's directory allows no variable but `${CLAUDE_PLUGIN_ROOT}` in a hook
-        // command, so each plugin hook is a plain sh script in scripts/ that runs the linked
-        // `cal` and exits quietly without it (the app's own install writes that guard inline).
+    /// The grouped hooks a plugin at `root` must list for `specs`, each run as
+    /// `"${<root_var>}"/scripts/<command>.sh`, checking each script on the way: a plain,
+    /// executable sh script that exits quietly without the linked `cal`, asks `cal help` first
+    /// for the given pattern when there is one, and ends by running `cal <subcommand>`.
+    fn plugin_hooks(root: &Path, root_var: &str, specs: Vec<(&HookSpec, Option<String>)>) -> Value {
         let cal = "~/.local/bin/cal";
-        // A plugin-only hook also runs only when the linked `cal` lists its command in `cal
-        // help`: the marketplace can update the plugin ahead of the app, and an older app's
-        // `cal` answers an unknown command with exit 1, a hook error in every session.
-        let probe = |spec: &HookSpec| {
-            let cmd = spec.subcommand.split(' ').next().unwrap();
-            let line = format!("\n  cal {cmd} ");
-            assert!(
-                crate::cli_core::USAGE.contains(&line),
-                "`cal help` must list `cal {cmd}` for the plugin's probe"
-            );
-            format!("{cal} help 2>/dev/null | grep -q '^  cal {cmd} ' || exit 0\n")
-        };
         let mut expected = Map::new();
-        let plugin_only = PLUGIN_ONLY_HOOKS.iter().map(|s| (s, true));
-        for (spec, probed) in BASE_HOOKS.iter().map(|s| (*s, false)).chain(plugin_only) {
+        for (spec, probe) in specs {
             let name = spec.subcommand.split(' ').next().unwrap();
             let script = format!("scripts/{name}.sh");
-            let body = read(&script);
+            let body = std::fs::read_to_string(root.join(&script))
+                .unwrap_or_else(|e| panic!("{script}: {e}"));
             assert!(
                 body.starts_with("#!/bin/sh\n"),
                 "{script} is a plain sh script"
@@ -4551,9 +4777,11 @@ mod tests {
                 body.contains(&format!("[ -x {cal} ] || exit 0\n")),
                 "{script} exits quietly when cal is not installed"
             );
-            if probed {
+            if let Some(pattern) = probe {
                 assert!(
-                    body.contains(&probe(spec)),
+                    body.contains(&format!(
+                        "{cal} help 2>/dev/null | grep -q '{pattern}' || exit 0\n"
+                    )),
                     "{script} asks `cal help` first"
                 );
             }
@@ -4582,15 +4810,66 @@ mod tests {
                 "hooks".into(),
                 json!([{
                     "type": "command",
-                    "command": format!("\"${{CLAUDE_PLUGIN_ROOT}}\"/{script}"),
+                    "command": format!("\"${{{root_var}}}\"/{script}"),
                     "timeout": spec.timeout_secs,
                 }]),
             );
             let groups = expected.entry(spec.event).or_insert_with(|| json!([]));
             groups.as_array_mut().unwrap().push(Value::Object(group));
         }
+        Value::Object(expected)
+    }
+
+    /// What a plugin-only hook's script greps `cal help` for first: its command's own line.
+    /// The marketplace can update a plugin ahead of the app, and an older app's `cal` answers
+    /// an unknown command with exit 1, a hook error in every session.
+    fn usage_probe(spec: &HookSpec) -> String {
+        let cmd = spec.subcommand.split(' ').next().unwrap();
+        assert!(
+            crate::cli_core::USAGE.contains(&format!("\n  cal {cmd} ")),
+            "`cal help` must list `cal {cmd}` for the plugin's probe"
+        );
+        format!("^  cal {cmd} ")
+    }
+    /// The repo's Claude Code plugin (plugins/claude-code) ships what `install()` would: the
+    /// bundled skill byte for byte, the base hooks with the same events, matchers, timeouts and
+    /// subcommands (as scripts that run the `cal` link the app installs, guarded like ours) plus
+    /// `PLUGIN_ONLY_HOOKS`, the MCP server under our name, and the app's version, which
+    /// sync-versions.mjs keeps in step.
+    #[test]
+    fn claude_plugin_mirrors_the_app_install() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../../plugins/claude-code");
+        let read = |rel: &str| {
+            std::fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"))
+        };
+        // The plugin's copy is the bundled text plus a fixed note on where `cal` lives (the
+        // app renders that note per machine instead); plugins/test pins the same suffix.
+        const PLUGIN_SKILL_SUFFIX: &str = "\n## With the Claude Code plugin\n\nThe `cal` CLI is \
+            `~/.local/bin/cal` (on Windows, `cal.exe` next to the Callimachus app). If a bare \
+            `cal` is not found or prints a calendar (the system `cal(1)` winning on PATH), call \
+            it by that full path. The MCP prompts' slash commands carry the plugin's prefix, \
+            for example `/mcp__plugin_callimachus_callimachus__recall`.\n";
+        assert_eq!(
+            read("skills/recall/SKILL.md"),
+            format!("{SKILL_MD}{PLUGIN_SKILL_SUFFIX}"),
+            "plugins/claude-code/skills/recall/SKILL.md is resources/recall/SKILL.md plus the \
+             plugin note"
+        );
+
+        // Anthropic's directory allows no variable but `${CLAUDE_PLUGIN_ROOT}` in a hook
+        // command, so each plugin hook is a plain sh script in scripts/ that runs the linked
+        // `cal` and exits quietly without it (the app's own install writes that guard inline).
+        let base = BASE_HOOKS.iter().map(|s| (*s, None));
+        let plugin_only = PLUGIN_ONLY_HOOKS.iter().map(|s| (s, Some(usage_probe(s))));
         let hooks: Value = serde_json::from_str(&read("hooks/hooks.json")).unwrap();
-        assert_eq!(hooks["hooks"], Value::Object(expected));
+        assert_eq!(
+            hooks["hooks"],
+            plugin_hooks(
+                &root,
+                "CLAUDE_PLUGIN_ROOT",
+                base.chain(plugin_only).collect()
+            )
+        );
 
         // Anthropic's directory flags an `npx` package as a launcher it cannot read, so the npm
         // launcher is vendored into the plugin, byte for byte, and run with node. It downloads
@@ -4737,6 +5016,338 @@ mod tests {
             skill.starts_with(SKILL_MD) && skill.contains("\n## With the Cursor plugin\n"),
             "plugins/cursor/skills/recall/SKILL.md is resources/recall/SKILL.md plus the plugin note"
         );
+    }
+
+    /// The Codex plugin in plugins/codex carries the hooks the app writes to
+    /// `<CODEX_HOME>/hooks.json` ([`CODEX_HOOKS`]), each asking `cal help` first whether this
+    /// `cal` speaks Codex's protocol, plus the Claude Code plugin's freshness guard
+    /// ([`PLUGIN_ONLY_HOOKS`]: a machine without the app has nothing else that indexes new
+    /// sessions), at the path Codex's loader reads by default (`hooks/hooks.json`,
+    /// `DEFAULT_HOOKS_CONFIG_FILE` in core-plugins/src/loader.rs at rust-v0.167.0). The skill is
+    /// the bundled one byte for byte, the MCP server the npm launcher pinned to the app's
+    /// version, and the manifest and marketplace carry that version too (sync-versions.mjs).
+    #[test]
+    fn codex_plugin_mirrors_the_app_install() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../..");
+        let root = repo.join("plugins/codex");
+        let read = |rel: &str| {
+            std::fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"))
+        };
+        assert_eq!(
+            read("skills/recall/SKILL.md"),
+            SKILL_MD,
+            "plugins/codex/skills/recall/SKILL.md is resources/recall/SKILL.md"
+        );
+
+        // `cal hook --for codex` and its siblings shipped in 0.12.0, but a Codex hook claims
+        // its event (`cli_core::claim_hook_run`) only from the release that says so in `cal
+        // help`; an older cal would inject a second time beside the app's own Codex hook.
+        let probe = "codex or cursor, one run per event";
+        assert_eq!(
+            crate::cli_core::USAGE
+                .lines()
+                .filter(|l| l.contains(probe))
+                .count(),
+            1,
+            "`cal help` must say on one line that a Codex hook acts once, for the plugin's probe"
+        );
+        // Codex replaces `${PLUGIN_ROOT}` in a plugin hook's command with the plugin's root
+        // before the shell runs it (hooks/src/engine/discovery.rs at the tag), so no shell
+        // syntax is involved; the quotes keep a root with spaces one word.
+        let base = CODEX_HOOKS.iter().map(|s| (*s, Some(probe.to_string())));
+        let plugin_only = PLUGIN_ONLY_HOOKS.iter().map(|s| (s, Some(usage_probe(s))));
+        let hooks: Value = serde_json::from_str(&read("hooks/hooks.json")).unwrap();
+        assert_eq!(
+            hooks["hooks"],
+            plugin_hooks(&root, "PLUGIN_ROOT", base.chain(plugin_only).collect())
+        );
+        // Codex parses the file as `HooksFile` with `deny_unknown_fields` (config/src/
+        // hook_config.rs): one more top-level key and no hook in it loads.
+        assert!(hooks
+            .as_object()
+            .unwrap()
+            .keys()
+            .all(|k| k == "description" || k == "hooks"));
+        // Codex clamps a SessionEnd hook to 3 s (hooks/src/events/session_end.rs).
+        const { assert!(CODEX_SESSION_END_HOOK.timeout_secs <= 3) };
+
+        // The server runs where the session runs: without a `cwd` Codex starts a stdio server
+        // in the turn's working directory (rmcp-client/src/stdio_server_launcher.rs), which is
+        // how the server finds the current project. A plugin-relative launcher would need
+        // `"cwd": "."`, which Codex resolves to the plugin's own folder (codex-mcp/src/
+        // plugin_config.rs), and every project-scoped tool would then answer for that folder.
+        let version = env!("CALLIMACHUS_VERSION");
+        let mcp: Value = serde_json::from_str(&read(".mcp.json")).unwrap();
+        assert_eq!(
+            mcp,
+            json!({"mcpServers": {MCP_NAME: {
+                "command": "npx", "args": ["-y", format!("callimachus-mcp@{version}")]
+            }}})
+        );
+
+        let manifest: Value = serde_json::from_str(&read(".codex-plugin/plugin.json")).unwrap();
+        assert_eq!(manifest["name"], PLUGIN_NAME);
+        assert_eq!(manifest["version"], version);
+        assert_eq!(manifest["skills"], "./skills/");
+        let logo = manifest["interface"]["logo"].as_str().unwrap();
+        assert!(
+            std::fs::read(root.join(logo)).unwrap()
+                == std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("../icons/icon.png"))
+                    .unwrap(),
+            "the logo is apps/desktop/src-tauri/icons/icon.png"
+        );
+        // An Agent Plugins manifest at the root would be found first and loads no hooks at all
+        // at rust-v0.167.0 (loader.rs); Claude Code's and Cursor's manifest dirs are theirs.
+        for other in [
+            "plugin.json",
+            ".claude-plugin/plugin.json",
+            ".cursor-plugin/plugin.json",
+        ] {
+            assert!(!root.join(other).exists(), "plugins/codex/{other}");
+        }
+
+        let market: Value = serde_json::from_str(
+            &std::fs::read_to_string(repo.join(".agents/plugins/marketplace.json")).unwrap(),
+        )
+        .unwrap();
+        let entry = &market["plugins"][0];
+        assert_eq!(entry["name"], manifest["name"]);
+        assert_eq!(
+            entry["source"],
+            json!({"source": "git-subdir", "url": "BetaBots-LLC/callimachus",
+                   "path": "plugins/codex", "ref": format!("v{version}")})
+        );
+    }
+
+    /// Codex runs the plugin when `config.toml` holds `[plugins."callimachus@<any>"]` whose
+    /// effective `enabled` is not false, as config/src/types.rs decides at rust-v0.167.0
+    /// (`PluginConfig`, `PluginsConfigToml::allows_plugin`).
+    #[test]
+    fn codex_plugin_detection_follows_codex_config() {
+        let tmp = TempDir::new("codex-plugin-detect");
+        let codex = tmp.path();
+        for mp in ["callimachus", "a-fork"] {
+            install_codex_plugin_package(codex, mp, ".codex-plugin");
+        }
+        let on = |toml: &str| {
+            std::fs::write(codex.join("config.toml"), toml).unwrap();
+            codex_plugin_enabled_at(codex)
+        };
+        let table = "[plugins.\"callimachus@callimachus\"]\n";
+        assert!(on(&format!("{table}enabled = true\n")));
+        assert!(!on(&format!("{table}enabled = false\n")));
+        assert!(on(table), "omitted: the installed default, on");
+        assert!(
+            on(&format!("{table}[plugins.\"callimachus@callimachus\".mcp_servers.callimachus]\nenabled = true\n")),
+            "a per-server policy table is no `enabled`"
+        );
+        assert!(!on(&format!("{table}enabled = \"yes\"\n")), "not a boolean");
+        // `[plugins._default]`: an omitted `enabled` follows it, an explicit one wins.
+        assert!(!on(&format!(
+            "[plugins._default]\nenabled = false\n\n{table}"
+        )));
+        assert!(on(&format!(
+            "[plugins._default]\nenabled = false\n\n{table}enabled = true\n"
+        )));
+        assert!(on(&format!("[plugins._default]\n\n{table}")));
+        // Another plugin's table, a look-alike name, none without a marketplace; a fork's
+        // marketplace carries the same server.
+        assert!(!on(
+            "[plugins.\"documents@openai-primary-runtime\"]\nenabled = true\n"
+        ));
+        assert!(!on(
+            "[plugins.\"callimachus-pro@callimachus\"]\nenabled = true\n"
+        ));
+        assert!(
+            !on("[plugins.callimachus]\nenabled = true\n"),
+            "no marketplace"
+        );
+        assert!(on("[plugins.\"callimachus@a-fork\"]\nenabled = true\n"));
+        // Inline tables are the same TOML.
+        assert!(on(
+            "plugins = { \"callimachus@callimachus\" = { enabled = true } }\n"
+        ));
+        assert!(!on(
+            "plugins = { \"callimachus@callimachus\" = { enabled = false } }\n"
+        ));
+        // A malformed file, and none at all.
+        assert!(!on(&format!("{table}enabled = tru\n")));
+        std::fs::remove_file(codex.join("config.toml")).unwrap();
+        assert!(!codex_plugin_enabled_at(codex));
+    }
+
+    /// What Codex installed for `callimachus@<marketplace>`, at Codex's cache layout
+    /// (`<CODEX_HOME>/plugins/cache/<marketplace>/<plugin>/<version>/`, store.rs at
+    /// rust-v0.167.0): a version folder holding `<manifest_dir>/plugin.json`.
+    fn install_codex_plugin_package(codex_home: &Path, marketplace: &str, manifest_dir: &str) {
+        let dir = codex_home
+            .join("plugins/cache")
+            .join(marketplace)
+            .join(PLUGIN_NAME)
+            .join("0.12.0")
+            .join(manifest_dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("plugin.json"), "{\"name\": \"callimachus\"}").unwrap();
+    }
+
+    /// An enabled table takes over only when Codex installed plugins/codex under that name: not
+    /// before the install, not for the Claude Code plugin Codex can install under the same
+    /// name from `.claude-plugin/marketplace.json`, and not for another marketplace's copy.
+    #[test]
+    fn codex_plugin_detection_needs_the_codex_package() {
+        let tmp = TempDir::new("codex-plugin-package");
+        let codex = tmp.path();
+        std::fs::write(
+            codex.join("config.toml"),
+            "[plugins.\"callimachus@callimachus\"]\nenabled = true\n",
+        )
+        .unwrap();
+        assert!(!codex_plugin_enabled_at(codex), "nothing installed");
+        install_codex_plugin_package(codex, "callimachus", ".claude-plugin");
+        assert!(!codex_plugin_enabled_at(codex), "the Claude Code plugin");
+        install_codex_plugin_package(codex, "a-fork", ".codex-plugin");
+        assert!(!codex_plugin_enabled_at(codex), "another marketplace's");
+        install_codex_plugin_package(codex, "callimachus", ".codex-plugin");
+        assert!(codex_plugin_enabled_at(codex));
+    }
+
+    /// While the Codex plugin is on, the app's own `[mcp_servers.callimachus]` goes (a
+    /// hand-written entry and the rest of the config stay), recorded in the marker; once it is
+    /// off the entry comes back only when the app had put it there, and nothing at all once
+    /// Codex's home is gone. The app's Codex hooks are never touched.
+    #[test]
+    fn codex_plugin_takes_only_the_mcp_entry() {
+        let tmp = TempDir::new("codex-plugin-handover");
+        let dir = tmp.path().join(".codex");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (config, hooks) = (dir.join("config.toml"), dir.join("hooks.json"));
+        let marker = tmp.path().join(CODEX_PLUGIN_MARKER);
+        let exe = Path::new("/Applications/Callimachus.app/Contents/MacOS/callimachus");
+        let sync = |on: bool| sync_codex_mcp_in(&config, &marker, exe, on).unwrap();
+        let text = || std::fs::read_to_string(&config).unwrap();
+        std::fs::write(
+            &config,
+            "model = \"gpt-5\"\n\n[mcp_servers.other]\ncommand = \"x\"\n",
+        )
+        .unwrap();
+        register_mcp_toml(&config, exe).unwrap();
+        install_hooks_into(&hooks, &CODEX_HOOKS, exe).unwrap();
+        let app_hooks = std::fs::read(&hooks).unwrap();
+
+        assert!(sync(true));
+        assert!(!text().contains("[mcp_servers.callimachus]"), "{}", text());
+        assert!(text().contains("model = \"gpt-5\"") && text().contains("[mcp_servers.other]"));
+        assert!(marker.exists());
+        assert!(!sync(true), "nothing left to take");
+        assert!(marker.exists(), "the record is kept");
+        assert!(sync(false));
+        assert!(mcp_registered_toml(&config, exe) && !marker.exists());
+        assert!(!sync(false), "no marker: nothing to restore");
+        assert_eq!(std::fs::read(&hooks).unwrap(), app_hooks, "the hooks stay");
+
+        // A hand-written server entry is the user's: it neither goes nor is replaced, and
+        // one the user wrote while the plugin ran stays as it is when the plugin goes.
+        let own =
+            "[mcp_servers.callimachus]\ncommand = \"npx\"\nargs = [\"-y\", \"callimachus-mcp\"]\n";
+        std::fs::write(&config, own).unwrap();
+        assert!(!sync(true) && !marker.exists());
+        register_mcp_toml(&config, exe).unwrap();
+        assert!(sync(true));
+        std::fs::write(&config, own).unwrap();
+        assert!(!sync(false) && !marker.exists());
+        assert_eq!(text(), own);
+
+        // Codex uninstalled meanwhile: the marker goes, nothing is recreated.
+        register_mcp_toml(&config, exe).unwrap();
+        assert!(sync(true));
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(!sync(false));
+        assert!(!dir.exists() && !marker.exists());
+    }
+
+    /// The hand-over keeps the user's side of the entry. The table it takes comes back with
+    /// every key and subtable the user added, only `command` re-pointed at the current app (it
+    /// came back as a bare `command` + `args`, the disabled server enabled again). An
+    /// app-shaped entry that shows up while the plugin is on is the user's and stays (every
+    /// launch removed it again). A marker from the first builds, empty, still restores the
+    /// plain registration.
+    #[test]
+    fn codex_plugin_hand_over_keeps_what_the_user_wrote() {
+        let tmp = TempDir::new("codex-plugin-user-keys");
+        let dir = tmp.path().join(".codex");
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("config.toml");
+        let marker = tmp.path().join(CODEX_PLUGIN_MARKER);
+        let exe = Path::new("/Applications/Callimachus.app/Contents/MacOS/callimachus");
+        let sync = |on: bool| sync_codex_mcp_in(&config, &marker, exe, on).unwrap();
+        let text = || std::fs::read_to_string(&config).unwrap();
+        let entry = || -> Option<toml_edit::Item> {
+            let doc = read_codex_config(&config).unwrap().unwrap();
+            doc.get("mcp_servers")?.get(MCP_NAME).cloned()
+        };
+        std::fs::write(
+            &config,
+            "model = \"gpt-5\"\n\n\
+             [mcp_servers.callimachus]\n\
+             command = \"/Applications/Old.app/Contents/MacOS/callimachus\"\n\
+             args = [\"--mcp\"]\n\
+             enabled = false\n\
+             startup_timeout_sec = 30\n\
+             disabled_tools = [\"record_decision\"]\n\n\
+             [mcp_servers.callimachus.env]\n\
+             CALLIMACHUS_DB = \"/r/app/index.db\"\n\n\
+             [mcp_servers.other]\n\
+             command = \"x\"\n",
+        )
+        .unwrap();
+        assert!(sync(true));
+        assert!(entry().is_none(), "{}", text());
+
+        // The user puts the app's line back while the plugin is on: it stays.
+        register_mcp_toml(&config, exe).unwrap();
+        let theirs = text();
+        assert!(
+            !sync(true),
+            "an entry that shows up after the hand-over is the user's"
+        );
+        assert!(!sync(true));
+        assert_eq!(text(), theirs);
+
+        remove_mcp_toml(&config).unwrap();
+        assert!(sync(false));
+        let back = entry().unwrap();
+        assert_eq!(back["command"].as_str(), exe.to_str());
+        let args: Vec<_> = back["args"].as_array().unwrap().iter().collect();
+        assert_eq!(args.len(), 1);
+        assert_eq!(args[0].as_str(), Some("--mcp"));
+        assert_eq!(back["enabled"].as_bool(), Some(false), "still off");
+        assert_eq!(back["startup_timeout_sec"].as_integer(), Some(30));
+        assert_eq!(back["disabled_tools"][0].as_str(), Some("record_decision"));
+        assert_eq!(
+            back["env"]["CALLIMACHUS_DB"].as_str(),
+            Some("/r/app/index.db")
+        );
+        assert!(text().contains("model = \"gpt-5\"") && text().contains("[mcp_servers.other]"));
+        assert!(!marker.exists());
+
+        // The same for an inline table.
+        std::fs::write(
+            &config,
+            "mcp_servers = { callimachus = { command = \"/old/callimachus\", args = [\"--mcp\"], enabled = false } }\n",
+        )
+        .unwrap();
+        assert!(sync(true) && entry().is_none());
+        assert!(sync(false));
+        let back = entry().unwrap();
+        assert_eq!(back["command"].as_str(), exe.to_str());
+        assert_eq!(back["enabled"].as_bool(), Some(false));
+
+        // An empty marker, as the first builds wrote it.
+        remove_mcp_toml(&config).unwrap();
+        std::fs::write(&marker, "").unwrap();
+        assert!(sync(false));
+        assert!(mcp_registered_toml(&config, exe) && !marker.exists());
+        assert!(entry().unwrap().get("enabled").is_none());
     }
 
     /// The error-playbook hooks are opt-in like proactive recall: Install leaves them out,

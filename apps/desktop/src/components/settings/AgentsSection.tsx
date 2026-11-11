@@ -396,7 +396,8 @@ function OtherAgentsRow() {
 
   const present = (status.data ?? []).filter((a) => a.present);
   const anyRegistered = present.some((a) => a.registered);
-  const allRegistered = present.length > 0 && present.every((a) => a.registered);
+  // An agent whose Callimachus plugin runs the server is served too.
+  const allRegistered = present.length > 0 && present.every((a) => a.registered || a.pluginManaged);
 
   if (status.isPending) {
     return (
@@ -468,8 +469,8 @@ function OtherAgentsRow() {
       {!allRegistered && (
         <StatusList>
           {present.map((a) => (
-            <StatusItem key={a.id} state={a.registered ? "ok" : "missing"}>
-              {a.label}
+            <StatusItem key={a.id} state={a.registered || a.pluginManaged ? "ok" : "missing"}>
+              {a.pluginManaged ? `${a.label} (through its Callimachus plugin)` : a.label}
             </StatusItem>
           ))}
         </StatusList>
@@ -556,6 +557,10 @@ function AgentHooksRows() {
   // `present` comes with each row; an older backend leaves it out, and then the MCP rows
   // (which have no Copilot) decide.
   const rows = (hooks.data ?? []).filter((r) => r.present ?? present.has(r.agent));
+  // Agents whose Callimachus plugin is on (Codex's): its hooks run beside the app's.
+  const plugins = new Set(
+    (integrations.data ?? []).filter((a) => a.pluginManaged).map((a) => a.id),
+  );
   if (hooks.isError) {
     return (
       <SettingRow title="Memory hooks">
@@ -568,13 +573,26 @@ function AgentHooksRows() {
   return (
     <>
       {rows.map((row) => (
-        <AgentHookRow key={row.agent} row={row} exeProblem={exeProblem ?? null} />
+        <AgentHookRow
+          key={row.agent}
+          row={row}
+          exeProblem={exeProblem ?? null}
+          plugin={plugins.has(row.agent)}
+        />
       ))}
     </>
   );
 }
 
-function AgentHookRow({ row, exeProblem }: { row: AgentHooksStatus; exeProblem: string | null }) {
+function AgentHookRow({
+  row,
+  exeProblem,
+  plugin,
+}: {
+  row: AgentHooksStatus;
+  exeProblem: string | null;
+  plugin: boolean;
+}) {
   const id = useId();
   const qc = useQueryClient();
   const info = HOOK_AGENTS[row.agent];
@@ -623,6 +641,14 @@ function AgentHookRow({ row, exeProblem }: { row: AgentHooksStatus; exeProblem: 
           <code>{row.configPath}</code>. Mute the digest for one repo with{" "}
           <code className="whitespace-nowrap">cal hook --mute</code> from inside it; that works for
           every agent.
+        </Note>
+      )}
+      {plugin && (
+        <Note>
+          The Callimachus plugin for {info.label} runs the MCP server. Its memory hooks run beside
+          these once you trust them in <code>/hooks</code>, and whichever runs first for a session
+          start, clear or compaction injects the memory, so it arrives once. While the plugin is on,
+          a second clear or compaction of one session within 5 seconds injects nothing.
         </Note>
       )}
       {/* Codex trusts a hook by its command, and an app update or move changes the path the
