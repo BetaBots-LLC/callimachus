@@ -252,7 +252,7 @@
         },
         "plugin": {
           "type": "boolean",
-          "description": "Claude Code only: the Callimachus plugin is enabled, so its own hooks and MCP server\n(not listed here) run instead of the app's."
+          "description": "The Callimachus plugin is enabled. Claude Code then runs its hooks and MCP server (not\nlisted here) instead of the app's. Codex runs its MCP server instead of the app's, and\nits hooks (once trusted in `/hooks`) beside the app's, listed here: whichever runs first\nin a session injects."
         }
       },
       "required": [

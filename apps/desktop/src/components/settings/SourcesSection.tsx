@@ -245,7 +245,7 @@ function claudeSetupParts(s: IntegrationStatus | undefined): number {
 }
 
 function codexRegistered(agents: AgentIntegration[] | undefined): boolean {
-  return !!agents?.some((a) => a.id === "codex" && a.registered);
+  return !!agents?.some((a) => a.id === "codex" && (a.registered || a.pluginManaged));
 }
 
 /** Overrides for relocated Claude Code / Codex / Copilot CLI data. An app opened from the

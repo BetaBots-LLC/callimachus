@@ -144,7 +144,8 @@ export function Onboarding() {
   const live: Record<OnboardingStep, boolean> = {
     index: threads > 0,
     agents:
-      claudeConnected(recall.data) || (others.data ?? []).some((a) => a.present && a.registered),
+      claudeConnected(recall.data) ||
+      (others.data ?? []).some((a) => a.present && (a.registered || a.pluginManaged)),
     memory: !!knowledge.data?.enabled,
     semantic: coverage !== null && coverage >= SEMANTIC_DONE_RATIO,
     report: false,
@@ -674,7 +675,7 @@ function AgentsStep({
         </p>
       )}
       {/* install_agent_integrations has no per-agent form, so say what a Connect does. */}
-      {present.length > 1 && present.some((a) => !a.registered) && (
+      {present.length > 1 && present.some((a) => !a.registered && !a.pluginManaged) && (
         <p className="text-xs text-muted-foreground">
           Connecting one of these registers the MCP server with all of them; memory hooks are added
           per agent.
@@ -717,9 +718,11 @@ function OtherAgentRow({
   const qc = useQueryClient();
   const hookId = HOOK_AGENT_IDS.includes(agent.id) ? (agent.id as HookAgentId) : null;
   const hooksWanted = !!hookId && !!hooks && !hooks.installed && !hooks.blocked;
+  // The agent's Callimachus plugin runs the MCP server; the app's memory hooks are still added.
+  const served = agent.registered || !!agent.pluginManaged;
   const connect = useMutation({
     mutationFn: async () => {
-      if (!agent.registered) {
+      if (!served) {
         const list = await api.installAgentIntegrations();
         qc.setQueryData(["agent_integrations"], list);
       }
@@ -736,8 +739,8 @@ function OtherAgentRow({
     },
   });
   // Blocked hooks (turned off in the agent's own config) leave MCP as all a Connect can do.
-  const connected = agent.registered && !hooksWanted;
-  const action = connected ? null : agent.registered ? "Add memory hooks" : "Connect";
+  const connected = served && !hooksWanted;
+  const action = connected ? null : served ? "Add memory hooks" : "Connect";
   const detail =
     !hookId || hooks?.blocked
       ? "The callimachus MCP server, so it can search this history."
@@ -753,6 +756,11 @@ function OtherAgentRow({
       action={action}
       onConnect={() => connect.mutate()}
     >
+      {agent.pluginManaged && (
+        <p className="text-[13px] leading-normal text-muted-foreground">
+          Its Callimachus plugin runs the MCP server.
+        </p>
+      )}
       {hooks?.blocked && (
         <p className="text-[13px] leading-normal text-muted-foreground">
           No memory hooks: {hooks.blocked}. Settings &gt; Agents says how to turn them on.

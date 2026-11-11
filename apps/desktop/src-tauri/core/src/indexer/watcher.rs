@@ -161,7 +161,8 @@ fn watch_targets() -> Vec<Target> {
         v.push(Target::new(p, super::goose::KIND));
     }
     // Watch the JSON storage tree (legacy) and the directory holding opencode.db
-    // (V1 SQLite). Both may exist; the indexer dispatches based on DB presence.
+    // (V1 and V2 SQLite; the prefix also takes its -wal, where new turns land first).
+    // Both may exist; the indexer dispatches based on DB presence.
     if let Some(p) = super::opencode::storage_root() {
         v.push(Target::new(p, super::opencode::KIND));
     }

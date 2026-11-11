@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "results": [
+    {
+      "example": "error[E0425]: cannot find value `conn` in this scope",
+      "count": 7,
+      "threads": 3,
+      "firstSeen": 1772366400,
+      "lastSeen": 1793188800,
+      "threadIds": [42, 17, 9],
+      "fix": {
+        "sha": "3f9c2ab0d4e5f60718293a4b5c6d7e8f90a1b2c3",
+        "shortSha": "3f9c2ab",
+        "subject": "fix: pass the connection through",
+        "committedAt": 1793707200,
+        "threadId": 42
+      },
+      "playbook": "`error[E0425]: cannot find value `conn` in this scope`: seen 7 times; fixed in 3f9c2ab"
+    },
+    {
+      "example": "TypeError: Cannot read properties of undefined (reading 'map')",
+      "count": 4,
+      "threads": 2,
+      "firstSeen": 1776686400,
+      "lastSeen": 1790942400,
+      "threadIds": [30, 12],
+      "fix": null,
+      "playbook": null
+    },
+    {
+      "example": "ModuleNotFoundError: No module named 'yaml'",
+      "count": 3,
+      "threads": 3,
+      "firstSeen": 1777982400,
+      "lastSeen": 1788955200,
+      "threadIds": [5],
+      "fix": {
+        "sha": "a1b2c3d4e5f60718293a4b5c6d7e8f9001122334",
+        "shortSha": "a1b2c3d",
+        "subject": null,
+        "committedAt": 1788955200,
+        "threadId": 5
+      },
+      "playbook": null
+    }
+  ]
+}

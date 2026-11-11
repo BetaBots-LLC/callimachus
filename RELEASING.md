@@ -57,7 +57,11 @@ cursor.directory and team marketplaces read the plugin from a branch (cursor.dir
 the default one), not a tag, and the Cursor Marketplace lists an update only after Cursor
 reviews it. So after the version PR merges, the pin names an npm version that resolves once
 that release's npm publish lands; the hook scripts ask `cal help` first, so a plugin ahead of
-the user's app stays silent.
+the user's app stays silent. For the Codex plugin (experimental) it stamps
+`plugins/codex/.codex-plugin/plugin.json`, the `npx -y callimachus-mcp@<ver>` pin in
+`plugins/codex/.mcp.json` and the `"ref": "v<ver>"` of its `git-subdir` source in
+`.agents/plugins/marketplace.json`, which Codex reads like Claude Code's catalog: from the
+branch the marketplace was added at, fetching the plugin from the tag.
 
 **The plugin follows the release, not main.** Claude Code reads the marketplace catalog from
 the default branch but fetches the plugin itself from the `v<ver>` tag the catalog names. Once

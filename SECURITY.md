@@ -173,8 +173,20 @@ browser storage, no cross-site tracking.
   `--for gemini`, written into `~/.codex/hooks.json` and `~/.gemini/settings.json`
   next to your own hooks, and hold to the same rules: read the local index, never
   create or upgrade it, exit silently on any error. The Codex PreCompact hook only
-  takes a local snapshot. These agents also receive imported Claude Code memories,
-  which they send to their own providers with the rest of their context.
+  takes a local snapshot. The Codex hooks also read `~/.codex/config.toml` and
+  Codex's plugin folder to see whether the Callimachus plugin for Codex is enabled
+  and installed; while it is, each leaves a per-event claim file under
+  `~/.callimachus/recall`, so that the app's hook and the plugin's act once, and
+  those files are removed after 7 days. These agents also receive imported Claude
+  Code memories, which they send to their own providers with the rest of their
+  context.
+- While the Callimachus plugin for Codex is enabled in `~/.codex/config.toml` and
+  installed in Codex, the app removes its own `[mcp_servers.callimachus]` entry
+  from that file without asking (at launch, and within a minute while it runs), so
+  that one Callimachus server starts, and keeps a copy of the entry next to the
+  index. Once the plugin is off, it puts that entry back, with any keys you had
+  added to it, pointed at the current app. It edits nothing else in that file, and
+  an entry you add back while the plugin is on stays.
 - The GitHub Copilot and Cursor memory hooks (also off until you turn them on) are
   `--for copilot` / `--for cursor`, in their own file
   `~/.copilot/hooks/callimachus.json` (read by Copilot CLI and VS Code's Copilot

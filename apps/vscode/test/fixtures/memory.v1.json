@@ -1,0 +1,138 @@
+{
+  "schema_version": 1,
+  "project": "/work/acme/app",
+  "decisions": [
+    {
+      "id": 101,
+      "threadId": 7,
+      "text": "Keep the local cache in SQLite with WAL mode,\nnot a JSON file.",
+      "title": "Pick a cache store",
+      "createdAt": 1767268800,
+      "pinned": false,
+      "extractor": "llm",
+      "originRef": null,
+      "kind": "decision",
+      "decidedAt": 1767268800,
+      "source": "claude_code",
+      "status": "current",
+      "support": 3,
+      "lastConfirmed": 1772366400
+    },
+    {
+      "id": 102,
+      "threadId": 8,
+      "text": "Ship the CLI as one static binary per platform.",
+      "title": null,
+      "createdAt": 1771070400,
+      "pinned": true,
+      "extractor": "user",
+      "originRef": null,
+      "kind": "decision",
+      "decidedAt": 1771070400,
+      "source": "codex",
+      "status": "current",
+      "support": 1
+    },
+    {
+      "id": 103,
+      "threadId": 9,
+      "text": "Retry failed uploads three times with backoff.",
+      "title": "Upload retries",
+      "createdAt": 1776686400,
+      "pinned": false,
+      "extractor": "llm",
+      "originRef": null,
+      "kind": "decision",
+      "decidedAt": 1776686400,
+      "source": "gemini",
+      "status": "disputed",
+      "disputedBy": [
+        {
+          "id": 140,
+          "text": "Never retry uploads; surface the error.",
+          "decidedAt": 1777982400,
+          "threadId": 12
+        }
+      ],
+      "support": 1
+    }
+  ],
+  "gotchas": [
+    {
+      "id": 201,
+      "threadId": 10,
+      "text": "The test runner needs TZ=UTC or the date tests drift.",
+      "title": "Flaky date tests",
+      "createdAt": 1782820800,
+      "pinned": true,
+      "edited": true,
+      "extractor": "llm",
+      "originRef": null,
+      "kind": "gotcha",
+      "decidedAt": 1782820800,
+      "source": "claude_code",
+      "status": "flagged",
+      "support": 1,
+      "flags": [
+        {
+          "id": 9,
+          "kind": "stale",
+          "source": "agent",
+          "reason": "the runner sets TZ itself now",
+          "createdAt": 1788955200,
+          "threadId": null
+        }
+      ]
+    },
+    {
+      "id": 202,
+      "threadId": 3,
+      "text": "Run the migrations before seeding the fixtures.",
+      "title": "Recorded memory",
+      "createdAt": 1788955200,
+      "pinned": false,
+      "extractor": "agent",
+      "originRef": null,
+      "kind": "gotcha",
+      "decidedAt": 1788955200,
+      "source": "in_app",
+      "status": "current",
+      "support": 1
+    },
+    {
+      "id": 203,
+      "threadId": 3,
+      "text": "Port 5432 is taken on CI runners; use 5433.",
+      "title": "Recorded memory",
+      "createdAt": 1790942400,
+      "pinned": false,
+      "extractor": "repo",
+      "originRef": ".callimachus/memory/gotchas.jsonl",
+      "kind": "gotcha",
+      "decidedAt": 1790942400,
+      "source": "in_app",
+      "status": "current",
+      "support": 1
+    }
+  ],
+  "openTodos": [
+    {
+      "id": 301,
+      "threadId": 11,
+      "text": "Add an index on events(created_at).",
+      "title": "Slow events page",
+      "createdAt": 1793188800,
+      "pinned": false,
+      "extractor": "heuristic",
+      "originRef": null,
+      "kind": "todo",
+      "decidedAt": 1793188800,
+      "source": "copilot_cli",
+      "status": "current",
+      "support": 1
+    }
+  ],
+  "threadCount": 42,
+  "distilledCount": 30,
+  "pendingCount": 12
+}

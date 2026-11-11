@@ -1,0 +1,9 @@
+[
+  {
+    "example": "TypeError: Cannot read properties of undefined (reading 'map')",
+    "count": 4,
+    "threads": 2,
+    "firstSeen": 1776686400,
+    "lastSeen": 1790942400
+  }
+]

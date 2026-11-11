@@ -1406,6 +1406,9 @@ export interface AgentIntegration {
   present: boolean; // the agent's config dir exists (the user uses it)
   registered: boolean;
   configPath: string;
+  /** Codex only: the Callimachus plugin for Codex runs the MCP server, so the app registers
+   *  none there. Its hooks run beside the app's. Optional: an older backend doesn't send it. */
+  pluginManaged?: boolean;
 }
 
 /** An agent whose own hook system Callimachus can install memory hooks into. */
