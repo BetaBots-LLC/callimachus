@@ -147,7 +147,9 @@ vectors are read from the index's own stored chunks.
 
 `core/src/eval/` holds a small synthetic corpus (`fixtures/memory_truth_v1.json`: eight
 projects with planted corrections, fixes, reversals and restatements; `memory_truth_v2.json`
-adds proposals checked in a project that never decided them) and ignored tests that run it
+adds proposals checked in a project that never decided them; `memory_truth_v3.json` adds
+18 paraphrase queries (24 with v1's), 10 off-topic long queries and a working-set project for the
+SessionStart hook, checked in CI by `working_set_slice_reaches_the_hook`) and ignored tests that run it
 through the real search, `check_decision` and hook-memory paths with hand-written distill
 output, so no LLM is involved. Run them after changing search, recall, fact links, the
 guard or the memory renderer:

@@ -14,6 +14,10 @@ pub mod identity;
 pub mod priority;
 pub mod repo_memory;
 pub mod truth;
+// SessionStart memory: facts naming the files the latest sessions edited go first.
+pub mod working_set;
+
+pub use working_set::get_project_memory_for_working_set;
 
 pub use fallback::{
     check_or_fallback, recall_or_fallback, ClosestSession, DistillCoverage, RecallOutcome,
@@ -26,9 +30,9 @@ pub use priority::{distill_priority_ready, enqueue_distill_priority};
 pub use truth::{
     agent_supersedes_recent, distill_memory_context, fact_date, fact_in_project, fact_truth,
     flag_fact, has_truth_tables, is_session_extractor, link_facts, resolve_fact_flags,
-    unlink_facts, unlink_link, FactFlag, FactStatus, FactTruth, FlagKind, FlagOutcome, LinkKind,
-    LinkOutcome, LinkRejection, LinkSource, LinkedFact, RefEntry, RefMap, SignalSource,
-    AGENT_FLAG_CAP, AGENT_SUPERSEDE_CAP, AGENT_SUPERSEDE_WINDOW_SECS, DECIDED_AT_SQL,
+    restore_fact, unlink_facts, unlink_link, FactFlag, FactStatus, FactTruth, FlagKind,
+    FlagOutcome, LinkKind, LinkOutcome, LinkRejection, LinkSource, LinkedFact, RefEntry, RefMap,
+    SignalSource, AGENT_FLAG_CAP, AGENT_SUPERSEDE_CAP, AGENT_SUPERSEDE_WINDOW_SECS, DECIDED_AT_SQL,
 };
 
 use crate::agent::Distilled;
@@ -38,6 +42,16 @@ use serde::Serialize;
 
 /// Hard cap on a single extracted TODO so one runaway line can't bloat the list.
 const MAX_TODO_LEN: usize = 240;
+
+/// `facts.extractor` of a TODO taken from a deferred-work list in an assistant message
+/// ([`extract_followups`]): only a thread's latest such list, and only one from the last 30
+/// days ([`TodoDeriver`]). Re-derived from message text on every index like a `heuristic`
+/// one, and curated the same way (done / pinned / hidden / edited rows are kept).
+pub const EXTRACTOR_FOLLOWUP: &str = "followup";
+
+/// The extractors whose TODOs the indexer re-derives from message text, as a SQL list. Every
+/// re-derive, its curated-row seed and the one-time backfills read both.
+pub(crate) const DERIVED_TODO_EXTRACTORS_SQL: &str = "('heuristic', 'followup')";
 
 /// Pull likely TODO/action items out of one message's text. Intentionally
 /// conservative, so we get signal, not every "we need to" aside:
@@ -49,7 +63,62 @@ const MAX_TODO_LEN: usize = 240;
 /// `'todo' kind`, `TODO/FIXME markers`) is prose about TODOs, not a TODO, and is ignored.
 /// So are fenced code blocks (code under discussion, not the user's action items) and
 /// injected context such as a loaded skill body, whose checklists are templates.
+///
+/// This is the user-message rule; an assistant message goes through [`message_todos`],
+/// which also gates its checklists.
 pub fn extract_todos(text: &str) -> Vec<String> {
+    scan_todos(text, false)
+}
+
+/// The TODOs one message yields, each with the extractor it is stored under: `heuristic`
+/// ([`extract_todos`]'s rule) and, in an assistant message, [`EXTRACTOR_FOLLOWUP`]. An
+/// assistant's `- [ ]` item must name a specific ([`names_a_specific`]): on the measured index
+/// 116 of 129 open TODOs came from assistant messages, and the 76 this gate rejects were
+/// how-to checklists written for the user (posting steps, profile fields, recording tips), not
+/// this project's work. A TODO / FIXME marker is kept as it is, and so is a user's checklist:
+/// the user wrote it as their own list.
+pub(crate) fn message_todos(text: &str, assistant: bool) -> Vec<(String, &'static str)> {
+    let mut out: Vec<(String, &'static str)> = scan_todos(text, assistant)
+        .into_iter()
+        .map(|t| (t, "heuristic"))
+        .collect();
+    if assistant {
+        out.extend(
+            extract_followups(text)
+                .into_iter()
+                .map(|t| (t, EXTRACTOR_FOLLOWUP)),
+        );
+    }
+    out
+}
+
+/// Whether a TODO names a file, symbol or identifier (`grounding::keep_tokens` finds one, or
+/// a word is a ticket id such as `LIN-482` or an issue number such as `#482`, which name this
+/// project's work as precisely as a file and which grounding has no rule for): a checklist
+/// line that names none is a how-to step, not this project's work.
+fn names_a_specific(text: &str) -> bool {
+    !grounding::keep_tokens(text).is_empty()
+        || text.split_whitespace().any(|w| {
+            let w = w.trim_matches(|c: char| !c.is_alphanumeric() && c != '#');
+            let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+            if let Some(n) = w.strip_prefix('#') {
+                return digits(n);
+            }
+            // An uppercase letter, then uppercase letters or digits, a dash and digits: not
+            // `v1-2` or `utf-8`.
+            w.split_once('-').is_some_and(|(key, n)| {
+                key.len() >= 2
+                    && key.starts_with(|c: char| c.is_ascii_uppercase())
+                    && key
+                        .bytes()
+                        .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+                    && digits(n)
+            })
+        })
+}
+
+/// [`extract_todos`], with `gate_tasks` dropping a `- [ ]` item that names no specific.
+fn scan_todos(text: &str, gate_tasks: bool) -> Vec<String> {
     let mut out = Vec::new();
     if is_injected_context(text) {
         return out;
@@ -64,12 +133,255 @@ pub fn extract_todos(text: &str) -> Vec<String> {
         if in_fence || line.is_empty() {
             continue;
         }
-        let candidate = unchecked_task(line).or_else(|| leading_marker(line));
-        if let Some(todo) = candidate.and_then(clean) {
+        let todo = match unchecked_task(line) {
+            Some(task) => clean(task).filter(|t| !gate_tasks || names_a_specific(t)),
+            None => leading_marker(line).and_then(clean),
+        };
+        if let Some(todo) = todo {
             out.push(todo);
         }
     }
     out
+}
+
+/// Most items one message's deferred-work lists yield.
+const MAX_FOLLOWUPS_PER_MESSAGE: usize = 12;
+/// A heading, bold line or `...:` line longer than this is prose, not a section title.
+const MAX_FOLLOWUP_TITLE: usize = 60;
+/// Prose lines a deferred-work heading may have before its first bullet ("These are out of
+/// scope for this PR:").
+const MAX_FOLLOWUP_INTRO: usize = 2;
+
+/// Section titles that introduce deferred work, matched at the start of the title (an `s`
+/// may follow: "Follow-ups"). Not "Next steps", even for bullets that name a specific: on the
+/// measured index its 55 such bullets were mostly setup instructions for the user (run the
+/// migration, regenerate the types, configure a dashboard), about 23 of a 30-item sample.
+const FOLLOWUP_TITLES: &[&str] = &[
+    "known follow-up",
+    "known follow up",
+    "follow-up",
+    "follow up",
+    "followup",
+    "not done",
+    "not in this pr",
+    "deferred",
+    "left to do",
+    "remaining",
+];
+
+/// Words that, anywhere after a deferred-work phrase, say its list is work already done
+/// ("Follow-ups, all merged", "Remaining: none, all done"), unless a negation comes first
+/// ("Follow-ups that never landed"). A whole-title match instead ("Remaining", "Follow-ups"
+/// and nothing after) would keep about 27 of the measured index's 295 items: most of its 79
+/// titles add a qualifier ("Remaining cleanup (by risk)", "Deferred, needs a decision"), over
+/// deferred work all the same. This rule rejects its one list of completed work (3 items).
+const DONE_WORDS: &[&str] = &[
+    "shipped",
+    "done",
+    "fixed",
+    "landed",
+    "merged",
+    "applied",
+    "completed",
+    "finished",
+    "resolved",
+    "addressed",
+    "implemented",
+    "delivered",
+];
+
+/// What a singular "follow-up" names as made when it is an adjective: "Follow-up fixes:" over
+/// the fixes a review asked for are done, unlike "Follow-ups" or "Remaining fixes", and so is
+/// "Follow-up commit `abc1234`:".
+const MADE_WORDS: &[&str] = &["fix", "fixes", "change", "changes", "commit", "commits"];
+
+/// A first word after the phrase that names something other than work: "Remaining risks" and
+/// "Follow-up questions" list what may go wrong or what to ask, not what is left to do.
+const NOT_WORK_WORDS: &[&str] = &["risk", "risks", "question", "questions", "note", "notes"];
+
+/// "none" or "nothing" says nothing is left when it ends the title or one of these words
+/// follows it ("Remaining work is none", "Follow-ups: none needed", "nothing left to do"), and
+/// not when it only qualifies the items ("Follow-ups (none blocking)", "Remaining (nothing
+/// urgent)"), whose list is deferred work all the same.
+const NOTHING_LEFT: &[&str] = &[
+    "left",
+    "remaining",
+    "needed",
+    "pending",
+    "outstanding",
+    "else",
+    "to",
+];
+
+/// Work an agent said it left for later: the bullets under a heading, a bold line or a short
+/// `...:` line titled like "Follow-ups", "Known follow-ups, not in this PR", "Not done",
+/// "Deferred", "Remaining" or "Left to do", at most [`MAX_FOLLOWUPS_PER_MESSAGE`] per message.
+/// On the measured index (1,789 top-level sessions) such lists held 292 items and none of them
+/// reached the TODO list, which reads only `- [ ]` tasks and TODO markers. A list ends at the
+/// next heading or at an unindented line that is not a bullet, and a title that says its list
+/// is done ([`DONE_WORDS`]) opens none; nested bullets are details of their parent and are
+/// skipped (but a bullet ending in `:` is a label, not an item, and the bullets nested under
+/// it are read as items), as are checked (`[x]`) and struck (`~~`) items. Fenced
+/// code and injected context are never read, as in [`extract_todos`].
+pub fn extract_followups(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if is_injected_context(text) {
+        return out;
+    }
+    // The open list: the indent of its bullets (set by the first one), how many prose lines
+    // came before that, and the indent of the last item read, deeper bullets being its
+    // details (None after a label, whose nested bullets are read).
+    struct List {
+        indent: Option<usize>,
+        intro: usize,
+        item: Option<usize>,
+    }
+    let mut list: Option<List> = None;
+    let mut in_fence = false;
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.starts_with("```") || line.starts_with("~~~") {
+            in_fence = !in_fence;
+            list = None;
+            continue;
+        }
+        if in_fence || line.is_empty() {
+            continue;
+        }
+        if followup_title(line).is_some() {
+            list = Some(List {
+                indent: None,
+                intro: 0,
+                item: None,
+            });
+            continue;
+        }
+        let Some(open) = list.as_mut() else {
+            continue;
+        };
+        if line.starts_with('#') {
+            list = None;
+            continue;
+        }
+        let indent = raw.len() - raw.trim_start().len();
+        let Some(item) = bullet_text(line) else {
+            match open.indent {
+                // A wrapped bullet continues under its parent.
+                Some(i) if indent > i => {}
+                Some(_) => list = None,
+                None => {
+                    open.intro += 1;
+                    if open.intro > MAX_FOLLOWUP_INTRO {
+                        list = None;
+                    }
+                }
+            }
+            continue;
+        };
+        open.indent.get_or_insert(indent);
+        // Under an item its details, and theirs.
+        if open.item.is_some_and(|at| indent > at) {
+            continue;
+        }
+        open.item = Some(indent);
+        let item = match item.strip_prefix("[ ]").or_else(|| item.strip_prefix("[]")) {
+            Some(rest) => rest.trim_start(),
+            None if item.starts_with("[x]") || item.starts_with("[X]") => continue,
+            None => item,
+        };
+        if item.starts_with("~~") {
+            continue;
+        }
+        let Some(todo) = clean(item) else { continue };
+        // A bullet ending in `:` labels the items nested under it ("**Three questions are
+        // still open:**"), at any depth ("- Backend:" under it): on a measured index 5 of 24
+        // follow-ups were such labels, their real items skipped as details.
+        if todo.trim_end_matches(['*', '_']).ends_with(':') {
+            open.item = None;
+            continue;
+        }
+        if !out.iter().any(|o| o.eq_ignore_ascii_case(&todo)) {
+            out.push(todo);
+        }
+        if out.len() >= MAX_FOLLOWUPS_PER_MESSAGE {
+            break;
+        }
+    }
+    out
+}
+
+/// The text after a list bullet (`- `, `* `, `+ `, `• `, `1. `, `2) `), else None.
+fn bullet_text(line: &str) -> Option<&str> {
+    for p in ["- ", "* ", "+ ", "\u{2022} "] {
+        if let Some(rest) = line.strip_prefix(p) {
+            return Some(rest.trim_start());
+        }
+    }
+    let digits = line.bytes().take_while(u8::is_ascii_digit).count();
+    if (1..=3).contains(&digits) {
+        let rest = &line[digits..];
+        if let Some(rest) = rest.strip_prefix(". ").or_else(|| rest.strip_prefix(") ")) {
+            return Some(rest.trim_start());
+        }
+    }
+    None
+}
+
+/// Whether `line` titles a deferred-work list ([`FOLLOWUP_TITLES`]): a markdown heading, a
+/// line in bold, or a short line ending in `:`, whose words after the phrase do not say the
+/// work is done ([`DONE_WORDS`], [`MADE_WORDS`], [`NOTHING_LEFT`]) or name something else
+/// ([`NOT_WORK_WORDS`]). Some(the phrase it matched), else None.
+fn followup_title(line: &str) -> Option<&'static str> {
+    let title = if let Some(h) = line.strip_prefix('#') {
+        h.trim_start_matches('#').trim()
+    } else if let Some(inner) = ["**", "__"]
+        .iter()
+        .find_map(|m| line.strip_prefix(m).and_then(|r| r.split_once(m)))
+    {
+        // `**Follow-ups:**` or `**Follow-ups**:`, and nothing after it on the line.
+        let (inner, after) = inner;
+        if !after.trim().trim_start_matches(':').is_empty() {
+            return None;
+        }
+        inner.trim()
+    } else if let Some(t) = line.strip_suffix(':') {
+        t.trim()
+    } else {
+        return None;
+    };
+    let title = title
+        .trim_matches(|c: char| matches!(c, '*' | '_' | ':' | ' '))
+        .trim_start_matches(|c: char| c.is_ascii_digit() || matches!(c, '.' | ')' | ' '));
+    if title.chars().count() > MAX_FOLLOWUP_TITLE {
+        return None;
+    }
+    let lower = title.to_lowercase();
+    let (phrase, plural, rest) = FOLLOWUP_TITLES.iter().copied().find_map(|phrase| {
+        let rest = lower.strip_prefix(phrase)?;
+        let (plural, rest) = match rest.strip_prefix('s') {
+            Some(r) => (true, r),
+            None => (false, rest),
+        };
+        rest.chars()
+            .next()
+            .is_none_or(|c| !c.is_alphanumeric())
+            .then_some((phrase, plural, rest))
+    })?;
+    let words: Vec<&str> = rest
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    let done = words.iter().enumerate().any(|(i, w)| {
+        let said = DONE_WORDS.contains(w)
+            || (matches!(*w, "none" | "nothing")
+                && words.get(i + 1).is_none_or(|n| NOTHING_LEFT.contains(n)));
+        said && (i == 0 || !matches!(words[i - 1], "not" | "no" | "never"))
+    });
+    let made = !plural
+        && phrase.contains("follow")
+        && words.first().is_some_and(|w| MADE_WORDS.contains(w));
+    let not_work = words.first().is_some_and(|w| NOT_WORK_WORDS.contains(w));
+    (!done && !made && !not_work).then_some(phrase)
 }
 
 /// Message text that an agent harness injected rather than the user or model writing it:
@@ -188,8 +500,16 @@ fn is_noise(t: &str) -> bool {
         || t.contains('}')
 }
 
-/// Cap on heuristic todos kept per thread (matches the indexer).
+/// Cap on heuristic todos kept per thread. Follow-ups have no per-thread cap: only a thread's
+/// latest deferred-work list yields them (see [`TodoDeriver`]), at most
+/// [`MAX_FOLLOWUPS_PER_MESSAGE`] items.
 const MAX_TODOS_PER_THREAD: usize = 25;
+/// A deferred-work list older than this at derive time yields no follow-ups: a "Remaining"
+/// list from months ago says nothing about today, and nothing closes a follow-up but the
+/// user. On a measured index only 23 of about 300 follow-ups were from the last 30 days, and
+/// without this limit the open list would have grown from 128 to about 350 on upgrade, nine
+/// tenths of the new rows older than a month.
+const FOLLOWUP_MAX_AGE_SECS: i64 = 30 * 24 * 60 * 60;
 
 /// `facts.created_at` for a heuristic TODO: when its source message was written, not when
 /// the thread was (re)indexed, so "newest first" means newest TODO rather than "most
@@ -208,19 +528,18 @@ pub fn todo_created_at(message_ts: Option<i64>, now: i64) -> i64 {
 /// cheap; run once at startup. Returns the number of rows removed.
 pub fn purge_subagent_todos(conn: &Connection) -> Result<usize> {
     Ok(conn.execute(
-        "DELETE FROM facts WHERE extractor = 'heuristic' AND kind = 'todo'
-            AND status = 'open' AND pinned = 0 AND hidden = 0
-            AND thread_id IN (SELECT id FROM threads WHERE is_subagent = 1)",
+        &format!(
+            "DELETE FROM facts WHERE extractor IN {DERIVED_TODO_EXTRACTORS_SQL} AND kind = 'todo'
+                AND status = 'open' AND pinned = 0 AND hidden = 0
+                AND thread_id IN (SELECT id FROM threads WHERE is_subagent = 1)"
+        ),
         [],
     )?)
 }
 
-/// Re-derive a single thread's heuristic todos from its already-stored messages,
-/// inside the caller's transaction. Shared by the indexer and the backfill.
+/// Re-derive a single thread's heuristic and follow-up todos from its already-stored
+/// messages, inside the caller's transaction. Shared by the indexer and the backfill.
 fn rebuild_thread_todos(tx: &Connection, thread_id: i64, now: i64) -> Result<()> {
-    // Keep CURATED todos (done / dismissed / pinned) so closing a TODO survives re-index;
-    // only the open, untouched ones are re-derived, under the uid each had before.
-    let uids = take_open_heuristic_todos(tx, thread_id)?;
     // Subagent transcripts are the parent session's delegated work (most of the corpus in
     // workflow-heavy repos); their checklists and code comments are not the user's TODOs.
     let is_subagent: bool = tx
@@ -231,77 +550,323 @@ fn rebuild_thread_todos(tx: &Connection, thread_id: i64, now: i64) -> Result<()>
         )
         .optional()?
         .is_some_and(|v| v != 0);
+    // Keep CURATED todos (done / dismissed / pinned) so closing a TODO survives re-index;
+    // only the open, untouched ones are re-derived, under the uid each had before.
+    let mut derive = TodoDeriver::start(tx, thread_id, true, now)?;
     if is_subagent {
         return Ok(());
     }
     let mut sel = tx.prepare(
-        "SELECT id, text, ts, seq FROM messages
+        "SELECT id, role, text, ts, seq FROM messages
          WHERE thread_id = ?1 AND role IN ('user', 'assistant')
          ORDER BY seq, id",
     )?;
-    let rows: Vec<(i64, String, Option<i64>, i64)> = sel
+    let rows: Vec<(i64, String, String, Option<i64>, i64)> = sel
         .query_map([thread_id], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
         })?
         .collect::<rusqlite::Result<_>>()?;
-    let mut ins = tx.prepare(INSERT_HEURISTIC_TODO_SQL)?;
-    let mut seen = std::collections::HashSet::new();
-    // Seed with kept curated todos so we don't insert an open duplicate of a closed one.
-    {
-        let mut kept =
-            tx.prepare("SELECT text FROM facts WHERE thread_id = ?1 AND extractor = 'heuristic'")?;
-        for t in kept
-            .query_map([thread_id], |r| r.get::<_, String>(0))?
-            .flatten()
-        {
-            seen.insert(t.to_ascii_lowercase());
-        }
-    }
-    let edited = edited_todo_seqs(tx, thread_id)?;
-    let mut per = 0usize;
-    'outer: for (mid, text, ts, seq) in rows {
-        if per >= MAX_TODOS_PER_THREAD {
-            break;
-        }
-        for todo in extract_todos(&text) {
-            if per >= MAX_TODOS_PER_THREAD {
-                break 'outer;
-            }
-            let lower = todo.to_ascii_lowercase();
-            if edited.contains(&seq) && !uids.contains_key(&lower) {
-                // The user reworded the TODO this message raised (see `edited_todo_seqs`).
-                seen.insert(lower);
-                continue;
-            }
-            if seen.insert(lower.clone()) {
-                let created = todo_created_at(ts, now);
-                let uid = uids.get(&lower).cloned().unwrap_or_else(new_fact_uid);
-                ins.execute(rusqlite::params![thread_id, todo, mid, created, seq, uid])?;
-                per += 1;
-            }
-        }
+    // Every message is read: a later deferred-work list replaces the earlier ones.
+    for (mid, role, text, ts, seq) in rows {
+        derive.message(mid, role == "assistant", &text, ts, seq)?;
     }
     Ok(())
 }
 
-/// The insert for one heuristic TODO: (thread, text, source message, created_at, source seq,
-/// uid). Shared by the indexer and the backfill.
-pub(crate) const INSERT_HEURISTIC_TODO_SQL: &str = "INSERT INTO facts
+/// The insert for one derived TODO: (thread, text, source message, created_at, source seq,
+/// uid, extractor). Shared by the indexer and the backfills.
+pub(crate) const INSERT_DERIVED_TODO_SQL: &str = "INSERT INTO facts
         (thread_id, kind, text, source_message_id, status, extractor, created_at, source_seq, uid)
-     VALUES (?1, 'todo', ?2, ?3, 'open', 'heuristic', ?4, ?5, ?6)";
+     VALUES (?1, 'todo', ?2, ?3, 'open', ?7, ?4, ?5, ?6)";
 
-/// Delete this thread's open, uncurated heuristic TODOs (the ones a re-derive replaces) and
-/// return their uids by lowercased text, so the same TODO found again keeps its identity
-/// instead of turning into a new fact on every full re-index. A TODO the user reworded
-/// (`edit_fact`) is curated: it stays, under its uid, like a done or pinned one.
-pub(crate) fn take_open_heuristic_todos(
+/// One thread's TODO re-derive, message by message, shared by the indexer (a full replace or
+/// an appended tail) and the backfills so they keep one rule: the curated rows it must not
+/// duplicate, the uid a TODO found again keeps, the messages whose TODO the user reworded,
+/// the heuristic cap, and these rules for follow-ups:
+///
+/// - **The latest list wins.** A thread's follow-ups are the items of its latest assistant
+///   message (in seq order) with a deferred-work list: such a list first removes the
+///   thread's open, uncurated follow-ups from earlier messages (on an append they are already
+///   in the table), then adds its own items. On a measured index 87 of the 90 messages
+///   holding a list were status reports from the middle of a session (a median of 9 user
+///   turns followed), a quarter of the items in a second or later list repeated an earlier
+///   one in other words, and the old per-thread cap of 25 cut the newest list, the only one
+///   that still said what was left. The cost: in a session that reports on several pieces of
+///   work one after another, an earlier piece's deferred items leave the list when a later
+///   report does not repeat them; they stay in the transcript and in search.
+/// - **Identity.** An item the list just removed keeps its uid when that list repeats it. One
+///   that leaves a list and comes back in a later one is a new fact, on an append and on a
+///   one-pass derive alike: the uid of a removed row outlives no deriver, so carrying it
+///   across a gap would make the uid depend on how the messages were batched. A full
+///   re-derive keeps the uid of every open row it takes.
+/// - **What stays.** A curated follow-up (done, hidden, pinned or edited) is never removed and
+///   still blocks an open copy of its text. Heuristic TODOs keep accumulating across messages:
+///   one whose text an open, uncurated follow-up holds takes that row over
+///   ([`Self::take_over_followup`]), so a later list cannot remove it.
+/// - **A hand-curated thread is left alone.** In a thread with a derived TODO the user reworded
+///   ([`hand_curated`]), a derive adds no follow-up and removes none: a full re-derive takes
+///   only its open, uncurated heuristic rows, its lists are not read, and the age limit
+///   removes nothing there. `edit_fact` overwrites the original wording, so a derive knows the
+///   reworded item only by its message's seq (which a full replace can renumber), and each
+///   rule that guessed which item of a list was the original from the rows that came and went
+///   during the derive had a hole, one found in each of three reviews (the siblings blocked
+///   for good, the original back on an append, the original back through a row the same
+///   derive added and removed). Its heuristic TODOs derive as before follow-ups existed
+///   ([`edited_todo_seqs`]). The cost: from the moment a TODO of a session is reworded, later
+///   deferred-work lists of that session are not added and its open follow-ups stay until
+///   the user closes or hides them; and an open checklist TODO an older build took from one
+///   of its deferred-work lists, which the checklist gate now rejects, goes on the re-judge or
+///   a full re-derive without coming back as a follow-up, as it would in another thread.
+/// - **An age limit.** A list in a message older than [`FOLLOWUP_MAX_AGE_SECS`] at derive
+///   time (the message's own time, normalized as [`todo_created_at`] does; a message without
+///   one counts as new) is ignored: it adds no follow-up and removes none. So the one-time
+///   re-judge adds only the last 30 days' follow-ups, and a later full re-index drops the
+///   open, uncurated ones that have aged past the limit (pin, edit or close one to keep it).
+pub(crate) struct TodoDeriver<'c> {
+    tx: &'c Connection,
+    ins: rusqlite::Statement<'c>,
+    thread_id: i64,
+    now: i64,
+    /// The uids of the open rows a full re-derive took, by lowercased text.
+    uids: std::collections::HashMap<String, String>,
+    edited: std::collections::HashSet<i64>,
+    /// [`hand_curated`]: the thread's follow-ups stay as they are.
+    frozen: bool,
+    seen: std::collections::HashSet<String>,
+    heuristic: usize,
+}
+
+impl<'c> TodoDeriver<'c> {
+    /// `replace`: take the thread's open, uncurated derived TODOs first (a full re-derive; only
+    /// the heuristic ones in a hand-curated thread); else keep every row and count the open
+    /// heuristic ones toward their cap (an appended tail).
+    pub(crate) fn start(
+        tx: &'c Connection,
+        thread_id: i64,
+        replace: bool,
+        now: i64,
+    ) -> Result<Self> {
+        let frozen = hand_curated(tx, thread_id)?;
+        let (uids, edited) = if replace {
+            (
+                take_open_derived_todos(tx, thread_id, frozen)?,
+                edited_todo_seqs(tx, thread_id)?,
+            )
+        } else {
+            Default::default()
+        };
+        // Seed with the rows that stay (curated ones on a replace, all of them on an append)
+        // so a closed TODO never comes back as an open copy, under either extractor.
+        let mut seen = std::collections::HashSet::new();
+        let mut heuristic = 0;
+        let mut kept = tx.prepare(&format!(
+            "SELECT text, extractor, status FROM facts
+             WHERE thread_id = ?1 AND extractor IN {DERIVED_TODO_EXTRACTORS_SQL}"
+        ))?;
+        let rows = kept.query_map([thread_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        for (text, extractor, status) in rows.flatten() {
+            seen.insert(text.to_ascii_lowercase());
+            // The cap is a per-thread TOTAL of open rows: on an append the existing ones were
+            // not deleted, so they still count toward it.
+            if !replace && status == "open" && extractor != EXTRACTOR_FOLLOWUP {
+                heuristic += 1;
+            }
+        }
+        Ok(TodoDeriver {
+            tx,
+            ins: tx.prepare(INSERT_DERIVED_TODO_SQL)?,
+            thread_id,
+            now,
+            uids,
+            edited,
+            frozen,
+            seen,
+            heuristic,
+        })
+    }
+
+    /// The re-judge's mode, over a thread's messages already indexed: take follow-ups only
+    /// (what the new extractor finds, and no heuristic TODO a re-index would bring back one
+    /// past an old cap). A hand-curated thread gets none, as on every derive.
+    pub(crate) fn rejudging(mut self) -> Self {
+        self.heuristic = MAX_TODOS_PER_THREAD;
+        self
+    }
+
+    /// Insert the TODOs message `message_id` (at `seq`, written at `ts`) yields.
+    pub(crate) fn message(
+        &mut self,
+        message_id: i64,
+        assistant: bool,
+        text: &str,
+        ts: Option<i64>,
+        seq: i64,
+    ) -> Result<()> {
+        let todos = message_todos(text, assistant);
+        // Stamped with the source message's time, not index time, so a re-index of old
+        // history doesn't make old TODOs look new. The same time judges a list's age.
+        let created_at = todo_created_at(ts, self.now);
+        // Only a recent list outside a hand-curated thread yields or removes follow-ups.
+        let listed = !self.frozen
+            && self.now - created_at <= FOLLOWUP_MAX_AGE_SECS
+            && todos.iter().any(|(_, e)| *e == EXTRACTOR_FOLLOWUP);
+        let dropped = if listed {
+            self.drop_earlier_followups(seq)?
+        } else {
+            Default::default()
+        };
+        for (todo, extractor) in todos {
+            let followup = extractor == EXTRACTOR_FOLLOWUP;
+            if (followup && !listed) || (!followup && self.heuristic >= MAX_TODOS_PER_THREAD) {
+                continue;
+            }
+            let lower = todo.to_ascii_lowercase();
+            if self.edited.contains(&seq) && !self.uids.contains_key(&lower) {
+                // The user reworded the TODO this message raised (see `edited_todo_seqs`).
+                self.seen.insert(lower);
+                continue;
+            }
+            if self.seen.insert(lower.clone()) {
+                // The uid its open row had when a full re-derive took it or this list removed
+                // it, else a new fact (see **Identity**).
+                let uid = self
+                    .uids
+                    .get(&lower)
+                    .or_else(|| dropped.get(&lower))
+                    .cloned()
+                    .unwrap_or_else(new_fact_uid);
+                self.ins.execute(rusqlite::params![
+                    self.thread_id,
+                    todo,
+                    message_id,
+                    created_at,
+                    seq,
+                    uid,
+                    extractor
+                ])?;
+                if !followup {
+                    self.heuristic += 1;
+                }
+            } else if !followup
+                && !self.frozen
+                && self.take_over_followup(&lower, message_id, created_at, seq)?
+            {
+                self.heuristic += 1;
+            }
+        }
+        Ok(())
+    }
+
+    /// A heuristic TODO (a TODO marker, the user's own checklist line) whose text an open,
+    /// uncurated follow-up holds takes that row over, uid and all, as the row the heuristic
+    /// would have been: heuristic TODOs accumulate, and without this the seen-dedupe skipped
+    /// the marker, so a later list that removed the follow-up took the marker's TODO with it.
+    /// A curated row still blocks it, and a hand-curated thread needs none: no list removes
+    /// its follow-ups. Returns whether a row was taken over.
+    fn take_over_followup(
+        &mut self,
+        lower: &str,
+        message_id: i64,
+        created_at: i64,
+        seq: i64,
+    ) -> Result<bool> {
+        let tx = self.tx;
+        let open: Vec<(i64, String)> = tx
+            .prepare_cached(&format!(
+                "SELECT id, text FROM facts
+                 WHERE {OPEN_UNCURATED_DERIVED_SQL} AND extractor = '{EXTRACTOR_FOLLOWUP}'"
+            ))?
+            .query_map([self.thread_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        // Matched in Rust: `seen` lowercases ASCII only, SQLite's `lower()` may do more.
+        let Some((id, _)) = open
+            .into_iter()
+            .find(|(_, text)| text.to_ascii_lowercase() == lower)
+        else {
+            return Ok(false);
+        };
+        tx.prepare_cached(
+            "UPDATE facts SET extractor = 'heuristic', source_message_id = ?2, source_seq = ?3,
+                              created_at = ?4
+             WHERE id = ?1",
+        )?
+        .execute(params![id, message_id, seq, created_at])?;
+        Ok(true)
+    }
+
+    /// The latest list wins, for a list at `seq`: delete this thread's open, uncurated
+    /// follow-ups from earlier messages and let the list add their text again unless a row
+    /// that stays holds it. Returns their uids by lowercased text, for an item the list
+    /// repeats.
+    fn drop_earlier_followups(
+        &mut self,
+        seq: i64,
+    ) -> Result<std::collections::HashMap<String, String>> {
+        let tx = self.tx;
+        let earlier = format!(
+            "{OPEN_UNCURATED_DERIVED_SQL} AND extractor = '{EXTRACTOR_FOLLOWUP}'
+             AND COALESCE(source_seq, -1) < ?2"
+        );
+        let gone: Vec<(String, Option<String>)> = tx
+            .prepare_cached(&format!("SELECT text, uid FROM facts WHERE {earlier}"))?
+            .query_map(params![self.thread_id, seq], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut dropped = std::collections::HashMap::new();
+        if !gone.is_empty() {
+            tx.prepare_cached(&format!("DELETE FROM facts WHERE {earlier}"))?
+                .execute(params![self.thread_id, seq])?;
+            let left: std::collections::HashSet<String> = tx
+                .prepare_cached(&format!(
+                    "SELECT text FROM facts
+                     WHERE thread_id = ?1 AND extractor IN {DERIVED_TODO_EXTRACTORS_SQL}"
+                ))?
+                .query_map([self.thread_id], |r| {
+                    r.get::<_, String>(0).map(|t| t.to_ascii_lowercase())
+                })?
+                .collect::<rusqlite::Result<_>>()?;
+            for (text, uid) in gone {
+                let lower = text.to_ascii_lowercase();
+                if !left.contains(&lower) {
+                    self.seen.remove(&lower);
+                }
+                if let Some(uid) = uid {
+                    dropped.insert(lower, uid);
+                }
+            }
+        }
+        Ok(dropped)
+    }
+}
+
+/// The predicate of a derived TODO a re-derive may replace: open and never curated (not
+/// done, hidden, pinned or reworded by the user). Over `facts` with ?1 the thread.
+const OPEN_UNCURATED_DERIVED_SQL: &str = "thread_id = ?1 AND kind = 'todo'
+        AND extractor IN ('heuristic', 'followup')
+        AND status = 'open' AND hidden = 0 AND pinned = 0 AND edited = 0";
+
+/// Delete this thread's open, uncurated derived TODOs (the ones a re-derive replaces; only
+/// the heuristic ones with `heuristic_only`, for a hand-curated thread) and return their uids
+/// by lowercased text, so the same TODO found again keeps its identity instead of turning
+/// into a new fact on every full re-index. A TODO the user reworded (`edit_fact`) is curated:
+/// it stays, under its uid, like a done or pinned one.
+pub(crate) fn take_open_derived_todos(
     tx: &Connection,
     thread_id: i64,
+    heuristic_only: bool,
 ) -> Result<std::collections::HashMap<String, String>> {
-    const OPEN_UNCURATED: &str = "thread_id = ?1 AND extractor = 'heuristic'
-            AND status = 'open' AND hidden = 0 AND pinned = 0 AND edited = 0";
+    let only = if heuristic_only {
+        " AND extractor = 'heuristic'"
+    } else {
+        ""
+    };
     let mut sel = tx.prepare(&format!(
-        "SELECT text, uid FROM facts WHERE {OPEN_UNCURATED} AND uid IS NOT NULL"
+        "SELECT text, uid FROM facts WHERE {OPEN_UNCURATED_DERIVED_SQL}{only} AND uid IS NOT NULL"
     ))?;
     let uids = sel
         .query_map([thread_id], |r| {
@@ -309,22 +874,39 @@ pub(crate) fn take_open_heuristic_todos(
         })?
         .collect::<rusqlite::Result<std::collections::HashMap<_, _>>>()?;
     tx.execute(
-        &format!("DELETE FROM facts WHERE {OPEN_UNCURATED}"),
+        &format!("DELETE FROM facts WHERE {OPEN_UNCURATED_DERIVED_SQL}{only}"),
         [thread_id],
     )?;
     Ok(uids)
 }
 
-/// The messages (by `source_seq`) whose heuristic TODO the user reworded. Its original text
+/// Whether the user reworded one of this thread's derived TODOs (`edited = 1`, whatever its
+/// status, pin or hidden flag): a hand-curated thread, whose follow-ups a derive leaves as
+/// they are ([`TodoDeriver`]).
+fn hand_curated(tx: &Connection, thread_id: i64) -> Result<bool> {
+    Ok(tx
+        .prepare_cached(
+            "SELECT EXISTS (SELECT 1 FROM facts WHERE thread_id = ?1 AND kind = 'todo'
+                AND extractor IN ('heuristic', 'followup') AND edited = 1)",
+        )?
+        .query_row([thread_id], |r| r.get(0))?)
+}
+
+/// The messages (by `source_seq`) whose derived TODO the user reworded. Its original text
 /// is gone (`edit_fact` overwrites it), so a re-derive cannot match it by text: it skips the
-/// TODOs it finds again in those messages that no open fact it just took claims, or the
-/// original would come back as a second, open copy beside the edited one.
+/// heuristic TODOs it finds again in those messages that no open fact it just took claims,
+/// or the original would come back as a second, open copy beside the edited one (no
+/// follow-up is derived in such a thread: [`hand_curated`]). The seq can go stale: a full
+/// replace that renumbers a thread's messages leaves it where it was, since
+/// `rebind_fact_sources` finds a fact by its text, which the edit replaced. That is older
+/// than follow-ups and unchanged for heuristic TODOs.
 pub(crate) fn edited_todo_seqs(
     tx: &Connection,
     thread_id: i64,
 ) -> Result<std::collections::HashSet<i64>> {
     let mut stmt = tx.prepare_cached(
-        "SELECT source_seq FROM facts WHERE thread_id = ?1 AND extractor = 'heuristic'
+        "SELECT source_seq FROM facts WHERE thread_id = ?1
+            AND extractor IN ('heuristic', 'followup')
             AND edited = 1 AND source_seq IS NOT NULL",
     )?;
     let seqs = stmt
@@ -388,10 +970,12 @@ const BACKFILL_PAUSE_POLL: std::time::Duration = std::time::Duration::from_secs(
 /// Set once the one-time TODO backfill has run (or was not needed).
 const TODOS_BACKFILLED: &str = "knowledge.todos_backfilled";
 
-/// Mark the one-time backfill as not needed: an index with no threads yet gets every TODO at
-/// index time, since TODO extraction no longer depends on `knowledge.enabled`.
+/// Mark the one-time backfills as not needed: an index with no threads yet gets every TODO at
+/// index time, since TODO extraction no longer depends on `knowledge.enabled`, and under
+/// today's rules, so the re-judge ([`regate_todos_once`]) has nothing to do either.
 pub fn mark_todos_backfilled(conn: &Connection) -> Result<()> {
-    app_config::put_flag(conn, TODOS_BACKFILLED, true)
+    app_config::put_flag(conn, TODOS_BACKFILLED, true)?;
+    app_config::put(conn, TODOS_REGATED, REGATE_DONE)
 }
 
 /// The one-time TODO backfill for indexes from before TODOs were always on. Until then the
@@ -408,8 +992,260 @@ pub fn backfill_todos_once(db: &crate::db::Db, now: i64, pause: &dyn Fn() -> boo
         return Ok(false);
     }
     backfill_todos(db, now, pause)?;
-    app_config::put_flag(&lock(), TODOS_BACKFILLED, true)?;
+    let conn = lock();
+    app_config::put_flag(&conn, TODOS_BACKFILLED, true)?;
+    // The full rebuild just applied today's rules, the checklist gate and follow-ups included.
+    app_config::put(&conn, TODOS_REGATED, REGATE_DONE)?;
     Ok(true)
+}
+
+/// app_config: progress of the one-time TODO re-judge ([`regate_todos_once`]): the id of the
+/// last thread it finished (it walks them in id order), then [`REGATE_DONE`].
+pub(crate) const TODOS_REGATED: &str = "knowledge.todos_regated";
+const REGATE_DONE: &str = "done";
+
+/// What a [`regate_todos_once`] pass did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RegateReport {
+    /// Threads it walked (this run; a resumed run starts after the last one it finished).
+    pub threads: usize,
+    /// Open heuristic TODOs it deleted because the checklist gate now rejects them (one that
+    /// another message still yields moves there instead).
+    pub dropped: usize,
+    /// Follow-up TODOs it added from the threads' deferred-work lists, net of the open ones
+    /// a later list replaced.
+    pub added: usize,
+}
+
+/// The one-time re-judge of the TODOs indexed before the assistant checklist gate and
+/// [`extract_followups`]: for every top-level thread, in id order, it deletes the open
+/// heuristic TODOs the gate now rejects ([`regate_drops`]; one another message still yields
+/// moves there) and adds the thread's follow-ups under [`TodoDeriver`]'s rules (its latest
+/// deferred-work list only, and only from the last 30 days, so an earlier list's open,
+/// uncurated follow-ups go too; none in a hand-curated thread). Only those rows change:
+/// a TODO that is done, pinned, hidden or edited, one a user or agent recorded, one from any
+/// other extractor, and one whose source message cannot be found are never deleted, and no
+/// other heuristic TODO is added. Batched like [`backfill_todos`] (at most [`BACKFILL_BATCH`]
+/// threads or [`BACKFILL_BATCH_TIME`] per IMMEDIATE transaction, waiting while `pause()` says
+/// a writer job runs); each batch records the last thread it finished under [`TODOS_REGATED`]
+/// in the same transaction, so an interrupted pass resumes there and a finished one never
+/// runs again. Skipped (None, nothing recorded) on an index
+/// without the columns it reads, and when it already ran. For the watcher only (the app's or
+/// `cal watch`'s, after the launch catch-up): never a hook or the MCP server, which must not
+/// write the index behind the user's back.
+pub fn regate_todos_once(
+    db: &crate::db::Db,
+    now: i64,
+    pause: &dyn Fn() -> bool,
+) -> Result<Option<RegateReport>> {
+    let lock = || crate::db::lock_conn(&db.0);
+    let (mut after, thread_ids) = {
+        let conn = lock();
+        if !regate_columns_present(&conn) {
+            return Ok(None);
+        }
+        let after = match app_config::get(&conn, TODOS_REGATED)? {
+            Some(v) if v == REGATE_DONE => return Ok(None),
+            Some(v) => v.trim().parse::<i64>().unwrap_or(0),
+            None => 0,
+        };
+        // Subagent threads hold no derived TODOs (`purge_subagent_todos`) and get none.
+        let mut stmt =
+            conn.prepare("SELECT id FROM threads WHERE is_subagent = 0 AND id > ?1 ORDER BY id")?;
+        let ids: Vec<i64> = stmt
+            .query_map([after], |r| r.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        (after, ids)
+    };
+    let mut report = RegateReport::default();
+    let mut next = 0;
+    while next < thread_ids.len() {
+        while pause() {
+            std::thread::sleep(BACKFILL_PAUSE_POLL);
+        }
+        let mut conn = lock();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let started = std::time::Instant::now();
+        let end = (next + BACKFILL_BATCH).min(thread_ids.len());
+        while next < end {
+            let (dropped, added) = regate_thread(&tx, thread_ids[next], now)?;
+            report.dropped += dropped;
+            report.added += added;
+            after = thread_ids[next];
+            next += 1;
+            if started.elapsed() >= BACKFILL_BATCH_TIME {
+                break;
+            }
+        }
+        app_config::put(&tx, TODOS_REGATED, &after.to_string())?;
+        tx.commit()?;
+    }
+    report.threads = thread_ids.len();
+    app_config::put(&lock(), TODOS_REGATED, REGATE_DONE)?;
+    Ok(Some(report))
+}
+
+/// Whether the index has every column the re-judge reads (`facts` curation from 0015, the
+/// uid and source seq from 0034). The app always migrates before its watcher runs, but an
+/// index this build has not upgraded must be left alone rather than half judged.
+fn regate_columns_present(conn: &Connection) -> bool {
+    conn.prepare(
+        "SELECT COUNT(*) FROM pragma_table_info('facts')
+         WHERE name IN ('pinned', 'hidden', 'edited', 'uid', 'source_seq', 'source_message_id')",
+    )
+    .and_then(|mut stmt| stmt.query_row([], |r| r.get::<_, i64>(0)))
+    .is_ok_and(|n| n == 6)
+}
+
+/// One thread's re-judge, inside the caller's transaction: (TODOs deleted, follow-ups added).
+fn regate_thread(tx: &Connection, thread_id: i64, now: i64) -> Result<(usize, usize)> {
+    let mut dropped = 0;
+    for (id, to) in regate_drops(tx, thread_id)? {
+        // The predicate again: the row must still be this thread's open, uncurated heuristic
+        // TODO when it moves or goes.
+        let row = format!("id = ?2 AND extractor = 'heuristic' AND {OPEN_UNCURATED_DERIVED_SQL}");
+        match to {
+            // Where a full re-derive puts it, under the uid it has.
+            Some((message_id, seq, ts)) => {
+                tx.execute(
+                    &format!(
+                        "UPDATE facts SET source_message_id = ?3, source_seq = ?4, created_at = ?5
+                         WHERE {row}"
+                    ),
+                    params![thread_id, id, message_id, seq, todo_created_at(ts, now)],
+                )?;
+            }
+            None => {
+                dropped += tx.execute(
+                    &format!("DELETE FROM facts WHERE {row}"),
+                    params![thread_id, id],
+                )?;
+            }
+        }
+    }
+    // Counted, not tallied per insert: a later list removes what an earlier one added.
+    let followups = |tx: &Connection| -> Result<usize> {
+        let n: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM facts WHERE thread_id = ?1 AND extractor = 'followup'",
+            [thread_id],
+            |r| r.get(0),
+        )?;
+        Ok(n as usize)
+    };
+    let before = followups(tx)?;
+    // An append over the thread's own messages: every row that stays seeds the duplicate
+    // check, and only follow-ups are taken (a heuristic TODO missing now stays missing).
+    let mut derive = TodoDeriver::start(tx, thread_id, false, now)?.rejudging();
+    let mut sel = tx.prepare_cached(
+        "SELECT id, text, ts, seq FROM messages
+         WHERE thread_id = ?1 AND role = 'assistant' ORDER BY seq, id",
+    )?;
+    let rows = sel.query_map([thread_id], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, Option<i64>>(2)?,
+            r.get::<_, i64>(3)?,
+        ))
+    })?;
+    for row in rows {
+        let (mid, text, ts, seq) = row?;
+        derive.message(mid, true, &text, ts, seq)?;
+    }
+    Ok((dropped, followups(tx)?.saturating_sub(before)))
+}
+
+/// A message that yields a TODO: (message id, seq, ts).
+pub(crate) type Yield = (i64, i64, Option<i64>);
+
+/// The open, uncurated heuristic TODOs of `thread_id` that the assistant checklist gate now
+/// rejects: rows the old rule ([`extract_todos`]) derived from their source message, an
+/// assistant one, that today's rule for it ([`message_todos`]) no longer yields as a
+/// heuristic TODO. A row whose source message is gone (no id, no seq that finds one) or whose
+/// message no longer yields its text is left alone: nothing proves the gate rejects it. Each
+/// comes with the first user or assistant message of the thread (id, seq, ts) that still
+/// yields its text as a heuristic TODO (a later `TODO:` marker, the user's own `- [ ]` line),
+/// if any: a full re-derive keeps the TODO there, and the re-judge adds no heuristic TODO
+/// back, so deleting it would lose it until the thread is parsed again.
+pub(crate) fn regate_drops(tx: &Connection, thread_id: i64) -> Result<Vec<(i64, Option<Yield>)>> {
+    let mut sel = tx.prepare_cached(&format!(
+        "SELECT id, text, source_message_id, source_seq FROM facts
+         WHERE extractor = 'heuristic' AND {OPEN_UNCURATED_DERIVED_SQL}"
+    ))?;
+    let rows: Vec<(i64, String, Option<i64>, Option<i64>)> = sel
+        .query_map([thread_id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut by_id =
+        tx.prepare_cached("SELECT role, text FROM messages WHERE id = ?1 AND thread_id = ?2")?;
+    let mut by_seq = tx.prepare_cached(
+        "SELECT role, text FROM messages WHERE thread_id = ?1 AND seq = ?2 ORDER BY id LIMIT 1",
+    )?;
+    let mut rejected = Vec::new();
+    for (id, text, message_id, seq) in rows {
+        let found: Option<(String, String)> = match message_id {
+            Some(m) => by_id
+                .query_row(params![m, thread_id], |r| Ok((r.get(0)?, r.get(1)?)))
+                .optional()?,
+            None => None,
+        };
+        let found = match (found, seq) {
+            (Some(f), _) => Some(f),
+            (None, Some(s)) => by_seq
+                .query_row(params![thread_id, s], |r| Ok((r.get(0)?, r.get(1)?)))
+                .optional()?,
+            (None, None) => None,
+        };
+        let Some((role, message)) = found else {
+            continue;
+        };
+        if role != "assistant" {
+            continue;
+        }
+        let same = |t: &String| t.eq_ignore_ascii_case(&text);
+        if extract_todos(&message).iter().any(same) && !scan_todos(&message, true).iter().any(same)
+        {
+            rejected.push((id, text));
+        }
+    }
+    if rejected.is_empty() {
+        return Ok(Vec::new());
+    }
+    // (id, seq, ts, heuristic TODOs: `message_todos`' heuristic half) of each message that
+    // yields one, read only for a thread with a rejected row (the measured index's re-judge
+    // rejected 76 TODOs across its 1,789 sessions).
+    let mut yields = Vec::new();
+    let mut sel = tx.prepare_cached(
+        "SELECT id, role, text, ts, seq FROM messages
+         WHERE thread_id = ?1 AND role IN ('user', 'assistant') ORDER BY seq, id",
+    )?;
+    let rows = sel.query_map([thread_id], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, Option<i64>>(3)?,
+            r.get::<_, i64>(4)?,
+        ))
+    })?;
+    for row in rows {
+        let (mid, role, text, ts, seq) = row?;
+        let todos = scan_todos(&text, role == "assistant");
+        if !todos.is_empty() {
+            yields.push((mid, seq, ts, todos));
+        }
+    }
+    Ok(rejected
+        .into_iter()
+        .map(|(id, text)| {
+            let to = yields
+                .iter()
+                .find(|(.., todos)| todos.iter().any(|t| t.eq_ignore_ascii_case(&text)))
+                .map(|&(mid, seq, ts, _)| (mid, seq, ts));
+            (id, to)
+        })
+        .collect())
 }
 
 /// An open TODO surfaced to the UI / agents, with the thread it came from.
@@ -425,7 +1261,8 @@ pub struct TodoFact {
     pub project_path: Option<String>,
     #[serde(rename = "createdAt")]
     pub created_at: i64,
-    /// Who wrote it: 'heuristic', 'llm', 'user', 'agent', or an importer
+    /// Who wrote it: 'heuristic', 'followup' (an item from an agent's deferred-work list,
+    /// [`EXTRACTOR_FOLLOWUP`]), 'llm', 'user', 'agent', or an importer
     /// ([`harvest::EXTRACTOR_CLAUDE_MEMORY`], [`harvest::EXTRACTOR_CLAUDE_COMPACT`],
     /// [`EXTRACTOR_PLAYBOOK`]).
     pub extractor: String,
@@ -1672,7 +2509,12 @@ enum Slice {
 /// (harvested auto memories sort by file mtime, so they are often the newest) can neither
 /// push the other facts out of the window nor shadow an identical fact from another
 /// extractor. Each fact comes with its uid; the derived fields are left at their defaults for
-/// [`get_project_memory_with`] to fill in one batch.
+/// [`get_project_memory_with`] to fill in one batch. `ids`, a JSON array of fact ids, keeps
+/// only those facts (the working set's candidates, [`working_set`]): the slice filter and
+/// the order then run on them alone. `playbooks` false leaves unpinned playbook gotchas out
+/// in SQL, like `exclude`; true keeps them and, once the list is capped, moves the unpinned
+/// ones after the other facts, so the list holds the same facts as without the move
+/// ([`MemoryQuery::playbooks`]).
 #[allow(clippy::too_many_arguments)]
 fn project_facts(
     conn: &Connection,
@@ -1683,6 +2525,8 @@ fn project_facts(
     exclude: Option<&str>,
     borrowed: Option<&str>,
     slice: Slice,
+    ids: Option<&str>,
+    playbooks: bool,
 ) -> Result<Vec<(MemoryFact, String)>> {
     let truth = truth::has_truth_tables(conn);
     if !truth && slice != Slice::Live {
@@ -1696,6 +2540,8 @@ fn project_facts(
         open_only,
         exclude.is_some(),
         slice,
+        ids.is_some(),
+        playbooks,
     );
     // `?1` is the kind, unused (bound to '') for decisions and gotchas together.
     let kind = kind.unwrap_or("");
@@ -1705,6 +2551,9 @@ fn project_facts(
     }
     if let Some(x) = &exclude {
         params.push(x);
+    }
+    if let Some(i) = &ids {
+        params.push(i);
     }
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params.as_slice(), |r| {
@@ -1739,13 +2588,26 @@ fn project_facts(
             }
         }
     }
+    if playbooks {
+        // After the cap and the dedupe, not in the ORDER BY: sorted last in SQL, a repo's
+        // other gotchas (often more than the cap) would push every playbook out of the list
+        // `cal memory --json` printed before. This moves them and keeps the same facts.
+        let (mut kept, last): (Vec<_>, Vec<_>) = out
+            .into_iter()
+            .partition(|(f, _)| f.pinned || f.extractor != EXTRACTOR_PLAYBOOK);
+        kept.extend(last);
+        out = kept;
+    }
     Ok(out)
 }
 
 /// The SQL of [`project_facts`]. Parameters: `?1` the kind (`''` when `kind` is false: then
 /// decisions and gotchas), `?2` the project key, then the borrowed uids (JSON) when
-/// `borrowed`, then the excluded extractor when `exclude`. `truth`: the index has 0035's
-/// tables (see [`truth::has_truth_tables`]); without them every fact reads as live.
+/// `borrowed`, then the excluded extractor when `exclude`, then the fact ids (JSON) when
+/// `ids`. `truth`: the index has 0035's tables (see [`truth::has_truth_tables`]);
+/// without them every fact reads as live. `playbooks`: keep unpinned playbook gotchas
+/// ([`MemoryQuery::playbooks`]).
+#[allow(clippy::too_many_arguments)]
 fn project_facts_sql(
     conn: &Connection,
     truth: bool,
@@ -1754,6 +2616,8 @@ fn project_facts_sql(
     open_only: bool,
     exclude: bool,
     slice: Slice,
+    ids: bool,
+    playbooks: bool,
 ) -> String {
     // Match the canonical project key (callers pass it; falls back to project_path until
     // backfill), so all of one repo's threads aggregate together. `borrowed` (a JSON array of
@@ -1804,8 +2668,22 @@ fn project_facts_sql(
             3 + usize::from(borrowed)
         ));
     }
+    if ids {
+        sql.push_str(&format!(
+            " AND f.id IN (SELECT value FROM json_each(?{}))",
+            3 + usize::from(borrowed) + usize::from(exclude)
+        ));
+    }
+    // Before the cap and the dedupe, like `exclude`: playbooks are filed under the session
+    // that made the fix, so they are among a repo's newest gotchas and would fill the window.
+    if !playbooks {
+        sql.push_str(&format!(
+            " AND (f.extractor != '{EXTRACTOR_PLAYBOOK}' OR f.pinned = 1)"
+        ));
+    }
     // Pinned facts first (the user's trusted set), then by session time, so a backlog
     // distilled newest-first still ranks a reversal above the decision it reversed.
+    // [`project_facts`] moves kept unpinned playbooks last after its cap, not here.
     sql.push_str(&format!(
         " ORDER BY f.pinned DESC, {} DESC, f.id DESC",
         truth::recency_sql(truth)
@@ -1827,6 +2705,14 @@ pub struct MemoryQuery<'a> {
     /// Count the project's distillable and distilled threads (about 0.85 ms; the hook skips
     /// it).
     pub coverage: bool,
+    /// Keep unpinned failure playbooks ([`EXTRACTOR_PLAYBOOK`]), after every other fact of
+    /// their kind (moved there after the cap, so a capped list keeps the newest facts, as
+    /// before): lists a person reads and curates (the Projects page, `cal memory`). Off
+    /// (the default, and every `get_project_memory*` shorthand) for memory handed to an agent
+    /// or written to a file, where only a pinned one stays. On a large index they grew from 8
+    /// to 38 in one re-mine, took all 8 of the hook's gotcha slots in one repo, and none held:
+    /// most named a commit made within a day after the error's last sighting.
+    pub playbooks: bool,
 }
 
 /// A project's memory as `q` asks: the live lists always, the history lists and coverage
@@ -1842,7 +2728,7 @@ pub fn get_project_memory_with(
         .then(|| serde_json::to_string(&borrowed))
         .transpose()?;
     let b = borrowed.as_deref();
-    let (per_kind, exclude) = (q.per_kind, q.exclude);
+    let (per_kind, exclude, playbooks) = (q.per_kind, q.exclude, q.playbooks);
     let live = |kind: &str| {
         project_facts(
             conn,
@@ -1853,11 +2739,15 @@ pub fn get_project_memory_with(
             exclude,
             b,
             Slice::Live,
+            None,
+            playbooks,
         )
     };
     let history = |slice| {
         if q.history {
-            project_facts(conn, None, project, false, per_kind, exclude, b, slice)
+            project_facts(
+                conn, None, project, false, per_kind, exclude, b, slice, None, playbooks,
+            )
         } else {
             Ok(Vec::new())
         }
@@ -1874,6 +2764,8 @@ pub fn get_project_memory_with(
             exclude,
             None,
             Slice::Live,
+            None,
+            playbooks,
         )?,
         history(Slice::Superseded)?,
         history(Slice::Flagged)?,
@@ -2166,6 +3058,12 @@ fn record_fact_once(
 /// recurring error was fixed by a linked commit. `origin_ref` is
 /// `playbook:<signature>@<project key>` ([`crate::issues::playbook_ref`]), one fact per signature
 /// and project, so a fix in another repo never moves this repo's fact.
+///
+/// An unpinned one takes no slot in memory handed to an agent or written to a file
+/// ([`MemoryQuery::playbooks`]): the recorded fix is a commit right after the error's latest
+/// sighting, which is not evidence the error stopped (on a large index 35 of 38 named one
+/// within a week after it, and 3 were seen again). The lists a person reads keep them, and
+/// the error's own readers (`issues::playbooks_for`, `recurring_issues`, topic recall) find them.
 pub const EXTRACTOR_PLAYBOOK: &str = "playbook";
 
 /// Record or refresh a playbook gotcha, one per `origin_ref` (see [`EXTRACTOR_PLAYBOOK`]),
@@ -2672,13 +3570,110 @@ mod tests {
         assert!(json(plain).get("edited").is_none());
     }
 
+    /// Unpinned playbooks take no slot in memory handed to an agent ([`MemoryQuery::playbooks`]):
+    /// ten newer than every distilled gotcha leave the default read as it was, the cap
+    /// counting only what survives the filter, and a pinned one stays, first. The lists a
+    /// person reads keep the same facts as before, the unpinned playbooks moved after the
+    /// other gotchas.
+    #[test]
+    fn unpinned_playbooks_take_no_slot_unless_the_reader_asks() {
+        use crate::export::digest_test_support as dts;
+        const P: &str = "/r/app";
+        let mut conn = dts::temp_db("playbook_slots");
+        let gotchas = ["Gotcha three", "Gotcha two", "Gotcha one"];
+        for (i, text) in gotchas.iter().enumerate() {
+            let age = 70_000 + 10_000 * i as i64;
+            let t = dts::session(&mut conn, &format!("pb-g{i}"), P, "g", age, &["go"]);
+            dts::fact(&conn, t, "gotcha", text, "llm");
+        }
+        let fixer = dts::session(&mut conn, "pb-fix", P, "fix", 600, &["fix it"]);
+        let now = chrono::Utc::now().timestamp();
+        let playbook = |i: i64| {
+            format!("error[E0308]: mismatched types ({i}): seen 2 times; fixed in abc{i:04}")
+        };
+        for i in 0..10 {
+            let origin = format!("playbook:sig{i}@{P}");
+            upsert_playbook(&conn, &origin, fixer, &playbook(i), now + i).unwrap();
+        }
+        let pinned = "error[E0061]: wrong number of arguments: seen 3 times; fixed in def0000";
+        upsert_playbook(&conn, "playbook:pinned@/r/app", fixer, pinned, now - 50).unwrap();
+        conn.execute(
+            "UPDATE facts SET pinned = 1 WHERE origin_ref = 'playbook:pinned@/r/app'",
+            [],
+        )
+        .unwrap();
+
+        let read = |per_kind: usize, playbooks: bool| {
+            let q = MemoryQuery {
+                per_kind,
+                playbooks,
+                ..Default::default()
+            };
+            get_project_memory_with(&conn, P, &q).unwrap().gotchas
+        };
+        let texts = |l: &[MemoryFact]| l.iter().map(|f| f.text.clone()).collect::<Vec<_>>();
+        let expected: Vec<String> = std::iter::once(pinned)
+            .chain(gotchas)
+            .map(str::to_string)
+            .collect();
+        assert_eq!(texts(&read(4, false)), expected);
+        assert_eq!(texts(&read(3, false)), expected[..3].to_vec());
+        // Every shorthand the agent surfaces read keeps the default.
+        assert_eq!(
+            texts(&get_project_memory(&conn, P, 40).unwrap().gotchas),
+            expected
+        );
+        assert_eq!(
+            texts(&get_project_memory_facts(&conn, P, 40).unwrap().gotchas),
+            expected
+        );
+
+        let all = read(20, true);
+        assert_eq!(all.len(), 14);
+        assert_eq!(texts(&all[..4]), expected);
+        assert!(all[4..]
+            .iter()
+            .all(|f| f.extractor == EXTRACTOR_PLAYBOOK && !f.pinned));
+        assert_eq!(all[4].text, playbook(9), "newest first among them");
+        // Moved after the cap, not sorted last in SQL: with a cap below the count of the
+        // other gotchas, the list keeps the newest facts as `cal memory --json` printed
+        // them before, instead of losing every playbook to the older gotchas.
+        assert_eq!(
+            texts(&read(3, true)),
+            [pinned.to_string(), playbook(9), playbook(8)]
+        );
+        let twelve = read(12, true);
+        assert_eq!(texts(&twelve[..2]), [pinned, "Gotcha three"]);
+        assert_eq!(
+            texts(&twelve[2..]),
+            (0..10).rev().map(playbook).collect::<Vec<_>>()
+        );
+    }
+
     /// The live-only memory read (the hook's hot path) checks supersession by an index probe
-    /// per fact, never a scan of `fact_links` or `fact_signals`, for every shape of the query.
+    /// per fact, never a scan of `fact_links` or `fact_signals`, for every shape of the query
+    /// (the working set's, both kinds over a list of ids, included).
     #[test]
     fn live_memory_filter_probes_the_truth_indexes() {
         let conn = temp_db();
-        for (borrowed, exclude) in [(false, false), (false, true), (true, true)] {
-            let sql = project_facts_sql(&conn, true, true, borrowed, false, exclude, Slice::Live);
+        for (kind, borrowed, exclude, ids) in [
+            (true, false, false, false),
+            (true, false, true, false),
+            (true, true, true, false),
+            (false, false, true, true),
+            (false, true, false, true),
+        ] {
+            let sql = project_facts_sql(
+                &conn,
+                true,
+                kind,
+                borrowed,
+                false,
+                exclude,
+                Slice::Live,
+                ids,
+                false,
+            );
             let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
             let n = stmt.parameter_count();
             let args: Vec<String> = (0..n).map(|_| "x".to_string()).collect();
@@ -3703,6 +4698,1537 @@ mod tests {
         assert!(app_config::get_flag(&db.0.lock().unwrap(), TODOS_BACKFILLED).unwrap());
     }
 
+    /// An assistant's checklist line counts only when it names a file, symbol or identifier;
+    /// a TODO marker and a user's own checklist are kept as they were.
+    #[test]
+    fn assistant_checklists_must_name_a_specific() {
+        let text = "\
+            - [ ] Post the clip on Tuesday morning\n\
+            - [ ] Add captions before you upload\n\
+            - [ ] wire `retry_backoff` into the uploader\n\
+            - [ ] move the check into src/sync/queue.rs\n\
+            - [ ] rename fetchUser to loadUser\n\
+            - [ ] Close LIN-482 once the fix ships\n\
+            - [ ] Bump PROJ-1234\n\
+            - [ ] Fix issue #482 before the release\n\
+            - [ ] Save the notes as utf-8\n\
+            - [ ] Pin the plugin at v1-2 for now\n\
+            TODO: ask the designer about the footer";
+        let found = |assistant| -> Vec<String> {
+            message_todos(text, assistant)
+                .into_iter()
+                .filter(|(_, e)| *e == "heuristic")
+                .map(|(t, _)| t)
+                .collect()
+        };
+        assert_eq!(
+            found(true),
+            vec![
+                "wire `retry_backoff` into the uploader",
+                "move the check into src/sync/queue.rs",
+                "rename fetchUser to loadUser",
+                // A ticket or an issue names this project's work; a version or an encoding
+                // that only looks like one does not.
+                "Close LIN-482 once the fix ships",
+                "Bump PROJ-1234",
+                "Fix issue #482 before the release",
+                "ask the designer about the footer",
+            ]
+        );
+        assert_eq!(found(false).len(), 11, "a user's checklist is theirs");
+        assert_eq!(
+            extract_todos(text).len(),
+            11,
+            "extract_todos is the user rule"
+        );
+    }
+
+    #[test]
+    fn followups_come_from_deferred_work_lists_only() {
+        let text = "\
+            ## Summary\n\
+            - shipped the parser\n\
+            \n\
+            ## Known follow-ups, not in this PR\n\
+            - cap the retry queue in `jobs.rs`\n\
+            - [ ] add a Windows path test\n\
+            - [x] already handled\n\
+            - ~~dropped idea~~\n\
+            - make the export lazy\n  \
+              which needs the cursor API\n  \
+              - a nested detail\n\
+            That is all for now.\n\
+            - not a follow-up any more\n\
+            \n\
+            **Deferred:**\n\
+            1. port the hook to Cursor\n\
+            2) document the budget\n\
+            \n\
+            Next steps:\n\
+            - restart the app and check Settings\n\
+            - bump `MAX_BATCH` to 64\n\
+            \n\
+            ### Remaining\n\
+            * the `cal why` gutter\n\
+            ### Changes\n\
+            * not deferred\n\
+            ```\n\
+            ## Follow-ups\n\
+            - inside a fence\n\
+            ```\n\
+            #### Following the plan\n\
+            - not a follow-up heading";
+        assert_eq!(
+            extract_followups(text),
+            vec![
+                "cap the retry queue in `jobs.rs`",
+                "add a Windows path test",
+                "make the export lazy",
+                "port the hook to Cursor",
+                "document the budget",
+                // Not "Next steps", even with a specific: those were setup instructions.
+                "the `cal why` gutter",
+            ]
+        );
+        // At most 12 per message, and nothing from injected context or a long title.
+        let many: String = std::iter::once("## Follow-ups\n".to_string())
+            .chain((0..20).map(|i| format!("- follow-up number {i}\n")))
+            .collect();
+        assert_eq!(extract_followups(&many).len(), MAX_FOLLOWUPS_PER_MESSAGE);
+        let skill = format!("Base directory for this skill: /x\n\n{many}");
+        assert!(extract_followups(&skill).is_empty());
+        let long =
+            "## Remaining questions about how the old scheduler handled clock drift on resume\n\
+                    - one";
+        assert!(extract_followups(long).is_empty());
+        // A title that says its list is done introduces a summary of work, not deferred work;
+        // the same words negated, or after a phrase that is not an adjective, do not. Nor
+        // does one over risks or questions, or one that says nothing is left.
+        for done in [
+            "**Follow-ups, all merged:**",
+            "## Follow-up fixes",
+            "Follow-up changes:",
+            "### Remaining: none, all done",
+            "**Deferred items (now merged)**",
+            "Follow-up commit `abc1234`:",
+            "**Follow-up fix:**",
+            "## Remaining risks",
+            "Follow-up questions:",
+            "## Remaining work is none",
+            "**Follow-ups: nothing left to do**",
+            "## Follow-ups: none needed",
+        ] {
+            assert_eq!(followup_title(done), None, "{done}");
+            let list = format!("{done}\n- moved the retry cap into the scheduler");
+            assert!(extract_followups(&list).is_empty(), "{done}");
+        }
+        for open in [
+            "## Follow-ups (not merged yet)",
+            "## Remaining fixes",
+            "**Follow-ups (fixes for later):**",
+            "### Deferred (needs a decision)",
+            "Not done yet, by risk:",
+            // "none" / "nothing" qualifying the items, not saying none are left.
+            "**Follow-ups (none blocking):**",
+            "## Remaining (nothing urgent)",
+            "Remaining: nothing blocking, but two nice-to-haves:",
+        ] {
+            assert!(followup_title(open).is_some(), "{open}");
+        }
+        // Only an assistant's message yields them.
+        assert!(message_todos(&many, false).is_empty());
+        assert!(message_todos(&many, true)
+            .iter()
+            .all(|(_, e)| *e == EXTRACTOR_FOLLOWUP));
+    }
+
+    /// A bullet ending in `:` is a label: the bullets nested directly under it are the items,
+    /// while those under an ordinary item stay its details, and a label with nothing nested
+    /// yields nothing.
+    #[test]
+    fn a_label_bullet_yields_the_items_nested_under_it() {
+        let text = "\
+            ## Follow-ups\n\
+            - cap the retry queue in `jobs.rs`\n  \
+              - a detail of the cap\n\
+            - **Two questions are still open:**\n  \
+              - port the hook to Cursor\n  \
+              - document the budget\n    \
+                - a detail of the budget";
+        assert_eq!(
+            extract_followups(text),
+            [
+                "cap the retry queue in `jobs.rs`",
+                "port the hook to Cursor",
+                "document the budget",
+            ]
+        );
+        let bare = "## Remaining\n- Still open:\n- keep the log quiet\n- Also open:";
+        assert_eq!(extract_followups(bare), ["keep the log quiet"]);
+        // A label under a label is one too, not an item that hides the real ones.
+        let nested = "\
+            ## Follow-ups\n\
+            - **Open:**\n  \
+              - Backend:\n    \
+                - add the retry\n      \
+                  - a detail of the retry\n  \
+              - Frontend:\n    \
+                - add the toast";
+        assert_eq!(
+            extract_followups(nested),
+            ["add the retry", "add the toast"]
+        );
+    }
+
+    fn todo_rows(conn: &Connection, thread_id: i64) -> Vec<(String, String, String)> {
+        conn.prepare(
+            "SELECT text, extractor, status FROM facts WHERE thread_id = ?1 AND kind = 'todo'
+             ORDER BY text",
+        )
+        .unwrap()
+        .query_map([thread_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+    }
+
+    /// Follow-ups are derived at index time, keep their uid through a full re-index, and a
+    /// closed one stays closed without an open copy.
+    #[test]
+    fn followups_are_indexed_and_survive_a_reindex_curated() {
+        let mut conn = temp_db();
+        let text = "## Follow-ups\n- cap the retry queue\n- add a Windows path test";
+        // Written an hour ago: the indexer judges a list's age against the clock.
+        let now = chrono::Utc::now().timestamp();
+        let t = seed_timed(
+            &mut conn,
+            "f1",
+            "/proj/f",
+            false,
+            &[("go", Some(now - 3_600)), (text, Some(now - 3_599))],
+        );
+        assert_eq!(
+            todo_rows(&conn, t),
+            vec![
+                (
+                    "add a Windows path test".into(),
+                    "followup".into(),
+                    "open".into()
+                ),
+                (
+                    "cap the retry queue".into(),
+                    "followup".into(),
+                    "open".into()
+                ),
+            ]
+        );
+        let uid = |conn: &Connection, text: &str| -> String {
+            conn.query_row("SELECT uid FROM facts WHERE text = ?1", [text], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        };
+        let before = uid(&conn, "cap the retry queue");
+        conn.execute(
+            "UPDATE facts SET status = 'done' WHERE text = 'add a Windows path test'",
+            [],
+        )
+        .unwrap();
+        // The listing carries the extractor, under the schema it always had.
+        let listed = list_open_todos(&conn, None, Some("/proj/f"), None, 10).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].extractor, EXTRACTOR_FOLLOWUP);
+        {
+            let tx = conn.transaction().unwrap();
+            rebuild_thread_todos(&tx, t, now).unwrap();
+            tx.commit().unwrap();
+        }
+        assert_eq!(uid(&conn, "cap the retry queue"), before);
+        assert_eq!(
+            todo_rows(&conn, t),
+            vec![
+                (
+                    "add a Windows path test".into(),
+                    "followup".into(),
+                    "done".into()
+                ),
+                (
+                    "cap the retry queue".into(),
+                    "followup".into(),
+                    "open".into()
+                ),
+            ]
+        );
+    }
+
+    /// The follow-up texts of a thread, in text order.
+    fn followup_texts(conn: &Connection, thread_id: i64) -> Vec<String> {
+        todo_rows(conn, thread_id)
+            .into_iter()
+            .filter(|r| r.1 == EXTRACTOR_FOLLOWUP)
+            .map(|r| r.0)
+            .collect()
+    }
+
+    /// (text, ts) for each message, the first written at `ts`, one second apart.
+    fn timed<'a>(texts: &[&'a str], ts: i64) -> Vec<(&'a str, Option<i64>)> {
+        texts
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (*t, Some(ts + i as i64)))
+            .collect()
+    }
+
+    /// A thread's follow-ups are its latest deferred-work list's items, on a full derive and
+    /// on an appended tail (where the earlier list's rows are already in the table and must
+    /// go); an item both lists hold keeps its uid; heuristic TODOs keep accumulating.
+    #[test]
+    fn only_the_latest_follow_up_list_counts() {
+        let now = chrono::Utc::now().timestamp();
+        let l1 = "TODO: tidy the first marker\n## Follow-ups\n- port the hook to Cursor\n\
+                  - keep the log quiet";
+        let l2 = "TODO: tidy the second marker\n## Remaining\n- document the budget\n\
+                  - cap the retry queue";
+        let l3 = "TODO: tidy the third marker\n**Deferred:**\n- cap the retry queue\n\
+                  - add a Windows path test";
+        let msgs = timed(&["go", l1, "and?", l2, "next?", l3], now - 3_600);
+        let latest = ["add a Windows path test", "cap the retry queue"];
+        let markers = [
+            "tidy the first marker",
+            "tidy the second marker",
+            "tidy the third marker",
+        ];
+        let marker_texts = |conn: &Connection, t: i64| -> Vec<String> {
+            heuristic_todos(conn, t).into_iter().map(|r| r.0).collect()
+        };
+        let uid = |conn: &Connection, t: i64| -> String {
+            conn.query_row(
+                "SELECT uid FROM facts WHERE thread_id = ?1 AND text = 'cap the retry queue'",
+                [t],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+
+        // A full derive of the three lists.
+        let mut conn = temp_db();
+        let full = seed_timed(&mut conn, "l1", "/proj/l", false, &msgs);
+        assert_eq!(followup_texts(&conn, full), latest);
+        assert_eq!(marker_texts(&conn, full), markers);
+
+        // Two lists indexed, then the third appended.
+        let tail = seed_timed(&mut conn, "l2", "/proj/l", false, &msgs[..4]);
+        assert_eq!(
+            followup_texts(&conn, tail),
+            ["cap the retry queue", "document the budget"]
+        );
+        let shared = uid(&conn, tail);
+        let first_message = |conn: &Connection| -> i64 {
+            conn.query_row(
+                "SELECT id FROM messages WHERE thread_id = ?1 AND seq = 0",
+                [tail],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let first = first_message(&conn);
+        seed_timed(&mut conn, "l2", "/proj/l", false, &msgs);
+        assert_eq!(first_message(&conn), first, "appended, not replaced");
+        assert_eq!(followup_texts(&conn, tail), latest);
+        assert_eq!(uid(&conn, tail), shared, "the item both lists hold");
+        assert_eq!(marker_texts(&conn, tail), markers);
+
+        // A full re-derive of either keeps the same rows, and the uid.
+        {
+            let tx = conn.transaction().unwrap();
+            rebuild_thread_todos(&tx, full, now).unwrap();
+            rebuild_thread_todos(&tx, tail, now).unwrap();
+            tx.commit().unwrap();
+        }
+        for t in [full, tail] {
+            assert_eq!(followup_texts(&conn, t), latest);
+            assert_eq!(marker_texts(&conn, t), markers);
+        }
+        assert_eq!(uid(&conn, tail), shared);
+    }
+
+    /// A done, pinned or hidden follow-up from an earlier list survives a later list and is
+    /// not copied by it, on an appended tail and on a full re-derive, while the open one the
+    /// later list leaves out goes. (This pinned an edited one too, and a sibling of it the
+    /// later list left out staying; an edited row now freezes the thread's follow-ups:
+    /// `a_reworded_todo_freezes_its_threads_follow_ups`.)
+    #[test]
+    fn curated_follow_ups_survive_a_later_list() {
+        let now = chrono::Utc::now().timestamp();
+        let items = "- close the done one\n- pin the pinned one\n- hide the hidden one";
+        let l1 =
+            format!("TODO: tidy the first marker\n## Follow-ups\n{items}\n- drop the open one");
+        let l2 = format!("TODO: tidy the second marker\n## Remaining\n{items}\n- add the new one");
+        let msgs = timed(&["go", l1.as_str(), "and?", l2.as_str()], now - 3_600);
+        let mut conn = temp_db();
+        let t = seed_timed(&mut conn, "c1", "/proj/c", false, &msgs[..2]);
+        for sql in [
+            "UPDATE facts SET status = 'done' WHERE text = 'close the done one'",
+            "UPDATE facts SET pinned = 1 WHERE text = 'pin the pinned one'",
+            "UPDATE facts SET hidden = 1 WHERE text = 'hide the hidden one'",
+        ] {
+            assert_eq!(conn.execute(sql, []).unwrap(), 1, "{sql}");
+        }
+        // (text, status, pinned, hidden, edited) of each follow-up.
+        type Row = (String, String, i64, i64, i64);
+        let rows = |conn: &Connection| -> Vec<Row> {
+            conn.prepare(
+                "SELECT text, status, pinned, hidden, edited FROM facts
+                 WHERE thread_id = ?1 AND extractor = 'followup' ORDER BY text",
+            )
+            .unwrap()
+            .query_map([t], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+        };
+        let row = |text: &str, status: &str, pinned, hidden, edited| -> Row {
+            (text.into(), status.into(), pinned, hidden, edited)
+        };
+        let expected = vec![
+            row("add the new one", "open", 0, 0, 0),
+            row("close the done one", "done", 0, 0, 0),
+            row("hide the hidden one", "open", 0, 1, 0),
+            row("pin the pinned one", "open", 1, 0, 0),
+        ];
+        seed_timed(&mut conn, "c1", "/proj/c", false, &msgs);
+        assert_eq!(rows(&conn), expected, "appended");
+        {
+            let tx = conn.transaction().unwrap();
+            rebuild_thread_todos(&tx, t, now).unwrap();
+            tx.commit().unwrap();
+        }
+        assert_eq!(rows(&conn), expected, "a full re-derive");
+        assert_eq!(
+            heuristic_todos(&conn, t),
+            [
+                ("tidy the first marker".to_string(), "open".to_string()),
+                ("tidy the second marker".to_string(), "open".to_string()),
+            ]
+        );
+    }
+
+    /// Two recent lists both hold an item and the user rewords it in the latest list's row: a
+    /// full re-derive and the re-judge each leave exactly the rows that were there, the edited
+    /// row and its sibling, and no open copy of the original wording (which a row the derive
+    /// itself added at the earlier list and then removed used to bring back).
+    #[test]
+    fn a_reworded_follow_up_is_never_copied_back() {
+        let now = chrono::Utc::now().timestamp();
+        let msgs = timed(
+            &[
+                "go",
+                "## Follow-ups\n- cap the retry queue",
+                "and?",
+                "## Remaining\n- cap the retry queue\n- add a Windows path test",
+            ],
+            now - 3_600,
+        );
+        let mut conn = temp_db();
+        let t = seed_timed(&mut conn, "w1", "/proj/w", false, &msgs);
+        let cap: i64 = conn
+            .query_row(
+                "SELECT id FROM facts WHERE thread_id = ?1 AND text = 'cap the retry queue'",
+                [t],
+                |r| r.get(0),
+            )
+            .unwrap();
+        edit_fact(&conn, cap, "cap the queue at 50").unwrap();
+        // (text, status, edited, source seq, uid) of each TODO.
+        type Row = (String, String, i64, i64, String);
+        let rows = |conn: &Connection| -> Vec<Row> {
+            conn.prepare(
+                "SELECT text, status, edited, source_seq, uid FROM facts
+                 WHERE thread_id = ?1 AND kind = 'todo' ORDER BY text",
+            )
+            .unwrap()
+            .query_map([t], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+        };
+        let edited = rows(&conn);
+        assert_eq!(
+            edited
+                .iter()
+                .map(|r| (r.0.as_str(), r.2, r.3))
+                .collect::<Vec<_>>(),
+            [
+                ("add a Windows path test", 0, 3),
+                ("cap the queue at 50", 1, 3)
+            ]
+        );
+        {
+            let tx = conn.transaction().unwrap();
+            rebuild_thread_todos(&tx, t, now).unwrap();
+            tx.commit().unwrap();
+        }
+        assert_eq!(rows(&conn), edited, "a full re-derive");
+        let db = crate::db::Db(std::sync::Mutex::new(conn));
+        let report = regate_todos_once(&db, now, &|| false).unwrap().unwrap();
+        assert_eq!((report.dropped, report.added), (0, 0), "{report:?}");
+        assert_eq!(rows(&db.0.lock().unwrap()), edited, "the re-judge");
+    }
+
+    /// Once the user rewords a derived TODO of a thread, a follow-up or a heuristic one, its
+    /// follow-ups stay as they are: a later list arriving by append adds nothing and removes
+    /// nothing, and neither a full re-derive past the age limit nor the re-judge touches them.
+    /// Its heuristic TODOs derive as before follow-ups existed: a marker in the appended
+    /// message is added, and a reworded one's original never comes back.
+    #[test]
+    fn a_reworded_todo_freezes_its_threads_follow_ups() {
+        let now = chrono::Utc::now().timestamp();
+        let msgs = timed(
+            &[
+                "go",
+                "TODO: tidy the first marker\n## Follow-ups\n- cap the retry queue\n\
+                 - keep the log quiet",
+                "and?",
+                "TODO: tidy the second marker\n## Remaining\n- add a Windows path test",
+            ],
+            now - 3_600,
+        );
+        let row = |text: &str, extractor: &str| -> (String, String, String) {
+            (text.into(), extractor.into(), "open".into())
+        };
+        let mut conn = temp_db();
+        let mut frozen = Vec::new();
+        for (ext, from, to) in [
+            ("z1", "cap the retry queue", "cap the queue at 50"),
+            ("z2", "tidy the first marker", "tidy the first marker twice"),
+        ] {
+            let t = seed_timed(&mut conn, ext, "/proj/z", false, &msgs[..2]);
+            let id: i64 = conn
+                .query_row(
+                    "SELECT id FROM facts WHERE thread_id = ?1 AND text = ?2",
+                    params![t, from],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            edit_fact(&conn, id, to).unwrap();
+            seed_timed(&mut conn, ext, "/proj/z", false, &msgs);
+            let mut expected = vec![
+                row("cap the retry queue", "followup"),
+                row("keep the log quiet", "followup"),
+                row("tidy the first marker", "heuristic"),
+                row("tidy the second marker", "heuristic"),
+            ];
+            for r in &mut expected {
+                if r.0 == from {
+                    r.0 = to.into();
+                }
+            }
+            expected.sort();
+            assert_eq!(todo_rows(&conn, t), expected, "{ext}: appended");
+            frozen.push((t, expected));
+        }
+        {
+            let tx = conn.transaction().unwrap();
+            for (t, _) in &frozen {
+                rebuild_thread_todos(&tx, *t, now + FOLLOWUP_MAX_AGE_SECS + 86_400).unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        for (t, expected) in &frozen {
+            assert_eq!(&todo_rows(&conn, *t), expected, "a full re-derive");
+        }
+        let db = crate::db::Db(std::sync::Mutex::new(conn));
+        let report = regate_todos_once(&db, now, &|| false).unwrap().unwrap();
+        assert_eq!((report.dropped, report.added), (0, 0), "{report:?}");
+        for (t, expected) in &frozen {
+            assert_eq!(
+                &todo_rows(&db.0.lock().unwrap(), *t),
+                expected,
+                "the re-judge"
+            );
+        }
+    }
+
+    /// A heuristic TODO that repeats an open follow-up (an assistant's TODO marker, the user's
+    /// own checklist line) takes the follow-up's row over, uid and all, so a later list that
+    /// leaves the follow-up out does not take the TODO with it: heuristic TODOs accumulate, on
+    /// appends, on a one-pass derive and on a re-derive.
+    #[test]
+    fn a_heuristic_todo_outlives_the_follow_up_it_repeats() {
+        let now = chrono::Utc::now().timestamp();
+        let msgs = timed(
+            &[
+                "go",
+                "## Follow-ups\n- cap the retry queue\n- keep the log quiet",
+                "- [ ] keep the log quiet",
+                "TODO: cap the retry queue",
+                "next?",
+                "## Remaining\n- add a Windows path test",
+            ],
+            now - 3_600,
+        );
+        let row = |text: &str, extractor: &str| -> (String, String, String) {
+            (text.into(), extractor.into(), "open".into())
+        };
+        let expected = vec![
+            row("add a Windows path test", "followup"),
+            row("cap the retry queue", "heuristic"),
+            row("keep the log quiet", "heuristic"),
+        ];
+        // (text, uid, source seq) of the two repeated items.
+        let repeated = |conn: &Connection, t: i64| -> Vec<(String, String, i64)> {
+            conn.prepare(
+                "SELECT text, uid, source_seq FROM facts WHERE thread_id = ?1
+                   AND text IN ('cap the retry queue', 'keep the log quiet') ORDER BY text",
+            )
+            .unwrap()
+            .query_map([t], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+        };
+        let mut conn = temp_db();
+        let tail = seed_timed(&mut conn, "h1", "/proj/h", false, &msgs[..2]);
+        let uids: Vec<String> = repeated(&conn, tail).into_iter().map(|r| r.1).collect();
+        seed_timed(&mut conn, "h1", "/proj/h", false, &msgs[..4]);
+        assert_eq!(
+            todo_rows(&conn, tail),
+            [
+                row("cap the retry queue", "heuristic"),
+                row("keep the log quiet", "heuristic")
+            ],
+            "taken over"
+        );
+        let taken = vec![
+            ("cap the retry queue".to_string(), uids[0].clone(), 3),
+            ("keep the log quiet".to_string(), uids[1].clone(), 2),
+        ];
+        assert_eq!(
+            repeated(&conn, tail),
+            taken,
+            "the uid, at the heuristic's message"
+        );
+        seed_timed(&mut conn, "h1", "/proj/h", false, &msgs);
+        assert_eq!(todo_rows(&conn, tail), expected, "appended");
+        let full = seed_timed(&mut conn, "h2", "/proj/h", false, &msgs);
+        assert_eq!(todo_rows(&conn, full), expected, "one pass");
+        {
+            let tx = conn.transaction().unwrap();
+            rebuild_thread_todos(&tx, tail, now).unwrap();
+            rebuild_thread_todos(&tx, full, now).unwrap();
+            tx.commit().unwrap();
+        }
+        for t in [tail, full] {
+            assert_eq!(todo_rows(&conn, t), expected, "a full re-derive");
+        }
+        assert_eq!(repeated(&conn, tail), taken);
+    }
+
+    /// An item that leaves the latest list and comes back in a later one is a new fact
+    /// however the messages were batched (three appends or one), and a full re-derive keeps
+    /// the uid it has now. One that two lists in a row hold keeps its uid
+    /// (`only_the_latest_follow_up_list_counts`).
+    #[test]
+    fn a_follow_up_that_leaves_the_list_comes_back_as_a_new_fact() {
+        let now = chrono::Utc::now().timestamp();
+        let msgs = timed(
+            &[
+                "go",
+                "## Follow-ups\n- cap the retry queue",
+                "and?",
+                "## Remaining\n- document the budget",
+                "next?",
+                "**Deferred:**\n- cap the retry queue",
+            ],
+            now - 3_600,
+        );
+        let uid = |conn: &Connection, t: i64| -> String {
+            conn.query_row(
+                "SELECT uid FROM facts WHERE thread_id = ?1 AND text = 'cap the retry queue'",
+                [t],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let mut conn = temp_db();
+        let three = seed_timed(&mut conn, "u1", "/proj/u", false, &msgs[..2]);
+        let one = seed_timed(&mut conn, "u2", "/proj/u", false, &msgs[..2]);
+        let first = [uid(&conn, three), uid(&conn, one)];
+        seed_timed(&mut conn, "u1", "/proj/u", false, &msgs[..4]);
+        assert_eq!(followup_texts(&conn, three), ["document the budget"]);
+        seed_timed(&mut conn, "u1", "/proj/u", false, &msgs);
+        seed_timed(&mut conn, "u2", "/proj/u", false, &msgs);
+        let back = [uid(&conn, three), uid(&conn, one)];
+        for (i, t) in [three, one].into_iter().enumerate() {
+            assert_eq!(followup_texts(&conn, t), ["cap the retry queue"]);
+            assert_ne!(back[i], first[i], "a new fact");
+        }
+        {
+            let tx = conn.transaction().unwrap();
+            rebuild_thread_todos(&tx, three, now).unwrap();
+            rebuild_thread_todos(&tx, one, now).unwrap();
+            tx.commit().unwrap();
+        }
+        assert_eq!([uid(&conn, three), uid(&conn, one)], back);
+    }
+
+    /// A deferred-work list more than 30 days old at derive time yields nothing and removes
+    /// nothing, judged by its own message's time (seconds or milliseconds; none counts as
+    /// new): a newer list's rows stay even when the old list comes later in the thread.
+    #[test]
+    fn an_old_follow_up_list_yields_nothing_and_removes_nothing() {
+        let now = chrono::Utc::now().timestamp();
+        let old = now - FOLLOWUP_MAX_AGE_SECS - 86_400;
+        let recent = "TODO: tidy the recent marker\n## Follow-ups\n- cap the retry queue";
+        let stale = "TODO: tidy the old marker\n## Remaining\n- port the hook to Cursor";
+        let mut conn = temp_db();
+        for (ext, ts) in [("a1", old), ("a2", old * 1_000)] {
+            let t = seed_timed(
+                &mut conn,
+                ext,
+                "/proj/a",
+                false,
+                &[("go", Some(ts)), (stale, Some(ts))],
+            );
+            assert!(followup_texts(&conn, t).is_empty(), "{ext}");
+            assert_eq!(
+                heuristic_todos(&conn, t).len(),
+                1,
+                "{ext}: its marker stays"
+            );
+        }
+        let t = seed_timed(
+            &mut conn,
+            "a3",
+            "/proj/a",
+            false,
+            &[("go", None), (stale, None)],
+        );
+        assert_eq!(followup_texts(&conn, t), ["port the hook to Cursor"]);
+
+        // The old list after a recent one (the clocks disagree), on a full derive and on an
+        // appended tail.
+        let msgs = [
+            ("go", Some(now - 60)),
+            (recent, Some(now - 59)),
+            ("and?", Some(old)),
+            (stale, Some(old)),
+        ];
+        let full = seed_timed(&mut conn, "a4", "/proj/a", false, &msgs);
+        let tail = seed_timed(&mut conn, "a5", "/proj/a", false, &msgs[..2]);
+        seed_timed(&mut conn, "a5", "/proj/a", false, &msgs);
+        for t in [full, tail] {
+            assert_eq!(followup_texts(&conn, t), ["cap the retry queue"]);
+            assert_eq!(heuristic_todos(&conn, t).len(), 2, "both markers");
+        }
+    }
+
+    /// An open follow-up that has aged past the limit leaves on a full re-derive unless the
+    /// user pinned it; the heuristic TODO of the same message stays.
+    #[test]
+    fn an_aged_follow_up_leaves_on_a_full_re_derive_unless_pinned() {
+        let now = chrono::Utc::now().timestamp();
+        let text =
+            "TODO: tidy the marker\n## Follow-ups\n- cap the retry queue\n- pin the kept one";
+        let mut conn = temp_db();
+        let t = seed_timed(
+            &mut conn,
+            "g1",
+            "/proj/g",
+            false,
+            &timed(&["go", text], now - 60),
+        );
+        assert_eq!(
+            followup_texts(&conn, t),
+            ["cap the retry queue", "pin the kept one"]
+        );
+        conn.execute(
+            "UPDATE facts SET pinned = 1 WHERE text = 'pin the kept one'",
+            [],
+        )
+        .unwrap();
+        {
+            let tx = conn.transaction().unwrap();
+            rebuild_thread_todos(&tx, t, now + FOLLOWUP_MAX_AGE_SECS + 86_400).unwrap();
+            tx.commit().unwrap();
+        }
+        let row = |text: &str, extractor: &str| -> (String, String, String) {
+            (text.into(), extractor.into(), "open".into())
+        };
+        assert_eq!(
+            todo_rows(&conn, t),
+            [
+                row("pin the kept one", "followup"),
+                row("tidy the marker", "heuristic")
+            ]
+        );
+    }
+
+    /// The re-judge applies both rules: over threads indexed before follow-ups it adds only a
+    /// thread's latest list from the last 30 days, removes an earlier list's open follow-ups
+    /// already in the table (one the latest list repeats keeps its uid), leaves heuristic
+    /// TODOs as they were, resumes after the last thread it finished and runs once.
+    #[test]
+    fn the_re_judge_applies_the_follow_up_rules() {
+        let now = chrono::Utc::now().timestamp();
+        let old = now - FOLLOWUP_MAX_AGE_SECS - 86_400;
+        let l1 = "TODO: tidy the first marker\n## Follow-ups\n- port the hook to Cursor\n\
+                  - cap the retry queue";
+        let l2 = "TODO: tidy the second marker\n## Remaining\n- cap the retry queue\n\
+                  - add a Windows path test";
+        let latest = ["add a Windows path test", "cap the retry queue"];
+        let mut conn = temp_db();
+        let p = "/proj/j";
+        let walked = seed_timed(
+            &mut conn,
+            "j0",
+            p,
+            false,
+            &timed(&["go", "## Follow-ups\n- left as it was"], now - 60),
+        );
+        let two = seed_timed(
+            &mut conn,
+            "j1",
+            p,
+            false,
+            &timed(&["go", l1, "and?", l2], now - 60),
+        );
+        let stale = seed_timed(&mut conn, "j2", p, false, &timed(&["go", l1], old));
+        let one = seed_timed(&mut conn, "j3", p, false, &timed(&["go", l2], now - 60));
+        // As an index from before follow-ups: none, except the first list's, as if the
+        // indexer had appended them to `two` before its second list arrived.
+        conn.execute("DELETE FROM facts WHERE extractor = 'followup'", [])
+            .unwrap();
+        let l1_message: i64 = conn
+            .query_row(
+                "SELECT id FROM messages WHERE thread_id = ?1 AND seq = 1",
+                [two],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let shared = new_fact_uid();
+        for (text, uid) in [
+            ("port the hook to Cursor", new_fact_uid()),
+            ("cap the retry queue", shared.clone()),
+        ] {
+            conn.execute(
+                "INSERT INTO facts (thread_id, kind, text, status, extractor, source_message_id,
+                                    source_seq, created_at, uid)
+                 VALUES (?1, 'todo', ?2, 'open', 'followup', ?3, 1, ?4, ?5)",
+                params![two, text, l1_message, now - 59, uid],
+            )
+            .unwrap();
+        }
+        let markers = |conn: &Connection| -> Vec<(i64, String, String)> {
+            conn.prepare(
+                "SELECT thread_id, text, status FROM facts WHERE extractor = 'heuristic'
+                 ORDER BY thread_id, text",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+        };
+        let before = markers(&conn);
+        assert_eq!(before.len(), 4, "{before:?}");
+        // Interrupted after the first thread.
+        app_config::put(&conn, TODOS_REGATED, &walked.to_string()).unwrap();
+        let db = crate::db::Db(std::sync::Mutex::new(conn));
+        let report = regate_todos_once(&db, now, &|| false).unwrap().unwrap();
+        assert_eq!(report.threads, 3, "{report:?}");
+        // `two` holds two follow-ups before and after; `one` gains its two.
+        assert_eq!((report.dropped, report.added), (0, 2), "{report:?}");
+        {
+            let conn = db.0.lock().unwrap();
+            assert!(followup_texts(&conn, walked).is_empty(), "not walked again");
+            assert_eq!(followup_texts(&conn, two), latest);
+            let uid: String = conn
+                .query_row(
+                    "SELECT uid FROM facts WHERE thread_id = ?1 AND text = 'cap the retry queue'",
+                    [two],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(uid, shared);
+            assert!(followup_texts(&conn, stale).is_empty(), "an old list");
+            assert_eq!(followup_texts(&conn, one), latest);
+            assert_eq!(markers(&conn), before);
+        }
+        assert_eq!(regate_todos_once(&db, now, &|| false).unwrap(), None);
+    }
+
+    /// The re-judge's pre-gate state: TODO rows as the old rule stored them, one per curated
+    /// state, each named by its text. Every curated row holds text its source message yields
+    /// (in another case), so only the curation predicate keeps it from the re-judge.
+    fn regate_fixture() -> (crate::db::Db, i64, i64) {
+        let mut conn = temp_db();
+        // Indexed under today's rules: the assistant's how-to checklist yields nothing, and no
+        // other message repeats its line (one that does keeps the row:
+        // `the_re_judge_moves_a_rejected_todo_another_message_yields`). The edited row below
+        // makes the thread hand-curated, so the re-judge adds none of its follow-ups.
+        let howto = "- [ ] Post the clip on Tuesday\n- [ ] wire `retry_backoff` in\n\
+                     TODO: post the clip later";
+        let t = seed_thread(
+            &mut conn,
+            "r1",
+            "/proj/r",
+            false,
+            &[
+                "- [ ] Post the clip on Monday",
+                howto,
+                "and the rest?",
+                "## Follow-ups\n- cap the retry queue",
+            ],
+        );
+        let other = seed_thread(
+            &mut conn,
+            "r2",
+            "/proj/r",
+            false,
+            &["hi", "- [ ] Upload it"],
+        );
+        let (user_msg, asst_msg): (i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT id FROM messages WHERE thread_id = ?1 AND seq = 0),
+                        (SELECT id FROM messages WHERE thread_id = ?1 AND seq = 1)",
+                [t],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        conn.execute("DELETE FROM facts", []).unwrap();
+        // (text, extractor, status, pinned, hidden, edited, source message, source seq).
+        type Row<'a> = (
+            &'a str,
+            &'a str,
+            &'a str,
+            i64,
+            i64,
+            i64,
+            Option<i64>,
+            Option<i64>,
+        );
+        let rows: [Row; 13] = [
+            // The one row the gate rejects.
+            (
+                "Post the clip on Tuesday",
+                "heuristic",
+                "open",
+                0,
+                0,
+                0,
+                Some(asst_msg),
+                Some(1),
+            ),
+            // The same line, curated or written by someone else: all kept.
+            (
+                "post the clip on tuesday",
+                "heuristic",
+                "done",
+                0,
+                0,
+                0,
+                Some(asst_msg),
+                Some(1),
+            ),
+            (
+                "Post The Clip On Tuesday",
+                "heuristic",
+                "open",
+                1,
+                0,
+                0,
+                Some(asst_msg),
+                Some(1),
+            ),
+            (
+                "POST the clip on Tuesday",
+                "heuristic",
+                "open",
+                0,
+                1,
+                0,
+                Some(asst_msg),
+                Some(1),
+            ),
+            // Reworded by only its case, as a user fixing a capital would.
+            (
+                "Post the clip on TUESDAY",
+                "heuristic",
+                "open",
+                0,
+                0,
+                1,
+                Some(asst_msg),
+                Some(1),
+            ),
+            (
+                "Post the clip on Tuesday",
+                "user",
+                "open",
+                0,
+                0,
+                0,
+                None,
+                None,
+            ),
+            (
+                "Post the clip on Tuesday",
+                "agent",
+                "open",
+                0,
+                0,
+                0,
+                None,
+                None,
+            ),
+            (
+                "Post the clip on Tuesday",
+                "llm",
+                "open",
+                0,
+                0,
+                0,
+                Some(asst_msg),
+                Some(1),
+            ),
+            // A follow-up: in this hand-curated thread no derive touches one.
+            (
+                "Post the clip on Tuesday",
+                "followup",
+                "open",
+                0,
+                0,
+                0,
+                None,
+                Some(3),
+            ),
+            // The user's own checklist, a source that is gone, a specific, a marker.
+            (
+                "Post the clip on Monday",
+                "heuristic",
+                "open",
+                0,
+                0,
+                0,
+                Some(user_msg),
+                Some(0),
+            ),
+            (
+                "Post the clip on Tuesday",
+                "heuristic",
+                "open",
+                0,
+                0,
+                0,
+                None,
+                None,
+            ),
+            (
+                "wire `retry_backoff` in",
+                "heuristic",
+                "open",
+                0,
+                0,
+                0,
+                Some(asst_msg),
+                Some(1),
+            ),
+            (
+                "post the clip later",
+                "heuristic",
+                "open",
+                0,
+                0,
+                0,
+                Some(asst_msg),
+                Some(1),
+            ),
+        ];
+        for (text, extractor, status, pinned, hidden, edited, mid, seq) in rows {
+            conn.execute(
+                "INSERT INTO facts (thread_id, kind, text, status, extractor, pinned, hidden,
+                                    edited, source_message_id, source_seq, created_at, uid)
+                 VALUES (?1, 'todo', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 5, ?10)",
+                params![
+                    t,
+                    text,
+                    status,
+                    extractor,
+                    pinned,
+                    hidden,
+                    edited,
+                    mid,
+                    seq,
+                    new_fact_uid()
+                ],
+            )
+            .unwrap();
+        }
+        // Found only by its seq: a re-index nulled the message id.
+        conn.execute(
+            "INSERT INTO facts (thread_id, kind, text, status, extractor, source_seq, created_at)
+             VALUES (?1, 'todo', 'Upload it', 'open', 'heuristic', 1, 5)",
+            [other],
+        )
+        .unwrap();
+        (crate::db::Db(std::sync::Mutex::new(conn)), t, other)
+    }
+
+    /// The re-judge deletes only open, uncurated heuristic TODOs that an assistant's checklist
+    /// raised and the gate now rejects: never a done, pinned, hidden or edited one, one a
+    /// user or agent wrote, one from another extractor, the user's own checklist, one whose
+    /// source is gone, or a marker. It adds no follow-up to the hand-curated thread (it added
+    /// one before an edited row froze a thread's follow-ups) and runs once.
+    #[test]
+    fn the_re_judge_drops_only_rejected_checklist_todos() {
+        let (db, t, other) = regate_fixture();
+        let before = |conn: &Connection| -> i64 {
+            conn.query_row("SELECT COUNT(*) FROM facts WHERE kind = 'todo'", [], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        };
+        let n = before(&db.0.lock().unwrap());
+        let polls = std::cell::Cell::new(0);
+        let pause = || {
+            polls.set(polls.get() + 1);
+            false
+        };
+        let report = regate_todos_once(&db, 9_999, &pause).unwrap().unwrap();
+        assert!(polls.get() >= 1, "asks before its batch");
+        assert_eq!(report.dropped, 2, "{report:?}");
+        assert_eq!(report.added, 0, "{report:?}");
+        let conn = db.0.lock().unwrap();
+        assert_eq!(before(&conn), n - 2);
+        let rows = todo_rows(&conn, t);
+        let has = |text: &str, extractor: &str, status: &str| {
+            rows.iter()
+                .filter(|r| r.0 == text && r.1 == extractor && r.2 == status)
+                .count()
+        };
+        // Gone: the open, uncurated, assistant-raised one (the other thread's too, found
+        // by its seq).
+        let curated: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM facts WHERE thread_id = ?1 AND extractor = 'heuristic'
+                   AND text = 'Post the clip on Tuesday' AND source_message_id IS NOT NULL
+                   AND source_seq = 1 AND status = 'open' AND pinned = 0 AND hidden = 0
+                   AND edited = 0",
+                [t],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(curated, 0);
+        assert!(todo_rows(&conn, other).is_empty());
+        // Kept: every curated state, every other extractor, the user's checklist, the row
+        // with no source, the specific and the marker.
+        assert_eq!(has("post the clip on tuesday", "heuristic", "done"), 1);
+        assert_eq!(has("Post The Clip On Tuesday", "heuristic", "open"), 1);
+        assert_eq!(has("POST the clip on Tuesday", "heuristic", "open"), 1);
+        assert_eq!(has("Post the clip on TUESDAY", "heuristic", "open"), 1);
+        for extractor in ["user", "agent", "llm", "followup"] {
+            assert_eq!(
+                has("Post the clip on Tuesday", extractor, "open"),
+                1,
+                "{extractor}"
+            );
+        }
+        assert_eq!(has("Post the clip on Monday", "heuristic", "open"), 1);
+        assert_eq!(
+            has("Post the clip on Tuesday", "heuristic", "open"),
+            1,
+            "the one whose source is gone"
+        );
+        assert_eq!(has("wire `retry_backoff` in", "heuristic", "open"), 1);
+        assert_eq!(has("post the clip later", "heuristic", "open"), 1);
+        // Not added: the thread is hand-curated.
+        assert_eq!(has("cap the retry queue", "followup", "open"), 0);
+        assert_eq!(
+            app_config::get(&conn, TODOS_REGATED).unwrap().as_deref(),
+            Some(REGATE_DONE)
+        );
+        drop(conn);
+        assert_eq!(regate_todos_once(&db, 9_999, &|| false).unwrap(), None);
+    }
+
+    /// A checklist row the gate rejects in its own message stays when another message of the
+    /// thread still yields its text as a heuristic TODO, in any case (a later `TODO:` marker,
+    /// the user's own `- [ ]` line): it moves to the first such message under its uid, where a
+    /// full re-derive keeps it. One that no message yields still goes.
+    #[test]
+    fn the_re_judge_moves_a_rejected_todo_another_message_yields() {
+        let mut conn = temp_db();
+        let checklist = "- [ ] update the docs";
+        let mut threads = Vec::new();
+        for (ext, rest) in [
+            ("m1", &["and?", "TODO: update the docs"][..]),
+            ("m2", &["- [ ] Update the Docs"][..]),
+            ("m3", &["thanks"][..]),
+        ] {
+            let texts: Vec<&str> = ["go", checklist].iter().chain(rest).copied().collect();
+            let t = seed_thread(&mut conn, ext, "/proj/m", false, &texts);
+            conn.execute("DELETE FROM facts WHERE thread_id = ?1", [t])
+                .unwrap();
+            // As the old rule stored it: from the assistant's checklist at seq 1.
+            let uid = new_fact_uid();
+            conn.execute(
+                "INSERT INTO facts (thread_id, kind, text, status, extractor, source_message_id,
+                                    source_seq, created_at, uid)
+                 SELECT ?1, 'todo', 'update the docs', 'open', 'heuristic', id, 1, 5, ?2
+                 FROM messages WHERE thread_id = ?1 AND seq = 1",
+                params![t, uid],
+            )
+            .unwrap();
+            threads.push((t, uid));
+        }
+        let db = crate::db::Db(std::sync::Mutex::new(conn));
+        let report = regate_todos_once(&db, 9_999, &|| false).unwrap().unwrap();
+        assert_eq!((report.dropped, report.added), (1, 0), "{report:?}");
+        let conn = db.0.lock().unwrap();
+        // (text, source seq, the seq of its source message, created_at, uid).
+        let row = |t: i64| -> Option<(String, i64, i64, i64, String)> {
+            conn.query_row(
+                "SELECT f.text, f.source_seq, m.seq, f.created_at, f.uid
+                 FROM facts f JOIN messages m ON m.id = f.source_message_id
+                 WHERE f.thread_id = ?1",
+                [t],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .optional()
+            .unwrap()
+        };
+        let moved = |seq: i64, uid: &str| {
+            Some((
+                "update the docs".to_string(),
+                seq,
+                seq,
+                1_000 + seq,
+                uid.to_string(),
+            ))
+        };
+        assert_eq!(row(threads[0].0), moved(3, &threads[0].1), "a later marker");
+        assert_eq!(
+            row(threads[1].0),
+            moved(2, &threads[1].1),
+            "the user's line"
+        );
+        assert_eq!(row(threads[2].0), None, "no message yields it");
+    }
+
+    /// A `- [ ]` item under a "Follow-ups" heading that the old rule stored and the user then
+    /// reworded never comes back as an open follow-up with its original text: the thread is
+    /// hand-curated, so the re-judge adds no follow-up there (this pinned the later list's
+    /// item being added before), and it leaves the rows a later full re-index leaves.
+    #[test]
+    fn the_re_judge_never_brings_back_a_reworded_todo_as_a_follow_up() {
+        let mut conn = temp_db();
+        let t = seed_thread(
+            &mut conn,
+            "e1",
+            "/proj/e",
+            false,
+            &[
+                "go",
+                "## Follow-ups\n- [ ] wire `retry` into jobs.rs",
+                "and?",
+                "## Remaining\n- cap the retry queue",
+            ],
+        );
+        conn.execute("DELETE FROM facts WHERE thread_id = ?1", [t])
+            .unwrap();
+        let asst: i64 = conn
+            .query_row(
+                "SELECT id FROM messages WHERE thread_id = ?1 AND seq = 1",
+                [t],
+                |r| r.get(0),
+            )
+            .unwrap();
+        // As the old rule stored the checklist item, after the user reworded it.
+        conn.execute(
+            "INSERT INTO facts (thread_id, kind, text, status, extractor, edited,
+                                source_message_id, source_seq, created_at, uid)
+             VALUES (?1, 'todo', 'wire `retry` into the job runner', 'open', 'heuristic', 1,
+                     ?2, 1, 5, ?3)",
+            params![t, asst, new_fact_uid()],
+        )
+        .unwrap();
+        let db = crate::db::Db(std::sync::Mutex::new(conn));
+        let report = regate_todos_once(&db, 9_999, &|| false).unwrap().unwrap();
+        assert_eq!((report.dropped, report.added), (0, 0), "{report:?}");
+        let mut conn = db.0.lock().unwrap();
+        let after = todo_rows(&conn, t);
+        assert_eq!(
+            after,
+            vec![(
+                "wire `retry` into the job runner".to_string(),
+                "heuristic".to_string(),
+                "open".to_string()
+            )]
+        );
+        let tx = conn.transaction().unwrap();
+        rebuild_thread_todos(&tx, t, 9_999).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(
+            todo_rows(&conn, t),
+            after,
+            "a full re-derive keeps the same rows"
+        );
+    }
+
+    /// An interrupted pass resumes after the last thread it finished; one that already ran,
+    /// or a fresh index, does nothing.
+    #[test]
+    fn the_re_judge_resumes_and_never_repeats() {
+        let (db, t, other) = regate_fixture();
+        {
+            let conn = db.0.lock().unwrap();
+            app_config::put(&conn, TODOS_REGATED, &t.to_string()).unwrap();
+        }
+        let report = regate_todos_once(&db, 9_999, &|| false).unwrap().unwrap();
+        assert_eq!(report.threads, 1, "only the threads after the cursor");
+        assert_eq!(report.dropped, 1);
+        let conn = db.0.lock().unwrap();
+        assert!(todo_rows(&conn, other).is_empty());
+        assert!(
+            todo_rows(&conn, t)
+                .iter()
+                .any(|r| r.0 == "Post the clip on Tuesday" && r.1 == "heuristic"),
+            "the thread before the cursor is not judged again"
+        );
+        drop(conn);
+
+        let mut fresh = temp_db();
+        mark_todos_backfilled(&fresh).unwrap();
+        seed_thread(
+            &mut fresh,
+            "n1",
+            "/proj/n",
+            false,
+            &["hi", "- [ ] Upload it"],
+        );
+        let db = crate::db::Db(std::sync::Mutex::new(fresh));
+        assert_eq!(regate_todos_once(&db, 9_999, &|| false).unwrap(), None);
+    }
+
+    /// On an index without the columns it reads (before 0034's uid and source seq), the
+    /// re-judge does nothing and records nothing, so it runs once the app has upgraded it.
+    #[test]
+    fn the_re_judge_skips_an_index_without_its_columns() {
+        let path = crate::db::test_support::TestPath::new("regate_old");
+        crate::db::test_support::index_at_version(&path, 33, |conn| {
+            conn.execute(
+                "INSERT INTO threads (source_id, external_id, title) VALUES (1, 'x', 'x')",
+                [],
+            )
+            .unwrap();
+        });
+        let conn = Connection::open(&*path).unwrap();
+        let db = crate::db::Db(std::sync::Mutex::new(conn));
+        assert_eq!(regate_todos_once(&db, 9_999, &|| false).unwrap(), None);
+        let conn = db.0.lock().unwrap();
+        assert_eq!(app_config::get(&conn, TODOS_REGATED).unwrap(), None);
+    }
+
+    /// Real-data gate of the checklist gate and follow-ups, on an APFS clone of an index that
+    /// this test WRITES: it migrates the clone, plans the re-judge in a transaction it rolls
+    /// back (timing each thread), then runs it for real and counts again. Prints counts,
+    /// timings and samples (ids and the first 60 characters) to stderr for a person to judge;
+    /// nothing is stored. Refuses a file in the app's data folder.
+    ///
+    /// CALLIMACHUS_GROUNDING_DB=<clone>/index.db cargo test -p callimachus-core --lib \
+    ///   real_todo_regate -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn real_todo_regate() {
+        use std::time::{Duration, Instant};
+        let Ok(path) = std::env::var("CALLIMACHUS_GROUNDING_DB") else {
+            eprintln!("set CALLIMACHUS_GROUNDING_DB to an index clone");
+            return;
+        };
+        let path = std::path::PathBuf::from(path);
+        let canonical =
+            |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        assert!(
+            canonical(&path).parent() != Some(canonical(&crate::db::app_data_dir()).as_path()),
+            "{} is in the app's data folder; clone it elsewhere first (cp -c on APFS)",
+            path.display()
+        );
+        let started = Instant::now();
+        let conn = crate::db::open(&path).unwrap();
+        eprintln!("open + migrate: {:.1?}", started.elapsed());
+        let now = chrono::Utc::now().timestamp();
+        let open_by = |conn: &Connection| -> Vec<(String, i64)> {
+            conn.prepare(
+                "SELECT extractor, COUNT(*) FROM facts
+                 WHERE kind = 'todo' AND status = 'open' AND hidden = 0 GROUP BY 1 ORDER BY 1",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+        };
+        let rows = |conn: &Connection, sql: &str| -> Vec<(i64, String)> {
+            conn.prepare(sql)
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        let listed = |conn: &Connection| list_open_todos(conn, None, None, None, 1 << 30).unwrap();
+        let before = open_by(&conn);
+        let listed_before = listed(&conn).len();
+
+        // The plan, rolled back: what each thread would lose and gain, and how long it takes.
+        let ids: Vec<i64> = conn
+            .prepare("SELECT id FROM threads WHERE is_subagent = 0 ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let (mut dropped, mut slowest, mut total) = (Vec::new(), Duration::ZERO, Duration::ZERO);
+        {
+            let tx = conn.unchecked_transaction().unwrap();
+            for &id in &ids {
+                // One that another message still yields moves there instead.
+                for (d, _) in regate_drops(&tx, id)
+                    .unwrap()
+                    .into_iter()
+                    .filter(|(_, to)| to.is_none())
+                {
+                    let text: String = tx
+                        .query_row("SELECT text FROM facts WHERE id = ?1", [d], |r| r.get(0))
+                        .unwrap();
+                    dropped.push((d, text));
+                }
+                let at = Instant::now();
+                regate_thread(&tx, id, now).unwrap();
+                slowest = slowest.max(at.elapsed());
+                total += at.elapsed();
+            }
+            // Dropped without a commit: rolled back.
+        }
+
+        let db = crate::db::Db(std::sync::Mutex::new(conn));
+        let at = Instant::now();
+        let report = regate_todos_once(&db, now, &|| false).unwrap();
+        let wall = at.elapsed();
+        let conn = db.0.lock().unwrap();
+        let after = open_by(&conn);
+        let kept = rows(
+            &conn,
+            "SELECT id, text FROM facts WHERE kind = 'todo' AND status = 'open' AND hidden = 0
+               AND extractor = 'heuristic' ORDER BY id",
+        );
+        let followups = rows(
+            &conn,
+            "SELECT id, text FROM facts WHERE kind = 'todo' AND extractor = 'followup' ORDER BY id",
+        );
+        eprintln!("threads: {} top-level", ids.len());
+        eprintln!("open TODOs before: {before:?} (listed {listed_before})");
+        eprintln!(
+            "open TODOs after:  {after:?} (listed {})",
+            listed(&conn).len()
+        );
+        eprintln!("run: {report:?} in {wall:.1?}");
+        eprintln!(
+            "plan: {} dropped; per thread slowest {slowest:.1?}, all {total:.1?}",
+            dropped.len()
+        );
+        let sample = |label: &str, items: &[(i64, String)]| {
+            let step = (items.len() / 30).max(1);
+            eprintln!("-- {label}: {} (every {step}th)", items.len());
+            for (id, text) in items.iter().step_by(step).take(30) {
+                let head: String = text.chars().take(60).collect();
+                eprintln!("  #{id} {}", head.replace(['\n', '\r'], " "));
+            }
+        };
+        sample("dropped heuristic", &dropped);
+        sample("kept heuristic", &kept);
+        sample("followup", &followups);
+        // Which title each follow-up came from: the nearest title line above its bullet.
+        let mut by_title: std::collections::BTreeMap<&str, Vec<(i64, String)>> = Default::default();
+        for (id, text) in &followups {
+            let message: Option<String> = conn
+                .query_row(
+                    "SELECT m.text FROM facts f JOIN messages m ON m.id = f.source_message_id
+                     WHERE f.id = ?1",
+                    [id],
+                    |r| r.get(0),
+                )
+                .optional()
+                .unwrap();
+            let title = message.and_then(|m| {
+                let lines: Vec<&str> = m.lines().collect();
+                let at = lines.iter().position(|l| l.contains(text.as_str()))?;
+                lines[..at]
+                    .iter()
+                    .rev()
+                    .find_map(|l| followup_title(l.trim()))
+            });
+            by_title
+                .entry(title.unwrap_or("?"))
+                .or_default()
+                .push((*id, text.clone()));
+        }
+        for (title, items) in &by_title {
+            sample(&format!("followup under {title:?}"), items);
+        }
+    }
+
+    /// The re-judge deletes rows from the user's index, so only the watcher's job thread may
+    /// start it: never a hook, the MCP server or a `cal` read command.
+    #[test]
+    fn the_re_judge_runs_only_from_the_watchers_job() {
+        // The workspace: core, the app crate and the standalone binaries.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let mut callers = Vec::new();
+        let mut stack = vec![
+            root.join("core/src"),
+            root.join("src"),
+            root.join("standalone"),
+        ];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.extension().is_some_and(|x| x == "rs")
+                    && std::fs::read_to_string(&p)
+                        .unwrap()
+                        .contains("regate_todos_once(")
+                {
+                    let rel = p.strip_prefix(&root).unwrap_or(&p);
+                    callers.push(rel.to_string_lossy().replace('\\', "/"));
+                }
+            }
+        }
+        callers.sort();
+        assert_eq!(
+            callers,
+            ["core/src/jobs.rs", "core/src/knowledge/mod.rs"],
+            "{callers:?}"
+        );
+        let jobs = std::fs::read_to_string(root.join("core/src/jobs.rs")).unwrap();
+        let kick = jobs.find("pub fn todo_backfill_kick").unwrap();
+        let call = jobs.find("regate_todos_once(").unwrap();
+        let next_fn = jobs[kick + 1..].find("\npub fn ").unwrap() + kick + 1;
+        assert!(
+            kick < call && call < next_fn,
+            "called from todo_backfill_kick only"
+        );
+    }
+
     fn engine(id: &str, kind: &'static str, detected: bool) -> MemoryEngine {
         MemoryEngine {
             id: id.into(),
@@ -3763,6 +6289,24 @@ mod tests {
         subagent: bool,
         texts: &[&str],
     ) -> i64 {
+        let messages: Vec<(&str, Option<i64>)> = texts
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (*t, Some(1_000 + i as i64)))
+            .collect();
+        seed_timed(conn, ext, project, subagent, &messages)
+    }
+
+    /// [`seed_thread`] with each message's time: (text, ts), user and assistant in turn. A
+    /// thread indexed again with more messages after the same ones takes the appended-tail
+    /// path.
+    fn seed_timed(
+        conn: &mut Connection,
+        ext: &str,
+        project: &str,
+        subagent: bool,
+        messages: &[(&str, Option<i64>)],
+    ) -> i64 {
         use crate::indexer::{source_id, upsert_thread, ParsedMessage, ParsedThread};
         let sid = source_id(conn, "claude_code").unwrap();
         upsert_thread(
@@ -3775,14 +6319,14 @@ mod tests {
                 created_at: Some(1),
                 updated_at: Some(2),
                 is_subagent: subagent,
-                messages: texts
+                messages: messages
                     .iter()
                     .enumerate()
-                    .map(|(i, t)| ParsedMessage {
+                    .map(|(i, (t, ts))| ParsedMessage {
                         role: if i % 2 == 0 { "user" } else { "assistant" }.into(),
                         text: (*t).into(),
                         tool_name: None,
-                        ts: Some(1_000 + i as i64),
+                        ts: *ts,
                     })
                     .collect(),
                 ..Default::default()

@@ -904,13 +904,16 @@ fn digest_entry(
     if !files.is_empty() {
         out.push_str(&format!("  files: {}\n", files.join(", ")));
     }
+    // Both derived extractors, as Today and `list_open_todos` show them: a session's latest
+    // deferred-work list is stored as `followup`.
     let todos: Vec<String> = conn
-        .prepare_cached(
+        .prepare_cached(&format!(
             "SELECT text FROM facts
              WHERE thread_id = ?1 AND kind = 'todo' AND status = 'open'
-               AND extractor = 'heuristic' AND hidden = 0
+               AND extractor IN {} AND hidden = 0
              ORDER BY created_at DESC, id DESC LIMIT 2",
-        )?
+            crate::knowledge::DERIVED_TODO_EXTRACTORS_SQL
+        ))?
         .query_map([row.id], |r| r.get::<_, String>(0))?
         .collect::<rusqlite::Result<_>>()?;
     if !todos.is_empty() {
@@ -942,7 +945,8 @@ const DIGEST_SNAPSHOT_SQL: &str = "SELECT s.id, s.label FROM snapshots s
 /// A day-one digest of a repo's recent sessions, for surfaces whose distilled memory is
 /// still empty (the SessionStart hook, MCP `project_memory`): each of the last
 /// `opts.max_sessions` non-subagent sessions with its source, branch, age, gist, touched
-/// files and open heuristic TODOs, then the latest snapshot to resume from. Needs no LLM.
+/// files and open heuristic and follow-up TODOs, then the latest snapshot to resume from.
+/// Needs no LLM.
 ///
 /// None when the project has no sessions. Everything is redacted and fence-escaped
 /// (`fact_line`); the result never exceeds `opts.max_chars`, is cut between sessions with a
@@ -2202,6 +2206,8 @@ mod tests {
             "Moved the gateway to mTLS",
             "claude-compact",
         );
+        // A follow-up shows too; written before the heuristic one, it lists second.
+        dts::fact(&conn, new, "todo", "cap the retry queue", "followup");
         dts::fact(
             &conn,
             new,
@@ -2258,7 +2264,10 @@ mod tests {
             out.contains("  files: src/lib.rs, src/search/mod.rs\n"),
             "{out}"
         );
-        assert!(out.contains("  open TODOs: retry the flaky test on Linux"));
+        assert!(
+            out.contains("  open TODOs: retry the flaky test on Linux; cap the retry queue\n"),
+            "{out}"
+        );
         assert!(!out.contains("an llm todo"), "{out}");
         // A summary fact (here a compaction summary) beats the prompt.
         assert!(out.contains("  gist: Moved the gateway to mTLS"), "{out}");

@@ -1,4 +1,4 @@
-//! The versioned `cal --json` contract. The sixteen query outputs other tools read (the VS Code
+//! The versioned `cal --json` contract. The seventeen query outputs other tools read (the VS Code
 //! extension, PR auditors, scripts) come as these envelopes, each opening with
 //! `schema_version`, when the caller asks for a version: `--json-version 1`, or
 //! `CAL_JSON_VERSION=1` in the environment beside `--json`. Plain `--json` keeps printing the
@@ -58,6 +58,16 @@ impl<'a, T> Listing<'a, T> {
         self.notice = Some(notice.into());
         self
     }
+}
+
+/// `cal memory review`: a [`Listing`] that also says how many items its cap left out.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ReviewListing<'a> {
+    #[serde(flatten)]
+    pub listing: Listing<'a, crate::today::ReviewItem>,
+    /// How many more items there are to review than `results` lists (it stops at 50, the
+    /// replaced and recorded ones first); 0 when it lists them all.
+    pub more: usize,
 }
 
 /// An object output (`stats`, `memory`): the object's own fields after `schema_version`, so
@@ -181,6 +191,10 @@ impl CalSchema {
     }
 }
 
+/// The schemas of a subcommand's output: (the schema's name, the command line `cal help`
+/// lists it under).
+const SUBCOMMAND_SCHEMAS: &[(&str, &str)] = &[("memory-review", "memory review")];
+
 /// The JSON Schema of every versioned `cal --json` output, in `COMMANDS` order.
 pub fn schemas() -> Vec<CalSchema> {
     use crate::gitlink::TimelineRow;
@@ -208,6 +222,12 @@ pub fn schemas() -> Vec<CalSchema> {
         schema::<Versioned<knowledge::ProjectMemory>>(
             "memory",
             "A project's decisions, gotchas and open TODOs.",
+        ),
+        schema::<ReviewListing>(
+            "memory-review",
+            "`cal memory review`: what agents and memory passes did to memory that nobody \
+             reviewed: the facts agents replaced or recorded in the last 7 days, then open \
+             disputes and stale / wrong flags, each group newest first.",
         ),
         schema::<Listing<TimelineRow>>(
             "commits",
@@ -274,7 +294,11 @@ fn schema<T: JsonSchema>(command: &'static str, description: &str) -> CalSchema 
         "$id".into(),
         format!("{SCHEMA_BASE_URL}{command}.v{CAL_SCHEMA_VERSION}.json").into(),
     );
-    out.insert("title".into(), format!("cal {command} --json").into());
+    let invocation = SUBCOMMAND_SCHEMAS
+        .iter()
+        .find(|(name, _)| *name == command)
+        .map_or(command, |(_, line)| line);
+    out.insert("title".into(), format!("cal {invocation} --json").into());
     out.insert("description".into(), description.into());
     for (k, v) in body {
         if !matches!(k.as_str(), "$schema" | "title" | "description") {
@@ -402,13 +426,18 @@ mod tests {
     #[test]
     fn every_schema_is_published_under_its_command() {
         let names: Vec<_> = schemas().iter().map(|s| s.command).collect();
-        assert_eq!(names.len(), 16);
+        assert_eq!(names.len(), 17);
         for s in schemas() {
-            assert!(
-                crate::cli_core::COMMANDS.contains(&s.command),
-                "{} is not a cal command",
-                s.command
-            );
+            // A command, or a subcommand `cal help` lists (`cal memory review`).
+            let named = crate::cli_core::COMMANDS.contains(&s.command)
+                || SUBCOMMAND_SCHEMAS.iter().any(|(name, line)| {
+                    *name == s.command
+                        && line.split(' ').next().is_some_and(|c| {
+                            crate::cli_core::COMMANDS.contains(&c)
+                                && crate::cli_core::USAGE.contains(&format!("  cal {line} "))
+                        })
+                });
+            assert!(named, "{} is not a cal command", s.command);
             assert_eq!(
                 s.schema["$id"],
                 format!("{SCHEMA_BASE_URL}{}", s.file_name()),

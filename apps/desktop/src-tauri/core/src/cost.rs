@@ -966,22 +966,6 @@ fn day_sql(since: i64, project: Option<&str>, mode: ProjectMatch) -> (String, Ve
     (sql, args)
 }
 
-/// Each Claude Code subagent transcript's parent session: `<slug>/<session>.jsonl` for
-/// `<slug>/<session>/subagents/.../agent-<id>.jsonl`, matched on the unique
-/// (source, external id) index. A subagent whose parent is not indexed stays on its own.
-fn subagent_parents(conn: &Connection) -> Result<HashMap<i64, i64>> {
-    let mut stmt = conn.prepare_cached(SUBAGENT_PARENTS_SQL)?;
-    let pairs = stmt
-        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?
-        .collect::<rusqlite::Result<HashMap<_, _>>>()?;
-    Ok(pairs)
-}
-
-const SUBAGENT_PARENTS_SQL: &str = "SELECT c.id, p.id FROM threads c
-     JOIN threads p ON p.source_id = c.source_id
-      AND p.external_id = substr(c.external_id, 1, instr(c.external_id, '/subagents/') - 1) || '.jsonl'
-     WHERE c.is_subagent = 1 AND instr(c.external_id, '/subagents/') > 0";
-
 /// The priciest sessions, each with its subagents folded in and its waste signals.
 fn session_costs(
     conn: &Connection,
@@ -989,7 +973,7 @@ fn session_costs(
     since: i64,
     limit: usize,
 ) -> Result<Vec<SessionCost>> {
-    let parents = subagent_parents(conn)?;
+    let parents = crate::indexer::subagent_parents(conn)?;
     // (own, subagents' total, subagent count) per session.
     let mut sessions: HashMap<i64, (Tally, Tally, i64)> = HashMap::new();
     for (id, t) in per_thread {
@@ -1190,7 +1174,7 @@ const TOOL_ROWS_SQL: &str = "SELECT role, tool_name,
 
 /// Whether a tool result reads as a failure, from how each agent reports one: Claude Code's
 /// `<tool_use_error>` and `Exit code N`, Codex's `Exit code: N` / `Process exited with code
-/// N` / `"exit_code": N`, or an error line leading the output.
+/// N` / `"exit_code": N`, or an error line or Python's traceback header leading the output.
 pub(crate) fn tool_failed(text: &str) -> bool {
     let head = text.trim_start();
     if head.starts_with("<tool_use_error>") {
@@ -1217,8 +1201,11 @@ pub(crate) fn tool_failed(text: &str) -> bool {
     {
         return nonzero(&head[i + "\"exit_code\":".len()..]);
     }
+    // Python's traceback header leads a failed run, and the extractor no longer returns it
+    // (it takes the block's exception line, which this first line alone never reaches).
     lower.starts_with("error")
         || lower.starts_with("fatal")
+        || lower.starts_with("traceback (most recent call last)")
         || !crate::issues::extract_errors(first).is_empty()
 }
 
@@ -1232,7 +1219,7 @@ fn project_costs(
         .prepare_cached("SELECT COALESCE(project_key, project_path) FROM threads WHERE id = ?1")?;
     // A subagent transcript counts toward its session, not as one: on the clone a project
     // with 182 sessions read "10471 sessions" when every transcript counted.
-    let parents = subagent_parents(conn)?;
+    let parents = crate::indexer::subagent_parents(conn)?;
     let mut by: HashMap<Option<String>, (ProjectCost, HashSet<i64>)> = HashMap::new();
     for (id, t) in per_thread {
         let project: Option<String> = stmt.query_row([id], |r| r.get(0)).optional()?.flatten();
@@ -1327,7 +1314,7 @@ fn commit_costs(
     if links.is_empty() {
         return Ok(Vec::new());
     }
-    let parents = subagent_parents(conn)?;
+    let parents = crate::indexer::subagent_parents(conn)?;
     let root = |id: i64| parents.get(&id).copied().unwrap_or(id);
     let mut children: HashMap<i64, Vec<i64>> = HashMap::new();
     for (child, parent) in &parents {
@@ -1829,6 +1816,7 @@ mod tests {
             r#"{"output":"boom","metadata":{"exit_code":1,"duration_seconds":0.2}}"#,
             "Error: ENOENT: no such file or directory",
             "TypeError: x is not a function",
+            "Traceback (most recent call last):\n  File \"a.py\", line 1, in <module>",
         ] {
             assert!(tool_failed(failed), "{failed}");
         }
@@ -2224,7 +2212,7 @@ mod tests {
         }
         let p = plan(&f.conn, TOOL_ROWS_SQL, &[&1i64]);
         assert!(p.contains("sqlite_autoindex_messages_1"), "{p}");
-        let p = plan(&f.conn, SUBAGENT_PARENTS_SQL, &[]);
+        let p = plan(&f.conn, crate::indexer::SUBAGENT_PARENTS_SQL, &[]);
         assert!(p.contains("SEARCH p USING"), "{p}");
     }
 }

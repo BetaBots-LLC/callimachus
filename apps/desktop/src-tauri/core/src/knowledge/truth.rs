@@ -908,6 +908,29 @@ pub fn unlink_facts(
     )?)
 }
 
+/// The user restores fact `fact_id` as current (the Replaced list's and Today's Undo): every
+/// `supersedes` link onto it that the user has not undone yet is dismissed, in one
+/// transaction ([`atomic`]), as [`unlink_link`] dismisses one, so no machine source declares
+/// them again. One Undo used to dismiss only the newest replacer's link, and a fact two
+/// sessions replaced stayed replaced by the other (the #125 follow-up). A link whose newer
+/// side is hidden goes too: it is inactive only until that fact is unhidden, which must not
+/// take back the restore. Returns how many links were dismissed.
+pub fn restore_fact(conn: &Connection, fact_id: i64, now: i64) -> Result<usize> {
+    if !has_truth_tables(conn) {
+        return Ok(0);
+    }
+    atomic(conn, |c| {
+        let Some(uid) = uid_of(c, fact_id)? else {
+            return Ok(0);
+        };
+        Ok(c.execute(
+            "UPDATE fact_links SET dismissed_at = ?2
+             WHERE to_uid = ?1 AND kind = 'supersedes' AND dismissed_at IS NULL",
+            params![uid, now],
+        )?)
+    })
+}
+
 // ---- writers: signals ----
 
 /// A flag on one fact.
@@ -1252,8 +1275,8 @@ pub(crate) fn cut_words(s: &str, max: usize) -> String {
 /// [`RefMap`] that resolves its refs: up to [`DISTILL_CONTEXT_DECISIONS`] decisions and
 /// [`DISTILL_CONTEXT_GOTCHAS`] gotchas that are not superseded or flagged (disputed ones are
 /// listed: the session may settle them; so are the ones only this thread's own last distill
-/// superseded or retired, which a re-distill must be able to declare again), excluding the thread's own facts and Claude Code's
-/// private auto memory, pinned first, then by session time. One line each,
+/// superseded or retired, which a re-distill must be able to declare again), excluding the thread's own facts, Claude Code's
+/// private auto memory and unpinned failure playbooks other than those this thread's last distill linked or retired, pinned first, then by session time. One line each,
 /// `D1 (2026-10-01): text`, the text redacted and cut at [`DISTILL_CONTEXT_TEXT_CHARS`]. An
 /// empty project (or a thread with no project) gives an empty block. The caller fences it.
 pub fn distill_memory_context(conn: &Connection, thread_id: i64) -> Result<(String, RefMap)> {
@@ -1295,13 +1318,31 @@ pub fn distill_memory_context(conn: &Connection, thread_id: i64) -> Result<(Stri
     } else {
         String::new()
     };
+    // An unpinned playbook is no memory here either (`super::MemoryQuery::playbooks`): they
+    // are a repo's newest gotchas, and 27 in one measured repo would take all 20 slots. Except
+    // one this thread's last pass linked (supersedes or contradicts, either way) or retired
+    // (before playbooks left this list): the re-distill drops that link or flag, so unlisted,
+    // the playbook came back as current or lost its dispute. An OR, not `IN (to, from)`: SQLite
+    // then searches both indexes of fact_links instead of scanning it.
+    let own_playbook = if truth {
+        " OR EXISTS (SELECT 1 FROM fact_links lk
+               WHERE (lk.to_uid = f.uid OR lk.from_uid = f.uid) AND lk.source = 'distill'
+                 AND lk.thread_id IS ?3 AND lk.dismissed_at IS NULL)
+           OR EXISTS (SELECT 1 FROM fact_signals sg
+               WHERE sg.fact_uid = f.uid AND sg.kind IN ('stale', 'wrong')
+                 AND sg.source = 'distill' AND sg.thread_id IS ?3 AND sg.resolved_at IS NULL)"
+    } else {
+        ""
+    };
     let sql = format!(
         "SELECT f.id, f.uid, f.text, f.pinned, f.edited, {DECIDED_AT_SQL}
          FROM facts f JOIN threads t ON t.id = f.thread_id
          WHERE f.kind = ?1 AND COALESCE(t.project_key, t.project_path) = ?2
            AND f.thread_id != ?3 AND f.hidden = 0 AND f.uid IS NOT NULL
-           AND f.extractor != ?4 AND (t.is_subagent = 0 OR f.pinned = 1){live}
+           AND f.extractor != ?4 AND (f.extractor != '{}' OR f.pinned = 1{own_playbook})
+           AND (t.is_subagent = 0 OR f.pinned = 1){live}
          ORDER BY f.pinned DESC, {} DESC, f.id DESC LIMIT ?5",
+        super::EXTRACTOR_PLAYBOOK,
         recency_sql(truth)
     );
     let mut lines = Vec::new();
@@ -2387,6 +2428,92 @@ mod tests {
         assert!(user(here, third).link_id().is_some());
     }
 
+    /// One Undo restores a fact however many facts replaced it: every replacement link onto it
+    /// is dismissed together (a hidden replacer's too, so unhiding it takes nothing back), each
+    /// one stays undone, and a failure on one leaves every link as it was.
+    #[test]
+    fn restoring_a_fact_undoes_every_replacement_at_once() {
+        let conn = temp_db();
+        let a = fact(
+            &conn,
+            session(&conn, "A", P, day(10, 1)),
+            "decision",
+            BINCODE,
+        );
+        let b = fact(&conn, session(&conn, "B", P, day(10, 3)), "decision", JSON);
+        let c = fact(
+            &conn,
+            session(&conn, "C", P, day(10, 5)),
+            "decision",
+            "Use protobuf",
+        );
+        let d = fact(
+            &conn,
+            session(&conn, "D", P, day(10, 6)),
+            "decision",
+            "Use CBOR",
+        );
+        for (from, source) in [
+            (b, LinkSource::User),
+            (c, LinkSource::Agent),
+            (d, LinkSource::User),
+        ] {
+            let o = link_facts(
+                &conn,
+                from,
+                a,
+                LinkKind::Supersedes,
+                source,
+                None,
+                day(11, 1),
+            );
+            assert!(matches!(o.unwrap(), LinkOutcome::Linked { .. }));
+        }
+        set_fact_hidden(&conn, d, true).unwrap();
+        assert_eq!(status(&conn, a), FactStatus::Superseded);
+        // The pairwise Undo: the fact stays replaced by the others.
+        assert_eq!(
+            unlink_facts(&conn, c, a, Some(LinkKind::Supersedes), day(11, 2)).unwrap(),
+            1
+        );
+        assert_eq!(status(&conn, a), FactStatus::Superseded);
+
+        let active =
+            "SELECT COUNT(*) FROM fact_links WHERE kind = 'supersedes' AND dismissed_at IS NULL";
+        let b_uid = uid_of(&conn, b).unwrap().unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TEMP TRIGGER refuse_one BEFORE UPDATE OF dismissed_at ON fact_links
+             WHEN OLD.from_uid = '{b_uid}' BEGIN SELECT RAISE(ABORT, 'refused'); END;"
+        ))
+        .unwrap();
+        assert!(restore_fact(&conn, a, day(11, 3)).is_err());
+        assert_eq!(count(&conn, active), 2, "all or nothing");
+        conn.execute_batch("DROP TRIGGER refuse_one").unwrap();
+
+        assert_eq!(restore_fact(&conn, a, day(11, 3)).unwrap(), 2);
+        assert_eq!(status(&conn, a), FactStatus::Current);
+        assert_eq!(count(&conn, active), 0);
+        set_fact_hidden(&conn, d, false).unwrap();
+        assert_eq!(status(&conn, a), FactStatus::Current);
+        let again = link_facts(
+            &conn,
+            c,
+            a,
+            LinkKind::Supersedes,
+            LinkSource::Agent,
+            None,
+            day(11, 4),
+        );
+        assert!(matches!(
+            again.unwrap(),
+            LinkOutcome::Rejected {
+                reason: LinkRejection::Dismissed
+            }
+        ));
+        assert_eq!(restore_fact(&conn, a, day(11, 5)).unwrap(), 0);
+        assert_eq!(restore_fact(&conn, 9_999, day(11, 5)).unwrap(), 0);
+    }
+
     /// The user's Undo sticks: the link stays as a dismissed row, every reader treats it as
     /// inactive, a re-distill of the session that declared it (and an agent or a repo import
     /// asserting the pair, either way round) is a no-op, and only a user link revives it.
@@ -2731,6 +2858,128 @@ mod tests {
             .unwrap();
         assert!(record(&conn).unwrap().link.unwrap().link_id().is_some());
         assert_eq!(recorded(&conn), 1);
+    }
+
+    /// The distiller is shown no unpinned playbook (`MemoryQuery::playbooks`): they are a
+    /// repo's newest gotchas and would take the slots of the ones a session may supersede or
+    /// reaffirm. A pinned one is the user's and is listed.
+    #[test]
+    fn the_distiller_sees_no_unpinned_playbook() {
+        use crate::export::digest_test_support as dts;
+        let mut conn = dts::temp_db("distill_playbooks");
+        let old = dts::session(&mut conn, "dp-old", P, "old", 90_000, &["go"]);
+        let gotcha = "The staging proxy strips auth headers";
+        dts::fact(&conn, old, "gotcha", gotcha, "llm");
+        let fixer = dts::session(&mut conn, "dp-fix", P, "fix", 6_000, &["fix"]);
+        let now = chrono::Utc::now().timestamp();
+        for (origin, text) in [
+            (
+                "playbook:a@/proj/app",
+                "error[E0308]: mismatched types: seen 2 times; fixed in abc1234",
+            ),
+            (
+                "playbook:b@/proj/app",
+                "error[E0061]: wrong number of arguments: seen 3 times; fixed in def5678",
+            ),
+        ] {
+            crate::knowledge::upsert_playbook(&conn, origin, fixer, text, now).unwrap();
+        }
+        conn.execute(
+            "UPDATE facts SET pinned = 1 WHERE origin_ref = 'playbook:b@/proj/app'",
+            [],
+        )
+        .unwrap();
+        let next = dts::session(&mut conn, "dp-next", P, "next", 60, &["next"]);
+        let (block, _) = distill_memory_context(&conn, next).unwrap();
+        assert!(block.contains(gotcha), "{block}");
+        assert!(block.contains("wrong number of arguments"), "{block}");
+        assert!(!block.contains("mismatched types"), "{block}");
+    }
+
+    /// A pass from before playbooks left the distiller's list retired one, superseded
+    /// another and disputed two more (one from each side): re-distilling that thread still
+    /// lists all four, so it declares them again, and none comes back as current. An
+    /// untouched unpinned playbook stays unlisted.
+    #[test]
+    fn a_re_distill_still_sees_the_playbooks_its_last_pass_settled() {
+        let mut conn = temp_db();
+        let fixer = session(&conn, "fix", P, day(9, 1));
+        const RETIRED: &str = "error[E0308]: mismatched types: seen 2 times; fixed in abc1234";
+        const REPLACED: &str = "error[E0061]: wrong arguments: seen 3 times; fixed in def5678";
+        const UNTOUCHED: &str = "error[E0425]: cannot find value: seen 4 times; fixed in 0a1b2c3";
+        const DISPUTED: &str = "error[E0599]: no method named: seen 2 times; fixed in 1a2b3c4";
+        const DISPUTING: &str = "error[E0277]: trait not satisfied: seen 5 times; fixed in 5d6e7f8";
+        for (origin, text) in [
+            ("a", RETIRED),
+            ("b", REPLACED),
+            ("c", UNTOUCHED),
+            ("d", DISPUTED),
+            ("e", DISPUTING),
+        ] {
+            let origin = format!("playbook:{origin}@{P}");
+            crate::knowledge::upsert_playbook(&conn, &origin, fixer, text, day(9, 2)).unwrap();
+        }
+        let (retired, replaced) = (id_of(&conn, RETIRED), id_of(&conn, REPLACED));
+        let (disputed, disputing) = (id_of(&conn, DISPUTED), id_of(&conn, DISPUTING));
+        let tid = session(&conn, "T", P, day(10, 1));
+        const NEWER: &str = "the config is passed by reference now";
+        let newer = fact(&conn, tid, "gotcha", NEWER);
+        flag_fact(
+            &conn,
+            retired,
+            FlagKind::Stale,
+            SignalSource::Distill,
+            None,
+            Some(tid),
+            day(12, 1),
+        )
+        .unwrap();
+        for (from, to, kind) in [
+            (newer, replaced, LinkKind::Supersedes),
+            (newer, disputed, LinkKind::Contradicts),
+            (disputing, newer, LinkKind::Contradicts),
+        ] {
+            link_facts(
+                &conn,
+                from,
+                to,
+                kind,
+                LinkSource::Distill,
+                Some(tid),
+                day(12, 1),
+            )
+            .unwrap();
+        }
+        let settled = |conn: &Connection| {
+            assert_eq!(status(conn, retired), FactStatus::Flagged);
+            assert_eq!(status(conn, replaced), FactStatus::Superseded);
+            assert_eq!(status(conn, disputed), FactStatus::Disputed);
+            assert_eq!(status(conn, disputing), FactStatus::Disputed);
+        };
+        settled(&conn);
+
+        let (block, _) = distill_memory_context(&conn, tid).unwrap();
+        let refs = refs_by_text(&block);
+        for text in [RETIRED, REPLACED, DISPUTED, DISPUTING] {
+            assert!(refs.contains_key(text), "{text} in {block}");
+        }
+        assert!(!block.contains(UNTOUCHED), "{block}");
+        distill(
+            &mut conn,
+            tid,
+            |refs| Distilled {
+                gotchas: vec![NEWER.into()],
+                links: vec![
+                    link("g1", &refs[REPLACED], "supersedes"),
+                    link("g1", &refs[DISPUTED], "contradicts"),
+                    link(&refs[DISPUTING], "g1", "contradicts"),
+                ],
+                retires: vec![refs[RETIRED].clone()],
+                ..Default::default()
+            },
+            day(12, 2),
+        );
+        settled(&conn);
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //   http://localhost:1420/mock.html?view=settings&section=engine&theme=light
 // Params: theme, consent, memory (alias: knowledge), engines, agents, agenthooks, plugin, claude, keys,
 // update, jobs, semantic, searchMs, onboarding, ledger, chats, projectdata, lastproject, muted,
-// sections, today, scope, cliwatch, repomemory, report, truth, conflicts, drift (see SCENARIO below). mock-entry.ts also reads view, section,
+// sections, today, review, scope, cliwatch, repomemory, report, truth, conflicts, drift (see SCENARIO below). mock-entry.ts also reads view, section,
 // chatmode=ask and ask=<question> (sends it on load). Dev-only.
 import type {
   AgentHooksStatus,
@@ -11,6 +11,7 @@ import type {
   FactFlag,
   LinkKind,
   LinkOutcome,
+  ReviewItem,
   AgentIntegration,
   AutoDistillBudget,
   AgentView,
@@ -153,6 +154,11 @@ const SCENARIO = {
   // The Today view: a working morning across three repos (default), nothing since the last
   // open, or the busy morning reported as cut at the backend's newest-200 cap.
   today: pick("today", ["busy", "quiet", "capped"] as const, "busy"),
+  // Today's "Memory to review" strip: nothing to review (default, the strip stays hidden), one
+  // item of each kind, only a flagged fact the user pinned (it stays in memory), or a long
+  // list cut at the backend's 50 (`memoryReviewMore`). Keep / Undo / Hide remove the item, as
+  // the backend's refetch would.
+  review: pick("review", ["none", "some", "trusted", "many"] as const, "none"),
   // The Stats activity card: loaded (default), a cold cache that never answers, or a failure.
   activity: pick("activity", ["ready", "slow", "error"] as const, "ready"),
   // The remembered last project (`last_project`), which Search scopes to by default:
@@ -1045,6 +1051,84 @@ function searchFacts(query: string, project: string | null, limit: number): Fact
     .slice(0, limit);
 }
 
+// The review list `today` returns, edited by the actions that settle an item.
+let reviewItems: ReviewItem[] = mockReview();
+
+function mockReview(): ReviewItem[] {
+  const item = (
+    reason: ReviewItem["reason"],
+    factId: number,
+    text: string,
+    hoursAgo: number,
+    extra: Partial<ReviewItem> = {},
+  ): ReviewItem => ({
+    reason,
+    factId,
+    kind: "decision",
+    text,
+    project: PROJECTS[0],
+    at: NOW - Math.round(hoursAgo * 3_600),
+    source: "agent",
+    trusted: false,
+    injectable: true,
+    ...extra,
+  });
+  if (SCENARIO.review === "none") return [];
+  if (SCENARIO.review === "trusted") {
+    return [
+      item("flagged", 41, "Webhook handlers ack before they process.", 3, {
+        flag: "wrong",
+        note: "Processing moved in front of the ack in the v2 queue.",
+        trusted: true,
+      }),
+    ];
+  }
+  const some: ReviewItem[] = [
+    item("flagged", 41, "The sandbox rejects amounts under 50 cents.", 2, {
+      kind: "gotcha",
+      flag: "stale",
+      note: "The v3 API accepts any amount.",
+    }),
+    item("flagged", 42, "Refunds settle in one business day.", 30, {
+      flag: "stale",
+      source: "distill",
+      project: PROJECTS[1],
+    }),
+    item("disputed", 43, "Retries use exponential backoff capped at 5 minutes.", 50, {
+      source: "distill",
+      other: { id: 44, text: "Retries use a fixed 30-second interval." },
+    }),
+    item("replaced", 45, "Refund webhooks retry for 24 hours, then stop.", 1, {
+      other: { id: 46, text: "Refund webhooks retry for 72 hours with jitter." },
+    }),
+    item("recorded", 47, "Use idempotency keys on every POST that moves money.", 0.5),
+    // An unpinned playbook: injected memory never carries it, flagged or not.
+    item("flagged", 48, "error[E0308]: mismatched types: seen 3 times; fixed in 4f2a91c", 6, {
+      kind: "gotcha",
+      flag: "stale",
+      source: "distill",
+      injectable: false,
+    }),
+  ];
+  if (SCENARIO.review === "some") return some;
+  // The backend lists at most 50 and counts the rest (REVIEW_MORE).
+  return Array.from({ length: 10 }, (_, n) =>
+    some.map((i) => ({ ...i, factId: i.factId + 100 * n, at: i.at - n * 3_600 })),
+  )
+    .flat()
+    .slice(0, 50);
+}
+
+/** What the "many" list's cut left out, as `memoryReviewMore`. */
+const REVIEW_MORE = SCENARIO.review === "many" ? 10 : 0;
+
+/** Drop the review items an action settled. */
+function settleReview(keep: (i: ReviewItem) => boolean): number {
+  const before = reviewItems.length;
+  reviewItems = reviewItems.filter(keep);
+  return before - reviewItems.length;
+}
+
 function todayReport(since: number | null): Today {
   const from = since ?? NOW - 15 * 3_600;
   const busy = SCENARIO.today !== "quiet";
@@ -1074,6 +1158,8 @@ function todayReport(since: number | null): Today {
       newTodos: [],
       issuesSeenAgain: [],
       snapshots: [],
+      memoryReview: reviewItems,
+      memoryReviewMore: REVIEW_MORE,
       commitsPartial: false,
       truncated: false,
     };
@@ -1168,6 +1254,8 @@ function todayReport(since: number | null): Today {
         chars: 18_400,
       },
     ],
+    memoryReview: reviewItems,
+    memoryReviewMore: REVIEW_MORE,
     commitsPartial: false,
     truncated: SCENARIO.today === "capped",
   };
@@ -2475,13 +2563,40 @@ const handlers: Record<string, Handler> = {
       return plan;
     }),
   set_fact_pinned: ok,
-  hide_fact: ok,
+  hide_fact: (a) => {
+    settleReview((i) => i.factId !== Number(a.factId));
+    return null;
+  },
   set_todo_done: ok,
   edit_fact: ok,
   detect_conflicts: () => sleep(400).then(detectConflicts),
   link_facts: linkMock,
-  unlink_facts: unlinkMock,
-  resolve_fact_flags: (a) => (memTruth.flags.delete(Number(a.factId)) ? 1 : 0),
+  unlink_facts: (a) => {
+    const [from, to] = [Number(a.fromId), Number(a.toId)];
+    settleReview(
+      (i) =>
+        !(
+          i.reason === "disputed" &&
+          ((i.factId === to && i.other?.id === from) || (i.factId === from && i.other?.id === to))
+        ),
+    );
+    return unlinkMock(a);
+  },
+  restore_fact: (a) => {
+    const id = Number(a.factId);
+    const n = settleReview((i) => !(i.reason === "replaced" && i.factId === id));
+    return memTruth.replacedBy.delete(id) ? Math.max(n, 1) : n;
+  },
+  keep_review_item: (a) => {
+    const id = Number(a.factId);
+    settleReview((i) => !(i.reason === a.reason && i.factId === id));
+    return null;
+  },
+  resolve_fact_flags: (a) => {
+    const id = Number(a.factId);
+    const n = settleReview((i) => !(i.reason === "flagged" && i.factId === id));
+    return memTruth.flags.delete(id) ? Math.max(n, 1) : n;
+  },
   remember: ok,
   list_open_todos: () => [
     {

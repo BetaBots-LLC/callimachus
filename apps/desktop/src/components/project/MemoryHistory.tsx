@@ -8,9 +8,9 @@ import { dateTitle, factDate, flaggedStanding, flagLine } from "./FactTruth";
 /**
  * The Memory section's history: facts that are out of injected memory but kept, so the user
  * can see why and change their mind. "Replaced" holds facts a newer one replaced (Undo
- * removes the link from the newest replacer, and it stays removed; a fact two others replace
- * stays replaced by the other); "Flagged" holds facts an agent, a memory pass or
- * the user marked stale or wrong (Keep returns one to memory, Hide drops it).
+ * restores the fact: every replacement of it is undone at once and stays undone, however
+ * many facts replaced it); "Flagged" holds facts an agent, a memory pass or the user marked
+ * stale or wrong (Keep returns one to memory, Hide drops it).
  */
 
 function GroupHeading({ title, count }: { title: string; count: number }) {
@@ -33,8 +33,8 @@ export function ReplacedGroup({
   onUndo,
 }: {
   facts: MemoryFact[];
-  /** Undo the link from the newer fact to the replaced one. */
-  onUndo: (newerId: number, olderId: number) => void;
+  /** Restore the replaced fact: undo every replacement of it. */
+  onUndo: (id: number) => void;
 }) {
   const [open, setOpen] = useState(false);
   if (!facts.length) return null;
@@ -81,8 +81,8 @@ export function ReplacedGroup({
                   size="xs"
                   variant="ghost"
                   className="shrink-0"
-                  title="Undo this replacement. The fact returns to memory unless another fact also replaces it."
-                  onClick={() => f.supersededBy && onUndo(f.supersededBy.id, f.id)}
+                  title="Undo this replacement: the fact returns to memory, whatever else replaced it."
+                  onClick={() => onUndo(f.id)}
                 >
                   Undo
                 </Button>

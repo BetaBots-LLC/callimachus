@@ -1,0 +1,154 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://callimachus.app/schemas/cal/memory-review.v1.json",
+  "title": "cal memory review --json",
+  "description": "`cal memory review`: what agents and memory passes did to memory that nobody reviewed: the facts agents replaced or recorded in the last 7 days, then open disputes and stale / wrong flags, each group newest first.",
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "description": "Major version of this payload's shape. A reader refuses a version newer than it knows.",
+      "minimum": 0
+    },
+    "results": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ReviewItem"
+      },
+      "description": "The rows, best match (or newest) first."
+    },
+    "notice": {
+      "type": "string",
+      "description": "Present only when `results` is empty because this machine couldn't run the query (no\nembedding model for `decisions` / `gotchas`), so a reader can tell that from no match."
+    },
+    "more": {
+      "type": "integer",
+      "description": "How many more items there are to review than `results` lists (it stops at 50, the\nreplaced and recorded ones first); 0 when it lists them all.",
+      "minimum": 0
+    }
+  },
+  "required": [
+    "schema_version",
+    "results",
+    "more"
+  ],
+  "$defs": {
+    "ReviewItem": {
+      "type": "object",
+      "properties": {
+        "reason": {
+          "$ref": "#/$defs/ReviewReason"
+        },
+        "factId": {
+          "type": "integer",
+          "description": "The fact the item is about (for `replaced`, the one that was replaced)."
+        },
+        "kind": {
+          "type": "string",
+          "description": "`decision` or `gotcha`."
+        },
+        "text": {
+          "type": "string"
+        },
+        "project": {
+          "type": "string",
+          "description": "The fact's project key (\"\" when it has none)."
+        },
+        "at": {
+          "type": "integer",
+          "description": "When the reason arose (unix secs): the flag, the link, or the fact's recording."
+        },
+        "source": {
+          "type": "string",
+          "description": "Who did it: `agent` or `distill` (a memory pass) for a flag, the link's source for a\ndispute (`distill`, `agent`, `repo`, `review`, `user`), `agent` otherwise."
+        },
+        "other": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ReviewOther"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What replaced it, or what disputes it."
+        },
+        "flag": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "A flag's kind: `stale` or `wrong`."
+        },
+        "note": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "A flag's reason, as the agent gave it (redacted when it was stored)."
+        },
+        "trusted": {
+          "type": "boolean",
+          "description": "The user pinned or edited it, so a flag leaves it in memory (when `injectable`)."
+        },
+        "injectable": {
+          "type": "boolean",
+          "description": "Injected memory can carry it: it is pinned, or neither a failure playbook nor a\nsubagent's fact (those stay out unless pinned, whether edited or not). False: a flag\non it, or keeping one, changes nothing an agent is shown."
+        }
+      },
+      "required": [
+        "reason",
+        "factId",
+        "kind",
+        "text",
+        "project",
+        "at",
+        "source",
+        "trusted",
+        "injectable"
+      ],
+      "description": "One fact for the user to look at: something an agent (or a memory pass) did to memory that\nnobody reviewed."
+    },
+    "ReviewReason": {
+      "oneOf": [
+        {
+          "type": "string",
+          "const": "flagged",
+          "description": "An agent or a memory pass flagged it stale or wrong: it is out of injected memory\nuntil the user keeps or hides it, unless pinned or edited (`trusted`). A fact memory\nnever injects (`injectable` false) is not shown to agents either way."
+        },
+        {
+          "type": "string",
+          "const": "disputed",
+          "description": "Another fact contradicts it and nothing settled the pair: both stay injected, marked."
+        },
+        {
+          "type": "string",
+          "const": "replaced",
+          "description": "An agent's fact replaced it since `since`: it left injected memory with no review."
+        },
+        {
+          "type": "string",
+          "const": "recorded",
+          "description": "An agent recorded it since `since`."
+        }
+      ],
+      "description": "Why a fact is on the memory review list ([`memory_review`])."
+    },
+    "ReviewOther": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "text"
+      ],
+      "description": "The fact on the other side of a review item."
+    }
+  }
+}

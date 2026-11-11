@@ -199,6 +199,8 @@ export type FactExtractor =
   /** Imported from the repo's committed `.callimachus/memory/` files. */
   | "repo"
   | "playbook"
+  /** A TODO from a list an agent titled "Follow-ups", "Not done", "Deferred" or "Remaining". */
+  | "followup"
   | (string & {});
 
 /** An open TODO extracted from history (knowledge layer). */
@@ -979,6 +981,34 @@ export interface TodayIssue {
   project: string;
 }
 
+/** Why a fact is on Today's "Memory to review" list (`today::ReviewReason`). */
+export type ReviewReason = "flagged" | "disputed" | "replaced" | "recorded";
+
+/** Something an agent or a memory pass did to memory that nobody reviewed. */
+export interface ReviewItem {
+  reason: ReviewReason;
+  /** The fact the item is about (for `replaced`, the one that was replaced). */
+  factId: number;
+  kind: "decision" | "gotcha";
+  text: string;
+  project: string;
+  /** When the flag, the link or the recording happened (unix secs). */
+  at: number;
+  /** `agent`, `distill` (a memory pass), or a dispute's source (`repo`, `review`, `user`). */
+  source: string;
+  /** What replaced it, or what disputes it. */
+  other?: { id: number; text: string };
+  /** A flag's kind. */
+  flag?: "stale" | "wrong";
+  /** A flag's reason. */
+  note?: string;
+  /** Pinned or edited by the user: a flag leaves it in memory (when `injectable`). */
+  trusted: boolean;
+  /** Injected memory can carry it: false for an unpinned playbook or subagent fact, where a
+   *  flag (or keeping it) changes nothing an agent is shown. */
+  injectable: boolean;
+}
+
 /** Activity since the last open (`today`). Never involves an LLM. */
 export interface Today {
   since: number;
@@ -986,6 +1016,11 @@ export interface Today {
   newTodos: TodayTodo[];
   issuesSeenAgain: TodayIssue[];
   snapshots: Snapshot[];
+  /** Memory to review; absent from an older backend. */
+  memoryReview?: ReviewItem[];
+  /** How many more items there are to review than `memoryReview` lists (the backend stops
+   *  at 50). */
+  memoryReviewMore?: number;
   /** The 2 s git budget ran out before every repo's commits were linked. */
   commitsPartial: boolean;
   /** More sessions matched than the backend returns (its newest 200): `groups` holds only
@@ -1139,6 +1174,13 @@ export const api = {
     invoke<LinkOutcome>("link_facts", { fromId, toId, kind }),
   unlinkFacts: (fromId: number, toId: number, kind?: LinkKind) =>
     invoke<number>("unlink_facts", { fromId, toId, kind: kind ?? null }),
+  // Undo every replacement of a fact at once: it is current again, however many replaced it.
+  restoreFact: (factId: number) => invoke<number>("restore_fact", { factId }),
+  // Keep a recorded or replaced fact on Today's review list: it stays off that list and
+  // `cal memory review`. A flag or a dispute is kept by settling it (resolveFactFlags,
+  // unlinkFacts). `otherId`: the fact that replaced a replaced one.
+  keepReviewItem: (reason: "recorded" | "replaced", factId: number, otherId?: number) =>
+    invoke<void>("keep_review_item", { reason, factId, otherId: otherId ?? null }),
   resolveFactFlags: (factId: number) => invoke<number>("resolve_fact_flags", { factId }),
   // Write-back: record a decision or gotcha for a project. User-typed, so it is pinned.
   remember: (project: string, kind: "decision" | "gotcha", text: string) =>

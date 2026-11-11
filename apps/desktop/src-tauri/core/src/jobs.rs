@@ -1671,16 +1671,19 @@ pub(crate) const BATCH_THREADS_SQL: &str =
      ORDER BY COALESCE(updated_at, 0) DESC, id DESC LIMIT ?2";
 
 /// Threads one batch queues for linking. A batch during an active session writes one or
-/// two; a launch catch-up can write hundreds, and only the newest are worth a `git log` now
-/// (the rest link on a Today load or a project's whole-repo scan).
+/// two; a launch catch-up can write hundreds, and only the newest are worth a `git log` now.
+/// The rest link only while Today lists them (it links the sessions in its own window) or on
+/// a project's whole-repo scan (Scan git, `cal commits`): nothing links older history on its
+/// own, since no linking rule measured precise enough to spread over it
+/// (`gitlink::TUNING`).
 const BATCH_LINK_MAX_THREADS: i64 = 50;
 /// Least time between two links of the same checkout: an active session's transcript lands
 /// in a batch every few seconds, and `git log` over its window each time would be waste.
 pub const COMMIT_LINK_EVERY: Duration = Duration::from_secs(60);
 /// Tries before the linker drops a checkout whose `git log` keeps outrunning the budget or
 /// meeting a busy index (a resumed months-old session in a big repo asks for months of log).
-/// With the doubling backoff that is about half an hour; its sessions still link on a Today
-/// load or a project's whole-repo scan.
+/// With the doubling backoff that is about half an hour; its sessions still link while Today
+/// lists them or on a project's whole-repo scan.
 const LINK_MAX_ATTEMPTS: u32 = 5;
 /// Deadline for the two `git` calls that resolve a checkout's portable id. They run on the
 /// watcher's thread, and a git hung on a sleeping network mount or a slow fsmonitor hook
@@ -1723,7 +1726,7 @@ pub struct CommitLinker {
 /// `canonical_project` does, so a dotfiles `~/.git` never claims every session under home.
 /// Canonicalized, so `/tmp/x`, `/private/tmp/x` and `x/` share one queue entry and one
 /// once-a-minute slot.
-fn checkout_for(path: &str, key: &str) -> Option<String> {
+pub(crate) fn checkout_for(path: &str, key: &str) -> Option<String> {
     let home = dirs::home_dir();
     let start = if path.is_empty() { key } else { path };
     let start = std::path::Path::new(start);
@@ -1886,7 +1889,8 @@ impl CommitLinker {
                 if q.failures >= LINK_MAX_ATTEMPTS {
                     app_log!(
                         "[gitlink] {repo}: no link after {} tries (git log too slow or the index \
-                         busy); its sessions link on a Today load or a project scan",
+                         busy); its sessions link while Today lists them or on a project \
+                         scan",
                         q.failures
                     );
                     self.pending.remove(repo);
@@ -2065,7 +2069,9 @@ pub fn graph_upkeep_after_pass(conn: &rusqlite::Connection, since: i64) {
 /// `knowledge.todos_backfilled`, so later launches return at once). The watcher calls this
 /// once its launch catch-up is done, so the two never compete for the writer; the backfill
 /// then pauses between batches while a reindex, catch-up, semantic build or rewrite runs, as
-/// a distill drain does.
+/// a distill drain does. On the same thread, so the two never compete for the writer, the
+/// one-time re-judge of older TODOs (`knowledge::regate_todos_once`: the assistant checklist
+/// gate and follow-ups, resumable, done once `knowledge.todos_regated` says so).
 pub fn todo_backfill_kick(host: &Host) {
     let host = Arc::clone(host);
     std::thread::spawn(move || {
@@ -2079,6 +2085,24 @@ pub fn todo_backfill_kick(host: &Host) {
             }
             Ok(false) => {}
             Err(e) => app_log!("[knowledge] todo backfill: {e}"),
+        }
+        let clock = jobclock::JobClock::start();
+        match knowledge::regate_todos_once(db, chrono::Utc::now().timestamp(), &pause) {
+            Ok(Some(r)) => {
+                app_log!(
+                    "[knowledge] todo re-judge: {} threads, {} checklist TODOs dropped, {} \
+                     follow-ups added in {}",
+                    r.threads,
+                    r.dropped,
+                    r.added,
+                    clock.thread_summary()
+                );
+                if r.dropped + r.added > 0 {
+                    emit(&*host, "knowledge:todos-ready", &());
+                }
+            }
+            Ok(None) => {}
+            Err(e) => app_log!("[knowledge] todo re-judge: {e}"),
         }
     });
 }

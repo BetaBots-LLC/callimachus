@@ -10,12 +10,23 @@
 //! `knowledge::store_distilled`: the eval measures retrieval and rendering, not the LLM.
 //! `memory_truth_v2.json` extends it with a cross-project slice: proposals decided in one
 //! project, checked in another that never decided them, where check_decision must answer
-//! "no decision" (`knowledge::guard_no_decision`).
+//! "no decision" (`knowledge::guard_no_decision`). `memory_truth_v3.json` grows the
+//! paraphrase slice to 24 queries, adds 10 off-topic long queries (both scored in a table of
+//! their own, with what a loose semantic rerun would add) and a working-set project for the
+//! SessionStart hook (`knowledge::working_set`), checked in CI by
+//! `working_set_slice_reaches_the_hook`; `real_loose_rerun_off_topic` (`#[ignore]`, a clone)
+//! runs the off-topic queries against a real index.
 //!
-//! Four tests:
+//! Six tests:
 //! - `corpus_builds_with_the_planted_links` (default CI, no model): the corpus parses, every
 //!   reference resolves, every planted supersede and reaffirm is stored, and the HOOK block
 //!   leaves the superseded facts out.
+//! - `working_set_slice_reaches_the_hook` (default CI, no model): v3's working-set project,
+//!   whose old facts on the files the latest sessions edited are left out of the HOOK block by
+//!   date and reach it through the working set.
+//! - `real_loose_rerun_off_topic` (`#[ignore]`, needs `CALLIMACHUS_GROUNDING_DB` and the
+//!   model): whether a loose semantic rerun would add hits to v3's off-topic queries on a
+//!   real index (it does, so none shipped).
 //! - `eval_memory_truth` (`#[ignore]`): embeds the corpus with the cached model and prints a
 //!   markdown report (search hit@1/@5 and recall@5 per slice, check_decision status checks,
 //!   latency), then asserts floors set from the first run.
@@ -43,11 +54,14 @@ use crate::knowledge::truth::{distill_memory_context, FactStatus};
 use crate::knowledge::{self, store_distilled, RecallHit};
 use crate::search::{self, SearchFilters};
 
-/// The corpus. Bump to a new file (v3) rather than editing these, so numbers quoted in
+/// The corpus. Bump to a new file (v4) rather than editing these, so numbers quoted in
 /// comments (GUARD_CLOSE, GUARD_RELATED, the floors below) stay tied to the text they were
-/// measured on. v2 adds a slice to v1 and changes nothing in it, so v1's numbers still hold.
+/// measured on. v2 and v3 add slices and change nothing before them, so v1's numbers still
+/// hold: v3's search cases are scored in a table of their own, and its working-set project
+/// is built in an index of its own.
 const CORPUS_V1: &str = include_str!("fixtures/memory_truth_v1.json");
 const CORPUS_V2: &str = include_str!("fixtures/memory_truth_v2.json");
+const CORPUS_V3: &str = include_str!("fixtures/memory_truth_v3.json");
 
 #[derive(Debug, Deserialize)]
 struct Corpus {
@@ -59,6 +73,51 @@ struct Corpus {
     /// v2: proposals checked in a project that never decided them.
     #[serde(default)]
     cross_project: Vec<CrossProject>,
+    /// v3: more paraphrases of v1's sessions and off-topic long queries, scored apart from
+    /// `search` (the floors below are v1's).
+    #[serde(default)]
+    extra_search: Vec<SearchCase>,
+    /// v3: the SessionStart working-set slice.
+    #[serde(default)]
+    working_set: Option<WorkingSetSlice>,
+}
+
+/// v3's file: search cases and the working-set slice.
+#[derive(Debug, Deserialize)]
+struct CorpusV3 {
+    version: String,
+    extends: String,
+    search: Vec<SearchCase>,
+    working_set: WorkingSetSlice,
+}
+
+/// A project of its own for `knowledge::working_set`: old facts that name files, buried by
+/// date under newer ones, and the latest sessions editing some of those files.
+#[derive(Debug, Deserialize)]
+struct WorkingSetSlice {
+    project: String,
+    /// The branch checked out in the session the HOOK block is for.
+    branch: String,
+    sessions: Vec<WorkingSetSession>,
+    /// Facts the HOOK block leaves out by date and holds with the working set.
+    expect_in: Vec<String>,
+    /// Facts it leaves out either way: a file outside the working set, a bare `mod.rs`.
+    expect_out: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkingSetSession {
+    id: String,
+    /// `YYYY-MM-DD`, as [`Session::date`].
+    date: String,
+    branch: String,
+    title: String,
+    /// Paths the session edited, relative to the checkout.
+    edits: Vec<String>,
+    #[serde(default)]
+    decisions: Vec<FactCase>,
+    #[serde(default)]
+    gotchas: Vec<FactCase>,
 }
 
 /// v2's file: the slices it adds to the version it extends.
@@ -156,7 +215,244 @@ fn corpus() -> Corpus {
     assert_eq!(ext.extends, c.version, "v2 extends v1");
     c.version = ext.version;
     c.cross_project = ext.cross_project;
+    let v3: CorpusV3 = serde_json::from_str(CORPUS_V3).expect("the v3 extension parses");
+    assert_eq!(v3.extends, c.version, "v3 extends v2");
+    c.version = v3.version;
+    c.extra_search = v3.search;
+    c.working_set = Some(v3.working_set);
     c
+}
+
+/// The working-set slice in an index of its own, stored as the indexer and the distiller
+/// would have: each session with its branch and `file_edits`, its facts as `llm` facts
+/// (dated by the session's start). Returns the project key and fact id -> text.
+fn build_working_set(
+    conn: &mut Connection,
+    ws: &WorkingSetSlice,
+) -> (String, HashMap<String, String>) {
+    let sid = source_id(conn, "claude_code").unwrap();
+    let mut texts = HashMap::new();
+    for s in &ws.sessions {
+        let start = day_ts(&s.date);
+        let thread = ParsedThread {
+            external_id: s.id.clone(),
+            title: Some(s.title.clone()),
+            project_path: Some(ws.project.clone()),
+            git_branch: Some(s.branch.clone()),
+            created_at: Some(start),
+            updated_at: Some(start + 3600),
+            messages: vec![ParsedMessage {
+                role: "user".into(),
+                text: s.title.clone(),
+                tool_name: None,
+                ts: Some(start),
+            }],
+            ..Default::default()
+        };
+        upsert_thread(conn, sid, &thread).unwrap();
+        let tid: i64 = conn
+            .query_row(
+                "SELECT id FROM threads WHERE external_id = ?1",
+                [&s.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        for path in &s.edits {
+            conn.execute(
+                "INSERT INTO file_edits (thread_id, path, op, ts) VALUES (?1, ?2, 'edit', ?3)",
+                params![tid, path, start + 60],
+            )
+            .unwrap();
+        }
+        for (kind, facts) in [("decision", &s.decisions), ("gotcha", &s.gotchas)] {
+            for f in facts {
+                conn.execute(
+                    "INSERT INTO facts (thread_id, kind, text, extractor, created_at)
+                     VALUES (?1, ?2, ?3, 'llm', ?4)",
+                    params![tid, kind, f.text, start + 7200],
+                )
+                .unwrap();
+                assert!(
+                    texts.insert(f.id.clone(), f.text.clone()).is_none(),
+                    "duplicate fact id {}",
+                    f.id
+                );
+            }
+        }
+    }
+    let key: String = conn
+        .query_row(
+            "SELECT COALESCE(project_key, project_path) FROM threads WHERE external_id = ?1",
+            [&ws.sessions[0].id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    (key, texts)
+}
+
+/// The slice's HOOK blocks for a `startup` session on `branch`: by date (the order before
+/// the working set), and as `cal hook` renders it now.
+fn working_set_blocks(conn: &Connection, project: &str, branch: &str) -> (String, String) {
+    let budget = MemoryBudget::HOOK;
+    let per_kind = budget
+        .fetch_limit()
+        .max(budget.max_decisions)
+        .max(budget.max_gotchas);
+    let working = knowledge::working_set::working_set(conn, project, Some(branch)).unwrap();
+    // The session runs in the project's own checkout.
+    let mem = knowledge::get_project_memory_for_working_set(
+        conn,
+        project,
+        project,
+        per_kind,
+        budget.max_decisions,
+        budget.max_gotchas,
+        Some(knowledge::harvest::EXTRACTOR_CLAUDE_MEMORY),
+        &working,
+    )
+    .unwrap();
+    (
+        hook_block(conn, project),
+        agent_memory_md_budgeted(project, &mem, None, &budget),
+    )
+}
+
+/// What a loose semantic rerun would add to one hybrid query (Batch L, measured before any
+/// code): it fires when the semantic arm is empty at `SEM_SIMILARITY_FLOOR` and the keyword
+/// arm matched nothing with every word (its hits, if any, are the OR back-fill's), then reruns
+/// the KNN at `SEM_RELATED_FLOOR` under the relative cutoff and keeps at most 3.
+struct LooseRerun {
+    fired: bool,
+    /// The query's best similarity, floor or not.
+    best: Option<f32>,
+    /// What the rerun would fuse: (message id, similarity), best first.
+    hits: Vec<(i64, f32)>,
+}
+
+/// Most hits a loose rerun would fuse.
+const LOOSE_RERUN_MAX: usize = 3;
+
+fn loose_rerun(conn: &Connection, qv: &[f32], query: &str, filters: &SearchFilters) -> LooseRerun {
+    let scope = embed::KnnScope {
+        floor: 0.0,
+        ..embed::KnnScope::of(filters)
+    };
+    // One KNN with no floor; each floor is a filter of its top hits, as the arm applies it.
+    let all = embed::semantic_search_scoped(conn, qv, &scope, 50).unwrap();
+    let best = all.first().map(|h| h.1);
+    let at_floor = all.iter().any(|h| h.1 >= embed::SEM_SIMILARITY_FLOOR);
+    let strict = search::strict_pass_len(conn, query, filters, 1).unwrap();
+    let fired = !at_floor && strict == 0;
+    let hits = if fired {
+        let top = best.unwrap_or(0.0);
+        all.into_iter()
+            .filter(|h| h.1 >= embed::SEM_RELATED_FLOOR && h.1 >= top - embed::SEM_RELATIVE_CUTOFF)
+            .take(LOOSE_RERUN_MAX)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    LooseRerun { fired, best, hits }
+}
+
+/// v3's search slices, in a table of their own: the paraphrase slice grown to 24 (v1's 6 and
+/// v3's 18) and 10 off-topic long queries, each with what a loose rerun would add.
+struct V3Search {
+    paraphrase: SearchScore,
+    /// Paraphrases missed at hit@5 whose expected session the rerun returns.
+    recovered: usize,
+    /// Off-topic queries the rerun would add hits to.
+    off_topic_gained: usize,
+}
+
+fn v3_search_report(
+    conn: &Connection,
+    embedder: &Embedder,
+    c: &Corpus,
+    b: &Built,
+    md: &mut String,
+) -> V3Search {
+    let by_id: HashMap<i64, &str> = b.threads.iter().map(|(k, v)| (*v, k.as_str())).collect();
+    let names = |ts: &[i64]| ts.iter().map(|t| by_id[t]).collect::<Vec<&str>>();
+    let filters = search_filters(true);
+    let mut out = V3Search {
+        paraphrase: SearchScore::default(),
+        recovered: 0,
+        off_topic_gained: 0,
+    };
+    let (mut fired, mut wrong_first) = (0usize, 0usize);
+    let mut lines: Vec<String> = Vec::new();
+    let paraphrases = c
+        .search
+        .iter()
+        .chain(&c.extra_search)
+        .filter(|s| s.slice == "paraphrase");
+    for s in paraphrases {
+        let expect: Vec<i64> = s.expect.iter().map(|e| b.threads[e]).collect();
+        let ranked = ranked_threads(&search::hybrid(conn, embedder, &s.query, &filters).unwrap());
+        out.paraphrase.add(&ranked, &expect);
+        let qv = embed::embed_query(embedder, &s.query).unwrap().unwrap();
+        let r = loose_rerun(conn, &qv, &s.query, &filters);
+        let loose = message_threads(conn, &r.hits);
+        let hit5 = ranked.iter().take(5).any(|t| expect.contains(t));
+        fired += usize::from(r.fired);
+        if !hit5 && loose.iter().any(|t| expect.contains(t)) {
+            out.recovered += 1;
+        }
+        if loose.first().is_some_and(|t| !expect.contains(t)) {
+            wrong_first += 1;
+        }
+        lines.push(format!(
+            "- [paraphrase] \"{}\": want {:?}, top 3 {:?}, best {:.3}, rerun {}",
+            s.query,
+            s.expect,
+            names(&ranked[..ranked.len().min(3)]),
+            r.best.unwrap_or(0.0),
+            if r.fired {
+                format!("{:?}", names(&loose))
+            } else {
+                "not fired".into()
+            }
+        ));
+    }
+    let (mut off_n, mut off_fired, mut off_best) = (0usize, 0usize, 0f32);
+    for s in c.extra_search.iter().filter(|s| s.slice == "off_topic") {
+        off_n += 1;
+        let qv = embed::embed_query(embedder, &s.query).unwrap().unwrap();
+        let r = loose_rerun(conn, &qv, &s.query, &filters);
+        off_fired += usize::from(r.fired);
+        out.off_topic_gained += usize::from(!r.hits.is_empty());
+        off_best = off_best.max(r.best.unwrap_or(0.0));
+        lines.push(format!(
+            "- [off_topic] \"{}\": best {:.3}, rerun {}",
+            s.query,
+            r.best.unwrap_or(0.0),
+            if r.fired {
+                format!("{:?}", names(&message_threads(conn, &r.hits)))
+            } else {
+                "not fired".into()
+            }
+        ));
+    }
+    let p = out.paraphrase;
+    md.push_str(&format!(
+        "\n### memory_truth_v3 search slices, with a loose semantic rerun (at most {LOOSE_RERUN_MAX} \
+         hits at {} under the relative cutoff, when the arm is empty at {} and no keyword hit has \
+         every word)\n\n\
+         | slice | n | hit@1 | hit@5 | rerun fired | rerun adds a hit | misses recovered | rerun's first hit wrong |\n\
+         |---|---|---|---|---|---|---|---|\n\
+         | paraphrase | {} | {:.2} | {:.2} | {fired} | - | {} | {wrong_first} |\n\
+         | off_topic | {off_n} | - | - | {off_fired} | {} | - | best similarity {off_best:.3} |\n\n{}\n",
+        embed::SEM_RELATED_FLOOR,
+        embed::SEM_SIMILARITY_FLOOR,
+        p.n,
+        p.hit1_rate(),
+        p.hit5_rate(),
+        out.recovered,
+        out.off_topic_gained,
+        lines.join("\n")
+    ));
+    out
 }
 
 /// Unix seconds of 09:00 UTC on `date` (`YYYY-MM-DD`).
@@ -356,7 +652,8 @@ fn embed_all(conn: &mut Connection, embedder: &Embedder) {
 }
 
 /// The HOOK block for `project` as `cal hook` renders it at session start for Claude Code
-/// (`cli_core::hook_output`, facts only: the digest is not memory).
+/// (`cli_core::hook_output`, facts only: the digest is not memory), by date: v1's sessions
+/// edit no files, so the hook's working set is empty there ([`working_set_blocks`] has it).
 fn hook_block(conn: &Connection, project: &str) -> String {
     let budget = MemoryBudget::HOOK;
     let per_kind = budget
@@ -576,6 +873,8 @@ struct Report {
     guard_no_decision: usize,
     /// Cross-project cases answered "no decision", as a rate.
     cross_no_decision: f64,
+    /// v3's search slices.
+    v3: V3Search,
 }
 
 fn run_eval(embedder: &Embedder) -> Report {
@@ -682,6 +981,7 @@ fn run_eval(embedder: &Embedder) -> Report {
         md.push_str(&misses.join("\n"));
         md.push('\n');
     }
+    let v3 = v3_search_report(&conn, embedder, &c, &b, &mut md);
 
     // check_decision: the MCP tool's path (embed the proposal, then the guard).
     let mut guard_lat: Vec<Duration> = Vec::new();
@@ -804,6 +1104,25 @@ fn run_eval(embedder: &Embedder) -> Report {
             .collect::<Vec<_>>()
             .join("\n")
     ));
+    if let Some(ws) = &c.working_set {
+        let mut wconn = crate::db::test_support::TestIndex::new("eval_ws");
+        let (key, texts) = build_working_set(&mut wconn, ws);
+        let (by_date, with_ws) = working_set_blocks(&wconn, &key, &ws.branch);
+        let shown = |block: &str, ids: &[String]| {
+            ids.iter()
+                .filter(|id| block_has_fact(block, &texts[id.as_str()]))
+                .count()
+        };
+        md.push_str(&format!(
+            "\n### HOOK block, working set (v3)\n\n- old facts naming a file the latest \
+             sessions edited, shown by date: {}/{n}; with the working set: {}/{n}\n\
+             - facts that must stay out (file not in the working set, bare `mod.rs`) shown: {}\n",
+            shown(&by_date, &ws.expect_in),
+            shown(&with_ws, &ws.expect_in),
+            shown(&with_ws, &ws.expect_out),
+            n = ws.expect_in.len(),
+        ));
+    }
 
     search_lat.sort();
     guard_lat.sort();
@@ -826,6 +1145,7 @@ fn run_eval(embedder: &Embedder) -> Report {
         hook_leaks,
         guard_no_decision,
         cross_no_decision,
+        v3,
     }
 }
 
@@ -954,7 +1274,26 @@ mod tests {
         for label in ["restatement", "same_topic", "unrelated"] {
             assert!(c.pairs.iter().any(|p| p.label == label), "no {label} pairs");
         }
-        assert_eq!(c.version, "memory_truth_v2");
+        assert_eq!(c.version, "memory_truth_v3");
+        let slice = |name: &str| c.extra_search.iter().filter(|s| s.slice == name).count();
+        let v1_paraphrases = c.search.iter().filter(|s| s.slice == "paraphrase").count();
+        assert!(slice("paraphrase") + v1_paraphrases >= 20);
+        assert!(slice("off_topic") >= 10);
+        assert_eq!(
+            slice("paraphrase") + slice("off_topic"),
+            c.extra_search.len()
+        );
+        for s in &c.extra_search {
+            assert_eq!(s.expect.is_empty(), s.slice == "off_topic", "{}", s.query);
+            for e in &s.expect {
+                assert!(b.threads.contains_key(e), "v3 search expects unknown {e}");
+            }
+            assert!(
+                !c.search.iter().any(|v1| v1.query == s.query),
+                "{} repeats a v1 query",
+                s.query
+            );
+        }
         assert!(!c.cross_project.is_empty());
         for x in &c.cross_project {
             assert!(b.project_keys.contains_key(&x.project), "{}", x.project);
@@ -1008,6 +1347,84 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// v3's working-set slice, in CI (no model: the hook path embeds nothing): by date the
+    /// HOOK block leaves out the old facts naming files the latest sessions edited; with the
+    /// working set it holds them, and still leaves out a fact on a file nobody edited and one
+    /// naming a bare `mod.rs`.
+    #[test]
+    fn working_set_slice_reaches_the_hook() {
+        let c = corpus();
+        let ws = c
+            .working_set
+            .as_ref()
+            .expect("v3 has the working-set slice");
+        let mut conn = crate::db::test_support::TestIndex::new("eval_ws");
+        let (key, texts) = build_working_set(&mut conn, ws);
+        let (by_date, with_ws) = working_set_blocks(&conn, &key, &ws.branch);
+        for id in &ws.expect_in {
+            assert!(
+                !block_has_fact(&by_date, &texts[id]),
+                "{id} by date:\n{by_date}"
+            );
+            assert!(block_has_fact(&with_ws, &texts[id]), "{id}:\n{with_ws}");
+        }
+        for id in &ws.expect_out {
+            assert!(!block_has_fact(&with_ws, &texts[id]), "{id}:\n{with_ws}");
+        }
+        // The budget holds: the working-set facts took the place of the oldest shown ones.
+        let lines = |b: &str| b.lines().filter(|l| l.starts_with("- ")).count();
+        assert_eq!(lines(&with_ws), lines(&by_date), "{with_ws}");
+    }
+
+    /// The loose-rerun gate on a real index (Batch L): for v3's off-topic long queries, would
+    /// a rerun at `SEM_RELATED_FLOOR` add hits? Prints similarities and counts only.
+    ///
+    /// Measured 2026-11-09 on a 5.4 GB index: it fires on 9 of the 10 and would add hits to
+    /// all 9 (best 0.612 to 0.660; the tenth already reaches 0.710, over the 0.70 floor). On
+    /// the corpus it recovers 3 of v3's 6 paraphrase misses at hit@5, but its first hit is
+    /// wrong for 4 of the 12 paraphrases it fires on. So no rerun shipped: at 0.60 it cannot
+    /// tell a paraphrase from an off-topic question.
+    ///
+    /// CALLIMACHUS_GROUNDING_DB=<an APFS clone of index.db> FASTEMBED_CACHE_DIR=<models dir> \
+    ///   cargo test -p callimachus-core real_loose_rerun_off_topic -- --ignored --nocapture
+    #[test]
+    #[ignore = "needs CALLIMACHUS_GROUNDING_DB and the embedding model"]
+    fn real_loose_rerun_off_topic() {
+        let Ok(path) = std::env::var("CALLIMACHUS_GROUNDING_DB") else {
+            eprintln!("set CALLIMACHUS_GROUNDING_DB to an index clone");
+            return;
+        };
+        let Some(embedder) = eval_embedder() else {
+            return;
+        };
+        let conn = crate::db::open_readonly(std::path::Path::new(&path)).unwrap();
+        let c = corpus();
+        let filters = search_filters(true);
+        let (mut fired, mut gained) = (0usize, 0usize);
+        for (i, s) in c
+            .extra_search
+            .iter()
+            .filter(|s| s.slice == "off_topic")
+            .enumerate()
+        {
+            let t = Instant::now();
+            let qv = embed::embed_query(&embedder, &s.query).unwrap().unwrap();
+            let r = loose_rerun(&conn, &qv, &s.query, &filters);
+            fired += usize::from(r.fired);
+            gained += usize::from(!r.hits.is_empty());
+            let sims: Vec<String> = r.hits.iter().map(|h| format!("{:.3}", h.1)).collect();
+            eprintln!(
+                "off-topic {:>2}: best {:.3}, fired {}, rerun hits [{}] ({:.1} s)",
+                i + 1,
+                r.best.unwrap_or(0.0),
+                r.fired,
+                sims.join(", "),
+                t.elapsed().as_secs_f64()
+            );
+        }
+        eprintln!("fired {fired}, would add hits to {gained} of the off-topic queries");
     }
 
     #[test]
@@ -1112,6 +1529,13 @@ mod tests {
             "in-project proposals answered no decision"
         );
         assert_eq!(r.cross_no_decision, 1.0, "cross-project no-decision rate");
+        // memory_truth_v3 (Batch L): the loose-rerun gate's numbers, reported above; no
+        // floors on them, as nothing ships behind them.
+        assert!(r.v3.paraphrase.n >= 20, "paraphrase slice size");
+        eprintln!(
+            "loose rerun: {} paraphrase misses recovered, {} off-topic queries would gain hits",
+            r.v3.recovered, r.v3.off_topic_gained
+        );
     }
 
     /// Calibrates `knowledge::GUARD_CLOSE`. Run on demand:

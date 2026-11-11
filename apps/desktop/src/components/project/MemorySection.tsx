@@ -216,6 +216,12 @@ export function MemorySection({ project }: { project: string }) {
     mutationFn: (id: number) => api.resolveFactFlags(id),
     ...settled,
   });
+  // The Replaced list's Undo: every replacement of the fact at once, so it is current again.
+  const restore = useMutation({
+    mutationFn: (id: number) => api.restoreFact(id),
+    ...settled,
+    onSettled: (_n, _e, id) => refreshMem().then(() => focusFact(id)),
+  });
   // Locally remember hidden facts so the conflicts panel (a mutation result, not a
   // query) updates immediately: hiding a decision resolves any conflict it's in.
   const [hiddenIds, setHiddenIds] = useState<Set<number>>(() => new Set());
@@ -469,12 +475,7 @@ export function MemorySection({ project }: { project: string }) {
                 <Section title="Open TODOs" facts={mem.openTodos} actions={factActions} />
               </>
             )}
-            <ReplacedGroup
-              facts={mem.superseded ?? []}
-              onUndo={(newerId, olderId) =>
-                unlink.mutate({ fromId: newerId, toId: olderId, kind: "supersedes" })
-              }
-            />
+            <ReplacedGroup facts={mem.superseded ?? []} onUndo={(id) => restore.mutate(id)} />
           </div>
         ) : null}
       </div>
