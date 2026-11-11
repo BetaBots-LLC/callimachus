@@ -10,7 +10,7 @@
         "source": "git-subdir",
         "url": "BetaBots-LLC/callimachus",
         "path": "plugins/codex",
-        "ref": "v0.12.2"
+        "ref": "v0.12.3"
       },
       "policy": {
         "installation": "AVAILABLE",
