@@ -1,7 +1,7 @@
 {
   "name": "callimachus",
   "displayName": "Callimachus",
-  "version": "0.12.2",
+  "version": "0.12.3",
   "description": "Recall your past AI coding sessions from a local index: the recall skill, the Callimachus MCP server, and hooks that inject each repo's memory when a Cursor chat starts and queue it for distillation when it ends.",
   "author": {
     "name": "Ari Shaller",

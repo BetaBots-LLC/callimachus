@@ -6,10 +6,10 @@
   },
   "metadata": {
     "description": "Callimachus: one local, searchable memory of every AI coding session.",
-    "version": "0.12.2"
+    "version": "0.12.3"
   },
   "description": "Recall your past AI coding sessions from a local index: the recall skill, the Callimachus MCP server, and hooks that inject each repo's memory when a Cursor chat starts.",
-  "version": "0.12.2",
+  "version": "0.12.3",
   "author": {
     "name": "Ari Shaller",
     "url": "https://callimachus.app"
