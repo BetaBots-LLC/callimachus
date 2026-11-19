@@ -1,5 +1,22 @@
 # callimachus
 
+## 0.12.4
+
+### Patch Changes
+
+- 268d33e: Pick the terminal Resume opens on macOS.
+  
+  - **Settings > General > Terminal.** Resume and Open in CLI always opened Terminal.app. On a Mac with another terminal installed you can now choose it: Ghostty, iTerm2, WezTerm, kitty or Alacritty. The new window opens in the session's folder, runs the agent in your login shell (so the `claude`, `codex` and `cursor-agent` your shell finds are the ones that start) and stays open on a shell when the agent exits.
+  - **Nothing changes until you pick.** The default is still Terminal.app, and a chosen terminal that was later uninstalled falls back to it instead of failing. The row only shows when there is more than one terminal to choose from. Linux still reads `$TERMINAL`, and Windows still opens a console.
+  - Launching was checked on Terminal and Ghostty 1.4; iTerm2, WezTerm, kitty and Alacritty follow their documented command flags.
+- 5597126: Today no longer prints a commit's hash on top of its subject, and the rest of the screen was brought in line with the Project page.
+  
+  - **Commits you can read.** Each commit a session produced is one line: the short hash in a pill as wide as the hash, then the subject, which is the part that shortens when the window is narrow. The pill was sized for a 7-character hash and the app stores 10, so the hash ran over the chip's edge and into the subject. Clicking the hash still copies the full one, here and on the Project page, and a failed copy on the Project page now says so.
+  - **One click target per session.** The title and its details are one row that opens the transcript (the separate Open button is gone), Resume shows that it is starting, and the lists use the same card, row height and text sizes as the Project page.
+  - **Keyboard.** The time window is one Tab stop with arrow keys between the windows. Up, Down, Home and End move between sessions from anywhere in a row, Escape closes an open panel and returns to its button, and Keep, Hide and Undo explain what they do on focus as well as on hover and keep the focus in the list while they work.
+  - **States.** A refresh that fails in the background leaves Today on screen with a line saying it may be out of date, instead of replacing it with an error. While another window loads, only the list dims, and Copy as standup waits for it. A window with nothing in it offers 7 days, Search and Projects, and a window with only memory to review no longer reads "0 sessions in 0 repos".
+- 767d32b: The window no longer scrolls on top of the page inside it. On the setup checklist, Settings > Index & storage and Stats, a second scrollbar appeared beside the page's own and the page could be scrolled past its end (by 38 px on the checklist, 522 px on Stats). Labels meant only for screen readers were being laid out below the window; they now stay inside the app.
+
 ## 0.12.3
 
 ### Patch Changes
