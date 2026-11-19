@@ -2645,6 +2645,7 @@ async fn open_thread_in_cli(
             &packed,
             project.as_deref(),
             has_memory,
+            knowledge::get_cli_terminal(conn)?.as_deref(),
         )
     })
     .await
@@ -2670,6 +2671,7 @@ async fn resume_thread(pool: tauri::State<'_, db::ReadPool>, thread_id: i64) -> 
             is_subagent,
             project.as_deref(),
             cursor_cli,
+            knowledge::get_cli_terminal(conn)?.as_deref(),
         )
     })
     .await
@@ -2679,6 +2681,51 @@ async fn resume_thread(pool: tauri::State<'_, db::ReadPool>, thread_id: i64) -> 
 #[tauri::command]
 fn cli_launch_supported() -> bool {
     agent::cli_resume::launch_supported()
+}
+
+/// A terminal Resume can launch in, for the Settings picker.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminalChoice {
+    id: &'static str,
+    label: &'static str,
+}
+
+/// The terminals installed here and the one picked (`None`: the default, Terminal.app).
+/// `choices` is empty off macOS, where there is nothing to pick.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CliTerminal {
+    choices: Vec<TerminalChoice>,
+    selected: Option<String>,
+}
+
+#[tauri::command]
+async fn get_cli_terminal(pool: tauri::State<'_, db::ReadPool>) -> AppResult<CliTerminal> {
+    read_blocking(&pool, |conn| {
+        Ok(CliTerminal {
+            choices: agent::cli_resume::installed_terminals()
+                .into_iter()
+                .map(|t| TerminalChoice {
+                    id: t.id,
+                    label: t.label,
+                })
+                .collect(),
+            selected: knowledge::get_cli_terminal(conn)?,
+        })
+    })
+    .await
+}
+
+/// Pick the terminal Resume and "Open in CLI" launch in; `None` is the default.
+#[tauri::command]
+async fn set_cli_terminal(app: AppHandle, id: Option<String>) -> AppResult<()> {
+    blocking(move || {
+        let db = app.state::<db::Db>();
+        let conn = lock(&db)?;
+        knowledge::set_cli_terminal(&conn, id.as_deref())
+    })
+    .await
 }
 
 // ---- The Today view, the Project page's snapshots and agent preview, scoped search ----
@@ -2746,6 +2793,7 @@ async fn resume_snapshot(
             &body,
             snap.meta.project_path.as_deref(),
             snapshot::carries_memory(&body),
+            knowledge::get_cli_terminal(conn)?.as_deref(),
         )?;
         Ok(())
     })
@@ -4352,6 +4400,8 @@ pub fn run() {
             list_models,
             resume_thread,
             cli_launch_supported,
+            get_cli_terminal,
+            set_cli_terminal,
             thread_context,
             open_thread_in_cli,
             export_thread,

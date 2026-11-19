@@ -2,7 +2,8 @@
 //! its native session (Claude Code / Codex / the Cursor CLI), while "Open in <agent>" seeds a fresh
 //! session in any agent CLI with the packed transcript. We derive the command from
 //! the thread's source + external id, then open it in the user's terminal so the
-//! interactive TUI runs there: Terminal.app via osascript on macOS, a new console
+//! interactive TUI runs there: on macOS the terminal picked in Settings (Terminal.app unless
+//! another is chosen and still installed; see [`MAC_TERMINALS`]), a new console
 //! window (`cmd /C start`) on Windows, and the first terminal emulator found
 //! (`$TERMINAL`, `x-terminal-emulator`, GNOME Terminal, Konsole, ...) on Linux.
 
@@ -80,18 +81,20 @@ fn claude_session_id(external_id: &str, is_subagent: bool) -> String {
     }
 }
 
-/// Launch the resume command in the user's terminal.
+/// Launch the resume command in the user's terminal. `terminal` is the stored choice
+/// ([`TERMINAL_KEY`]); `None` is the platform's default.
 pub fn launch(
     source: &str,
     external_id: &str,
     is_subagent: bool,
     project_path: Option<&str>,
     cursor_cli: bool,
+    terminal: Option<&str>,
 ) -> Result<()> {
     let cmd = resume_command(source, external_id, is_subagent, project_path, cursor_cli)?;
     // A native resume fires SessionStart with source=resume, which `cal hook` already
     // leaves alone, so no skip flag is needed.
-    open_in_terminal(&cmd, false)
+    open_in_terminal(&cmd, false, terminal)
 }
 
 /// Write packed context to `~/.callimachus/context/ctx-<ms>.md` and return its path.
@@ -122,8 +125,9 @@ pub fn launch_with_context(
     program: &str,
     context_md: &str,
     project_path: Option<&str>,
+    terminal: Option<&str>,
 ) -> Result<String> {
-    launch_with_context_memory(program, context_md, project_path, true)
+    launch_with_context_memory(program, context_md, project_path, true, terminal)
 }
 
 /// [`launch_with_context`], skipping the SessionStart hook's memory injection only when
@@ -134,6 +138,7 @@ pub fn launch_with_context_memory(
     context_md: &str,
     project_path: Option<&str>,
     has_memory_block: bool,
+    terminal: Option<&str>,
 ) -> Result<String> {
     let file = write_context_file(context_md)?;
     let cmd = ResumeCommand {
@@ -141,7 +146,7 @@ pub fn launch_with_context_memory(
         args: vec![context_prompt(&file)],
         cwd: project_path.map(str::to_string),
     };
-    open_in_terminal(&cmd, has_memory_block)?;
+    open_in_terminal(&cmd, has_memory_block, terminal)?;
     Ok(file.to_string_lossy().into_owned())
 }
 
@@ -170,22 +175,174 @@ fn without_missing_cwd(cmd: &ResumeCommand) -> ResumeCommand {
     }
 }
 
+/// `app_config` key of the terminal Resume and "Open in CLI" launch in: an id from
+/// [`MAC_TERMINALS`], or absent for the default.
+pub const TERMINAL_KEY: &str = "cli.terminal";
+
+/// How a macOS terminal is told to run a command in a new window.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(not(unix), allow(dead_code))]
+enum MacLaunch {
+    /// Terminal.app: AppleScript `do script`.
+    TerminalScript,
+    /// iTerm2: AppleScript, a new window that types the command into its shell.
+    ItermScript,
+    /// `open -na <App> --args <these> <shell> -lic <command>`: the emulators that take the
+    /// command to run as trailing arguments.
+    OpenArgs(&'static [&'static str]),
+}
+
+/// A terminal a macOS user can pick.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MacTerminal {
+    /// Stored under [`TERMINAL_KEY`].
+    pub id: &'static str,
+    pub label: &'static str,
+    /// The bundle name `open -a` and AppleScript address, and the `.app` looked for.
+    app: &'static str,
+    launch: MacLaunch,
+}
+
+/// The terminals offered on macOS, Terminal.app (the default, always present) first. The
+/// flags are each emulator's own, as on Linux ([`KNOWN_TERMINALS`]): Ghostty and Alacritty
+/// take `-e`, WezTerm a `start --` subcommand, kitty the command bare. Verified by launching:
+/// Terminal and Ghostty 1.4. iTerm2, WezTerm, kitty and Alacritty follow their documentation.
+/// Warp is left out: it has no way to open a window on a command.
+pub const MAC_TERMINALS: &[MacTerminal] = &[
+    MacTerminal {
+        id: "terminal",
+        label: "Terminal",
+        app: "Terminal",
+        launch: MacLaunch::TerminalScript,
+    },
+    MacTerminal {
+        id: "ghostty",
+        label: "Ghostty",
+        app: "Ghostty",
+        launch: MacLaunch::OpenArgs(&["-e"]),
+    },
+    MacTerminal {
+        id: "iterm",
+        label: "iTerm2",
+        app: "iTerm",
+        launch: MacLaunch::ItermScript,
+    },
+    MacTerminal {
+        id: "wezterm",
+        label: "WezTerm",
+        app: "WezTerm",
+        launch: MacLaunch::OpenArgs(&["start", "--"]),
+    },
+    MacTerminal {
+        id: "kitty",
+        label: "kitty",
+        app: "kitty",
+        launch: MacLaunch::OpenArgs(&[]),
+    },
+    MacTerminal {
+        id: "alacritty",
+        label: "Alacritty",
+        app: "Alacritty",
+        launch: MacLaunch::OpenArgs(&["-e"]),
+    },
+];
+
+/// Whether `id` names a terminal that can be stored under [`TERMINAL_KEY`].
+pub fn is_known_terminal(id: &str) -> bool {
+    MAC_TERMINALS.iter().any(|t| t.id == id)
+}
+
+/// The terminals installed on this Mac, for the Settings picker; empty elsewhere (Linux
+/// reads `$TERMINAL`, Windows opens a console). Terminal.app is always listed.
+pub fn installed_terminals() -> Vec<&'static MacTerminal> {
+    if !cfg!(target_os = "macos") {
+        return Vec::new();
+    }
+    let home = dirs::home_dir();
+    installed_terminals_with(|app| {
+        let bundle = format!("{app}.app");
+        [
+            Some(PathBuf::from("/Applications")),
+            Some(PathBuf::from("/System/Applications/Utilities")),
+            home.as_ref().map(|h| h.join("Applications")),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|dir| dir.join(&bundle).is_dir())
+    })
+}
+
+/// [`installed_terminals`] with the "is this app here" probe injected.
+fn installed_terminals_with(has_app: impl Fn(&str) -> bool) -> Vec<&'static MacTerminal> {
+    MAC_TERMINALS
+        .iter()
+        .filter(|t| t.launch == MacLaunch::TerminalScript || has_app(t.app))
+        .collect()
+}
+
+/// The terminal to launch in: the stored choice while it is still installed, else
+/// Terminal.app. A choice that was uninstalled must not turn Resume into an error.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn pick_terminal(choice: Option<&str>, installed: &[&'static MacTerminal]) -> &'static MacTerminal {
+    choice
+        .and_then(|id| installed.iter().copied().find(|t| t.id == id))
+        .unwrap_or(&MAC_TERMINALS[0])
+}
+
+/// The process that opens `shell` (a POSIX line from [`build_shell_command`]) in a new
+/// window of `terminal`: the program and its argv. `user_shell` is the login shell the
+/// `OpenArgs` emulators run it in.
+#[cfg(unix)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn mac_launch_argv(terminal: &MacTerminal, shell: &str, user_shell: &str) -> (String, Vec<String>) {
+    let osascript = |script: String| ("osascript".to_string(), vec!["-e".to_string(), script]);
+    match terminal.launch {
+        MacLaunch::TerminalScript => osascript(format!(
+            "tell application \"Terminal\"\n  do script \"{}\"\n  activate\nend tell",
+            applescript_escape(shell)
+        )),
+        // Typed into the new window's own shell (not passed as its command), so the window
+        // stays open on a shell when the agent exits, as Terminal's `do script` does.
+        MacLaunch::ItermScript => osascript(format!(
+            "tell application \"iTerm\"\n  activate\n  set w to (create window with default profile)\n  tell current session of w to write text \"{}\"\nend tell",
+            applescript_escape(shell)
+        )),
+        // These run the command instead of a shell, so it gets one: a login, interactive
+        // shell (the agent CLIs are on the PATH the user's rc files set, which a bare `sh`
+        // launched from the Dock's environment does not have), which then stays open on a
+        // login shell so the agent's last output remains readable.
+        MacLaunch::OpenArgs(flags) => {
+            let mut args = vec![
+                "-na".to_string(),
+                terminal.app.to_string(),
+                "--args".to_string(),
+            ];
+            args.extend(flags.iter().map(|f| f.to_string()));
+            args.extend([
+                user_shell.to_string(),
+                "-lic".to_string(),
+                format!("{shell}; exec {} -l", shell_quote(user_shell)),
+            ]);
+            ("open".to_string(), args)
+        }
+    }
+}
+
 #[cfg(target_os = "macos")]
-fn open_in_terminal(cmd: &ResumeCommand, skip_hook: bool) -> Result<()> {
+fn open_in_terminal(cmd: &ResumeCommand, skip_hook: bool, terminal: Option<&str>) -> Result<()> {
     let shell = build_shell_command(&without_missing_cwd(cmd), skip_hook);
-    let script = format!(
-        "tell application \"Terminal\"\n  do script \"{}\"\n  activate\nend tell",
-        applescript_escape(&shell)
-    );
-    std::process::Command::new("osascript")
-        .arg("-e")
-        .arg(script)
-        .spawn()?;
+    let user_shell = std::env::var("SHELL")
+        .ok()
+        .filter(|s| Path::new(s).is_file())
+        .unwrap_or_else(|| "/bin/zsh".to_string());
+    let terminal = pick_terminal(terminal, &installed_terminals());
+    let (program, args) = mac_launch_argv(terminal, &shell, &user_shell);
+    std::process::Command::new(program).args(args).spawn()?;
     Ok(())
 }
 
 #[cfg(windows)]
-fn open_in_terminal(cmd: &ResumeCommand, skip_hook: bool) -> Result<()> {
+fn open_in_terminal(cmd: &ResumeCommand, skip_hook: bool, _terminal: Option<&str>) -> Result<()> {
     use std::os::windows::process::CommandExt;
     // Hide the short-lived outer `cmd /C`; `start` still opens a normal console window.
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -203,7 +360,7 @@ fn open_in_terminal(cmd: &ResumeCommand, skip_hook: bool) -> Result<()> {
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
-fn open_in_terminal(cmd: &ResumeCommand, skip_hook: bool) -> Result<()> {
+fn open_in_terminal(cmd: &ResumeCommand, skip_hook: bool, _terminal: Option<&str>) -> Result<()> {
     // Keep the terminal open after the agent exits, so its last output stays readable.
     let script = format!(
         "{}; exec \"${{SHELL:-sh}}\"",
@@ -312,7 +469,8 @@ fn shell_quote(s: &str) -> String {
 }
 
 /// Escape a string for embedding inside an AppleScript double-quoted literal.
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn applescript_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
@@ -504,9 +662,78 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "macos")] // applescript_escape is macOS-only
+    #[cfg(unix)]
     #[test]
     fn applescript_escapes_quotes() {
         assert_eq!(applescript_escape(r#"a "b" \c"#), r#"a \"b\" \\c"#);
+    }
+
+    fn mac(id: &str) -> &'static MacTerminal {
+        MAC_TERMINALS.iter().find(|t| t.id == id).unwrap()
+    }
+
+    #[test]
+    fn terminal_app_is_always_offered_and_the_rest_only_when_installed() {
+        let none = installed_terminals_with(|_| false);
+        assert_eq!(none.iter().map(|t| t.id).collect::<Vec<_>>(), ["terminal"]);
+        let some = installed_terminals_with(|app| app == "Ghostty");
+        assert_eq!(
+            some.iter().map(|t| t.id).collect::<Vec<_>>(),
+            ["terminal", "ghostty"]
+        );
+        assert!(is_known_terminal("ghostty"));
+        assert!(!is_known_terminal("warp"));
+    }
+
+    #[test]
+    fn an_uninstalled_or_unknown_choice_falls_back_to_terminal_app() {
+        let installed = installed_terminals_with(|app| app == "Ghostty");
+        assert_eq!(pick_terminal(Some("ghostty"), &installed).id, "ghostty");
+        assert_eq!(pick_terminal(Some("iterm"), &installed).id, "terminal");
+        assert_eq!(pick_terminal(Some("nonsense"), &installed).id, "terminal");
+        assert_eq!(pick_terminal(None, &installed).id, "terminal");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ghostty_runs_the_command_in_a_login_shell_that_stays_open() {
+        let (program, args) = mac_launch_argv(mac("ghostty"), "cd '/p' && 'claude'", "/bin/zsh");
+        assert_eq!(program, "open");
+        assert_eq!(
+            args,
+            [
+                "-na",
+                "Ghostty",
+                "--args",
+                "-e",
+                "/bin/zsh",
+                "-lic",
+                "cd '/p' && 'claude'; exec '/bin/zsh' -l",
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn each_emulator_gets_its_own_command_flag() {
+        let flags = |id| {
+            let (_, args) = mac_launch_argv(mac(id), "x", "/bin/zsh");
+            args[3..args.len() - 3].to_vec()
+        };
+        assert_eq!(flags("wezterm"), ["start", "--"]);
+        assert!(flags("kitty").is_empty());
+        assert_eq!(flags("alacritty"), ["-e"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_applescript_terminals_get_an_escaped_command() {
+        let shell = r#"'claude' 'say "hi"'"#;
+        let (program, args) = mac_launch_argv(mac("terminal"), shell, "/bin/zsh");
+        assert_eq!(program, "osascript");
+        assert!(args[1].contains(r#"do script "'claude' 'say \"hi\"'""#));
+        let (_, args) = mac_launch_argv(mac("iterm"), shell, "/bin/zsh");
+        assert!(args[1].contains(r#"write text "'claude' 'say \"hi\"'""#));
+        assert!(args[1].contains("tell application \"iTerm\""));
     }
 }

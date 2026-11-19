@@ -4,6 +4,13 @@ import { Toggle } from "@base-ui/react/toggle";
 import { ToggleGroup } from "@base-ui/react/toggle-group";
 import { Monitor, Moon, Sun } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { api } from "../../lib/api";
 import { copyAsyncText } from "../../lib/clipboard";
@@ -30,6 +37,7 @@ export function GeneralSection() {
         <SettingsGroup title="Window">
           <CloseToTrayRow />
         </SettingsGroup>
+        <TerminalGroup />
         <SettingsGroup title="Setup">
           <ChecklistRow />
         </SettingsGroup>
@@ -114,6 +122,64 @@ function CloseToTrayRow() {
         />
       }
     />
+  );
+}
+
+/** Stands for "no choice stored": the Select needs a value for the default too. */
+const DEFAULT_TERMINAL = "default";
+
+/** Which terminal Resume and "Open in CLI" open the agent in. Only where there is a choice:
+ *  a Mac with a terminal besides Terminal.app installed (Linux reads `$TERMINAL`, Windows
+ *  opens a console). */
+function TerminalGroup() {
+  const id = useId();
+  const queryClient = useQueryClient();
+  const terminal = useQuery({ queryKey: ["cli_terminal"], queryFn: api.getCliTerminal });
+  const setTerminal = useMutation({
+    mutationFn: api.setCliTerminal,
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["cli_terminal"] }),
+    onError: (e) => notify.error("Couldn't change the terminal", { description: errorText(e) }),
+  });
+  const choices = terminal.data?.choices ?? [];
+  if (choices.length < 2) return null;
+  // The stored one, unless it was uninstalled since: Resume then uses Terminal, so say so.
+  const selected = choices.some((c) => c.id === terminal.data?.selected)
+    ? (terminal.data?.selected ?? DEFAULT_TERMINAL)
+    : DEFAULT_TERMINAL;
+  const items = choices.map((c) => ({
+    value: c.id === "terminal" ? DEFAULT_TERMINAL : c.id,
+    label: c.label,
+  }));
+  return (
+    <SettingsGroup title="Terminal">
+      <SettingRow
+        htmlFor={id}
+        title="Open agents in"
+        description="Where Resume and Open in CLI start the agent. A new window opens in the session's folder."
+        control={
+          <Select
+            items={items}
+            value={selected === "terminal" ? DEFAULT_TERMINAL : selected}
+            onValueChange={(v) => {
+              const next = !v || v === DEFAULT_TERMINAL ? null : v;
+              if (next === (terminal.data?.selected ?? null)) return;
+              setTerminal.mutate(next);
+            }}
+          >
+            <SelectTrigger id={id} className="w-40" disabled={setTerminal.isPending}>
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {items.map((t) => (
+                <SelectItem key={t.value} value={t.value}>
+                  {t.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        }
+      />
+    </SettingsGroup>
   );
 }
 

@@ -1045,6 +1045,14 @@ export interface FactHit {
   createdAt?: number | null;
 }
 
+/** Where Resume and "Open in CLI" open the agent. `choices` lists the terminals installed
+ *  on this Mac (empty on Windows and Linux, which have nothing to pick); `selected` is null
+ *  for the default. */
+export interface CliTerminal {
+  choices: { id: string; label: string }[];
+  selected: string | null;
+}
+
 export const api = {
   dbStats: () => invoke<DbStats>("db_stats"),
   indexStats: () => invoke<Stats>("index_stats"),
@@ -1064,6 +1072,10 @@ export const api = {
   // Save the report card (PNG bytes) to Downloads; returns the written path.
   saveReportCard: (png: Uint8Array) => invoke<string>("save_report_card", { png: Array.from(png) }),
   // Whether closing the window hides the app to the system tray instead of quitting.
+  /** The terminals Resume can launch in on this machine, and the one picked. */
+  getCliTerminal: () => invoke<CliTerminal>("get_cli_terminal"),
+  /** `null` goes back to the default (Terminal.app). */
+  setCliTerminal: (id: string | null) => invoke<void>("set_cli_terminal", { id }),
   getCloseToTray: () => invoke<boolean>("get_close_to_tray"),
   setCloseToTray: (on: boolean) => invoke<void>("set_close_to_tray", { on }),
   findPriorWork: (query: string, opts?: { project?: string; limit?: number }) =>

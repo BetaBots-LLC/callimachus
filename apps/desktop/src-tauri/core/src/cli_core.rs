@@ -3986,6 +3986,8 @@ fn cmd_resume(args: &[String]) -> anyhow::Result<()> {
             &body,
             snap.meta.project_path.as_deref(),
             skip_hook,
+            // Windows opens a console; the terminal choice is a macOS setting.
+            None,
         )?;
         eprintln!(
             "Opened snapshot #{id} (\"{}\") in {agent} in a new window. Context: {file}",
