@@ -1,13 +1,11 @@
-import { useState } from "react";
 import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Check, GitCommitHorizontal } from "lucide-react";
+import { GitCommitHorizontal } from "lucide-react";
 import { api, type CommitLink, type ThreadSummary } from "../../lib/api";
-import { copyText } from "../../lib/clipboard";
 import { errorText } from "../../lib/toast";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { SectionNote, SectionSkeleton } from "./ProjectSection";
-import { fullDate, recentSessionsQuery, relativeAge, useOpenThread } from "./shared";
+import { CommitSha, fullDate, recentSessionsQuery, relativeAge, useOpenThread } from "./shared";
 
 /** The commits the recent sessions likely produced (file-overlap links from `git log`),
  *  grouped under the session that wrote them. */
@@ -142,24 +140,9 @@ function CommitGroup({ thread, commits }: { thread: ThreadSummary; commits: Comm
 }
 
 function CommitRow({ commit }: { commit: CommitLink }) {
-  const [copied, setCopied] = useState(false);
   return (
     <li className="flex items-center gap-2.5 px-3 py-2 text-sm">
-      <button
-        type="button"
-        onClick={() =>
-          copyText(commit.sha).then(() => {
-            setCopied(true);
-            setTimeout(() => setCopied(false), 1200);
-          })
-        }
-        title={`Copy ${commit.sha}`}
-        aria-label={`Copy commit ${commit.shortSha}`}
-        className="flex shrink-0 cursor-pointer items-center gap-1 rounded-md bg-muted px-1.5 py-0.5 font-mono text-xs text-foreground outline-none transition-colors hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring/50"
-      >
-        {copied && <Check aria-hidden="true" className="size-3" />}
-        {copied ? "Copied" : commit.shortSha}
-      </button>
+      <CommitSha sha={commit.sha} shortSha={commit.shortSha} />
       <span className="min-w-0 flex-1 truncate" title={commit.subject ?? undefined}>
         {commit.subject || "(no subject)"}
       </span>
