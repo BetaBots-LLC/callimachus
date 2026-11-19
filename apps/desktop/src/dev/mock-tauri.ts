@@ -155,8 +155,11 @@ const SCENARIO = {
   // The repo is muted for the SessionStart hook (`cal hook --mute`).
   muted: pick("muted", ["on", "off"] as const, "off"),
   // The Today view: a working morning across three repos (default), nothing since the last
-  // open, or the busy morning reported as cut at the backend's newest-200 cap.
-  today: pick("today", ["busy", "quiet", "capped"] as const, "busy"),
+  // open, or the busy morning reported as cut at the backend's newest-200 cap. `stress`: the
+  // same morning with the data that breaks layouts (a 40-character sha, a session with nine
+  // commits, titles, subjects, TODOs and signatures with no spaces, rows with nothing to
+  // open). `error`: the load fails.
+  today: pick("today", ["busy", "quiet", "capped", "stress", "error"] as const, "busy"),
   // Today's "Memory to review" strip: nothing to review (default, the strip stays hidden), one
   // item of each kind, only a flagged fact the user pinned (it stays in memory), or a long
   // list cut at the backend's 50 (`memoryReviewMore`). Keep / Undo / Hide remove the item, as
@@ -1134,6 +1137,60 @@ function settleReview(keep: (i: ReviewItem) => boolean): number {
 }
 
 function todayReport(since: number | null): Today {
+  if (SCENARIO.today === "error") throw new Error("database is locked");
+  const report = todayBase(since);
+  if (SCENARIO.today !== "stress") return report;
+  const first = report.groups[0].threads[0];
+  first.title =
+    "Fix flaky webhook retry test in payments, then chase the scheduler flush through apps/api/src/webhooks/retry/__tests__/scheduler.integration.test.ts";
+  const sha = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678";
+  first.commits = [
+    // Every width a sha can arrive in: the stored ten, git's seven and twelve, a full one.
+    ...[10, 7, 12, 40].map((n, i) => ({
+      sha: `${i}${sha.slice(1)}`,
+      shortSha: `${i}${sha.slice(1, n)}`,
+      subject:
+        i === 3
+          ? "fix(webhooks/retry/scheduler/flush/advance-timers/await-microtasks-before-asserting-on-the-queue-depth)"
+          : "test: await scheduler flush before advancing timers",
+      committedAt: NOW - 3_600,
+    })),
+    ...Array.from({ length: 5 }, (_, i) => ({
+      sha: `${i + 4}${sha.slice(1)}`,
+      shortSha: `${i + 4}${sha.slice(1, 10)}`,
+      subject: i === 0 ? null : `chore: follow-up ${i}`,
+      committedAt: NOW - 3_600,
+    })),
+  ];
+  report.groups.push({
+    project: "",
+    threads: [{ ...report.groups[2].threads[0], id: 9_001, title: "", source: "cursor" }],
+  });
+  report.newTodos[0].text =
+    "Backfill idempotency keys for legacy refunds in apps/api/src/refunds/legacy/backfill/2019-through-2023/idempotency_keys_for_refunds_created_before_the_v2_migration.sql and then delete the shim, the feature flag and the dashboard panel that still reads the old column.";
+  report.issuesSeenAgain[0].signature =
+    "error[E0502]: cannot borrow `self.pending_webhook_retries_by_endpoint_and_attempt` as mutable because it is also borrowed as immutable at crates/payments/src/webhooks/retry/scheduler.rs";
+  report.issuesSeenAgain.push({
+    signature: "ECONNRESET: socket hang up",
+    count: 1,
+    lastSeen: NOW - 6 * 3_600,
+    project: "",
+  });
+  report.snapshots.push({
+    ...report.snapshots[0],
+    id: 13,
+    threadId: null,
+    threadTitle: null,
+    projectPath: null,
+    projectKey: null,
+    label: "before the refunds refactor",
+    event: "manual",
+    chars: 640,
+  });
+  return report;
+}
+
+function todayBase(since: number | null): Today {
   const from = since ?? NOW - 15 * 3_600;
   const busy = SCENARIO.today !== "quiet";
   const t = (
@@ -1150,7 +1207,9 @@ function todayReport(since: number | null): Today {
     messages: threads[i].messageCount,
     commits: commits.map(([sha, subject], j) => ({
       sha,
-      shortSha: sha.slice(0, 7),
+      // Ten characters, as `gitlink` stores them: a seven-character mock hid a chip sized
+      // for seven that the real ten overflowed.
+      shortSha: sha.slice(0, 10),
       subject,
       committedAt: NOW - Math.round((hoursAgo + 0.1 * (j + 1)) * 3_600),
     })),
@@ -1682,7 +1741,7 @@ const RECURRING: Issue[] = [
     threadIds: [1, 2, 3],
     fix: {
       sha: "9f3c2a1b7e6d5c4b3a2f1e0d9c8b7a6f5e4d3c2b",
-      shortSha: "9f3c2a1",
+      shortSha: "9f3c2a1b7e",
       subject: "fix(cart): clone the line items before the borrow",
       committedAt: NOW - 2 * DAY + 3600,
       threadId: 1,
@@ -1780,7 +1839,7 @@ function spendBreakdownFor(project: string | null): SpendBreakdown {
         const t = pool[i % Math.max(pool.length, 1)];
         return {
           sha: String(sha),
-          shortSha: String(sha).slice(0, 7),
+          shortSha: String(sha).slice(0, 10),
           subject: String(subject),
           committedAt: NOW - Number(daysAgo) * DAY,
           project: t?.projectPath ?? null,
@@ -1987,7 +2046,7 @@ function commitsFor(threadId: number): CommitLink[] {
   const at = threads.findIndex((t) => t.id === threadId);
   const commit = (sha: string, subject: string, daysAgo: number): CommitLink => ({
     sha,
-    shortSha: sha.slice(0, 7),
+    shortSha: sha.slice(0, 10),
     subject,
     committedAt: NOW - Math.round(daysAgo * DAY),
     overlap: 3,
@@ -2502,7 +2561,7 @@ const handlers: Record<string, Handler> = {
   link_thread_commits: () => [
     {
       sha: "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
-      shortSha: "a1b2c3d",
+      shortSha: "a1b2c3d4e5",
       subject: "test: await scheduler flush before advancing timers",
       committedAt: NOW - DAY,
       overlap: 3,

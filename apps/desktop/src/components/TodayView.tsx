@@ -1,14 +1,25 @@
-import { type KeyboardEvent, useEffect, useId, useState } from "react";
+import {
+  type ComponentProps,
+  type KeyboardEvent,
+  type ReactNode,
+  useEffect,
+  useId,
+  useState,
+} from "react";
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
+  AlertCircle,
   AlertTriangle,
+  ArrowUpRight,
   Brain,
   Check,
+  ChevronDown,
+  ChevronRight,
   CircleDot,
   Copy,
   History,
+  Inbox,
   Sparkles,
-  TerminalSquare,
   X,
 } from "lucide-react";
 import { api, type ReviewItem, SOURCE_LABELS, type Today, type TodayThread } from "../lib/api";
@@ -21,13 +32,36 @@ import {
   snapshotEventText,
 } from "../lib/format";
 import { invalidateDomain } from "../lib/keys";
-import { CAN_LAUNCH_CLI_FALLBACK } from "../lib/platform";
 import { AGGREGATE_STALE_MS, queryClient } from "../lib/queryClient";
 import { errorText, notify } from "../lib/toast";
 import { useUi } from "../store/ui";
 import { factDate } from "./project/FactTruth";
 import { openProjectSection } from "./project/sections";
+import { CommitSha, formatChars, fullDate, useCanLaunchCli } from "./project/shared";
+import { Alert, AlertAction, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
+import { Card, CardAction, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import {
+  Empty,
+  EmptyContent,
+  EmptyDescription,
+  EmptyHeader,
+  EmptyMedia,
+  EmptyTitle,
+} from "@/components/ui/empty";
+import {
+  Item,
+  ItemActions,
+  ItemContent,
+  ItemDescription,
+  ItemFooter,
+  ItemGroup,
+  ItemSeparator,
+  ItemTitle,
+} from "@/components/ui/item";
+import { Spinner } from "@/components/ui/spinner";
+import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import { Loading } from "./Loading";
 
@@ -143,99 +177,229 @@ export function TodayView() {
   // The first successful load of an open moves "last open" to now, after the window on
   // screen has been read, so the next launch starts where this one did. Keyed on the data
   // too: a new open (the window shown again after an hour) refetches while still a success.
+  // Only a "since last open" load counts, and not the rows of another window held as its
+  // placeholder: marking after a 24 hour load (the first, when "since last open" failed and
+  // the picker on the error was used, or any after a new open) moved the mark to now before
+  // that window was read, and it then came back empty for good.
   // biome-ignore lint/correctness/useExhaustiveDependencies: dataUpdatedAt is the trigger (a refetch after a new open), read through the module flag
   useEffect(() => {
-    if (!report.isSuccess || markedOpen) return;
+    if (range !== "open" || report.isPlaceholderData || !report.isSuccess || markedOpen) return;
     markedOpen = true;
     api.markAppOpened().catch(() => {}); // an older backend without it just rejects
-  }, [report.isSuccess, report.dataUpdatedAt]);
+  }, [range, report.isPlaceholderData, report.isSuccess, report.dataUpdatedAt]);
 
-  const [openPanel, setPanel] = useState<Panel | null>(null);
-  const panelId = useId();
+  // The last load error, kept while its retry runs. Query puts a query with no data back to
+  // pending on a refetch and clears its error, so without this "Try again" (or picking
+  // another window) swapped the message for the loading pane: the control just pressed
+  // unmounted and focus fell to the page body.
+  const [loadError, setLoadError] = useState<unknown>(null);
+  if (report.error && report.error !== loadError) setLoadError(report.error);
+  else if (!report.error && report.data !== undefined && loadError !== null) setLoadError(null);
 
-  if (report.isPending) return <Loading label="Loading today…" className="h-full" />;
-  if (report.isError) {
-    return (
-      <div role="alert" className="mx-auto w-full max-w-3xl space-y-3 p-6 text-sm">
-        <p className="text-destructive">
-          Couldn't load today's activity: {errorText(report.error)}
-        </p>
-        <Button size="sm" variant="outline" onClick={() => void report.refetch()}>
-          Try again
-        </Button>
-      </div>
-    );
+  // The first load of the view: nothing to show and nothing failed yet.
+  if (report.data === undefined && loadError === null) {
+    return <Loading label="Loading today…" className="h-full" />;
   }
 
   const data = report.data;
-  const sessions = data.groups.reduce((n, g) => n + g.threads.length, 0);
-  // gitlink can link one commit to two sessions, so commits count once by sha.
-  const commits = new Set(
-    data.groups.flatMap((g) => g.threads.flatMap((t) => t.commits)).map((c) => c.sha),
-  ).size;
-  // A panel whose kind dropped to nothing (another range, a refetch) closes, since its
-  // strip button, the only control that closes it, is gone too.
-  const panel = openPanel && panelCount(data, openPanel) > 0 ? openPanel : null;
-  const since = formatSince(data.since);
-  const nothing =
-    sessions === 0 &&
-    toReview(data).length === 0 &&
-    data.newTodos.length === 0 &&
-    data.issuesSeenAgain.length === 0 &&
-    data.snapshots.length === 0;
+  const counts = data ? todayCounts(data) : null;
+  // The previous window's rows, shown dimmed while the picked one loads.
+  const stale = report.isPlaceholderData;
+  const focusHeading = () => document.querySelector<HTMLElement>("[data-today-heading]")?.focus();
+  // A retry that works unmounts the message and its button: the heading takes the focus.
+  const retry = () =>
+    void report.refetch().then((r) => {
+      if (!r.isError) focusHeading();
+    });
 
   return (
     // A block scroller, not a flex column: flex children with overflow-hidden shrink to
     // nothing once the page is taller than the window.
-    <div className="h-full overflow-y-auto" aria-busy={report.isFetching}>
-      <div
-        className={cn(
-          "mx-auto w-full max-w-3xl p-6 transition-opacity",
-          report.isPlaceholderData && "opacity-60",
-        )}
-      >
+    <div className="h-full overflow-y-auto">
+      <div className="mx-auto w-full max-w-3xl px-6 pt-5 pb-10">
         <ReportCard />
-        <header className="flex flex-wrap items-center gap-x-4 gap-y-3 pb-5">
+        {/* One header for every state, so the picker keeps its focus when a window fails or
+            a failed one loads. items-start with a heading line as tall as the controls: they
+            stay on the heading's line however many lines the summary under it takes. */}
+        <header className="flex flex-wrap items-start gap-x-4 gap-y-3 pb-6">
           <div className="min-w-0 flex-1">
             <h1
               data-today-heading
               tabIndex={-1}
-              className="text-lg font-semibold tracking-tight text-balance outline-none"
+              className="text-lg leading-7 font-semibold tracking-tight text-balance outline-none"
             >
-              Since {since}
+              {data ? `Since ${formatSince(data.since)}` : "Today"}
             </h1>
-            {!nothing && (
-              <p className="text-sm text-muted-foreground tabular-nums">
-                {plural(sessions, "session")} in {plural(data.groups.length, "repo")}
-                {commits > 0 && ` · ${plural(commits, "commit")}`}
-                {data.truncated && ` · showing the newest ${sessions.toLocaleString()}`}
+            {stale ? (
+              // In place of the counts, which belong to the window being left.
+              <p role="status" className="flex items-center gap-1.5 text-sm text-muted-foreground">
+                <Spinner className="size-3.5" />
+                Loading…
               </p>
+            ) : (
+              data &&
+              counts &&
+              counts.sessions > 0 && (
+                <p className="text-sm text-muted-foreground tabular-nums">
+                  {data.truncated
+                    ? `The newest ${plural(counts.sessions, "session")}`
+                    : plural(counts.sessions, "session")}{" "}
+                  in {plural(data.groups.length, "repo")}
+                  {counts.commits > 0 && ` · ${plural(counts.commits, "commit")}`}
+                </p>
+              )
             )}
           </div>
           <RangePicker range={range} onChange={setRange} />
-          <CopyStandup report={data} disabled={nothing} />
+          <CopyStandup
+            report={data}
+            // The standup lists sessions and new TODOs; with neither it would copy a lone
+            // heading, and while a window loads it would copy the one being left.
+            disabled={!counts || counts.standupEmpty || stale}
+          />
         </header>
 
-        {nothing ? (
-          <EmptyToday since={since} />
+        {data === undefined ? (
+          // Wide enough on the right for the button with its spinner.
+          <Alert variant="destructive" className="has-data-[slot=alert-action]:pr-32">
+            <AlertCircle />
+            <AlertTitle>Couldn't load today's activity</AlertTitle>
+            <AlertDescription className="wrap-break-word">
+              {errorText(report.error ?? loadError)}
+            </AlertDescription>
+            <AlertAction>
+              <Button
+                size="sm"
+                variant="outline"
+                // Focusable while it retries, so the focus is still here if it fails again.
+                focusableWhenDisabled
+                disabled={report.isFetching}
+                className="text-foreground aria-disabled:opacity-50"
+                onClick={retry}
+              >
+                {report.isFetching && <Spinner data-icon="inline-start" />}
+                Try again
+              </Button>
+            </AlertAction>
+          </Alert>
         ) : (
           <>
-            <Strip report={data} panel={panel} onToggle={setPanel} panelId={panelId} />
-            {panel && <StripPanel id={panelId} panel={panel} report={data} />}
-            {sessions === 0 ? (
-              <p className="text-sm text-muted-foreground">No sessions since {since}.</p>
-            ) : (
-              <SessionGroups report={data} />
+            {report.isRefetchError && (
+              // A refetch that fails (the watcher invalidates Today after every index pass;
+              // a busy index, a slow git) keeps the loaded page and says so here instead
+              // of replacing the page, its open panel and the focus in it.
+              <Alert variant="destructive" className="mb-6 has-data-[slot=alert-action]:pr-28">
+                <AlertCircle />
+                <AlertTitle>Couldn't refresh, so this may be out of date</AlertTitle>
+                <AlertDescription className="wrap-break-word">
+                  {errorText(report.error)}
+                </AlertDescription>
+                <AlertAction>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    focusableWhenDisabled
+                    disabled={report.isFetching}
+                    className="text-foreground aria-disabled:opacity-50"
+                    onClick={retry}
+                  >
+                    Try again
+                  </Button>
+                </AlertAction>
+              </Alert>
             )}
-            {data.commitsPartial && (
-              <p className="pt-4 text-xs text-muted-foreground">
-                Some repos show no commits: reading their git history took longer than 2 seconds.
-              </p>
-            )}
+            {/* Dimmed and inert below the header only: the picker just pressed stays crisp,
+                and neither a click nor the keyboard can Keep or Resume a row of the window
+                being left (a Keep there wrote, and the placeholder row stayed to be kept
+                again). */}
+            <div
+              inert={stale}
+              aria-busy={stale || undefined}
+              className={cn("transition-opacity", stale && "pointer-events-none opacity-60")}
+            >
+              <TodayBody
+                report={data}
+                range={range}
+                onRange={(r) => {
+                  // From a button inside the body, which goes inert (and, for the empty
+                  // state's own button, away) as the window changes.
+                  focusHeading();
+                  setRange(r);
+                }}
+              />
+            </div>
           </>
         )}
       </div>
     </div>
+  );
+}
+
+/** What a window holds, counted once for the header and the body. */
+function todayCounts(report: Today) {
+  const sessions = report.groups.reduce((n, g) => n + g.threads.length, 0);
+  // gitlink can link one commit to two sessions, so commits count once by sha.
+  const commits = new Set(
+    report.groups.flatMap((g) => g.threads.flatMap((t) => t.commits)).map((c) => c.sha),
+  ).size;
+  const extras =
+    toReview(report).length +
+    report.newTodos.length +
+    report.issuesSeenAgain.length +
+    report.snapshots.length;
+  return {
+    sessions,
+    commits,
+    extras,
+    nothing: sessions === 0 && extras === 0,
+    standupEmpty: sessions === 0 && report.newTodos.length === 0,
+  };
+}
+
+/** Everything under the header for a loaded window: the strip and its panel, then the
+ *  sessions by repo. */
+function TodayBody({
+  report,
+  range,
+  onRange,
+}: {
+  report: Today;
+  range: Range;
+  onRange: (r: Range) => void;
+}) {
+  const [openPanel, setPanel] = useState<Panel | null>(null);
+  const panelId = useId();
+  const counts = todayCounts(report);
+  const since = formatSince(report.since);
+  if (counts.nothing) return <EmptyToday since={since} range={range} onRange={onRange} />;
+  // A panel whose kind dropped to nothing (another range, a refetch) closes, since its
+  // strip button, the only control that closes it, is gone too.
+  const panel = openPanel && panelCount(report, openPanel) > 0 ? openPanel : null;
+  // Escape in a panel closes it and hands focus back to the button that opened it.
+  const closePanel = () => {
+    if (!panel) return;
+    setPanel(null);
+    document.querySelector<HTMLElement>(`[data-panel="${panel}"]`)?.focus();
+  };
+  return (
+    <>
+      {counts.extras > 0 && (
+        <div className="mb-6 space-y-2">
+          <Strip report={report} panel={panel} onToggle={setPanel} panelId={panelId} />
+          {panel && <StripPanel id={panelId} panel={panel} report={report} onClose={closePanel} />}
+        </div>
+      )}
+      {counts.sessions === 0 ? (
+        <p className="px-1 text-sm text-muted-foreground">No sessions since {since}.</p>
+      ) : (
+        <SessionGroups report={report} />
+      )}
+      {report.commitsPartial && (
+        <p className="px-1 pt-4 text-[13px] text-muted-foreground">
+          Some repos show no commits: reading their git history took longer than 2 seconds.
+        </p>
+      )}
+    </>
   );
 }
 
@@ -264,35 +428,55 @@ function ReportCard() {
   const indexed = !!stats.data && stats.data.threads > 0 && indexing.data === false;
   if (answered || !indexed || dismiss.isPending) return null;
   return (
-    <section
-      aria-label="Your agents, so far"
-      className="mb-5 flex flex-wrap items-center gap-x-4 gap-y-3 rounded-xl border bg-card p-4"
-    >
-      <Sparkles className="size-5 shrink-0 text-muted-foreground" aria-hidden="true" />
-      <div className="min-w-0 flex-1 space-y-0.5">
-        <h2 className="text-sm font-semibold">Your agents, so far</h2>
-        <p className="text-[13px] leading-normal text-muted-foreground">
-          Every session you've indexed on one screen: time, spend, the errors that keep coming back
-          and what your agents remember. Copy it as markdown or save a card to share.
-        </p>
-      </div>
-      <div className="flex shrink-0 items-center gap-1">
-        <Button size="sm" onClick={() => setView("report")}>
-          See your report
-        </Button>
-        <Button
-          size="icon-sm"
-          variant="ghost"
-          aria-label="Dismiss"
-          title="Dismiss (the report stays in Stats)"
-          onClick={() => dismiss.mutate()}
-        >
-          <X />
-        </Button>
-      </div>
+    <section aria-label="Your agents, so far" className="mb-6">
+      <Card size="sm">
+        <CardHeader>
+          {/* Not a heading: it sits above the page's h1. The section's label names it. */}
+          <CardTitle className="flex items-center gap-2">
+            <Sparkles aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
+            Your agents, so far
+          </CardTitle>
+          <CardDescription className="text-[13px] leading-normal">
+            Every session you've indexed on one screen: time, spend, the errors that keep coming
+            back and what your agents remember. Copy it as markdown or save a card to share.
+          </CardDescription>
+          <CardAction className="flex items-center gap-1">
+            <Button size="sm" onClick={() => setView("report")}>
+              See your report
+            </Button>
+            <TooltipProvider delay={TOOLTIP_DELAY_MS}>
+              <Tooltip>
+                <TooltipTrigger
+                  render={
+                    <Button
+                      size="icon-sm"
+                      variant="ghost"
+                      // The whole hint: the tooltip is visual only, and the title it
+                      // replaced was the button's description.
+                      aria-label="Dismiss (the report stays in Stats)"
+                      onClick={() => {
+                        // The card unmounts with the button in it: the heading takes the
+                        // focus that would otherwise fall to the page body.
+                        document.querySelector<HTMLElement>("[data-today-heading]")?.focus();
+                        dismiss.mutate();
+                      }}
+                    />
+                  }
+                >
+                  <X />
+                </TooltipTrigger>
+                <TooltipContent>Dismiss (the report stays in Stats)</TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
+          </CardAction>
+        </CardHeader>
+      </Card>
     </section>
   );
 }
+
+/** As the top bar's tooltips (App.tsx): long enough that passing over a button shows nothing. */
+const TOOLTIP_DELAY_MS = 200;
 
 function panelCount(report: Today, panel: Panel): number {
   if (panel === "memory") return toReview(report).length;
@@ -301,38 +485,49 @@ function panelCount(report: Today, panel: Panel): number {
   return report.snapshots.length;
 }
 
+/** "4 commits", for the screen only: the no-break space keeps a wrapped line from ending on
+ *  the number with its noun alone on the next. */
 function plural(n: number, word: string): string {
-  return `${n.toLocaleString()} ${word}${n === 1 ? "" : "s"}`;
+  return `${n.toLocaleString()}\u00a0${word}${n === 1 ? "" : "s"}`;
 }
 
+/** The time window: one Tab stop, arrow keys between the windows. */
 function RangePicker({ range, onChange }: { range: Range; onChange: (r: Range) => void }) {
   return (
-    <fieldset
+    <ToggleGroup
       aria-label="Time window"
-      className="m-0 flex h-8 min-w-0 shrink-0 items-center gap-0.5 rounded-lg border p-[3px]"
+      variant="outline"
+      size="sm"
+      spacing={0}
+      value={[range]}
+      onValueChange={(v) => {
+        // Pressing the selected window again reports none; Today always has one.
+        const next = v[0] as Range | undefined;
+        if (next) onChange(next);
+      }}
+      className="shrink-0"
     >
       {RANGES.map((r) => (
-        <Button
+        <ToggleGroupItem
           key={r.id}
-          size="xs"
-          variant={range === r.id ? "secondary" : "ghost"}
-          aria-pressed={range === r.id}
-          className={cn(range !== r.id && "text-muted-foreground")}
-          onClick={() => onChange(r.id)}
+          value={r.id}
+          className="text-muted-foreground aria-pressed:text-foreground"
         >
           {r.label}
-        </Button>
+        </ToggleGroupItem>
       ))}
-    </fieldset>
+    </ToggleGroup>
   );
 }
 
 /** Plain markdown for a standup note: each repo, its sessions and commits, then the new
  *  TODOs. Copied straight from the click, since WebKit allows clipboard writes only
  *  during the gesture. */
-function CopyStandup({ report, disabled }: { report: Today; disabled: boolean }) {
+function CopyStandup({ report, disabled }: { report: Today | undefined; disabled: boolean }) {
   const [state, setState] = useState<"idle" | "copied">("idle");
+  const copied = state === "copied";
   const copy = () => {
+    if (!report) return;
     copyText(standupMarkdown(report)).then(
       () => {
         setState("copied");
@@ -342,10 +537,22 @@ function CopyStandup({ report, disabled }: { report: Today; disabled: boolean })
     );
   };
   return (
-    <Button size="sm" variant="outline" onClick={copy} disabled={disabled}>
-      {state === "copied" ? <Check /> : <Copy />}
-      {state === "copied" ? "Copied" : "Copy as standup"}
-    </Button>
+    <>
+      <Button size="sm" variant="outline" onClick={copy} disabled={disabled}>
+        {copied ? <Check data-icon="inline-start" /> : <Copy data-icon="inline-start" />}
+        {/* Both labels in one cell, so "Copied" does not narrow the button and pull the
+            picker beside it sideways. */}
+        <span className="grid text-left">
+          <span className={cn("col-start-1 row-start-1", copied && "invisible")}>
+            Copy as standup
+          </span>
+          {copied && <span className="col-start-1 row-start-1">Copied</span>}
+        </span>
+      </Button>
+      <span aria-live="polite" className="sr-only">
+        {copied ? "Copied the standup" : ""}
+      </span>
+    </>
   );
 }
 
@@ -375,24 +582,44 @@ export function standupMarkdown(report: Today): string {
   return lines.join("\n");
 }
 
-function EmptyToday({ since }: { since: string }) {
+function EmptyToday({
+  since,
+  range,
+  onRange,
+}: {
+  since: string;
+  range: Range;
+  onRange: (r: Range) => void;
+}) {
   const openSearch = useUi((s) => s.openSearch);
   const setView = useUi((s) => s.setView);
-  const link = "h-auto p-0 align-baseline text-sm";
   return (
-    <div role="status" className="py-10 text-sm text-muted-foreground">
-      <p>
-        Nothing since {since}. Open{" "}
-        <Button variant="link" className={link} onClick={() => openSearch()}>
-          Search
-        </Button>{" "}
-        or{" "}
-        <Button variant="link" className={link} onClick={() => setView("projects")}>
-          Projects
+    <Empty role="status" className="border py-12">
+      <EmptyHeader>
+        <EmptyMedia variant="icon">
+          <Inbox />
+        </EmptyMedia>
+        <EmptyTitle>Nothing new</EmptyTitle>
+        <EmptyDescription>
+          No sessions, TODOs, errors or snapshots since {since}. They show up here as your agents
+          work.
+        </EmptyDescription>
+      </EmptyHeader>
+      <EmptyContent className="flex-row flex-wrap justify-center gap-2">
+        {/* Widening the window first: the likeliest reason for an empty one is its size. */}
+        {range !== "7d" && (
+          <Button size="sm" variant="outline" onClick={() => onRange("7d")}>
+            Show 7 days
+          </Button>
+        )}
+        <Button size="sm" variant="outline" onClick={() => openSearch()}>
+          Open Search
         </Button>
-        .
-      </p>
-    </div>
+        <Button size="sm" variant="outline" onClick={() => setView("projects")}>
+          Open Projects
+        </Button>
+      </EmptyContent>
+    </Empty>
   );
 }
 
@@ -442,107 +669,270 @@ function Strip({
   ].filter((i) => i.n > 0);
   if (items.length === 0) return null;
   return (
-    <div className="flex flex-wrap gap-2 pb-3">
+    <div className="flex flex-wrap gap-2">
       {items.map(({ id, n, more, label, icon: Icon }) => (
+        // Outline in both states: the variant fills itself while aria-expanded, and keeps
+        // the border (the borderless secondary read as disabled beside its neighbors).
         <Button
           key={id}
           data-panel={id}
           size="sm"
-          variant={panel === id ? "secondary" : "outline"}
+          variant="outline"
+          className="dark:aria-expanded:bg-muted"
           aria-expanded={panel === id}
           aria-controls={panel === id ? panelId : undefined}
           onClick={() => onToggle(panel === id ? null : id)}
         >
           <Icon
+            data-icon="inline-start"
             className={cn(
               (id === "issues" || id === "memory") && "text-amber-600 dark:text-amber-400",
             )}
           />
           <span className="tabular-nums">{more ? `${n}+` : n}</span> {label}
+          <ChevronDown
+            data-icon="inline-end"
+            className="text-muted-foreground transition-transform group-aria-expanded/button:rotate-180"
+          />
         </Button>
       ))}
     </div>
   );
 }
 
-function StripPanel({ id, panel, report }: { id: string; panel: Panel; report: Today }) {
+/**
+ * The carded list every part of Today uses: a Card around an ItemGroup, each row an Item in
+ * its own listitem (`ListRow`), parted by ItemSeparators.
+ */
+function ItemList({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <Card className="gap-0 py-0">
+      <ItemGroup aria-label={label} className="gap-0 has-data-[size=sm]:gap-0">
+        {children}
+      </ItemGroup>
+    </Card>
+  );
+}
+
+/** One row of an ItemList. The separator sits inside the listitem, so a row's next sibling is
+ *  the next row (what `focusAfterReview` walks) and the list holds listitems only. */
+function ListRow({
+  first,
+  children,
+  ...props
+}: { first: boolean; children: ReactNode } & ComponentProps<"div">) {
+  return (
+    // biome-ignore lint/a11y/useSemanticElements: ItemGroup is a div with role="list", where an li is not allowed
+    <div role="listitem" {...props}>
+      {!first && <ItemSeparator className="my-0" />}
+      {children}
+    </div>
+  );
+}
+
+/** An Item that is a square row of a carded list, tinted on hover like the app's other rows. */
+const ROW = "rounded-none transition-colors hover:bg-muted/40";
+/** A row whose title is its click target: the title's button is stretched over the whole Item
+ *  (`STRETCH`), and whatever else can be pressed in the row sits above it (`ABOVE`). A row
+ *  that holds other buttons cannot itself be one. */
+const ROW_STRETCHED = cn(ROW, "relative has-[[data-stretch]:focus-visible]:bg-muted/40");
+const STRETCH =
+  "cursor-pointer text-left outline-none after:absolute after:inset-0 focus-visible:after:ring-[3px] focus-visible:after:ring-ring/50 focus-visible:after:ring-inset";
+const ABOVE = "relative z-10";
+/** A row that is one button (Item rendered as a button): nothing else to press in it. */
+const ROW_BUTTON = cn(ROW, "cursor-pointer text-left focus-visible:bg-muted/40");
+/** The second line of a row. */
+const ROW_META = "line-clamp-1 text-[13px] tabular-nums";
+
+const PANEL_LABELS: Record<Panel, string> = {
+  memory: "Memory to review",
+  todos: "New TODOs",
+  issues: "Errors seen again",
+  snapshots: "Snapshots",
+};
+
+/** `aria-controls` of the pressed strip button points here. */
+function PanelFrame({
+  id,
+  onClose,
+  children,
+}: {
+  id: string;
+  onClose: () => void;
+  children: ReactNode;
+}) {
+  return (
+    // biome-ignore lint/a11y/noStaticElementInteractions: only takes Escape from the controls it contains
+    <div
+      id={id}
+      onKeyDown={(e) => {
+        if (e.key !== "Escape") return;
+        e.preventDefault();
+        onClose();
+      }}
+    >
+      {children}
+    </div>
+  );
+}
+
+function StripPanel({
+  id,
+  panel,
+  report,
+  onClose,
+}: {
+  id: string;
+  panel: Panel;
+  report: Today;
+  onClose: () => void;
+}) {
   const openThread = useUi((s) => s.openThread);
-  if (panel === "memory") return <MemoryReviewPanel id={id} items={toReview(report)} />;
+  if (panel === "memory") {
+    return (
+      <PanelFrame id={id} onClose={onClose}>
+        <MemoryReviewPanel listId={id} items={toReview(report)} />
+      </PanelFrame>
+    );
+  }
   // The repo's key, never the stored path: a worktree session's snapshot stores the
   // worktree path, which is no key, so the Project page opened on it (and remembered it as
   // Search's scope) matched nothing.
   const projectOf = (snap: Today["snapshots"][number]) => snap.projectKey || null;
-  const row =
-    "flex w-full cursor-pointer items-baseline gap-3 px-3 py-2 text-left text-sm outline-none hover:bg-muted/50 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/60";
+  const chevron = (
+    <ChevronRight aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
+  );
   return (
-    <ul id={id} className="mb-5 divide-y overflow-hidden rounded-lg border">
-      {panel === "todos" &&
-        report.newTodos.map((todo) => (
-          <li key={todo.id}>
-            <button
-              type="button"
-              className={row}
-              onClick={() => openThread(todo.threadId)}
-              title="Open the session it came from"
-            >
-              <span className="min-w-0 flex-1">{todo.text}</span>
-              {todo.project && (
-                <span className="shrink-0 text-xs text-muted-foreground">
-                  {baseName(todo.project)}
-                </span>
-              )}
-            </button>
-          </li>
-        ))}
-      {panel === "issues" &&
-        report.issuesSeenAgain.map((issue) => (
-          <li key={issue.signature}>
-            <button
-              type="button"
-              className={row}
-              disabled={!issue.project}
-              onClick={() => issue.project && openProjectSection(issue.project, "errors")}
-              title={issue.project ? "Open the project's recurring errors" : undefined}
-            >
-              <span className="min-w-0 flex-1 truncate font-mono text-xs">{issue.signature}</span>
-              <span className="shrink-0 text-xs text-muted-foreground tabular-nums">
-                {plural(issue.count, "time")}
-                {issue.project && ` · ${baseName(issue.project)}`} · {formatTime(issue.lastSeen)}
-              </span>
-            </button>
-          </li>
-        ))}
-      {panel === "snapshots" &&
-        report.snapshots.map((snap) => {
-          const project = projectOf(snap);
-          return (
-            <li key={snap.id}>
-              <button
-                type="button"
-                className={row}
-                disabled={!project && snap.threadId == null}
-                onClick={() => {
-                  if (project) openProjectSection(project, "snapshots");
-                  else if (snap.threadId != null) openThread(snap.threadId);
-                }}
-                title={project ? "Open the project's snapshots" : "Open the session"}
+    <PanelFrame id={id} onClose={onClose}>
+      <ItemList label={PANEL_LABELS[panel]}>
+        {panel === "todos" &&
+          report.newTodos.map((todo, i) => (
+            <ListRow key={todo.id} first={i === 0}>
+              <Item
+                size="sm"
+                className={ROW_BUTTON}
+                render={
+                  <button
+                    type="button"
+                    onClick={() => openThread(todo.threadId)}
+                    title="Open the session it came from"
+                  />
+                }
               >
-                {/* An auto snapshot's label only repeats its event ("auto · PreCompact"),
-                    so it goes by its session, with the event in words beside it. */}
-                <span className="min-w-0 flex-1 truncate">
-                  {(snap.event === "manual" && snap.label) ||
-                    snap.threadTitle ||
-                    `Snapshot #${snap.id}`}
-                </span>
-                <span className="shrink-0 text-xs text-muted-foreground tabular-nums">
-                  {snapshotEventText(snap.event)} · {Math.max(1, Math.round(snap.chars / 1000))}k
-                  chars · {formatTime(snap.createdAt)}
-                </span>
-              </button>
-            </li>
-          );
-        })}
-    </ul>
+                <ItemContent className="min-w-0">
+                  {/* Three lines at most, broken anywhere: a TODO can be one long path. */}
+                  <ItemTitle
+                    className="line-clamp-3 block w-full font-normal wrap-break-word"
+                    title={todo.text}
+                  >
+                    {todo.text}
+                  </ItemTitle>
+                </ItemContent>
+                {todo.project && (
+                  <span className="max-w-[40%] shrink-0 truncate text-[13px] text-muted-foreground">
+                    {baseName(todo.project)}
+                  </span>
+                )}
+                {chevron}
+              </Item>
+            </ListRow>
+          ))}
+        {panel === "issues" &&
+          report.issuesSeenAgain.map((issue, i) => {
+            // Two lines, as the Project page's recurring errors this row opens: the
+            // signature names the error, so it gets the width and the counts go under it.
+            const content = (
+              <ItemContent className="min-w-0">
+                <ItemTitle className="block w-full truncate font-normal" title={issue.signature}>
+                  <code className="font-mono text-xs">{issue.signature}</code>
+                </ItemTitle>
+                <ItemDescription className={ROW_META}>
+                  <span className="font-medium text-foreground">
+                    {issue.count.toLocaleString()}
+                  </span>{" "}
+                  {issue.count === 1 ? "time" : "times"}
+                  {issue.project && ` · ${baseName(issue.project)}`} · last seen{" "}
+                  <span title={fullDate(issue.lastSeen)}>{formatTime(issue.lastSeen)}</span>
+                </ItemDescription>
+              </ItemContent>
+            );
+            const project = issue.project;
+            return (
+              <ListRow key={issue.signature} first={i === 0}>
+                {project ? (
+                  <Item
+                    size="sm"
+                    className={ROW_BUTTON}
+                    render={
+                      <button
+                        type="button"
+                        onClick={() => openProjectSection(project, "errors")}
+                        title="Open the project's recurring errors"
+                      />
+                    }
+                  >
+                    {content}
+                    {chevron}
+                  </Item>
+                ) : (
+                  // Nothing to open: text to read, so no button, pointer or hover.
+                  <Item size="sm" className="rounded-none">
+                    {content}
+                  </Item>
+                )}
+              </ListRow>
+            );
+          })}
+        {panel === "snapshots" &&
+          report.snapshots.map((snap, i) => {
+            const project = projectOf(snap);
+            // An auto snapshot's label only repeats its event ("auto · PreCompact"), so it
+            // goes by its session, with the event in words under it.
+            const name =
+              (snap.event === "manual" && snap.label) || snap.threadTitle || `Snapshot #${snap.id}`;
+            const content = (
+              <ItemContent className="min-w-0">
+                <ItemTitle className="block w-full truncate font-normal" title={name}>
+                  {name}
+                </ItemTitle>
+                <ItemDescription className={ROW_META}>
+                  {project && `${baseName(project)} · `}
+                  {snapshotEventText(snap.event)} · {formatChars(snap.chars)} ·{" "}
+                  <span title={fullDate(snap.createdAt)}>{formatTime(snap.createdAt)}</span>
+                </ItemDescription>
+              </ItemContent>
+            );
+            const threadId = snap.threadId;
+            return (
+              <ListRow key={snap.id} first={i === 0}>
+                {project || threadId != null ? (
+                  <Item
+                    size="sm"
+                    className={ROW_BUTTON}
+                    render={
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (project) openProjectSection(project, "snapshots");
+                          else if (threadId != null) openThread(threadId);
+                        }}
+                        title={project ? "Open the project's snapshots" : "Open the session"}
+                      />
+                    }
+                  >
+                    {content}
+                    {chevron}
+                  </Item>
+                ) : (
+                  <Item size="sm" className="rounded-none">
+                    {content}
+                  </Item>
+                )}
+              </ListRow>
+            );
+          })}
+      </ItemList>
+    </PanelFrame>
   );
 }
 
@@ -578,8 +968,32 @@ function reviewHeadline(item: ReviewItem): string {
  * section, where the full history is.
  */
 type ReviewAction = "keep" | "undo" | "hide";
+/** Each reason's two actions, in the order of every row: the one that lets the fact (or the
+ *  change to it) stand, outlined, then the one that takes it back, quiet. "Keep" means a
+ *  different thing per reason, so each says what it does in a tooltip and to a screen reader. */
+const REVIEW_ACTIONS: Record<
+  ReviewItem["reason"],
+  [action: ReviewAction, label: string, hint: string][]
+> = {
+  flagged: [
+    ["keep", "Keep", "It still holds: clear the flag"],
+    ["hide", "Hide", "Hide from memory"],
+  ],
+  disputed: [
+    ["keep", "Keep both", "They don't conflict: drop the dispute"],
+    ["hide", "Hide", "Hide this one from memory; the other stays"],
+  ],
+  replaced: [
+    ["keep", "Keep", "The replacement stands"],
+    ["undo", "Undo", "Restore it: undo every replacement of it"],
+  ],
+  recorded: [
+    ["keep", "Keep", "It belongs in memory"],
+    ["hide", "Hide", "Hide from memory"],
+  ],
+};
 
-function MemoryReviewPanel({ id, items }: { id: string; items: ReviewItem[] }) {
+function MemoryReviewPanel({ listId, items }: { listId: string; items: ReviewItem[] }) {
   const act = useMutation({
     mutationFn: async ({ item, action }: { item: ReviewItem; action: ReviewAction }) => {
       if (action === "hide") return api.hideFact(item.factId, true);
@@ -596,7 +1010,7 @@ function MemoryReviewPanel({ id, items }: { id: string; items: ReviewItem[] }) {
       const key = reviewKey(item);
       // Picked while the row is still mounted; the target's own row (or the strip button,
       // or the heading) stays mounted through the re-render, so it can take focus now.
-      const next = focusAfterReview(id, key);
+      const next = focusAfterReview(listId, key);
       keptReview.add(key);
       dropReviewItem(key);
       next?.focus();
@@ -605,117 +1019,121 @@ function MemoryReviewPanel({ id, items }: { id: string; items: ReviewItem[] }) {
     onError: (e) => notify.error("Couldn't update memory", { description: errorText(e) }),
   });
   const busy = (item: ReviewItem) =>
-    act.isPending && act.variables && reviewKey(act.variables.item) === reviewKey(item);
+    !!act.isPending && !!act.variables && reviewKey(act.variables.item) === reviewKey(item);
   return (
-    <ul
-      id={id}
-      aria-label="Memory to review"
-      className="mb-5 divide-y overflow-hidden rounded-lg border"
-    >
-      {items.map((item) => {
-        const button = (action: ReviewAction, label: string, title: string) => (
-          <Button
-            size="xs"
-            variant={action === "hide" ? "ghost" : "outline"}
-            title={title}
-            disabled={busy(item)}
-            onClick={() => act.mutate({ item, action })}
-          >
-            {label}
-          </Button>
-        );
-        return (
-          <li
-            key={reviewKey(item)}
-            data-review-key={reviewKey(item)}
-            className="flex items-start gap-3 px-3 py-2"
-          >
-            <button
-              type="button"
-              className="min-w-0 flex-1 cursor-pointer rounded-sm text-left outline-none focus-visible:ring-2 focus-visible:ring-ring/60 disabled:cursor-default"
-              disabled={!item.project}
-              onClick={() => item.project && openProjectSection(item.project, "memory")}
-              title={item.project ? "Open the project's memory" : undefined}
-            >
-              <span className="block text-sm">{item.text}</span>
-              <span className="mt-0.5 block text-xs text-muted-foreground">
-                {reviewHeadline(item)}
-                {item.at > 0 && ` on ${factDate(item.at)}`}
-                {item.project && ` · ${baseName(item.project)}`}
-                {item.reason === "flagged" &&
-                  // An unpinned playbook or subagent fact: memory never injects it, flagged
-                  // or kept.
-                  (item.injectable === false
-                    ? " · not part of injected memory either way"
-                    : item.trusted
-                      ? " · pinned or edited, so it stays in memory"
-                      : " · left out of memory until you choose")}
-              </span>
-              {item.note && (
-                <span className="mt-0.5 block text-xs text-muted-foreground">
-                  Reason: <span className="text-foreground">{item.note}</span>
-                </span>
-              )}
-              {item.other && (
-                <span className="mt-0.5 block text-xs text-muted-foreground">
-                  {item.reason === "disputed" ? "Disputed by" : "Replaced by"}:{" "}
-                  <span className="text-foreground">{item.other.text}</span>
-                </span>
-              )}
-            </button>
-            <div className="flex shrink-0 gap-1">
-              {item.reason === "flagged" && (
-                <>
-                  {button("keep", "Keep", "It still holds: clear the flag")}
-                  {button("hide", "Hide", "Hide from memory")}
-                </>
-              )}
-              {item.reason === "disputed" && (
-                <>
-                  {button("keep", "Keep both", "They don't conflict: drop the dispute")}
-                  {button("hide", "Hide", "Hide this one from memory; the other stays")}
-                </>
-              )}
-              {item.reason === "replaced" && (
-                <>
-                  {button("undo", "Undo", "Restore it: undo every replacement of it")}
-                  {button("keep", "Keep", "The replacement stands")}
-                </>
-              )}
-              {item.reason === "recorded" && (
-                <>
-                  {button("keep", "Keep", "It belongs in memory")}
-                  {button("hide", "Hide", "Hide from memory")}
-                </>
-              )}
-            </div>
-          </li>
-        );
-      })}
-    </ul>
+    <TooltipProvider delay={TOOLTIP_DELAY_MS}>
+      <ItemList label={PANEL_LABELS.memory}>
+        {items.map((item, i) => {
+          const project = item.project;
+          return (
+            <ListRow key={reviewKey(item)} first={i === 0} data-review-key={reviewKey(item)}>
+              <Item
+                size="sm"
+                className={cn(project ? ROW_STRETCHED : "rounded-none", "items-start")}
+              >
+                <ItemContent className="min-w-0">
+                  <ItemTitle className="line-clamp-none block w-full font-normal wrap-break-word">
+                    {project ? (
+                      <button
+                        type="button"
+                        data-stretch
+                        className={STRETCH}
+                        onClick={() => openProjectSection(project, "memory")}
+                        title="Open the project's memory"
+                      >
+                        {item.text}
+                      </button>
+                    ) : (
+                      item.text
+                    )}
+                  </ItemTitle>
+                  <ItemDescription className="line-clamp-none text-[13px]">
+                    {reviewHeadline(item)}
+                    {item.at > 0 && ` on ${factDate(item.at)}`}
+                    {project && ` · ${baseName(project)}`}
+                    {item.reason === "flagged" &&
+                      // An unpinned playbook or subagent fact: memory never injects it,
+                      // flagged or kept.
+                      (item.injectable === false
+                        ? " · not part of injected memory either way"
+                        : item.trusted
+                          ? " · pinned or edited, so it stays in memory"
+                          : " · left out of memory until you choose")}
+                  </ItemDescription>
+                  {item.note && (
+                    <ItemDescription className="line-clamp-none text-[13px] wrap-break-word">
+                      Reason: <span className="text-foreground">{item.note}</span>
+                    </ItemDescription>
+                  )}
+                  {item.other && (
+                    <ItemDescription className="line-clamp-none text-[13px] wrap-break-word">
+                      {item.reason === "disputed" ? "Disputed by" : "Replaced by"}:{" "}
+                      <span className="text-foreground">{item.other.text}</span>
+                    </ItemDescription>
+                  )}
+                </ItemContent>
+                <ItemActions className={cn(ABOVE, "gap-1")}>
+                  {(REVIEW_ACTIONS[item.reason] ?? REVIEW_ACTIONS.recorded).map(
+                    ([action, label, hint], n) => (
+                      <Tooltip key={action}>
+                        <TooltipTrigger
+                          render={
+                            <Button
+                              size="xs"
+                              variant={n === 0 ? "outline" : "ghost"}
+                              // Stays focusable while its write runs, so focus is still in
+                              // the list when the row goes (focusAfterReview) or the write
+                              // fails; `disabled:` does not match an aria-disabled button.
+                              focusableWhenDisabled
+                              disabled={busy(item)}
+                              className={cn(
+                                "aria-disabled:opacity-50",
+                                n > 0 && "text-muted-foreground",
+                              )}
+                              onClick={() => act.mutate({ item, action })}
+                            />
+                          }
+                        >
+                          {label}
+                          <span className="sr-only">: {hint}</span>
+                        </TooltipTrigger>
+                        <TooltipContent>{hint}</TooltipContent>
+                      </Tooltip>
+                    ),
+                  )}
+                </ItemActions>
+              </Item>
+            </ListRow>
+          );
+        })}
+      </ItemList>
+    </TooltipProvider>
   );
 }
 
-/** ArrowUp / ArrowDown move between the session rows (their title buttons), across repos;
- *  Tab still walks every control in order. */
+/** ArrowUp / ArrowDown move between the session rows (their title buttons) and Home / End
+ *  jump to the first and last, across repos and from any control in a row (Resume, a
+ *  commit); Tab still walks every control in order. */
 function moveRowFocus(e: KeyboardEvent<HTMLElement>) {
-  if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
+  if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(e.key)) return;
   const rows = [...e.currentTarget.querySelectorAll<HTMLElement>("[data-today-row]")];
-  const at = rows.indexOf(document.activeElement as HTMLElement);
+  const active = document.activeElement;
+  const at = rows.findIndex((row) => row.closest("[data-slot=item]")?.contains(active));
   if (at < 0) return;
   e.preventDefault();
-  rows[Math.min(rows.length - 1, Math.max(0, at + (e.key === "ArrowDown" ? 1 : -1)))]?.focus();
+  const to =
+    e.key === "Home"
+      ? 0
+      : e.key === "End"
+        ? rows.length - 1
+        : Math.min(rows.length - 1, Math.max(0, at + (e.key === "ArrowDown" ? 1 : -1)));
+  rows[to]?.focus();
 }
 
 function SessionGroups({ report }: { report: Today }) {
   const openProject = useUi((s) => s.openProject);
   // Fixed for the session, like ThreadView: a Linux box without a terminal hides Resume.
-  const cliLaunch = useQuery({
-    queryKey: ["cli_launch_supported"],
-    queryFn: api.cliLaunchSupported,
-    staleTime: Number.POSITIVE_INFINITY,
-  });
-  const canLaunch = cliLaunch.data ?? CAN_LAUNCH_CLI_FALLBACK;
+  const canLaunch = useCanLaunchCli();
   return (
     // biome-ignore lint/a11y/noStaticElementInteractions: only forwards arrow keys between the row buttons it contains
     <div className="space-y-6" onKeyDown={moveRowFocus}>
@@ -723,15 +1141,17 @@ function SessionGroups({ report }: { report: Today }) {
         // The backend groups sessions with no project under "": no page to open for them.
         const name = group.project ? baseName(group.project) : "No project";
         return (
-          <section key={group.project} aria-label={name}>
-            <div className="flex items-center gap-2 pb-1.5">
+          // Unnamed: thirty repos would be thirty landmarks. The heading gives the structure
+          // and the list carries the repo's name.
+          <section key={group.project}>
+            <div className="flex items-center gap-2 px-1 pb-2">
               <h2
                 className="min-w-0 truncate text-sm font-semibold"
                 title={group.project || undefined}
               >
                 {name}
               </h2>
-              <span className="text-xs text-muted-foreground tabular-nums">
+              <span className="shrink-0 text-[13px] text-muted-foreground tabular-nums">
                 {plural(group.threads.length, "session")}
               </span>
               {group.project && (
@@ -739,17 +1159,20 @@ function SessionGroups({ report }: { report: Today }) {
                   size="xs"
                   variant="ghost"
                   className="ml-auto text-muted-foreground"
+                  // Starts with the visible words, and tells one repo's button from the next.
+                  aria-label={`Open project ${name}`}
                   onClick={() => openProject(group.project)}
                 >
                   Open project
+                  <ChevronRight data-icon="inline-end" />
                 </Button>
               )}
             </div>
-            <ul className="divide-y rounded-lg border">
-              {group.threads.map((t) => (
-                <SessionRow key={t.id} thread={t} canLaunch={canLaunch} />
+            <ItemList label={`Sessions in ${name}`}>
+              {group.threads.map((t, i) => (
+                <SessionRow key={t.id} thread={t} canLaunch={canLaunch} first={i === 0} />
               ))}
-            </ul>
+            </ItemList>
           </section>
         );
       })}
@@ -757,97 +1180,100 @@ function SessionGroups({ report }: { report: Today }) {
   );
 }
 
-function SessionRow({ thread, canLaunch }: { thread: TodayThread; canLaunch: boolean }) {
+/** A session: its title opens the transcript from anywhere on the row, with Resume beside it
+ *  and the commits the session produced under it. */
+function SessionRow({
+  thread,
+  canLaunch,
+  first,
+}: {
+  thread: TodayThread;
+  canLaunch: boolean;
+  first: boolean;
+}) {
   const openThread = useUi((s) => s.openThread);
+  // Native resume exists only for the agents whose CLI takes a session id.
   const canResume = canLaunch && (thread.source === "claude_code" || thread.source === "codex");
   const resume = useMutation({
     mutationFn: () => api.resumeThread(thread.id),
     onError: (e) => notify.error(`Couldn't resume the session: ${errorText(e)}`),
   });
   const title = thread.title || "Untitled session";
+  const source = SOURCE_LABELS[thread.source] ?? thread.source;
   return (
-    <li className="px-3 py-2.5">
-      <div className="flex items-start gap-3">
-        <div className="min-w-0 flex-1">
-          <button
-            type="button"
-            data-today-row
-            onClick={() => openThread(thread.id)}
-            className="block max-w-full cursor-pointer truncate rounded-sm text-left text-sm font-medium outline-none hover:underline hover:underline-offset-4 focus-visible:ring-2 focus-visible:ring-ring/60"
-          >
-            {title}
-          </button>
-          <p className="mt-0.5 text-xs text-muted-foreground tabular-nums">
-            {SOURCE_LABELS[thread.source] ?? thread.source} · {formatDuration(thread.durationSecs)}{" "}
-            · {plural(thread.messages, "message")} · {formatTime(thread.lastActive)}
-          </p>
-        </div>
-        <div className="flex shrink-0 items-center gap-1.5">
-          {canResume && (
+    <ListRow first={first}>
+      <Item size="sm" className={cn(ROW_STRETCHED, "gap-y-2")}>
+        <ItemContent className="min-w-0 gap-0.5">
+          <ItemTitle className="block w-full">
+            <button
+              type="button"
+              data-today-row
+              data-stretch
+              onClick={() => openThread(thread.id)}
+              // A cut-off name can be read on hover.
+              title={title}
+              className={cn(STRETCH, "block max-w-full truncate")}
+            >
+              {title}
+            </button>
+          </ItemTitle>
+          <ItemDescription className={ROW_META}>
+            {source} · {formatDuration(thread.durationSecs)} · {plural(thread.messages, "message")}{" "}
+            · {formatTime(thread.lastActive)}
+          </ItemDescription>
+        </ItemContent>
+        {canResume && (
+          <ItemActions className={ABOVE}>
             <Button
               size="xs"
               variant="outline"
-              onClick={() => resume.mutate()}
+              // Stays focusable while the terminal opens: a disabled button drops focus to
+              // the page body, and arrow keys then have no row to move from.
+              focusableWhenDisabled
               disabled={resume.isPending}
-              title={`Resume "${title}" in a terminal`}
+              className="aria-disabled:opacity-50"
+              onClick={() => resume.mutate()}
+              title={`Resume this session in ${source}`}
+              aria-label={`Resume "${title}" in ${source}`}
             >
-              <TerminalSquare />
-              Resume
+              {resume.isPending ? (
+                <>
+                  <Spinner data-icon="inline-start" className="size-3" />
+                  Resuming…
+                </>
+              ) : (
+                <>
+                  Resume
+                  <ArrowUpRight data-icon="inline-end" />
+                </>
+              )}
             </Button>
-          )}
-          <Button
-            size="xs"
-            variant="outline"
-            onClick={() => openThread(thread.id)}
-            aria-label={`Open "${title}"`}
-          >
-            Open
-          </Button>
-        </div>
-      </div>
-      {thread.commits.length > 0 && (
-        <div className="mt-2 flex flex-wrap gap-1.5">
-          {thread.commits.map((c) => (
-            <CommitChip key={c.sha} sha={c.sha} shortSha={c.shortSha} subject={c.subject} />
-          ))}
-        </div>
-      )}
-    </li>
-  );
-}
-
-/** A produced commit: its short sha and subject. Clicking copies the full sha. */
-function CommitChip({
-  sha,
-  shortSha,
-  subject,
-}: {
-  sha: string;
-  shortSha: string;
-  subject: string | null;
-}) {
-  const [copied, setCopied] = useState(false);
-  const copy = () => {
-    copyText(sha).then(
-      () => {
-        setCopied(true);
-        setTimeout(() => setCopied(false), 1500);
-      },
-      (e) => notify.error(`Couldn't copy the commit sha: ${errorText(e)}`),
-    );
-  };
-  return (
-    <button
-      type="button"
-      onClick={copy}
-      title={copied ? "Copied" : `Copy ${sha}`}
-      aria-label={`Copy commit ${shortSha}${subject ? `: ${subject}` : ""}`}
-      className="inline-flex max-w-full cursor-pointer items-center gap-1.5 rounded-md border bg-muted/40 px-1.5 py-0.5 text-xs outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring/60"
-    >
-      <span className="inline-flex w-[7ch] justify-center font-mono text-[11px] text-primary">
-        {copied ? <Check className="inline size-3" /> : shortSha}
-      </span>
-      {subject && <span className="max-w-[44ch] truncate text-muted-foreground">{subject}</span>}
-    </button>
+          </ItemActions>
+        )}
+        {thread.commits.length > 0 && (
+          // One line each: a sha badge is as wide as its text and only the subject gives
+          // way, so the two cannot meet however long either is.
+          <ItemFooter className={cn(ABOVE, "block min-w-0")}>
+            <ul aria-label={`Commits from "${title}"`} className="space-y-1">
+              {thread.commits.map((c) => (
+                <li key={c.sha} className="flex min-w-0 items-center gap-2 text-[13px]">
+                  <CommitSha
+                    sha={c.sha}
+                    shortSha={c.shortSha}
+                    label={`Copy commit ${c.shortSha}${c.subject ? `: ${c.subject}` : ""}`}
+                  />
+                  <span
+                    className="min-w-0 truncate text-muted-foreground"
+                    title={c.subject ?? undefined}
+                  >
+                    {c.subject || "(no subject)"}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          </ItemFooter>
+        )}
+      </Item>
+    </ListRow>
   );
 }

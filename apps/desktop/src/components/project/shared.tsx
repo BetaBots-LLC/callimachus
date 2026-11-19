@@ -4,9 +4,11 @@ import { Check, Copy } from "lucide-react";
 import { api, OPEN_TARGETS } from "../../lib/api";
 import { CAN_LAUNCH_CLI_FALLBACK } from "../../lib/platform";
 import { copyText } from "../../lib/clipboard";
-import { errorText } from "../../lib/toast";
+import { errorText, notify } from "../../lib/toast";
 import { useUi } from "../../store/ui";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { cn } from "@/lib/utils";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -112,6 +114,58 @@ export function AgentMenu({
         </MenuPrimitive.Group>
       </DropdownMenuContent>
     </DropdownMenu>
+  );
+}
+
+/**
+ * A commit's short sha as a Badge; clicking copies the full sha. The badge takes the width of
+ * its own text: `gitlink` stores ten characters and git may print more, so a fixed width
+ * (Today once gave it seven) lets the sha run into the subject beside it. The check is laid
+ * over the hidden sha, so confirming a copy moves nothing in the row.
+ */
+export function CommitSha({
+  sha,
+  shortSha,
+  label,
+}: {
+  sha: string;
+  shortSha: string;
+  /** The accessible name; defaults to "Copy commit <short sha>". */
+  label?: string;
+}) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <>
+      <Badge
+        variant="secondary"
+        render={
+          <button
+            type="button"
+            // Copied straight from the click: WebKit allows clipboard writes only in the
+            // gesture.
+            onClick={() =>
+              copyText(sha).then(
+                () => {
+                  setCopied(true);
+                  setTimeout(() => setCopied(false), 1500);
+                },
+                (e) => notify.error(`Couldn't copy the commit sha: ${errorText(e)}`),
+              )
+            }
+            title={`Copy ${sha}`}
+            aria-label={label ?? `Copy commit ${shortSha}`}
+          />
+        }
+        className="relative cursor-pointer rounded-md font-mono font-normal outline-none hover:bg-foreground/10"
+      >
+        <span className={cn(copied && "invisible")}>{shortSha}</span>
+        {copied && <Check aria-hidden="true" className="absolute inset-0 m-auto" />}
+      </Badge>
+      {/* The name stays "Copy commit ...", so the copy is said here. */}
+      <span aria-live="polite" className="sr-only">
+        {copied ? `Copied ${shortSha}` : ""}
+      </span>
+    </>
   );
 }
 
