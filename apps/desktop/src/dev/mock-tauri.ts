@@ -3,7 +3,7 @@
 //   http://localhost:1420/mock.html?view=settings&section=engine&theme=light
 // Params: theme, consent, memory (alias: knowledge), engines, agents, agenthooks, plugin, codexplugin, claude, keys,
 // update, jobs, semantic, searchMs, onboarding, ledger, chats, projectdata, lastproject, muted,
-// sections, today, review, scope, cliwatch, repomemory, report, truth, conflicts, drift (see SCENARIO below). mock-entry.ts also reads view, section,
+// sections, terminals, today, review, scope, cliwatch, repomemory, report, truth, conflicts, drift (see SCENARIO below). mock-entry.ts also reads view, section,
 // chatmode=ask and ask=<question> (sends it on load). Dev-only.
 import type {
   AgentHooksStatus,
@@ -425,6 +425,9 @@ const embed: EmbedStatus = {
   running: false,
 };
 let closeToTray = false;
+// Settings > General > Terminal: `terminals=one` is a Mac with only Terminal.app (the row
+// is hidden); the default has Ghostty and iTerm2 too.
+let cliTerminal: string | null = null;
 const keys = new Map<string, boolean>(
   ["anthropic", "openai", "gemini", "openrouter", "ollama", "ollama_cloud"].map((p) => [
     p,
@@ -2348,6 +2351,21 @@ const handlers: Record<string, Handler> = {
     const bytes = Array.isArray(a.png) ? a.png.length : 0;
     if (bytes < 8) throw new Error("the card is not a PNG image");
     return "/Users/me/Downloads/callimachus-report-2026-11-08.png";
+  },
+  get_cli_terminal: () => ({
+    choices: [
+      { id: "terminal", label: "Terminal" },
+      ...(params.get("terminals") === "one"
+        ? []
+        : [
+            { id: "ghostty", label: "Ghostty" },
+            { id: "iterm", label: "iTerm2" },
+          ]),
+    ],
+    selected: cliTerminal,
+  }),
+  set_cli_terminal: (a) => {
+    cliTerminal = typeof a.id === "string" ? a.id : null;
   },
   get_close_to_tray: () => closeToTray,
 

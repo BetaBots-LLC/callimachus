@@ -1402,6 +1402,25 @@ pub fn set_close_to_tray(conn: &Connection, on: bool) -> Result<()> {
     app_config::put_flag(conn, "window.close_to_tray", on)
 }
 
+/// The terminal Resume and "Open in CLI" launch in (`agent::cli_resume::MAC_TERMINALS`), or
+/// `None` for the platform default. A stored id this build does not know reads as `None`.
+pub fn get_cli_terminal(conn: &Connection) -> Result<Option<String>> {
+    Ok(
+        app_config::get_nonblank(conn, crate::agent::cli_resume::TERMINAL_KEY)?
+            .filter(|id| crate::agent::cli_resume::is_known_terminal(id)),
+    )
+}
+
+/// Persist the terminal choice; `None` goes back to the default.
+pub fn set_cli_terminal(conn: &Connection, id: Option<&str>) -> Result<()> {
+    use crate::agent::cli_resume::{is_known_terminal, TERMINAL_KEY};
+    match id {
+        None => app_config::delete(conn, TERMINAL_KEY),
+        Some(id) if is_known_terminal(id) => app_config::put(conn, TERMINAL_KEY, id),
+        Some(id) => anyhow::bail!("unknown terminal: {id}"),
+    }
+}
+
 /// Read a provider's saved custom base URL (unset / blank -> None). Non-secret config; API
 /// keys live in the OS keychain. Used for local Ollama pointed at a remote host, and for
 /// Ollama Cloud / authenticated proxies (paired with a keychain key).
