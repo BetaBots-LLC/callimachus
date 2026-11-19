@@ -205,7 +205,12 @@ function App() {
     import.meta.env.DEV &&
     (import.meta.env.VITE_ONBOARD === "1" || localStorage.getItem("cal:onboard") === "1");
   return (
-    <div className="flex h-screen flex-col bg-background text-foreground">
+    // `relative overflow-hidden`: every view scrolls in a pane of its own, and an `sr-only`
+    // label inside one is absolutely positioned. With no positioned ancestor it was laid out
+    // against the document, below the window once its pane had scrolled content, so the
+    // window itself scrolled too (38 px on the setup checklist, 522 px on Stats): two
+    // scrollbars, and a page that scrolled past its end.
+    <div className="relative flex h-screen flex-col overflow-hidden bg-background text-foreground">
       <header className="flex items-center justify-between border-b px-4 py-2">
         <div className="flex items-center gap-3">
           <span className="font-semibold tracking-tight">Callimachus</span>
